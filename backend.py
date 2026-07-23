@@ -101,7 +101,11 @@ SAMPLE_CLIENTS_FILE = Path(r"C:\Users\felip\Downloads\030-relatorioPessoas.csv")
 
 
 def resolve_data_dir() -> Path:
+    # PASSINI_CRM_DATA: diretorio persistente do banco no servidor (ex.: /srv/passini/data/crm).
+    # Tem prioridade. No Windows, se nao definida, mantem o comportamento anterior.
+    _env_data = os.environ.get("PASSINI_CRM_DATA")
     candidates = [
+        Path(_env_data) if _env_data else None,
         Path(os.environ.get("LOCALAPPDATA", "")) / "PassiniDashboardV2" if os.environ.get("LOCALAPPDATA") else None,
         Path(tempfile.gettempdir()) / "PassiniDashboardV2",
         ROOT_DIR / "runtime_data",
