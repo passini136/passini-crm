@@ -1,0 +1,27 @@
+# Dados e bancos (nunca versionar)
+*.db
+*.sqlite
+*.sqlite3
+data/
+runtime_data/
+auto-import/
+uploads/
+exports/
+
+# Segredos
+.env
+*.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Logs e temporários
+*.log
+server_out.log
+server_err.log
+tmp_*.txt
+debug_*.log
+
+# Documentos de contexto de negócio (não são código)
+Contexto projeto/
