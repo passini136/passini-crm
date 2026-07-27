@@ -3790,6 +3790,7 @@ function importacoesView() {
                   <option value="goals-unit">Meta unidade</option>
                   <option value="clients">Clientes PF/PJ</option>
                   <option value="users">Usuários</option>
+                  <option value="cidade-unidade">Cidades × Unidade</option>
                 </select>
               </div>
               <div class="field"><label>Arquivo CSV</label><input id="admin-import-file" type="file" /></div>

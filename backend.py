@@ -6107,6 +6107,66 @@ def import_admin_csv(conn: sqlite3.Connection, company_id: int, user_id: int, ta
     return total
 
 
+def import_city_mappings_csv(conn: sqlite3.Connection, company_id: int, user_id: int, content: bytes) -> dict[str, Any]:
+    """Importa em lote o vinculo cidade->unidade a partir de um CSV e resolve as
+    pendencias de 'cidade_sem_correspondencia' correspondentes.
+    Colunas aceitas (cabecalho, sem diferenciar maiusculas/acentos):
+      CIDADE (obrigatoria), PRINCIPAL ou UNIDADE (obrigatoria), ESTADO (opcional), PAIS (opcional).
+    Separador ; ou , detectado automaticamente. O CSV e autoritativo: substitui o
+    vinculo existente de cada cidade."""
+    text = decode_text_content(content)
+    first_line = next((ln for ln in text.splitlines() if ln.strip()), "")
+    delimiter = ";" if first_line.count(";") >= first_line.count(",") else ","
+    reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
+
+    field_map: dict[str, str] = {}
+    for header in (reader.fieldnames or []):
+        key = normalize_upper(header)
+        if key in ("CIDADE", "CITY", "MUNICIPIO"):
+            field_map["city"] = header
+        elif key in ("PRINCIPAL", "UNIDADE", "UNIDADE PRINCIPAL", "UNIT"):
+            field_map["unit"] = header
+        elif key in ("ESTADO", "UF", "STATE"):
+            field_map["state"] = header
+        elif key in ("PAIS", "PAÍS", "COUNTRY"):
+            field_map["country"] = header
+    if "city" not in field_map or "unit" not in field_map:
+        raise ValueError("O CSV precisa ter as colunas CIDADE e PRINCIPAL (ou UNIDADE).")
+
+    now = now_iso()
+    updated = 0
+    for row in reader:
+        city = normalize_upper(row.get(field_map["city"]))
+        unit = normalize_unit(row.get(field_map["unit"]))
+        if not city or not unit:
+            continue
+        state = normalize_upper(row.get(field_map["state"])) if field_map.get("state") else None
+        country = normalize_upper(row.get(field_map["country"])) if field_map.get("country") else None
+        conn.execute("DELETE FROM city_mappings WHERE company_id = ? AND city_name = ?", (company_id, city))
+        conn.execute(
+            """
+            INSERT INTO city_mappings
+                (company_id, city_name, principal_unit, state_name, country_name, valid_from, valid_to, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (company_id, city, unit, state or None, country or None, "2025-01-01", None, "csv_lote", now),
+        )
+        updated += 1
+
+    # Resolve as pendencias de cidade que agora tem vinculo
+    cur = conn.execute(
+        """
+        UPDATE import_issues
+        SET status = 'resolvida'
+        WHERE company_id = ? AND issue_type = 'cidade_sem_correspondencia' AND status = 'pendente'
+          AND reference_value IN (SELECT city_name FROM city_mappings WHERE company_id = ?)
+        """,
+        (company_id, company_id),
+    )
+    resolved = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
+    return {"updated": updated, "resolved": resolved}
+
+
 def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -7867,6 +7927,25 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not user or not self._require_admin_area(user):
                     return
                 import_type = path.split("/api/admin/import/")[-1]
+                if import_type == "cidade-unidade":
+                    files_payload, _ = self._parse_multipart()
+                    file_entry = next((f for f in files_payload if f.get("content")), None)
+                    if not file_entry:
+                        self._set_headers(400)
+                        self.wfile.write(json_dumps({"error": "Nenhum arquivo encontrado na requisição."}))
+                        return
+                    try:
+                        with closing(get_connection()) as conn:
+                            res = import_city_mappings_csv(conn, user["company_id"], user["id"], file_entry["content"])
+                            audit_log(conn, user["company_id"], user["id"], "importar", "city_mappings", import_type, res)
+                            conn.commit()
+                        self._set_headers(200)
+                        self.wfile.write(json_dumps({"message": f"{res['updated']} cidade(s) atualizada(s); {res['resolved']} pendência(s) de cidade resolvida(s)."}))
+                    except Exception as exc:
+                        traceback.print_exc()
+                        self._set_headers(500)
+                        self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
                 TABLE_MAP = {
                     "people":       "people_records",
                     "vacations":    "vacations",
