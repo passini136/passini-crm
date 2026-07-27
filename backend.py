@@ -6167,6 +6167,60 @@ def import_city_mappings_csv(conn: sqlite3.Connection, company_id: int, user_id:
     return {"updated": updated, "resolved": resolved}
 
 
+def update_person_unit(conn: sqlite3.Connection, company_id: int, user_id: int, person_name: str | None, base_unit: str | None) -> str:
+    """Corrige a unidade de um vendedor/pessoa. Aplica a todos os registros da pessoa
+    (fica consistente entre competencias). Cria o registro se ainda nao existir."""
+    person = normalize_whitespace(person_name)
+    unit = normalize_unit(base_unit)
+    if not person or not unit:
+        raise ValueError("Informe o vendedor e a unidade.")
+    cur = conn.execute(
+        "UPDATE people_records SET base_unit = ? WHERE company_id = ? AND person_name = ?",
+        (unit, company_id, person),
+    )
+    if not cur.rowcount:
+        conn.execute(
+            """
+            INSERT INTO people_records
+                (company_id, person_name, role_classification, base_unit, valid_from, valid_to, source, is_active, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (company_id, person, infer_role_from_name(person), unit, "2025-01-01", None, "edicao_manual", now_iso()),
+        )
+    audit_log(conn, company_id, user_id, "ajustar_unidade", "people_records", person, {"base_unit": unit})
+    return unit
+
+
+def update_city_unit(conn: sqlite3.Connection, company_id: int, user_id: int, city_name: str | None, principal_unit: str | None) -> str:
+    """Corrige a unidade principal de uma cidade e resolve a pendencia correspondente."""
+    city = normalize_upper(city_name)
+    unit = normalize_unit(principal_unit)
+    if not city or not unit:
+        raise ValueError("Informe a cidade e a unidade.")
+    cur = conn.execute(
+        "UPDATE city_mappings SET principal_unit = ? WHERE company_id = ? AND city_name = ?",
+        (unit, company_id, city),
+    )
+    if not cur.rowcount:
+        conn.execute(
+            """
+            INSERT INTO city_mappings
+                (company_id, city_name, principal_unit, state_name, country_name, valid_from, valid_to, source, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (company_id, city, unit, None, None, "2025-01-01", None, "edicao_manual", now_iso()),
+        )
+    conn.execute(
+        """
+        UPDATE import_issues SET status = 'resolvida'
+        WHERE company_id = ? AND issue_type = 'cidade_sem_correspondencia' AND status = 'pendente' AND reference_value = ?
+        """,
+        (company_id, city),
+    )
+    audit_log(conn, company_id, user_id, "ajustar_unidade", "city_mappings", city, {"principal_unit": unit})
+    return unit
+
+
 def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -7922,6 +7976,38 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/admin/people/update-unit":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        unit = update_person_unit(conn, user["company_id"], user["id"], payload.get("person_name"), payload.get("base_unit"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": f"Vendedor '{normalize_whitespace(payload.get('person_name'))}' ajustado para {unit}."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/city/update-unit":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        unit = update_city_unit(conn, user["company_id"], user["id"], payload.get("city_name"), payload.get("principal_unit"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": f"Cidade '{normalize_upper(payload.get('city_name'))}' ajustada para {unit}."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path.startswith("/api/admin/import/"):
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):

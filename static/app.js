@@ -3803,6 +3803,37 @@ function importacoesView() {
   `;
 }
 
+function adminEditorCards() {
+  const UNITS = ["MATRIZ", "LAJEADO", "PELOTAS", "ZONA SUL", "ZONA NORTE", "XANGRILA"];
+  const unitOptions = UNITS.map((u) => `<option value="${u}">${u}</option>`).join("");
+  const people = state.admin?.people || [];
+  const cities = state.admin?.cityMappings || [];
+  const sellerOpts = [...new Set(people.map((p) => p.person_name).filter(Boolean))].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
+  const cityOpts = [...new Set(cities.map((c) => c.city_name).filter(Boolean))].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
+  return `
+    <div class="grid-2">
+      <div class="form-card">
+        <div class="section-title"><div><h3>Ajustar vendedor × unidade</h3><div class="text-small">Busque o vendedor pelo nome e defina a unidade correta.</div></div></div>
+        <div class="two-column-form">
+          <div class="field"><label>Vendedor</label><input id="edit-seller-name" list="sellers-datalist" placeholder="Digite o nome" /></div>
+          <div class="field"><label>Unidade</label><select id="edit-seller-unit">${unitOptions}</select></div>
+        </div>
+        <div class="actions"><button class="btn btn-primary" onclick="submitPersonUnit()">Salvar vendedor</button></div>
+        <datalist id="sellers-datalist">${sellerOpts}</datalist>
+      </div>
+      <div class="form-card">
+        <div class="section-title"><div><h3>Ajustar cidade × unidade</h3><div class="text-small">Busque a cidade pelo nome e defina a unidade correta.</div></div></div>
+        <div class="two-column-form">
+          <div class="field"><label>Cidade</label><input id="edit-city-name" list="cities-datalist" placeholder="Digite a cidade" /></div>
+          <div class="field"><label>Unidade</label><select id="edit-city-unit">${unitOptions}</select></div>
+        </div>
+        <div class="actions"><button class="btn btn-primary" onclick="submitCityUnit()">Salvar cidade</button></div>
+        <datalist id="cities-datalist">${cityOpts}</datalist>
+      </div>
+    </div>
+  `;
+}
+
 administracaoView = function administracaoViewOverride() {
   if (!state.admin) return `<div class="loader panel">Carregando administração...</div>`;
   const section = state.adminSection || "cadastros";
@@ -3826,6 +3857,7 @@ administracaoView = function administracaoViewOverride() {
   return `
     <div class="stack">
       ${adminSectionNav}
+      ${adminEditorCards()}
       <div class="form-card">
         <div class="section-title"><div><h3>Pendências</h3><div class="text-small">Resolva vínculos e correspondências sem abrir telas gigantes.</div></div></div>
         <div class="stack">${pendingIssueCards()}</div>
@@ -4887,6 +4919,32 @@ async function submitAdminImport() {
   try {
     const result = await api(`/api/admin/import/${typeEl.value}`, { method: "POST", body: form });
     addMessage("success", result.message || "Importação concluída.");
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function submitPersonUnit() {
+  const name = document.getElementById("edit-seller-name")?.value?.trim();
+  const unit = document.getElementById("edit-seller-unit")?.value;
+  if (!name || !unit) { addMessage("error", "Selecione o vendedor e a unidade."); return; }
+  try {
+    const result = await api("/api/admin/people/update-unit", { method: "POST", body: JSON.stringify({ person_name: name, base_unit: unit }) });
+    addMessage("success", result.message || "Vendedor atualizado.");
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function submitCityUnit() {
+  const name = document.getElementById("edit-city-name")?.value?.trim();
+  const unit = document.getElementById("edit-city-unit")?.value;
+  if (!name || !unit) { addMessage("error", "Selecione a cidade e a unidade."); return; }
+  try {
+    const result = await api("/api/admin/city/update-unit", { method: "POST", body: JSON.stringify({ city_name: name, principal_unit: unit }) });
+    addMessage("success", result.message || "Cidade atualizada.");
     await loadAdmin();
   } catch (error) {
     addMessage("error", error.message);
