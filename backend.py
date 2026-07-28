@@ -5723,6 +5723,8 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         "users": users,
         "clients": [dict(row) for row in conn.execute("SELECT * FROM client_registry WHERE company_id = ? ORDER BY updated_at DESC, client_name LIMIT 300", (company_id,)).fetchall()],
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
+        "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
+        "salesCities": [row["city_name"] for row in conn.execute("SELECT DISTINCT city_name FROM fact_sales_detail WHERE company_id = ? AND city_name IS NOT NULL AND TRIM(city_name) <> '' ORDER BY city_name", (company_id,)).fetchall()],
         "cityMappings": [dict(row) for row in conn.execute("SELECT * FROM city_mappings WHERE company_id = ? ORDER BY city_name, valid_from DESC", (company_id,)).fetchall()],
         "vacations": [dict(row) for row in conn.execute("SELECT * FROM vacations WHERE company_id = ? ORDER BY start_date DESC", (company_id,)).fetchall()],
         "holidays": [dict(row) for row in conn.execute("SELECT * FROM holidays WHERE company_id = ? ORDER BY holiday_date DESC", (company_id,)).fetchall()],
@@ -6187,6 +6189,13 @@ def update_person_unit(conn: sqlite3.Connection, company_id: int, user_id: int, 
             """,
             (company_id, person, infer_role_from_name(person), unit, "2025-01-01", None, "edicao_manual", now_iso()),
         )
+    conn.execute(
+        """
+        UPDATE import_issues SET status = 'resolvida'
+        WHERE company_id = ? AND issue_type = 'vendedor_sem_vinculo' AND status = 'pendente' AND reference_value = ?
+        """,
+        (company_id, person),
+    )
     audit_log(conn, company_id, user_id, "ajustar_unidade", "people_records", person, {"base_unit": unit})
     return unit
 

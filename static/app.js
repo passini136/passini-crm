@@ -3808,8 +3808,19 @@ function adminEditorCards() {
   const unitOptions = UNITS.map((u) => `<option value="${u}">${u}</option>`).join("");
   const people = state.admin?.people || [];
   const cities = state.admin?.cityMappings || [];
-  const sellerOpts = [...new Set(people.map((p) => p.person_name).filter(Boolean))].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
-  const cityOpts = [...new Set(cities.map((c) => c.city_name).filter(Boolean))].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
+  const issues = state.admin?.issues || [];
+  const sellerNames = [
+    ...people.map((p) => p.person_name),
+    ...(state.admin?.salesSellers || []),
+    ...issues.filter((i) => i.issue_type === "vendedor_sem_vinculo").map((i) => i.reference_value),
+  ].filter(Boolean);
+  const cityNames = [
+    ...cities.map((c) => c.city_name),
+    ...(state.admin?.salesCities || []),
+    ...issues.filter((i) => i.issue_type === "cidade_sem_correspondencia").map((i) => i.reference_value),
+  ].filter(Boolean);
+  const sellerOpts = [...new Set(sellerNames)].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
+  const cityOpts = [...new Set(cityNames)].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
   return `
     <div class="grid-2">
       <div class="form-card">
