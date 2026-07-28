@@ -3874,36 +3874,34 @@ administracaoView = function administracaoViewOverride() {
         <div class="stack">${pendingIssueCards()}</div>
       </div>
       <div class="grid-2">
+        ${userEditorCard()}
         ${usersAdminTableCard()}
-        ${adminTableCard("Pendências de importação", ["issue_type", "reference_value", "status", "competence"], state.admin.issues)}
       </div>
       <div class="grid-2">
+        ${personEditorCard()}
         ${adminTableCard("Cadastros de pessoas", ["person_name", "role_classification", "base_unit", "valid_from", "valid_to", "source"], state.admin.people)}
-        ${adminTableCard("Base de clientes PF/PJ", ["client_name", "document_number", "person_type", "source", "confidence_score", "notes"], state.admin.clients)}
       </div>
       <div class="grid-2">
-        ${adminTableCard("Auditoria", ["entity_type", "action", "entity_id", "created_at"], state.admin.audit)}
+        ${adminTableCard("Base de clientes PF/PJ", ["client_name", "document_number", "person_type", "source", "confidence_score", "notes"], state.admin.clients)}
         ${adminTableCard("Mapeamento de cidades", ["city_name", "principal_unit", "valid_from", "valid_to", "source"], state.admin.cityMappings || [])}
+      </div>
+      <div class="grid-2">
+        ${adminTableCard("Pendências de importação", ["issue_type", "reference_value", "status", "competence"], state.admin.issues)}
+        ${adminTableCard("Auditoria", ["entity_type", "action", "entity_id", "created_at"], state.admin.audit)}
       </div>
     </div>
   `;
 };
 
-configuracoesView = function adminViewGoalsSellerUnitFinal() {
-  if (!state.admin) return `<div class="loader panel">Carregando configurações...</div>`;
+function userEditorCard() {
   const sellerOptions = sellerPeopleOptions();
   const userPasswordLabel = state.userEditor.id ? "Nova senha (opcional)" : "Senha inicial";
   const userSubmitLabel = state.userEditor.id ? "Salvar ajustes do usuário" : "Salvar usuário";
   const userTitle = state.userEditor.id ? "Editar usuário" : "Criar usuário";
   const userRole = state.userEditor.role || "Administrador";
-  const sellerGoalEditor = state.goalEditors.seller;
-  const unitGoalEditor = state.goalEditors.unit;
-
   return `
-    <div class="stack">
-      <div class="grid-2">
         <div class="form-card">
-          <div class="section-title"><div><h3>Usuários</h3><div class="text-small">Controle de acesso por vendedor, gerente, analista e administrador.</div></div></div>
+          <div class="section-title"><div><h3>Usuários</h3><div class="text-small">Criar e ajustar acesso: vendedor, gerente, analista e administrador.</div></div></div>
           <form onsubmit="saveUser(event)" class="stack">
             <input id="user-id" type="hidden" value="${escapeHtml(state.userEditor.id)}" />
             <strong>${userTitle}</strong>
@@ -3925,6 +3923,39 @@ configuracoesView = function adminViewGoalsSellerUnitFinal() {
             </div>
           </form>
         </div>
+  `;
+}
+
+function personEditorCard() {
+  return `
+        <div class="form-card">
+          <div class="section-title"><div><h3>Cadastro de pessoa</h3><div class="text-small">Cadastro manual de vendedor/gerente e classificação.</div></div></div>
+          <form onsubmit="savePerson(event)" class="stack">
+            <div class="two-column-form">
+              <div class="field"><label>Nome</label><input id="person-name" required /></div>
+              <div class="field"><label>Classificação</label><select id="person-role"><option>Vendedor</option><option>Gerente</option><option>Outro</option></select></div>
+              <div class="field"><label>Unidade base</label><input id="person-unit" placeholder="MATRIZ" /></div>
+              <div class="field"><label>Vigência inicial</label><input id="person-valid-from" type="date" required /></div>
+            </div>
+            <button class="btn btn-secondary" type="submit">Salvar pessoa</button>
+          </form>
+        </div>
+  `;
+}
+
+configuracoesView = function adminViewGoalsSellerUnitFinal() {
+  if (!state.admin) return `<div class="loader panel">Carregando configurações...</div>`;
+  const sellerOptions = sellerPeopleOptions();
+  const userPasswordLabel = state.userEditor.id ? "Nova senha (opcional)" : "Senha inicial";
+  const userSubmitLabel = state.userEditor.id ? "Salvar ajustes do usuário" : "Salvar usuário";
+  const userTitle = state.userEditor.id ? "Editar usuário" : "Criar usuário";
+  const userRole = state.userEditor.role || "Administrador";
+  const sellerGoalEditor = state.goalEditors.seller;
+  const unitGoalEditor = state.goalEditors.unit;
+
+  return `
+    <div class="stack">
+      <div class="stack">
         <div class="form-card">
           <div class="section-title"><div><h3>Metas e score</h3><div class="text-small">Metas por vendedor, unidade e pesos do score.</div></div></div>
           <div class="stack">
@@ -4063,18 +4094,8 @@ Cancelar edição
       </div>
       <div class="grid-2">
         <div class="form-card">
-          <div class="section-title"><div><h3>Pessoas e feriados</h3><div class="text-small">Cadastros operacionais essenciais.</div></div></div>
+          <div class="section-title"><div><h3>Feriados</h3><div class="text-small">Cadastro de feriados do calendário comercial.</div></div></div>
           <div class="stack">
-            <form onsubmit="savePerson(event)" class="stack">
-              <strong>Pessoa e classificação</strong>
-              <div class="two-column-form">
-                <div class="field"><label>Nome</label><input id="person-name" required /></div>
-                <div class="field"><label>Classificação</label><select id="person-role"><option>Vendedor</option><option>Gerente</option><option>Outro</option></select></div>
-                <div class="field"><label>Unidade base</label><input id="person-unit" placeholder="MATRIZ" /></div>
-                <div class="field"><label>Vigência inicial</label><input id="person-valid-from" type="date" required /></div>
-              </div>
-              <button class="btn btn-secondary" type="submit">Salvar pessoa</button>
-            </form>
             <form onsubmit="saveHoliday(event)" class="stack">
               <strong>Feriado</strong>
               <div class="two-column-form">
