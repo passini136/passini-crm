@@ -6099,6 +6099,74 @@ def delete_user_record(conn: sqlite3.Connection, company_id: int, actor_user_id:
     audit_log(conn, company_id, actor_user_id, "excluir", "users", str(target_user_id), {"username": target["username"]})
 
 
+ALLOWED_USER_ROLES = {"Administrador", "Gerente", "Analista", "Vendedor"}
+
+
+def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """Cria ou atualiza um usuário. Faz o hash da senha quando informada."""
+    username = normalize_whitespace(payload.get("username"))
+    full_name = normalize_whitespace(payload.get("full_name"))
+    role = normalize_whitespace(payload.get("role")) or "Administrador"
+    if role not in ALLOWED_USER_ROLES:
+        raise ValueError("Perfil inválido.")
+    if not username or not full_name:
+        raise ValueError("Informe o usuário e o nome completo.")
+    linked_person = normalize_whitespace(payload.get("linked_person_name")) or None
+    linked_units_raw = payload.get("linked_units") or []
+    if not isinstance(linked_units_raw, list):
+        linked_units_raw = []
+    linked_units = [normalize_unit(u) for u in linked_units_raw if u]
+    if role == "Vendedor":
+        linked_units = []
+    else:
+        linked_person = None
+    linked_units_json = json.dumps(linked_units, ensure_ascii=False) if linked_units else None
+    password = (payload.get("password") or "").strip()
+    user_id = payload.get("id")
+
+    if user_id:
+        existing = conn.execute("SELECT * FROM users WHERE company_id = ? AND id = ?", (company_id, user_id)).fetchone()
+        if not existing:
+            raise ValueError("Usuário não encontrado.")
+        dup = conn.execute("SELECT id FROM users WHERE username = ? AND id <> ?", (username, user_id)).fetchone()
+        if dup:
+            raise ValueError("Já existe um usuário com esse login.")
+        conn.execute(
+            "UPDATE users SET username = ?, full_name = ?, role = ?, linked_person_name = ?, linked_units_json = ? WHERE company_id = ? AND id = ?",
+            (username, full_name, role, linked_person, linked_units_json, company_id, user_id),
+        )
+        if password:
+            pwd_hash, salt = pbkdf2_hash(password)
+            conn.execute("UPDATE users SET password_hash = ?, password_salt = ? WHERE company_id = ? AND id = ?", (pwd_hash, salt, company_id, user_id))
+        audit_log(conn, company_id, actor_user_id, "atualizar", "users", str(user_id), {"username": username, "role": role})
+        return {"id": user_id, "created": False}
+
+    if not password:
+        raise ValueError("Defina a senha inicial.")
+    dup = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if dup:
+        raise ValueError("Já existe um usuário com esse login.")
+    pwd_hash, salt = pbkdf2_hash(password)
+    cur = conn.execute(
+        "INSERT INTO users (company_id, username, full_name, linked_person_name, linked_units_json, password_hash, password_salt, role, is_active, created_at) VALUES (?,?,?,?,?,?,?,?,1,?)",
+        (company_id, username, full_name, linked_person, linked_units_json, pwd_hash, salt, role, now_iso()),
+    )
+    audit_log(conn, company_id, actor_user_id, "criar", "users", str(cur.lastrowid), {"username": username, "role": role})
+    return {"id": cur.lastrowid, "created": True}
+
+
+def set_user_password(conn: sqlite3.Connection, company_id: int, actor_user_id: int, target_user_id: Any, new_password: str | None) -> None:
+    password = (new_password or "").strip()
+    if not password:
+        raise ValueError("Informe a nova senha.")
+    target = conn.execute("SELECT id FROM users WHERE company_id = ? AND id = ?", (company_id, target_user_id)).fetchone()
+    if not target:
+        raise ValueError("Usuário não encontrado.")
+    pwd_hash, salt = pbkdf2_hash(password)
+    conn.execute("UPDATE users SET password_hash = ?, password_salt = ? WHERE company_id = ? AND id = ?", (pwd_hash, salt, company_id, target_user_id))
+    audit_log(conn, company_id, actor_user_id, "trocar_senha", "users", str(target_user_id), {})
+
+
 def import_admin_csv(conn: sqlite3.Connection, company_id: int, user_id: int, table_name: str, content: bytes) -> int:
     text = decode_text_content(content)
     reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=";")
@@ -7985,6 +8053,54 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/admin/users":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        res = upsert_user(conn, user["company_id"], user["id"], payload)
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Usuário criado com sucesso." if res.get("created") else "Usuário atualizado.", **res}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/users/password":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        set_user_password(conn, user["company_id"], user["id"], payload.get("id"), payload.get("password"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Senha atualizada com sucesso."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/users/delete":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        delete_user_record(conn, user["company_id"], user["id"], payload.get("id"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Usuário excluído."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/admin/people/update-unit":
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):

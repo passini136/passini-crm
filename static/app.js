@@ -758,8 +758,14 @@ async function loadAutoImportStatus() {
 }
 
 function sellerPeopleOptions() {
-  return (state.admin?.people || [])
+  const fromPeople = (state.admin?.people || [])
     .filter((person) => person.role_classification === "Vendedor" && !person.valid_to)
+    .map((person) => ({ person_name: person.person_name, base_unit: person.base_unit || "" }));
+  const known = new Set(fromPeople.map((p) => p.person_name));
+  const fromSales = (state.admin?.salesSellers || [])
+    .filter((name) => name && !known.has(name))
+    .map((name) => ({ person_name: name, base_unit: "" }));
+  return [...fromPeople, ...fromSales]
     .sort((left, right) => String(left.person_name || "").localeCompare(String(right.person_name || ""), "pt-BR"));
 }
 
@@ -3906,16 +3912,16 @@ function userEditorCard() {
             <input id="user-id" type="hidden" value="${escapeHtml(state.userEditor.id)}" />
             <strong>${userTitle}</strong>
             <div class="two-column-form">
-              <div class="field"><label>Usuário</label><input id="user-username" value="${escapeHtml(state.userEditor.username)}" required /></div>
-              <div class="field"><label>Nome completo</label><input id="user-full-name" value="${escapeHtml(state.userEditor.fullName)}" required /></div>
+              <div class="field"><label>Usuário</label><input id="user-username" value="${escapeHtml(state.userEditor.username)}" oninput="state.userEditor.username=this.value" required /></div>
+              <div class="field"><label>Nome completo</label><input id="user-full-name" value="${escapeHtml(state.userEditor.fullName)}" oninput="state.userEditor.fullName=this.value" required /></div>
               <div class="field"><label>Perfil</label><select id="user-role" onchange="setUserRole(this.value)"><option ${userRole === "Administrador" ? "selected" : ""}>Administrador</option><option ${userRole === "Gerente" ? "selected" : ""}>Gerente</option><option ${userRole === "Analista" ? "selected" : ""}>Analista</option><option ${userRole === "Vendedor" ? "selected" : ""}>Vendedor</option></select></div>
               ${userRole === "Vendedor"
-                ? `<div class="field"><label>Pessoa vinculada</label><select id="user-linked-person"><option value="">Selecione</option>${sellerOptions.map((person) => `<option value="${escapeHtml(person.person_name)}" ${state.userEditor.linkedPersonName === person.person_name ? "selected" : ""}>${escapeHtml(person.person_name)}${person.base_unit ? ` · ${escapeHtml(person.base_unit)}` : ""}</option>`).join("")}</select></div>`
+                ? `<div class="field"><label>Pessoa vinculada</label><select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value"><option value="">Selecione</option>${sellerOptions.map((person) => `<option value="${escapeHtml(person.person_name)}" ${state.userEditor.linkedPersonName === person.person_name ? "selected" : ""}>${escapeHtml(person.person_name)}${person.base_unit ? ` · ${escapeHtml(person.base_unit)}` : ""}</option>`).join("")}</select></div>`
                 : ""}
               ${["Gerente", "Analista"].includes(userRole)
                 ? `<div class="field field-span-2"><label>Unidades vinculadas</label><div class="checkbox-grid">${(state.options.units || []).map((unit) => `<label class="checkbox-item"><input type="checkbox" ${state.userEditor.linkedUnits.includes(unit) ? "checked" : ""} onchange="toggleUserLinkedUnit('${unit}')" /><span>${escapeHtml(unit)}</span></label>`).join("")}</div></div>`
                 : ""}
-              <div class="field"><label>${userPasswordLabel}</label><input id="user-password" type="password" ${state.userEditor.id ? "" : "required"} /></div>
+              <div class="field"><label>${userPasswordLabel}</label><input id="user-password" type="password" value="${escapeHtml(state.userEditor.password || "")}" oninput="state.userEditor.password=this.value" ${state.userEditor.id ? "" : "required"} /></div>
             </div>
             <div class="actions">
               <button class="btn btn-primary" type="submit">${userSubmitLabel}</button>
@@ -4977,6 +4983,61 @@ async function submitCityUnit() {
   try {
     const result = await api("/api/admin/city/update-unit", { method: "POST", body: JSON.stringify({ city_name: name, principal_unit: unit }) });
     addMessage("success", result.message || "Cidade atualizada.");
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function saveUser(event) {
+  if (event) event.preventDefault();
+  const editor = state.userEditor || {};
+  const username = (document.getElementById("user-username")?.value ?? editor.username ?? "").trim();
+  const fullName = (document.getElementById("user-full-name")?.value ?? editor.fullName ?? "").trim();
+  const password = document.getElementById("user-password")?.value ?? editor.password ?? "";
+  const role = editor.role || "Administrador";
+  if (!username || !fullName) { addMessage("error", "Informe o usuário e o nome completo."); return; }
+  if (!editor.id && !password) { addMessage("error", "Defina a senha inicial."); return; }
+  const payload = {
+    id: editor.id || undefined,
+    username,
+    full_name: fullName,
+    role,
+    linked_person_name: role === "Vendedor" ? (document.getElementById("user-linked-person")?.value || editor.linkedPersonName || "") : "",
+    linked_units: ["Gerente", "Analista"].includes(role) ? (editor.linkedUnits || []) : [],
+    password,
+  };
+  try {
+    const result = await api("/api/admin/users", { method: "POST", body: JSON.stringify(payload) });
+    addMessage("success", result.message || "Usuário salvo.");
+    resetUserEditor();
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+function cancelUserEdit() {
+  resetUserEditor();
+  requestRender();
+}
+
+async function startPasswordChange(userId) {
+  const pwd = window.prompt("Nova senha para este usuário:");
+  if (!pwd) return;
+  try {
+    await api("/api/admin/users/password", { method: "POST", body: JSON.stringify({ id: userId, password: pwd }) });
+    addMessage("success", "Senha atualizada.");
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function deleteUser(userId) {
+  if (!confirm("Excluir este usuário? Esta ação não pode ser desfeita.")) return;
+  try {
+    await api("/api/admin/users/delete", { method: "POST", body: JSON.stringify({ id: userId }) });
+    addMessage("success", "Usuário excluído.");
     await loadAdmin();
   } catch (error) {
     addMessage("error", error.message);
