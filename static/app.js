@@ -3827,6 +3827,8 @@ function adminEditorCards() {
   ].filter(Boolean);
   const sellerOpts = [...new Set(sellerNames)].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
   const cityOpts = [...new Set(cityNames)].sort().map((n) => `<option value="${escapeHtml(n)}"></option>`).join("");
+  const peopleNames = new Set(people.map((p) => p.person_name));
+  const pendingSellers = [...new Set((state.admin?.salesSellers || []).filter((n) => n && !peopleNames.has(n)))].sort();
   return `
     <div class="grid-2">
       <div class="form-card">
@@ -3836,6 +3838,10 @@ function adminEditorCards() {
           <div class="field"><label>Unidade</label><select id="edit-seller-unit">${unitOptions}</select></div>
         </div>
         <div class="actions"><button class="btn btn-primary" onclick="submitPersonUnit()">Salvar vendedor</button></div>
+        ${pendingSellers.length
+          ? `<div class="text-small" style="margin-top:10px;font-weight:600">Vendedores sem unidade (${pendingSellers.length}) — clique para preencher:</div>
+        <div class="actions" style="flex-wrap:wrap;gap:6px;margin-top:6px">${pendingSellers.slice(0, 60).map((n) => `<button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('edit-seller-name').value=this.textContent.trim();document.getElementById('edit-seller-name').focus()">${escapeHtml(n)}</button>`).join("")}</div>`
+          : `<div class="text-small" style="margin-top:10px;color:var(--muted)">Nenhum vendedor sem unidade. ✅</div>`}
         <datalist id="sellers-datalist">${sellerOpts}</datalist>
       </div>
       <div class="form-card">
