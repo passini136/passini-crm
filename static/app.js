@@ -3712,6 +3712,12 @@ function importacoesView() {
   return `
     <div class="stack">
       ${autoImportPanel()}
+      ${(() => {
+        const cov = state.admin?.salesCoverage;
+        const fmt = (iso) => { if (!iso) return "—"; const d = String(iso).slice(0, 10).split("-"); return d.length === 3 ? `${d[2]}/${d[1]}/${d[0]}` : iso; };
+        if (!cov || !cov.total) return `<div class="message">Faturamento detalhado: base vazia (nenhum dado importado ainda).</div>`;
+        return `<div class="form-card"><div class="section-title"><div><h3>Cobertura do faturamento detalhado</h3><div class="text-small">Período que a base de faturamento detalhado abrange.</div></div></div><div style="font-size:15px">De <strong>${fmt(cov.min)}</strong> até <strong>${fmt(cov.max)}</strong> · <strong>${Number(cov.total || 0).toLocaleString("pt-BR")}</strong> linhas.</div></div>`;
+      })()}
       <div class="grid-3">
         <div class="timeline-card"><div class="section-title"><h3>Importações</h3></div><div class="text-small">${state.admin.imports.length} registros auditáveis</div><div class="timeline-list">${state.admin.imports.slice(0, 5).map((item) => `<div class="timeline-item"><strong>${item.competence}</strong><div class="text-small">${item.import_action}</div></div>`).join("")}</div></div>
         <div class="timeline-card"><div class="section-title"><h3>Pendências</h3></div><div class="timeline-list">${state.admin.issues.slice(0, 5).map((item) => `<div class="timeline-item"><strong>${escapeHtml(item.issue_type)}</strong><div class="text-small">${escapeHtml(item.reference_value)} · ${escapeHtml(item.status)}</div></div>`).join("")}</div></div>

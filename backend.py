@@ -5725,6 +5725,7 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
         "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
         "salesCities": [row["city_name"] for row in conn.execute("SELECT DISTINCT city_name FROM fact_sales_detail WHERE company_id = ? AND city_name IS NOT NULL AND TRIM(city_name) <> '' ORDER BY city_name", (company_id,)).fetchall()],
+        "salesCoverage": dict(zip(("min", "max", "total"), conn.execute("SELECT MIN(issue_date), MAX(issue_date), COUNT(*) FROM fact_sales_detail WHERE company_id = ? AND issue_date IS NOT NULL AND TRIM(issue_date) <> ''", (company_id,)).fetchone())),
         "cityMappings": [dict(row) for row in conn.execute("SELECT * FROM city_mappings WHERE company_id = ? ORDER BY city_name, valid_from DESC", (company_id,)).fetchall()],
         "vacations": [dict(row) for row in conn.execute("SELECT * FROM vacations WHERE company_id = ? ORDER BY start_date DESC", (company_id,)).fetchall()],
         "holidays": [dict(row) for row in conn.execute("SELECT * FROM holidays WHERE company_id = ? ORDER BY holiday_date DESC", (company_id,)).fetchall()],
