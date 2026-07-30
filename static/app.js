@@ -764,6 +764,7 @@ async function runAutoImportNow() {
   try {
     const result = await api("/api/auto-import/run", { method: "POST" });
     addMessage("success", result.message || "Importação executada.");
+    (result.warnings || []).forEach((w) => addMessage("error", w));
     await loadAutoImportStatus();
     await Promise.all([loadDashboard(), loadCrmData()]);
     addMessage("success", "Dados do dashboard atualizados.");
@@ -3671,7 +3672,7 @@ function autoImportPanel() {
   const logs = ai?.logs || [];
 
   function statusIcon(s) {
-    return s === "sucesso" ? "✅" : s === "erro" ? "❌" : "⏳";
+    return s === "sucesso" ? "✅" : s === "erro" ? "❌" : s === "alerta" ? "⚠️" : "⏳";
   }
 
   function folderCard(f) {
@@ -3719,7 +3720,7 @@ function autoImportPanel() {
                 <td>${escapeHtml(l.folder)}</td>
                 <td>${escapeHtml(l.competence || "—")}</td>
                 <td>${statusIcon(l.status)} ${escapeHtml(l.status)}</td>
-                <td style="font-size:12px;color:${l.status === "erro" ? "var(--bad)" : "inherit"}">${escapeHtml(l.message || "")}</td>
+                <td style="font-size:12px;color:${l.status === "erro" ? "var(--bad)" : l.status === "alerta" ? "#e67e22" : "inherit"}">${escapeHtml(l.message || "")}</td>
               </tr>`).join("")}
           </tbody>
         </table>

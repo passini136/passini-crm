@@ -132,13 +132,19 @@ DB_PATH = DATA_DIR / "passini_dashboard.db"
 
 AUTO_IMPORT_BASE = ROOT_DIR / "auto-import"
 AUTO_IMPORT_INTERVAL = 3600  # 1 hora (era 5 min — reduzia risco de reimport em loop)
+# A base de clientes do Alfa vem em vários arquivos complementares. Só importamos
+# quando nenhum arquivo foi modificado nos últimos N segundos, evitando processar
+# a base pela metade enquanto a segunda exportação ainda está sendo copiada.
+CRM_CLIENTS_SETTLE_SECONDS = 120
 AUTO_IMPORT_FOLDERS = [
     {"folder": "faturamento",  "scope": "sales", "label": "Faturamento Detalhado"},
     {"folder": "custo-venda",  "scope": "cost",  "label": "Custo de Venda"},
     # CRM separado em duas pastas — cada base importa de forma independente
     {"folder": "crm/clientes", "scope": "crm_clients",
      "label": "CRM · Cadastro de Clientes",
-     "hint": "Base mestre do Alfa, sem competência. Substitui toda a base anterior. Atualizar 1x ao dia."},
+     "hint": "Base do Alfa, sem competência. Coloque TODAS as exportações juntas (a base vem "
+             "dividida em 2 arquivos) — elas são importadas como uma só e substituem a base "
+             "anterior. Atualizar 1x ao dia."},
     {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
      "label": "CRM · Faturamento Consolidado",
      "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
@@ -1840,6 +1846,12 @@ def import_package(
         if item.get("fileType")
     }
     actual_action = import_action or "substituir"
+    # Guarda a contagem anterior da base de clientes para detectar exportação incompleta
+    clients_before = 0
+    if "cadastro_clientes" in selected_file_types:
+        clients_before = int(conn.execute(
+            "SELECT COUNT(*) FROM crm_client_profiles WHERE company_id = ?", (company_id,)
+        ).fetchone()[0] or 0)
     if actual_action == "substituir":
         delete_competence_data(conn, company_id, competence, selected_file_types)
 
@@ -1864,10 +1876,17 @@ def import_package(
         if not kind:
             continue
         rows = parse_csv_bytes(content)
+        # Um mesmo import pode receber VÁRIOS arquivos do mesmo tipo (ex.: a base de
+        # clientes do Alfa vem em duas exportações complementares). O UNIQUE
+        # (import_id, file_type) é preservado acumulando nomes e contagem de linhas.
         conn.execute(
             """
             INSERT INTO import_files (import_id, file_type, original_name, file_hash, row_count)
             VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(import_id, file_type) DO UPDATE SET
+                original_name = original_name || ' + ' || excluded.original_name,
+                file_hash = excluded.file_hash,
+                row_count = row_count + excluded.row_count
             """,
             (import_id, kind, filename, file_hash(content), len(rows)),
         )
@@ -2177,6 +2196,31 @@ def import_package(
         _msg = f"Faturamento detalhado: {_comps} | {duplicate_rows_skipped} linha(s) já existentes ignoradas"
         if sales_rows_without_date:
             _msg += f" | {sales_rows_without_date} linha(s) sem data usaram {competence}"
+        result["message"] = _msg
+
+    # Cadastro de clientes: reporta o tamanho da base e alerta se encolheu muito
+    # (indício de exportação parcial do Alfa — a base vem em vários arquivos).
+    if "cadastro_clientes" in selected_file_types:
+        clients_after = int(conn.execute(
+            "SELECT COUNT(*) FROM crm_client_profiles WHERE company_id = ?", (company_id,)
+        ).fetchone()[0] or 0)
+        _files_count = len([
+            e for e in normalize_upload_entries(files_payload)
+            if detect_upload_file_type(e["fileName"], e.get("fieldName")) == "cadastro_clientes"
+        ])
+        result["clientsBefore"] = clients_before
+        result["clientsAfter"] = clients_after
+        result["clientsFileCount"] = _files_count
+        _msg = f"Cadastro de clientes: {clients_after} clientes de {_files_count} arquivo(s)"
+        if clients_before:
+            _delta = clients_after - clients_before
+            _msg += f" (antes: {clients_before}, variação: {_delta:+d})"
+            if clients_after < clients_before * 0.7:
+                result["warning"] = (
+                    f"ATENÇÃO: a base caiu de {clients_before} para {clients_after} clientes. "
+                    "Verifique se todas as exportações do Alfa estavam na pasta."
+                )
+                _msg += " ⚠ possível exportação incompleta"
         result["message"] = _msg
     return result
 
@@ -7937,9 +7981,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": "Uma importação já está em andamento. Aguarde."}))
                     return
                 try:
+                    _AUTO_IMPORT_WARNINGS.clear()
                     auto_import_tick()
                     self._set_headers(200)
-                    self.wfile.write(json_dumps({"ok": True, "message": "Verificação de importação executada."}))
+                    self.wfile.write(json_dumps({
+                        "ok": True,
+                        "message": "Verificação de importação executada.",
+                        "warnings": list(_AUTO_IMPORT_WARNINGS),
+                    }))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(500)
@@ -8259,6 +8308,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
 _AUTO_IMPORT_LOCK = threading.Lock()
 _AUTO_IMPORT_RUNNING = threading.Event()
+# Avisos da última execução (ex.: base de clientes encolheu) — lidos pelo botão manual
+_AUTO_IMPORT_WARNINGS: list[str] = []
 
 
 def _auto_import_get_admin_user(conn: sqlite3.Connection) -> sqlite3.Row | None:
@@ -8377,14 +8428,22 @@ def _auto_import_tick_inner() -> None:
 
         scope = cfg["scope"]
 
-        # Cadastro de clientes: base mestre do Alfa, SEM competência. Cada arquivo é
-        # importado sozinho e substitui toda a base anterior (delete global).
+        # Cadastro de clientes: base mestre do Alfa, SEM competência.
+        # O Alfa não exporta a base inteira em um arquivo — são DUAS (ou mais)
+        # exportações COMPLEMENTARES. Portanto TODOS os CSVs da pasta entram em
+        # UM ÚNICO import: o delete da base acontece uma vez e as linhas de todos
+        # os arquivos são inseridas juntas (upsert por client_code).
+        # Se cada arquivo virasse um import próprio, o segundo apagaria o primeiro.
         if scope == "crm_clients":
-            by_competence: dict[str, list[Path]] = {}
-            for _idx, f in enumerate(csv_files):
-                # A competência é irrelevante aqui, mas import_package exige um valor.
-                # Usa o mês atual apenas como rótulo do registro de import.
-                by_competence[f"_clients__{_idx}"] = [f]
+            # Só processa quando os arquivos estão "estáveis" (nenhuma escrita recente),
+            # evitando importar meia base enquanto a segunda exportação ainda é copiada.
+            _now_ts = time.time()
+            _unstable = [f for f in csv_files if (_now_ts - f.stat().st_mtime) < CRM_CLIENTS_SETTLE_SECONDS]
+            if _unstable:
+                print(f"[auto-import] crm/clientes: {len(_unstable)} arquivo(s) ainda sendo gravado(s), "
+                      f"aguardando {CRM_CLIENTS_SETTLE_SECONDS}s de estabilidade")
+                continue
+            by_competence: dict[str, list[Path]] = {"_clients__all": list(csv_files)}
         else:
             # Agrupa arquivos por competência extraída do nome
             by_competence = {}
@@ -8476,9 +8535,15 @@ def _auto_import_tick_inner() -> None:
                     )
                     invalidate_crm_cache(user["company_id"])
                     msg = result.get("message", "OK")
+                    _warning = result.get("warning")
                     _auto_import_log(conn, cfg["folder"], scope, competence,
-                                     "sucesso", msg, [f.name for f in files])
+                                     "alerta" if _warning else "sucesso",
+                                     f"{msg} — {_warning}" if _warning else msg,
+                                     [f.name for f in files])
                     print(f"[auto-import] {cfg['folder']}/{competence}: {msg}")
+                    if _warning:
+                        print(f"[auto-import] ⚠ {_warning}")
+                        _AUTO_IMPORT_WARNINGS.append(_warning)
 
                 dest_ok.mkdir(parents=True, exist_ok=True)
                 for f in files:
