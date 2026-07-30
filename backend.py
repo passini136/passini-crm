@@ -428,6 +428,74 @@ def competence_from_date(dt_value: datetime | None) -> str | None:
     return dt_value.strftime("%Y-%m")
 
 
+# Nomes aceitos para a coluna de data no faturamento detalhado, em ordem de prioridade.
+# A comparação ignora acentos, maiúsculas, espaços e pontuação.
+SALES_DATE_COLUMN_CANDIDATES = (
+    "DATA EMISSAO", "DT EMISSAO", "EMISSAO", "DATA DA EMISSAO",
+    "DATA MOVIMENTO", "DATA MOVIMENTACAO", "DT MOVIMENTO", "MOVIMENTO",
+    "DATA", "DATA VENDA", "DT VENDA", "ULT COMPRA", "ULTIMA COMPRA",
+)
+
+
+def _column_lookup_key(value: str | None) -> str:
+    """Normaliza um nome de coluna para comparação tolerante."""
+    return re.sub(r"[^A-Z0-9]", "", strip_accents(value).upper())
+
+
+def find_sales_date_value(row: dict[str, str]) -> str | None:
+    """Retorna o valor da coluna de data do faturamento, tolerando variações de nome.
+
+    O relatório do Alfa nem sempre exporta o cabeçalho igual (acento em EMISSÃO,
+    caixa diferente, ponto em ULT.COMPRA). Buscar pelo nome exato fazia a
+    importação falhar com 'não foi possível determinar a competência'.
+    """
+    if not row:
+        return None
+    normalized = {_column_lookup_key(k): v for k, v in row.items() if k}
+    for candidate in SALES_DATE_COLUMN_CANDIDATES:
+        value = normalized.get(_column_lookup_key(candidate))
+        if normalize_whitespace(value):
+            return value
+    # Último recurso: qualquer coluna cujo nome contenha DATA/EMISSAO e tenha valor
+    for key, value in normalized.items():
+        if ("DATA" in key or "EMISSAO" in key) and normalize_whitespace(value):
+            return value
+    return None
+
+
+def parse_excel_serial_date(value: str | None) -> datetime | None:
+    """Converte número de série do Excel em data (ex.: '45659,3378' -> 02/01/2025).
+
+    Quando o relatório do Alfa passa pelo Excel antes de virar CSV, a coluna de data
+    é exportada como número de série (dias desde 30/12/1899, com a fração indicando
+    a hora). Sem esta conversão a competência não é reconhecida.
+    """
+    text = normalize_whitespace(value)
+    if not text or "/" in text or "-" in text or ":" in text:
+        return None
+    try:
+        serial = float(text.replace(",", "."))
+    except ValueError:
+        return None
+    # Faixa segura: 1954 a 2064. Evita interpretar códigos/quantidades como data.
+    if not (20000 <= serial <= 60000):
+        return None
+    try:
+        return datetime(1899, 12, 30) + timedelta(days=serial)
+    except (OverflowError, ValueError):
+        return None
+
+
+def parse_sales_row_date(row: dict[str, str]) -> datetime | None:
+    """Data de uma linha do faturamento detalhado, aceitando vários formatos."""
+    raw = find_sales_date_value(row)
+    return (
+        parse_datetime_pt(raw)
+        or parse_excel_serial_date(raw)
+        or parse_datetime_flexible(raw)
+    )
+
+
 def parse_datetime_flexible(value: str | None) -> datetime | None:
     text = normalize_whitespace(value)
     if not text:
@@ -1696,7 +1764,7 @@ def detect_upload_file_type(file_name: str, field_name: str | None = None) -> st
 def suggest_competence(rows: list[dict[str, str]]) -> str | None:
     counts = Counter()
     for row in rows:
-        dt_value = parse_datetime_pt(row.get("DATA EMISSAO"))
+        dt_value = parse_sales_row_date(row)
         competence = competence_from_date(dt_value)
         if competence:
             counts[competence] += 1
@@ -1866,6 +1934,7 @@ def import_package(
 
     duplicate_rows_skipped = 0
     sales_competences_seen: set[str] = set()
+    sales_rows_by_competence: Counter = Counter()
     sales_rows_without_date = 0
 
     for entry in normalize_upload_entries(files_payload):
@@ -1898,13 +1967,14 @@ def import_package(
                 city_name = normalize_upper(row.get("Cidade"))
                 gtin_value = normalize_whitespace(row.get(""))
                 manufacturer_sku = normalize_whitespace(row.get("Fabricante"))
-                dt_value = parse_datetime_pt(row.get("DATA EMISSAO") or row.get("ULT.COMPRA"))
+                dt_value = parse_sales_row_date(row)
                 # Competência POR LINHA, derivada da data de emissão. Um único arquivo
                 # pode conter vários meses; cada linha vai para o mês correto.
                 row_competence = competence_from_date(dt_value) or competence
                 if not competence_from_date(dt_value):
                     sales_rows_without_date += 1
                 sales_competences_seen.add(row_competence)
+                sales_rows_by_competence[row_competence] += 1
                 sku_key = normalize_sku(gtin_value, manufacturer_sku)
                 payload = {
                     "seller": seller_name,
@@ -2190,12 +2260,20 @@ def import_package(
         "importedFileTypes": sorted(selected_file_types),
     }
     if sales_competences_seen:
-        result["salesCompetences"] = sorted(sales_competences_seen)
+        _ordered = sorted(sales_competences_seen)
+        result["salesCompetences"] = _ordered
+        result["salesRowsByCompetence"] = dict(sorted(sales_rows_by_competence.items()))
         result["salesRowsWithoutDate"] = sales_rows_without_date
-        _comps = ", ".join(sorted(sales_competences_seen))
-        _msg = f"Faturamento detalhado: {_comps} | {duplicate_rows_skipped} linha(s) já existentes ignoradas"
+        # Mostra as competências com mais linhas; resume o restante
+        _top = sales_rows_by_competence.most_common(8)
+        _detail = ", ".join(f"{c}:{n}" for c, n in sorted(_top))
+        _rest = len(_ordered) - len(_top)
+        _msg = f"Faturamento detalhado — {len(_ordered)} competência(s) ({_ordered[0]}…{_ordered[-1]}): {_detail}"
+        if _rest > 0:
+            _msg += f" +{_rest} outra(s)"
+        _msg += f" | {duplicate_rows_skipped} linha(s) já existentes ignoradas"
         if sales_rows_without_date:
-            _msg += f" | {sales_rows_without_date} linha(s) sem data usaram {competence}"
+            _msg += f" | {sales_rows_without_date} sem data usaram {competence}"
         result["message"] = _msg
 
     # Cadastro de clientes: reporta o tamanho da base e alerta se encolheu muito
