@@ -131,7 +131,7 @@ DATA_DIR = resolve_data_dir()
 DB_PATH = DATA_DIR / "passini_dashboard.db"
 
 AUTO_IMPORT_BASE = ROOT_DIR / "auto-import"
-AUTO_IMPORT_INTERVAL = 300  # 5 minutos
+AUTO_IMPORT_INTERVAL = 3600  # 1 hora (era 5 min — reduzia risco de reimport em loop)
 AUTO_IMPORT_FOLDERS = [
     {"folder": "faturamento",  "scope": "sales", "label": "Faturamento Detalhado"},
     {"folder": "custo-venda",  "scope": "cost",  "label": "Custo de Venda"},
@@ -7310,7 +7310,12 @@ class AppHandler(BaseHTTPRequestHandler):
                             "pendingFiles": pending,
                         })
                     self._set_headers(200)
-                    self.wfile.write(json_dumps({"logs": logs, "folders": folders_info}))
+                    self.wfile.write(json_dumps({
+                        "logs": logs,
+                        "folders": folders_info,
+                        "intervalMinutes": AUTO_IMPORT_INTERVAL // 60,
+                        "running": _AUTO_IMPORT_RUNNING.is_set(),
+                    }))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(500)
@@ -7889,6 +7894,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
+            if path == "/api/auto-import/run":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                if _AUTO_IMPORT_RUNNING.is_set():
+                    self._set_headers(409)
+                    self.wfile.write(json_dumps({"error": "Uma importação já está em andamento. Aguarde."}))
+                    return
+                try:
+                    auto_import_tick()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"ok": True, "message": "Verificação de importação executada."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(500)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/admin/issues/resolve":
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):
@@ -8201,6 +8223,10 @@ class AppHandler(BaseHTTPRequestHandler):
             self.wfile.write(json_dumps({"error": f"Erro interno: {exc}"}))
 
 
+_AUTO_IMPORT_LOCK = threading.Lock()
+_AUTO_IMPORT_RUNNING = threading.Event()
+
+
 def _auto_import_get_admin_user(conn: sqlite3.Connection) -> sqlite3.Row | None:
     """Retorna o primeiro usuário Admin/Diretor da empresa para usar nos imports automáticos."""
     return conn.execute(
@@ -8288,6 +8314,18 @@ def _auto_import_build_payload(files: list[Path], scope: str) -> list[dict[str, 
 
 def auto_import_tick() -> None:
     """Verifica as pastas de auto-import e processa CSVs pendentes."""
+    if not _AUTO_IMPORT_LOCK.acquire(blocking=False):
+        print("[auto-import] já em execução, ignorando chamada concorrente")
+        return
+    _AUTO_IMPORT_RUNNING.set()
+    try:
+        _auto_import_tick_inner()
+    finally:
+        _AUTO_IMPORT_RUNNING.clear()
+        _AUTO_IMPORT_LOCK.release()
+
+
+def _auto_import_tick_inner() -> None:
     for cfg in AUTO_IMPORT_FOLDERS:
         folder_path = AUTO_IMPORT_BASE / cfg["folder"]
         if not folder_path.exists():
@@ -8347,11 +8385,15 @@ def auto_import_tick() -> None:
                 else:
                     no_comp.append(f)
 
-            # Faturamento: competência lida do conteúdo — aceita sem data no nome
-            # Custo: competência obrigatória no nome — rejeita se ausente
+            # Faturamento: competência lida do conteúdo — aceita sem data no nome.
+            # IMPORTANTE: cada arquivo vai em seu próprio grupo (_from_content__N).
+            # Agrupar vários arquivos sob uma única chave fazia a competência de UM
+            # arquivo ser aplicada a TODOS, gravando dados no mês errado e apagando
+            # (import "substituir") o mês correto.
             if no_comp:
                 if scope == "sales":
-                    by_competence.setdefault("_from_content", []).extend(no_comp)
+                    for _idx, _f in enumerate(no_comp):
+                        by_competence[f"_from_content__{_idx}"] = [_f]
                 else:
                     with closing(get_connection()) as conn:
                         for f in no_comp:
@@ -8382,7 +8424,7 @@ def auto_import_tick() -> None:
                 continue
 
             # Para faturamento sem data no nome, usa a competência sugerida pelo conteúdo
-            if competence_key == "_from_content":
+            if competence_key.startswith("_from_content"):
                 suggested = preview.get("suggestedCompetence")
                 if not suggested:
                     with closing(get_connection()) as conn:

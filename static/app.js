@@ -757,6 +757,23 @@ async function loadAutoImportStatus() {
   requestRender();
 }
 
+async function runAutoImportNow() {
+  const btn = document.getElementById("btn-auto-import-run");
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Importando…"; }
+  addMessage("info", "Verificando pastas e importando arquivos pendentes…");
+  try {
+    const result = await api("/api/auto-import/run", { method: "POST" });
+    addMessage("success", result.message || "Importação executada.");
+    await loadAutoImportStatus();
+    await Promise.all([loadDashboard(), loadCrmData()]);
+    addMessage("success", "Dados do dashboard atualizados.");
+  } catch (e) {
+    addMessage("error", `Falha ao importar: ${e.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "▶ Importar agora"; }
+  }
+}
+
 function sellerPeopleOptions() {
   const fromPeople = (state.admin?.people || [])
     .filter((person) => person.role_classification === "Vendedor" && !person.valid_to)
@@ -3678,9 +3695,12 @@ function autoImportPanel() {
       <div class="section-title">
         <div>
           <h3>🤖 Auto-Import</h3>
-          <div class="text-small">Coloque o CSV na pasta correspondente — o sistema importa automaticamente a cada 5 minutos.</div>
+          <div class="text-small">Coloque o CSV na pasta correspondente — o sistema verifica automaticamente a cada ${ai?.intervalMinutes || 60} minutos. Use "Importar agora" para antecipar.</div>
         </div>
-        <button class="btn btn-ghost btn-sm" onclick="loadAutoImportStatus(); addMessage('success','Status atualizado.')">↻ Atualizar</button>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-primary btn-sm" id="btn-auto-import-run" onclick="runAutoImportNow()">▶ Importar agora</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadAutoImportStatus(); addMessage('success','Status atualizado.')">↻ Atualizar</button>
+        </div>
       </div>
       ${!ai ? `<div class="message">Carregando status… <button class="btn btn-ghost btn-sm" onclick="loadAutoImportStatus()">Carregar</button></div>` : `
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-bottom:16px">
