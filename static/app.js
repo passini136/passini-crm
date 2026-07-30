@@ -3676,14 +3676,16 @@ function autoImportPanel() {
 
   function folderCard(f) {
     const hasPending = f.pendingFiles.length > 0;
+    const icons = { sales: "📊", cost: "💰", crm_clients: "👥", crm_summary: "🧾", crm: "👥" };
     return `
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-          <span style="font-size:18px">${f.scope === "sales" ? "📊" : f.scope === "cost" ? "💰" : "👥"}</span>
+          <span style="font-size:18px">${icons[f.scope] || "📁"}</span>
           <strong style="font-size:13px">${escapeHtml(f.label)}</strong>
           ${hasPending ? `<span class="soft-badge" style="background:#f39c12;color:#fff">${f.pendingFiles.length} pendente${f.pendingFiles.length > 1 ? "s" : ""}</span>` : `<span class="soft-badge">Vazia</span>`}
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:6px;word-break:break-all">${escapeHtml(f.folder)}/</div>
+        ${f.hint ? `<div style="font-size:11px;color:var(--muted);margin-bottom:6px;line-height:1.4">${escapeHtml(f.hint)}</div>` : ""}
         ${hasPending ? `<div style="font-size:12px;color:var(--accent)">${f.pendingFiles.map((n) => `📄 ${escapeHtml(n)}`).join("<br>")}</div>` : ""}
       </div>`;
   }

@@ -135,7 +135,13 @@ AUTO_IMPORT_INTERVAL = 3600  # 1 hora (era 5 min — reduzia risco de reimport e
 AUTO_IMPORT_FOLDERS = [
     {"folder": "faturamento",  "scope": "sales", "label": "Faturamento Detalhado"},
     {"folder": "custo-venda",  "scope": "cost",  "label": "Custo de Venda"},
-    {"folder": "crm",          "scope": "crm",   "label": "CRM Carteira"},
+    # CRM separado em duas pastas — cada base importa de forma independente
+    {"folder": "crm/clientes", "scope": "crm_clients",
+     "label": "CRM · Cadastro de Clientes",
+     "hint": "Base mestre do Alfa, sem competência. Substitui toda a base anterior. Atualizar 1x ao dia."},
+    {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
+     "label": "CRM · Faturamento Consolidado",
+     "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
 ]
 
 # Ordem canônica das unidades (inclui unidades sem dados ainda, ex: Zona Norte)
@@ -199,12 +205,17 @@ IMPORT_SCOPE_REQUIREMENTS = {
     "sales": {"faturamento_detalhado"},
     "cost": {"custo_vendedor", "custo_unidade"},
     "crm": {"cadastro_clientes", "faturamento_cliente_consolidado"},
+    # Escopos individuais do CRM — cada base é importada de forma independente
+    "crm_clients": {"cadastro_clientes"},
+    "crm_summary": {"faturamento_cliente_consolidado"},
 }
 IMPORT_SCOPE_LABELS = {
     "full": "pacote completo",
     "sales": "faturamento detalhado",
     "cost": "custo venda",
     "crm": "crm carteira",
+    "crm_clients": "cadastro de clientes",
+    "crm_summary": "faturamento consolidado por cliente",
 }
 IMPORT_SCOPE_TABLES = {
     "faturamento_detalhado": ("fact_sales_detail",),
@@ -1792,8 +1803,10 @@ def delete_competence_data(
     file_types: set[str] | None = None,
 ) -> None:
     selected_file_types = file_types or set(IMPORT_SCOPE_TABLES)
+    # Cadastro de clientes: base mestre sem competência — substitui TODA a base anterior.
     if "cadastro_clientes" in selected_file_types:
         conn.execute("DELETE FROM crm_client_profiles WHERE company_id = ?", (company_id,))
+    # Faturamento consolidado por cliente: competência vem do nome do arquivo — substitui só o mês.
     if "faturamento_cliente_consolidado" in selected_file_types:
         conn.execute(
             "DELETE FROM crm_client_summary WHERE company_id = ? AND competence = ?",
@@ -1801,7 +1814,9 @@ def delete_competence_data(
         )
     target_tables = set()
     for file_type in selected_file_types:
-        if file_type in {"cadastro_clientes", "faturamento_cliente_consolidado"}:
+        # faturamento_detalhado é APPEND-ONLY: a competência é derivada da data de cada
+        # linha e a deduplicação é feita por row_hash. Nunca apagar o histórico.
+        if file_type in {"cadastro_clientes", "faturamento_cliente_consolidado", "faturamento_detalhado"}:
             continue
         target_tables.update(IMPORT_SCOPE_TABLES.get(file_type, ()))
     for table in target_tables:
@@ -1838,6 +1853,8 @@ def import_package(
     import_id = import_cursor.lastrowid
 
     duplicate_rows_skipped = 0
+    sales_competences_seen: set[str] = set()
+    sales_rows_without_date = 0
 
     for entry in normalize_upload_entries(files_payload):
         filename = entry["fileName"]
@@ -1863,6 +1880,12 @@ def import_package(
                 gtin_value = normalize_whitespace(row.get(""))
                 manufacturer_sku = normalize_whitespace(row.get("Fabricante"))
                 dt_value = parse_datetime_pt(row.get("DATA EMISSAO") or row.get("ULT.COMPRA"))
+                # Competência POR LINHA, derivada da data de emissão. Um único arquivo
+                # pode conter vários meses; cada linha vai para o mês correto.
+                row_competence = competence_from_date(dt_value) or competence
+                if not competence_from_date(dt_value):
+                    sales_rows_without_date += 1
+                sales_competences_seen.add(row_competence)
                 sku_key = normalize_sku(gtin_value, manufacturer_sku)
                 payload = {
                     "seller": seller_name,
@@ -1892,7 +1915,7 @@ def import_package(
                         """,
                         (
                             company_id,
-                            competence,
+                            row_competence,
                             import_id,
                             row_hash,
                             seller_name,
@@ -1915,10 +1938,11 @@ def import_package(
                     )
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
-                role, _ = current_role_and_unit(conn, company_id, seller_name, competence)
+                role, _ = current_role_and_unit(conn, company_id, seller_name, row_competence)
                 if role is None:
-                    register_issue(conn, company_id, import_id, competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
+                    register_issue(conn, company_id, import_id, row_competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
                 if city_name:
+                    _comp_day = first_day_of_competence(row_competence).isoformat()
                     city_match = conn.execute(
                         """
                         SELECT id FROM city_mappings
@@ -1926,10 +1950,10 @@ def import_package(
                           AND (valid_to IS NULL OR date(valid_to) >= date(?))
                         LIMIT 1
                         """,
-                        (company_id, city_name, first_day_of_competence(competence).isoformat(), first_day_of_competence(competence).isoformat()),
+                        (company_id, city_name, _comp_day, _comp_day),
                     ).fetchone()
                     if not city_match:
-                        register_issue(conn, company_id, import_id, competence, "cidade_sem_correspondencia", city_name, {"kind": "city"})
+                        register_issue(conn, company_id, import_id, row_competence, "cidade_sem_correspondencia", city_name, {"kind": "city"})
         elif kind == "cadastro_clientes":
             for row in rows:
                 client_code = normalize_whitespace(row.get("Codigo"))
@@ -2139,13 +2163,22 @@ def import_package(
     )
     ensure_client_registry_for_sales(conn, company_id)
     conn.commit()
-    return {
+    result: dict[str, Any] = {
         "importId": import_id,
         "duplicateRowsSkipped": duplicate_rows_skipped,
         "importAction": actual_action,
         "importScope": import_scope,
         "importedFileTypes": sorted(selected_file_types),
     }
+    if sales_competences_seen:
+        result["salesCompetences"] = sorted(sales_competences_seen)
+        result["salesRowsWithoutDate"] = sales_rows_without_date
+        _comps = ", ".join(sorted(sales_competences_seen))
+        _msg = f"Faturamento detalhado: {_comps} | {duplicate_rows_skipped} linha(s) já existentes ignoradas"
+        if sales_rows_without_date:
+            _msg += f" | {sales_rows_without_date} linha(s) sem data usaram {competence}"
+        result["message"] = _msg
+    return result
 
 
 def query_competences(conn: sqlite3.Connection, company_id: int) -> list[str]:
@@ -7307,6 +7340,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         folders_info.append({
                             "folder": cfg["folder"], "label": cfg["label"],
                             "scope": cfg["scope"], "path": str(p),
+                            "hint": cfg.get("hint", ""),
                             "pendingFiles": pending,
                         })
                     self._set_headers(200)
@@ -8297,12 +8331,17 @@ def _auto_import_detect_crm_field(content: bytes, filename: str = "") -> str:
 def _auto_import_build_payload(files: list[Path], scope: str) -> list[dict[str, Any]]:
     """
     Monta o files_payload como lista de dicts com fieldName correto.
-    Para scope='cost' e 'crm', usa detecção por conteúdo para distinguir os arquivos.
+    Escopos com pasta dedicada (crm_clients / crm_summary) dispensam detecção por
+    conteúdo — a pasta já define o tipo, evitando classificação errada.
     """
     payload = []
     for f in files:
         content = f.read_bytes()
-        if scope == "cost":
+        if scope == "crm_clients":
+            field_name = "import-crm-clients-file"
+        elif scope == "crm_summary":
+            field_name = "import-crm-summary-file"
+        elif scope == "cost":
             field_name = _auto_import_detect_cost_field(content)
         elif scope == "crm":
             field_name = _auto_import_detect_crm_field(content, f.name)
@@ -8338,42 +8377,14 @@ def _auto_import_tick_inner() -> None:
 
         scope = cfg["scope"]
 
-        # CRM recebe tratamento especial: cadastro_clientes é dado mestre (sem competência
-        # específica) e deve ser pareado com todos os períodos de faturamento_consolidado.
-        if scope == "crm":
-            crm_master_files: list[Path] = []   # cadastro_clientes sem data
-            crm_by_comp: dict[str, list[Path]] = {}  # faturamento por competência
-            for f in csv_files:
-                comp = _auto_import_extract_competence(f.name)
-                content = f.read_bytes()
-                field = _auto_import_detect_crm_field(content, f.name)
-                if field == "import-crm-clients-file":
-                    # cadastro de pessoas: dado mestre, sem competência obrigatória
-                    crm_master_files.append(f)
-                elif comp:
-                    crm_by_comp.setdefault(comp, []).append(f)
-                else:
-                    with closing(get_connection()) as conn:
-                        _auto_import_log(conn, cfg["folder"], scope, None, "erro",
-                                         f"Faturamento consolidado '{f.name}' sem competência no nome. "
-                                         f"Inclua o mês, ex: 2026-07_{f.name}", [f.name])
-                    print(f"[auto-import] REJEITADO {f.name}: faturamento CRM sem competência")
-
-            # Se só tem cadastro (sem faturamento), importa com mês atual e MOVE o arquivo
-            # (não há faturamento para parear, então não faz sentido manter na pasta)
-            master_only = crm_master_files and not crm_by_comp
-            if master_only:
-                crm_by_comp[date.today().strftime("%Y-%m")] = []
-
-            # Cada competência de faturamento é importada junto com o cadastro mestre
-            by_competence: dict[str, list[Path]] = {
-                comp: fat_files + crm_master_files
-                for comp, fat_files in crm_by_comp.items()
-            }
-
-            # Arquivos mestre são mantidos na pasta APENAS quando há múltiplos períodos
-            # de faturamento para parear. No caso master-only, são movidos normalmente.
-            crm_master_set = set(crm_master_files) if not master_only and len(crm_by_comp) > 1 else set()
+        # Cadastro de clientes: base mestre do Alfa, SEM competência. Cada arquivo é
+        # importado sozinho e substitui toda a base anterior (delete global).
+        if scope == "crm_clients":
+            by_competence: dict[str, list[Path]] = {}
+            for _idx, f in enumerate(csv_files):
+                # A competência é irrelevante aqui, mas import_package exige um valor.
+                # Usa o mês atual apenas como rótulo do registro de import.
+                by_competence[f"_clients__{_idx}"] = [f]
         else:
             # Agrupa arquivos por competência extraída do nome
             by_competence = {}
@@ -8395,21 +8406,18 @@ def _auto_import_tick_inner() -> None:
                     for _idx, _f in enumerate(no_comp):
                         by_competence[f"_from_content__{_idx}"] = [_f]
                 else:
+                    _exemplo = "2026-07" if scope == "crm_summary" else "2026-06"
                     with closing(get_connection()) as conn:
                         for f in no_comp:
                             _auto_import_log(
                                 conn, cfg["folder"], scope, None, "erro",
                                 f"Competência não encontrada no nome do arquivo '{f.name}'. "
-                                f"Inclua o mês no nome, ex: 2026-06_{f.name}",
+                                f"Inclua o mês no nome, ex: {_exemplo}_{f.name}",
                                 [f.name],
                             )
                             print(f"[auto-import] REJEITADO {f.name}: sem competência no nome")
 
         required_kinds = IMPORT_SCOPE_REQUIREMENTS[scope]
-        # crm_master_set já definido dentro do bloco scope=="crm" acima;
-        # para outros escopos, inicializa vazio.
-        if scope != "crm":
-            crm_master_set = set()
 
         for competence_key, files in by_competence.items():
             # Monta payload com fieldName correto por escopo/conteúdo
@@ -8433,6 +8441,9 @@ def _auto_import_tick_inner() -> None:
                                          [f.name for f in files])
                     continue
                 competence = suggested
+            elif competence_key.startswith("_clients__"):
+                # Cadastro de clientes não tem competência; usa o mês atual como rótulo
+                competence = date.today().strftime("%Y-%m")
             else:
                 competence = competence_key
 
@@ -8440,17 +8451,18 @@ def _auto_import_tick_inner() -> None:
             if not detected_kinds:
                 print(f"[auto-import] {cfg['folder']}/{competence}: nenhum arquivo reconhecido, aguardando")
                 continue
-            # Para CRM: importa com os arquivos disponíveis (cadastro é opcional se faturamento presente)
-            # Para outros escopos: exige todos os tipos necessários
+            # Escopo "crm" (legado, pasta única) aceita import parcial.
+            # Escopos individuais e demais: exige os tipos necessários.
             if scope != "crm":
                 missing = required_kinds - detected_kinds
                 if missing:
                     print(f"[auto-import] {cfg['folder']}/{competence}: aguardando {missing}")
                     continue
 
-            # Executa o import
-            dest_ok  = AUTO_IMPORT_BASE / "processados" / competence
-            dest_err = AUTO_IMPORT_BASE / "erros" / competence
+            # Executa o import — pasta de destino espelha a origem para rastreabilidade
+            _dest_sub = cfg["folder"].replace("/", "-")
+            dest_ok  = AUTO_IMPORT_BASE / "processados" / _dest_sub / competence
+            dest_err = AUTO_IMPORT_BASE / "erros" / _dest_sub / competence
             try:
                 with closing(get_connection()) as conn:
                     user = _auto_import_get_admin_user(conn)
@@ -8470,11 +8482,11 @@ def _auto_import_tick_inner() -> None:
 
                 dest_ok.mkdir(parents=True, exist_ok=True)
                 for f in files:
-                    if f in crm_master_set:
-                        # Arquivo mestre: copia para processados, mantém na pasta original
-                        shutil.copy2(str(f), str(dest_ok / f.name))
-                    else:
-                        shutil.move(str(f), str(dest_ok / f.name))
+                    _target = dest_ok / f.name
+                    if _target.exists():
+                        _stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                        _target = dest_ok / f"{f.stem}__{_stamp}{f.suffix}"
+                    shutil.move(str(f), str(_target))
 
             except Exception as exc:
                 traceback.print_exc()
@@ -8483,10 +8495,12 @@ def _auto_import_tick_inner() -> None:
                                      "erro", str(exc), [f.name for f in files])
                 dest_err.mkdir(parents=True, exist_ok=True)
                 for f in files:
-                    if f in crm_master_set:
-                        continue  # não move arquivo mestre para erros
                     try:
-                        shutil.move(str(f), str(dest_err / f.name))
+                        _target = dest_err / f.name
+                        if _target.exists():
+                            _stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+                            _target = dest_err / f"{f.stem}__{_stamp}{f.suffix}"
+                        shutil.move(str(f), str(_target))
                     except Exception:
                         pass
 
@@ -8502,12 +8516,34 @@ def _auto_import_loop() -> None:
         time.sleep(AUTO_IMPORT_INTERVAL)
 
 
+def _migrate_legacy_crm_folder() -> None:
+    """Move CSVs soltos na antiga pasta crm/ para as novas subpastas dedicadas.
+
+    A pasta crm/ passou a ter subpastas (clientes / faturamento-consolidado). Arquivos
+    que ficaram na raiz são classificados por conteúdo e movidos uma única vez.
+    """
+    legacy = AUTO_IMPORT_BASE / "crm"
+    if not legacy.exists():
+        return
+    for f in sorted(legacy.glob("*.csv")):
+        try:
+            field = _auto_import_detect_crm_field(f.read_bytes(), f.name)
+            sub = "clientes" if field == "import-crm-clients-file" else "faturamento-consolidado"
+            dest_dir = legacy / sub
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(f), str(dest_dir / f.name))
+            print(f"[auto-import] migrado {f.name} -> crm/{sub}/")
+        except Exception:
+            traceback.print_exc()
+
+
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     # Cria pastas de auto-import se não existirem
     for cfg in AUTO_IMPORT_FOLDERS:
         (AUTO_IMPORT_BASE / cfg["folder"]).mkdir(parents=True, exist_ok=True)
     (AUTO_IMPORT_BASE / "processados").mkdir(parents=True, exist_ok=True)
     (AUTO_IMPORT_BASE / "erros").mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_crm_folder()
 
     t = threading.Thread(target=_auto_import_loop, daemon=True, name="auto-import")
     t.start()
