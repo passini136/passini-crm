@@ -3897,7 +3897,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         if competence_state["isFutureCompetence"]:
             continue
         if competence_state["isCurrentCompetence"]:
-            if not issue_dt or issue_dt.date() > cutoff_date:
+            # Exclui só se a data é conhecida E está no futuro; issue_date nulo = inclui (confia na competência)
+            if issue_dt and issue_dt.date() > cutoff_date:
                 continue
         seller_name = normalize_whitespace(row["seller_name"])
         city_name = normalize_upper(row["city_name"])
@@ -4643,7 +4644,7 @@ def single_competence_summary(
         issue_dt = parse_datetime_flexible(row["issue_date"])
         if competence_state["isFutureCompetence"]:
             continue
-        if competence_state["isCurrentCompetence"] and (not issue_dt or issue_dt.date() > cutoff_date):
+        if competence_state["isCurrentCompetence"] and issue_dt and issue_dt.date() > cutoff_date:
             continue
         seller_name = normalize_whitespace(row["seller_name"])
         city_name = normalize_upper(row["city_name"])
@@ -5064,7 +5065,7 @@ def audit_revenue_gap_detail(
             discarded["invalidCompetence"]["rows"] += 1
             discarded["invalidCompetence"]["revenue"] += net_value
             continue
-        if competence_state["isCurrentCompetence"] and (not issue_dt or issue_dt.date() > cutoff_date):
+        if competence_state["isCurrentCompetence"] and issue_dt and issue_dt.date() > cutoff_date:
             discarded["invalidCompetence"]["rows"] += 1
             discarded["invalidCompetence"]["revenue"] += net_value
             continue
@@ -7100,11 +7101,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 def q(sql, *p):
                     return [dict(r) for r in conn.execute(sql, p).fetchall()]
                 result = {
+                    "db_path": str(DB_PATH),
+                    "db_size_mb": round(DB_PATH.stat().st_size / 1024 / 1024, 2) if DB_PATH.exists() else 0,
                     "fact_sales_detail": q("SELECT competence, COUNT(DISTINCT client_name) AS clientes, COUNT(DISTINCT seller_name) AS vendedores, ROUND(SUM(net_value),2) AS total FROM fact_sales_detail WHERE company_id=? GROUP BY competence ORDER BY competence", cid),
                     "fact_vendor_summary": q("SELECT competence, COUNT(*) AS linhas, ROUND(SUM(sale_value),2) AS total FROM fact_vendor_summary WHERE company_id=? GROUP BY competence ORDER BY competence", cid),
                     "crm_client_summary": q("SELECT competence, COUNT(DISTINCT client_code) AS clientes, SUM(CASE WHEN net_value>0 THEN 1 ELSE 0 END) AS com_valor, ROUND(SUM(net_value),2) AS total FROM crm_client_summary WHERE company_id=? GROUP BY competence ORDER BY competence", cid),
                     "crm_client_profiles": q("SELECT COUNT(*) AS total FROM crm_client_profiles WHERE company_id=?", cid),
                     "fact_unit_summary": q("SELECT competence, COUNT(*) AS linhas FROM fact_unit_summary WHERE company_id=? GROUP BY competence ORDER BY competence", cid),
+                    "imports_recentes": q("SELECT file_type, competence, status, created_at FROM imports WHERE company_id=? ORDER BY created_at DESC LIMIT 20", cid),
                 }
                 conn.close()
                 self._set_headers(200)
