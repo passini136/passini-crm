@@ -395,9 +395,11 @@ def parse_decimal(value: str | None) -> float:
     elif "," in text:
         text = text.replace(",", ".")
     try:
-        return float(Decimal(text))
+        number = float(Decimal(text))
     except (InvalidOperation, ValueError):
         return 0.0
+    # Blinda contra "inf"/"nan" vindos do CSV — gravar isso no banco gera JSON inválido
+    return number if math.isfinite(number) else 0.0
 
 
 def parse_int(value: str | None) -> int:
@@ -847,8 +849,26 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
     return hmac.compare_digest(candidate, stored_hash)
 
 
+def _json_sanitize(value: Any) -> Any:
+    """Substitui Infinity/-Infinity/NaN por None em toda a estrutura.
+
+    O json do Python emite literais `Infinity` e `NaN`, que NÃO são JSON válido:
+    o JSON.parse do navegador lança SyntaxError e a tela trava carregando. Isso
+    acontecia, por exemplo, em marginValue quando a base de custo tinha divisão
+    degenerada. Sanear na serialização resolve a classe inteira do problema.
+    """
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: _json_sanitize(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_sanitize(v) for v in value]
+    return value
+
+
 def json_dumps(data: Any) -> bytes:
-    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+    # allow_nan=False faria levantar exceção; preferimos sanear e sempre responder.
+    return json.dumps(_json_sanitize(data), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
 def get_connection() -> sqlite3.Connection:
@@ -2480,7 +2500,21 @@ def get_business_calendar(
 
 
 def safe_div(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else 0.0
+    if not denominator:
+        return 0.0
+    result = numerator / denominator
+    return result if math.isfinite(result) else 0.0
+
+
+def finite_or_none(value: Any) -> float | None:
+    """Converte para float finito; devolve None para inf/NaN/valor inválido."""
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def official_cost_net(sale_value: float | int | None, return_value: float | int | None) -> float:
@@ -4577,7 +4611,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "discountValue": round(metrics["discountValue"], 2),
                 "discountPct": round(discount_pct, 2),
                 "returnRatioPct": round(return_ratio, 2),
-                "marginValue": round(margin_value, 2) if margin_value is not None else None,
+                "marginValue": (lambda _m: round(_m, 2) if _m is not None else None)(finite_or_none(margin_value)),
                 "score": round(score, 2),
                 "pendingMapping": role is None,
                 "missingGoal": revenue_goal <= 0,
@@ -4630,7 +4664,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "returnRatioPct": round(safe_div(returns_value, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "goalAttainmentPct": round(safe_div(revenue_net, revenue_goal) * 100 if revenue_goal else 0.0, 2),
                 "projectedGoalAttainmentPct": round(safe_div(projected_revenue, revenue_goal) * 100 if revenue_goal else 0.0, 2),
-                "marginValue": round(float(official_row.get("margin_value") or 0), 2) if official_row else None,
+                "marginValue": round(finite_or_none(official_row.get("margin_value")) or 0, 2) if official_row else None,
                 "qtySold": round(qty_sold, 2),
                 "ticketPerPiece": round(safe_div(revenue_net, qty_sold), 2),
                 "metaDiaria": round(daily_goal_value, 2),
