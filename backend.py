@@ -2252,6 +2252,8 @@ def import_package(
     )
     ensure_client_registry_for_sales(conn, company_id)
     conn.commit()
+    # Dados mudaram: derruba caches derivados (dashboard e CRM)
+    invalidate_crm_cache(company_id)
     result: dict[str, Any] = {
         "importId": import_id,
         "duplicateRowsSkipped": duplicate_rows_skipped,
@@ -2875,6 +2877,94 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
             for k in list(_crm_base_cache.keys()):
                 if k[0] == company_id:
                     del _crm_base_cache[k]
+    invalidate_dashboard_cache(company_id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache do dashboard
+#
+# Entre importações os dados são estáticos, então o resultado de get_dashboard_data
+# pode ser reaproveitado integralmente. Sem isso, cada troca de competência
+# reprocessava dezenas de milhares de linhas do faturamento detalhado em Python.
+# O cache é invalidado em toda importação e pré-aquecido em segundo plano.
+# ─────────────────────────────────────────────────────────────────────────────
+_dashboard_cache: dict[tuple, dict[str, Any]] = {}
+_dashboard_cache_lock = threading.Lock()
+_DASHBOARD_CACHE_MAX = 120
+
+
+def _dashboard_cache_key(company_id: int, filters: dict[str, str | None]) -> tuple:
+    # A competência efetiva vem de competence_end/competence_start (ver
+    # selected_primary_competence); competence_start vazio significa "mais recente".
+    return (
+        company_id,
+        normalize_whitespace(filters.get("competence_start")),
+        normalize_whitespace(filters.get("competence_end")),
+        normalize_whitespace(filters.get("unit_name")),
+        normalize_whitespace(filters.get("seller_name")),
+        normalize_whitespace(filters.get("city_name")),
+        tuple(sorted(normalize_unit_list(filters.get("allowed_units")))),
+    )
+
+
+def invalidate_dashboard_cache(company_id: int | None = None) -> None:
+    with _dashboard_cache_lock:
+        if company_id is None:
+            _dashboard_cache.clear()
+        else:
+            for k in list(_dashboard_cache.keys()):
+                if k[0] == company_id:
+                    del _dashboard_cache[k]
+
+
+def get_dashboard_data_cached(
+    conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None]
+) -> dict[str, Any]:
+    key = _dashboard_cache_key(company_id, filters)
+    with _dashboard_cache_lock:
+        hit = _dashboard_cache.get(key)
+    if hit is not None:
+        return hit
+    started = time.time()
+    data = get_dashboard_data(conn, company_id, filters)
+    elapsed = time.time() - started
+    with _dashboard_cache_lock:
+        if len(_dashboard_cache) >= _DASHBOARD_CACHE_MAX:
+            _dashboard_cache.clear()
+        _dashboard_cache[key] = data
+    if elapsed > 1.0:
+        print(f"[dashboard] {key[1] or 'sem competência'} calculado em {elapsed:.1f}s e cacheado")
+    return data
+
+
+def warm_dashboard_cache(company_id: int | None = None) -> None:
+    """Pré-calcula o dashboard de cada competência para que a troca seja instantânea."""
+    try:
+        with closing(get_connection()) as conn:
+            if company_id is None:
+                company_ids = [r["id"] for r in conn.execute("SELECT id FROM companies").fetchall()]
+            else:
+                company_ids = [company_id]
+            for cid in company_ids:
+                competences = query_competences(conn, cid)
+                # Aquece as competências mais recentes (as que o usuário abre na prática).
+                # A tela envia competenceStart e competenceEnd com o mesmo valor.
+                for competence in competences[:8]:
+                    filters = build_filters_from_query({})
+                    filters["competence_start"] = competence
+                    filters["competence_end"] = competence
+                    try:
+                        get_dashboard_data_cached(conn, cid, filters)
+                    except Exception:
+                        traceback.print_exc()
+                # E também a visão padrão (sem competência escolhida = mais recente)
+                try:
+                    get_dashboard_data_cached(conn, cid, build_filters_from_query({}))
+                except Exception:
+                    traceback.print_exc()
+            print(f"[dashboard] cache pré-aquecido: {len(_dashboard_cache)} combinação(ões)")
+    except Exception:
+        traceback.print_exc()
 
 
 def crm_base_client_count(conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None]) -> int:
@@ -7355,7 +7445,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
                     filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
-                    data = get_dashboard_data(conn, user["company_id"], filters)
+                    data = get_dashboard_data_cached(conn, user["company_id"], filters)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
                 return
@@ -8494,6 +8584,7 @@ def auto_import_tick() -> None:
 
 
 def _auto_import_tick_inner() -> None:
+    imported_any = False
     for cfg in AUTO_IMPORT_FOLDERS:
         folder_path = AUTO_IMPORT_BASE / cfg["folder"]
         if not folder_path.exists():
@@ -8612,6 +8703,7 @@ def _auto_import_tick_inner() -> None:
                         competence, "substituir", scope, preview, files_payload,
                     )
                     invalidate_crm_cache(user["company_id"])
+                    imported_any = True
                     msg = result.get("message", "OK")
                     _warning = result.get("warning")
                     _auto_import_log(conn, cfg["folder"], scope, competence,
@@ -8646,6 +8738,11 @@ def _auto_import_tick_inner() -> None:
                         shutil.move(str(f), str(_target))
                     except Exception:
                         pass
+
+    # Importou algo: recalcula o dashboard de todas as competências para que a
+    # primeira visualização já venha pronta.
+    if imported_any:
+        warm_dashboard_cache()
 
 
 def _auto_import_loop() -> None:
@@ -8690,6 +8787,9 @@ def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
 
     t = threading.Thread(target=_auto_import_loop, daemon=True, name="auto-import")
     t.start()
+
+    # Pré-aquece o cache do dashboard em segundo plano — o servidor já sobe atendendo
+    threading.Thread(target=warm_dashboard_cache, daemon=True, name="dashboard-warmup").start()
 
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"Servidor rodando em http://{host}:{port}")
