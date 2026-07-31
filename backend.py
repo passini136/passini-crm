@@ -2969,6 +2969,7 @@ def get_dashboard_data_cached(
     with _dashboard_cache_lock:
         hit = _dashboard_cache.get(key)
     if hit is not None:
+        print(f"[dashboard] CACHE HIT {key[1:5]}", flush=True)
         return hit
     started = time.time()
     data = get_dashboard_data(conn, company_id, filters)
@@ -2977,8 +2978,7 @@ def get_dashboard_data_cached(
         if len(_dashboard_cache) >= _DASHBOARD_CACHE_MAX:
             _dashboard_cache.clear()
         _dashboard_cache[key] = data
-    if elapsed > 1.0:
-        print(f"[dashboard] {key[1] or 'sem competência'} calculado em {elapsed:.1f}s e cacheado")
+    print(f"[dashboard] CALCULADO {key[1:5]} em {elapsed:.1f}s", flush=True)
     return data
 
 
@@ -7394,6 +7394,15 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:
+        _t0 = time.time()
+        try:
+            self._do_GET_inner()
+        finally:
+            _elapsed = time.time() - _t0
+            if _elapsed > 1.0 and "/api/" in self.path:
+                print(f"[req] {_elapsed:6.1f}s  GET {self.path}", flush=True)
+
+    def _do_GET_inner(self) -> None:
         try:
             parsed = urlparse(self.path)
             path = parsed.path

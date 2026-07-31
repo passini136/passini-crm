@@ -6,11 +6,20 @@ Uso no servidor:
 
 Se travar, após 25s imprime o stack trace mostrando a linha exata onde está parado.
 """
-import sys, time, faulthandler
+import sys, os, time, faulthandler
+from pathlib import Path
 
 sys.path.insert(0, "/srv/passini/apps/crm-comercial")
 
 competence = sys.argv[1] if len(sys.argv) > 1 else "2026-06"
+
+# O serviço systemd define PASSINI_CRM_DATA. Rodando o script na mão a variável não
+# existe e o backend acabaria abrindo um banco vazio em /tmp. Aponta para o real.
+if not os.environ.get("PASSINI_CRM_DATA"):
+    for candidate in ("/srv/passini/data/crm", "/srv/passini/data"):
+        if (Path(candidate) / "passini_dashboard.db").exists():
+            os.environ["PASSINI_CRM_DATA"] = candidate
+            break
 
 import backend  # noqa: E402
 
@@ -18,6 +27,14 @@ print(f"Banco: {backend.DB_PATH}")
 print(f"Competência testada: {competence}\n")
 
 conn = backend.get_connection()
+row = conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='companies'"
+).fetchone()
+if not row:
+    print("ERRO: banco sem tabelas. Rode apontando o caminho correto:")
+    print("  PASSINI_CRM_DATA=/srv/passini/data/crm \\")
+    print("  /srv/passini/venv/crm/bin/python /srv/passini/apps/crm-comercial/diag_competencia.py 2026-06")
+    sys.exit(1)
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
 
 # Contagens da competência
