@@ -2373,6 +2373,55 @@ def dashboard_competence_state(competence: str, today_value: date | None = None)
     }
 
 
+# Cache de feriados e férias por (empresa, competência). Estes dados quase nunca mudam
+# e get_business_calendar é chamado uma vez POR VENDEDOR dentro do dashboard — sem cache
+# eram 2 queries × dezenas de vendedores a cada troca de competência.
+_calendar_cache: dict[tuple, tuple[dict[str, str], dict[str, list[dict[str, Any]]]]] = {}
+_calendar_cache_lock = threading.Lock()
+
+
+def invalidate_calendar_cache(company_id: int | None = None) -> None:
+    with _calendar_cache_lock:
+        if company_id is None:
+            _calendar_cache.clear()
+        else:
+            for k in list(_calendar_cache.keys()):
+                if k[0] == company_id:
+                    del _calendar_cache[k]
+
+
+def _calendar_reference_data(
+    conn: sqlite3.Connection, company_id: int, competence: str, start: date, end: date
+) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]]]:
+    """Feriados da competência e férias agrupadas por pessoa, com cache."""
+    key = (company_id, competence)
+    with _calendar_cache_lock:
+        hit = _calendar_cache.get(key)
+    if hit is not None:
+        return hit
+    holidays = {
+        row["holiday_date"]: row["holiday_name"]
+        for row in conn.execute(
+            "SELECT holiday_date, holiday_name FROM holidays WHERE company_id = ? AND holiday_date BETWEEN ? AND ?",
+            (company_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    }
+    vacations_by_person: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in conn.execute(
+        """
+        SELECT person_name, start_date, end_date, notes
+        FROM vacations
+        WHERE company_id = ? AND date(end_date) >= date(?) AND date(start_date) <= date(?)
+        """,
+        (company_id, start.isoformat(), end.isoformat()),
+    ).fetchall():
+        vacations_by_person[normalize_whitespace(row["person_name"])].append(dict(row))
+    result = (holidays, dict(vacations_by_person))
+    with _calendar_cache_lock:
+        _calendar_cache[key] = result
+    return result
+
+
 def get_business_calendar(
     conn: sqlite3.Connection,
     company_id: int,
@@ -2383,26 +2432,18 @@ def get_business_calendar(
 ) -> dict[str, Any]:
     start = first_day_of_competence(competence)
     end = last_day_of_competence(competence)
-    holiday_rows = conn.execute(
-        "SELECT holiday_date, holiday_name FROM holidays WHERE company_id = ? AND holiday_date BETWEEN ? AND ?",
-        (company_id, start.isoformat(), end.isoformat()),
-    ).fetchall()
-    holidays = {row["holiday_date"]: row["holiday_name"] for row in holiday_rows}
+    holidays, vacations_by_person = _calendar_reference_data(conn, company_id, competence, start, end)
     vacation_dates = set()
     vacations = []
     if seller_name:
-        rows = conn.execute(
-            """
-            SELECT person_name, start_date, end_date, notes
-            FROM vacations
-            WHERE company_id = ? AND person_name = ?
-              AND date(end_date) >= date(?) AND date(start_date) <= date(?)
-            """,
-            (company_id, seller_name, start.isoformat(), end.isoformat()),
-        ).fetchall()
-        for row in rows:
+        for row in vacations_by_person.get(normalize_whitespace(seller_name), []):
             vacations.append(dict(row))
-            for day in daterange(max(start, date.fromisoformat(row["start_date"])), min(end, date.fromisoformat(row["end_date"]))):
+            try:
+                _vs = date.fromisoformat(row["start_date"])
+                _ve = date.fromisoformat(row["end_date"])
+            except (TypeError, ValueError):
+                continue
+            for day in daterange(max(start, _vs), min(end, _ve)):
                 vacation_dates.add(day.isoformat())
 
     actual_today = reference_today or today_in_brazil()
@@ -2881,6 +2922,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
                 if k[0] == company_id:
                     del _crm_base_cache[k]
     invalidate_dashboard_cache(company_id)
+    invalidate_calendar_cache(company_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -6326,6 +6368,9 @@ def save_json_payload(conn: sqlite3.Connection, company_id: int, user_id: int, t
         sanitize_unit_goals(conn, company_id, user_id)
     audit_log(conn, company_id, user_id, "salvar", table_name, "batch", {"rows": created})
     conn.commit()
+    # Metas, férias, feriados e cadastros alteram o dashboard — derruba os caches
+    invalidate_calendar_cache(company_id)
+    invalidate_dashboard_cache(company_id)
     return created
 
 
@@ -8133,6 +8178,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             (user["company_id"], competence, unit_name, revenue_goal, now_iso()),
                         )
                         conn.commit()
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
@@ -8149,6 +8195,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         (user["company_id"], competence, seller_name),
                     )
                     conn.commit()
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
@@ -8165,6 +8212,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         (user["company_id"], competence, unit_name),
                     )
                     conn.commit()
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
@@ -8237,6 +8285,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     )
                     audit_log(conn, user["company_id"], user["id"], "criar", "vacations", "", {"person_name": person_name, "start_date": start_date, "end_date": end_date})
                     conn.commit()
+                invalidate_calendar_cache(user["company_id"])
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
@@ -8266,6 +8316,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     )
                     audit_log(conn, user["company_id"], user["id"], "editar", "vacations", str(vac_id), {"person_name": person_name, "start_date": start_date, "end_date": end_date})
                     conn.commit()
+                invalidate_calendar_cache(user["company_id"])
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
@@ -8288,6 +8340,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     conn.execute("DELETE FROM vacations WHERE id = ? AND company_id = ?", (vac_id, user["company_id"]))
                     audit_log(conn, user["company_id"], user["id"], "excluir", "vacations", str(vac_id), {})
                     conn.commit()
+                invalidate_calendar_cache(user["company_id"])
+                invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
                 return
