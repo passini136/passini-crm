@@ -136,6 +136,9 @@ AUTO_IMPORT_INTERVAL = 3600  # 1 hora (era 5 min — reduzia risco de reimport e
 # quando nenhum arquivo foi modificado nos últimos N segundos, evitando processar
 # a base pela metade enquanto a segunda exportação ainda está sendo copiada.
 CRM_CLIENTS_SETTLE_SECONDS = 120
+# Logs de depuração do dashboard (projeção e comparativos). Desligados por padrão —
+# eram impressos a cada cálculo, poluindo o journal. Ative com PASSINI_DEBUG_DASHBOARD=1
+DASHBOARD_DEBUG_LOG = os.environ.get("PASSINI_DEBUG_DASHBOARD", "").strip() in {"1", "true", "yes"}
 AUTO_IMPORT_FOLDERS = [
     {"folder": "faturamento",  "scope": "sales", "label": "Faturamento Detalhado"},
     {"folder": "custo-venda",  "scope": "cost",  "label": "Custo de Venda"},
@@ -2890,7 +2893,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 _dashboard_cache: dict[tuple, dict[str, Any]] = {}
 _dashboard_cache_lock = threading.Lock()
-_DASHBOARD_CACHE_MAX = 120
+_DASHBOARD_CACHE_MAX = 400
 
 
 def _dashboard_cache_key(company_id: int, filters: dict[str, str | None]) -> tuple:
@@ -2945,10 +2948,24 @@ def warm_dashboard_cache(company_id: int | None = None) -> None:
                 company_ids = [r["id"] for r in conn.execute("SELECT id FROM companies").fetchall()]
             else:
                 company_ids = [company_id]
+            started = time.time()
             for cid in company_ids:
                 competences = query_competences(conn, cid)
-                # Aquece as competências mais recentes (as que o usuário abre na prática).
+                units = [
+                    normalize_unit(r["unit_name"])
+                    for r in conn.execute(
+                        "SELECT DISTINCT unit_name FROM fact_unit_summary WHERE company_id = ?", (cid,)
+                    ).fetchall()
+                    if r["unit_name"]
+                ]
+                # Visão padrão (sem competência escolhida = mais recente)
+                try:
+                    get_dashboard_data_cached(conn, cid, build_filters_from_query({}))
+                except Exception:
+                    traceback.print_exc()
+
                 # A tela envia competenceStart e competenceEnd com o mesmo valor.
+                # Competências recentes sem filtro de unidade.
                 for competence in competences[:8]:
                     filters = build_filters_from_query({})
                     filters["competence_start"] = competence
@@ -2957,12 +2974,21 @@ def warm_dashboard_cache(company_id: int | None = None) -> None:
                         get_dashboard_data_cached(conn, cid, filters)
                     except Exception:
                         traceback.print_exc()
-                # E também a visão padrão (sem competência escolhida = mais recente)
-                try:
-                    get_dashboard_data_cached(conn, cid, build_filters_from_query({}))
-                except Exception:
-                    traceback.print_exc()
-            print(f"[dashboard] cache pré-aquecido: {len(_dashboard_cache)} combinação(ões)")
+
+                # Combinação competência × unidade para as 3 competências mais recentes,
+                # que é o recorte usado no dia a dia.
+                for competence in competences[:3]:
+                    for unit in units:
+                        filters = build_filters_from_query({})
+                        filters["competence_start"] = competence
+                        filters["competence_end"] = competence
+                        filters["unit_name"] = unit
+                        try:
+                            get_dashboard_data_cached(conn, cid, filters)
+                        except Exception:
+                            traceback.print_exc()
+            print(f"[dashboard] cache pré-aquecido: {len(_dashboard_cache)} combinação(ões) "
+                  f"em {time.time() - started:.0f}s")
     except Exception:
         traceback.print_exc()
 
@@ -4712,7 +4738,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         "duplicateUnitGoals": duplicate_unit_goals,
         "duplicateSellerGoals": duplicate_seller_goals,
     }
-    print("[DASHBOARD D-1 PROJECTION DEBUG]", debug_projection)
+    if DASHBOARD_DEBUG_LOG:
+        print("[DASHBOARD D-1 PROJECTION DEBUG]", debug_projection)
     debug_comparisons = {
         "current": {
             "competence": primary_competence,
@@ -4736,7 +4763,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "revenueNet": comparison_yoy.get("revenueNet"),
         },
     }
-    print("[debugComparisons]", debug_comparisons)
+    if DASHBOARD_DEBUG_LOG:
+        print("[debugComparisons]", debug_comparisons)
 
     return {
         "filters": filters,
