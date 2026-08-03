@@ -2231,7 +2231,7 @@ function crmAgendaCard(item) {
           <div><span>Última compra</span><strong>${escapeHtml(item.lastPurchaseAt ? item.lastPurchaseAt.slice(0, 10) : "-")}</strong></div>
           <div><span>Dias sem compra</span><strong>${number(item.daysWithoutPurchase || 0)}</strong></div>
           <div><span>Mês atual</span><strong>${currency(item.currentRevenue)}</strong></div>
-          <div><span>Média trim.</span><strong>${currency(item.averageRevenue)}</strong></div>
+          <div><span>Média 3 meses ant.</span><strong>${currency(item.averageRevenue)}</strong></div>
           <div><span>Crescimento</span><strong>${pct((item.growthPct || 0) * 100)}</strong></div>
         </div>
       ` : ""}
@@ -2317,7 +2317,7 @@ function crmAgendaView() {
           <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0">
             <div class="crm-card-essentials" style="margin:0"><div><span>Última compra</span><strong>${escapeHtml(item.lastPurchaseAt ? item.lastPurchaseAt.slice(0,10) : "-")}</strong></div></div>
             <div class="crm-card-essentials" style="margin:0"><div><span>Mês atual</span><strong>${currency(item.currentRevenue)}</strong></div></div>
-            <div class="crm-card-essentials" style="margin:0"><div><span>Média trim.</span><strong>${currency(item.averageRevenue)}</strong></div></div>
+            <div class="crm-card-essentials" style="margin:0"><div><span>Média 3 meses ant.</span><strong>${currency(item.averageRevenue)}</strong></div></div>
           </div>
         ` : ""}
         <div class="actions" style="padding-top:8px;border-top:1px solid var(--line)">
@@ -2539,6 +2539,68 @@ function crmAgendaView() {
  * O gestor não recebe fila de ligações — recebe onde a execução falhou,
  * sempre com o vendedor responsável ao lado para cobrança direta.
  */
+const MES_ABREV = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
+
+/** Converte "2026-06" em "jun/26" para caber nos rótulos. */
+function competenceShort(competence) {
+  if (!competence || competence.length < 7) return competence || "";
+  const ano = competence.slice(2, 4);
+  const mes = parseInt(competence.slice(5, 7), 10) - 1;
+  return `${MES_ABREV[mes] || "?"}/${ano}`;
+}
+
+/**
+ * Rótulo da média com o período explícito.
+ * A média é sempre a soma dos 3 meses ANTERIORES dividida por 3 — inclusive
+ * meses sem compra. Sem dizer o período, o número parece arbitrário.
+ */
+function averageLabel(item) {
+  const basis = item.averageBasis;
+  const valor = currency(item.averageRevenue || 0);
+  if (!basis || !basis.months?.length) return `média ${valor}/mês`;
+  const meses = basis.months.map((m) => m.competence).sort();
+  return `média ${valor}/mês (${competenceShort(meses[0])}–${competenceShort(meses[meses.length - 1])})`;
+}
+
+/** Memória de cálculo da média, para conferência na ficha do cliente. */
+function averageBreakdown(item) {
+  const basis = item.averageBasis;
+  if (!basis || !basis.months?.length) return "";
+  const meses = [...basis.months].sort((a, b) => a.competence.localeCompare(b.competence));
+  const semCompra = 3 - (basis.monthsWithPurchase ?? 3);
+  return `
+    <div style="background:#f7fafc;border:1px solid var(--line);border-radius:6px;padding:10px 12px;margin-top:8px">
+      <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:6px">
+        COMO A MÉDIA É CALCULADA
+      </div>
+      <table style="width:100%;font-size:12px">
+        <tbody>
+          ${meses.map((m) => `
+            <tr>
+              <td style="padding:2px 0;color:var(--muted)">${escapeHtml(competenceShort(m.competence))}</td>
+              <td style="text-align:right;${Number(m.revenue) <= 0 ? "color:var(--bad)" : ""}">${currency(m.revenue)}</td>
+            </tr>`).join("")}
+          <tr style="border-top:1px solid var(--line)">
+            <td style="padding:4px 0;font-weight:700">Soma</td>
+            <td style="text-align:right;font-weight:700">${currency(basis.total)}</td>
+          </tr>
+          <tr>
+            <td style="color:var(--muted)">÷ ${basis.divisor} meses</td>
+            <td style="text-align:right;font-weight:800;color:var(--accent)">${currency(item.averageRevenue || 0)}</td>
+          </tr>
+        </tbody>
+      </table>
+      ${semCompra > 0 ? `<div class="text-small" style="color:var(--muted);margin-top:6px">
+        Dividimos sempre por 3, mesmo com ${semCompra} ${semCompra === 1 ? "mês" : "meses"} sem compra —
+        a média mostra o volume mensal, não o valor por pedido.
+      </div>` : ""}
+      <div class="text-small" style="color:var(--muted);margin-top:4px">
+        Base: faturamento total do cliente nos 3 meses anteriores a ${escapeHtml(competenceShort(basis.currentCompetence))},
+        somando todos os vendedores.
+      </div>
+    </div>`;
+}
+
 function managerRiskBlocks() {
   const risk = state.crm.teamActivity?.risk;
   if (!risk) return "";
@@ -2550,7 +2612,7 @@ function managerRiskBlocks() {
     const motive = isGap
       ? `${item.daysWithoutPurchase != null ? `${item.daysWithoutPurchase} dias sem comprar` : "Sem compra registrada"} · ${
           item.daysWithoutContact == null ? "nunca contatado" : `${item.daysWithoutContact} dias sem contato`}`
-      : `Queda de ${pct(Math.abs(Number(item.dropPct || 0)) * 100)} · média ${currency(item.averageRevenue || 0)}`;
+      : `Queda de ${pct(Math.abs(Number(item.dropPct || 0)) * 100)} · ${averageLabel(item)}`;
     const classBadge = { DIAMANTE: "💎", OURO: "🥇", PRATA: "🥈", BRONZE: "🥉" }[item.classCode] || "";
     const payload = encodeURIComponent(JSON.stringify({
       clientKey: item.clientKey, clientName: item.clientName, sellerName: seller,
@@ -3365,10 +3427,17 @@ function clientDrawerView() {
                 <div><span>Última compra</span><strong>${escapeHtml(client.lastPurchaseAt ? client.lastPurchaseAt.slice(0, 10) : "-")}</strong></div>
                 <div><span>Dias sem compra</span><strong>${number(client.daysWithoutPurchase || 0)}</strong></div>
                 <div><span>Faturamento mês atual</span><strong>${currency(client.currentRevenue)}</strong></div>
-                <div><span>Média trimestre</span><strong>${currency(client.averageRevenue)}</strong></div>
+                <div><span>Média dos 3 meses anteriores</span><strong>${currency(client.averageRevenue)}</strong></div>
                 <div><span>Crescimento ou queda</span><strong>${pct((client.growthPct || 0) * 100)}</strong></div>
                 <div><span>Motivo principal</span><strong>${escapeHtml(client.primaryReason || "-")}</strong></div>
               </div>
+              ${client.duplicateOfCode ? `
+                <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px;margin-top:8px">
+                  ⚠ Cadastro duplicado: este cliente também existe no código
+                  <strong>${escapeHtml(client.duplicateOfCode)}</strong>, que é onde o faturamento está
+                  contabilizado. Vale unificar os cadastros no Alfa.
+                </div>` : ""}
+              ${averageBreakdown(client)}
             </div>
             ${clientActionPanel(client)}
             <div class="table-card">

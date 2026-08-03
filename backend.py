@@ -3389,21 +3389,62 @@ def crm_base_client_rows(
             "lastPurchaseAt": parse_datetime_flexible(row["last_purchase_at"]),
         }
 
+    # ── Cadastros duplicados: mesmo cliente com mais de um código ──────────────
+    # O faturamento detalhado é indexado por NOME; a carteira, por CÓDIGO. Quando a
+    # mesma empresa tem código antigo e novo (recadastro), os dois códigos casariam
+    # com o mesmo faturamento e o valor apareceria em dobro nos totais.
+    # Regra: o faturamento fica com um único código — o que tem movimento no mês
+    # corrente; sem movimento em nenhum, fica com o de compra mais recente.
+    revenue_owner_by_name: dict[str, str] = {}
+    _candidates_by_name: dict[str, list[tuple[float, str, str]]] = defaultdict(list)
+    for row in aggregate_rows:
+        code = normalize_whitespace(row["client_code"])
+        if not code:
+            continue
+        for key in {
+            normalize_client_key(row["client_name"]),
+            normalize_client_key(row["summary_client_name"]),
+            normalize_client_key(row["trade_name"]),
+        }:
+            if key:
+                _candidates_by_name[key].append((
+                    float(row["current_revenue"] or 0.0),
+                    normalize_whitespace(row["last_purchase_at"]) or "",
+                    code,
+                ))
+    for name_key, candidates in _candidates_by_name.items():
+        if len(candidates) < 2:
+            revenue_owner_by_name[name_key] = candidates[0][2]
+            continue
+        # Maior receita no mês corrente; empate resolve pela compra mais recente
+        candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+        revenue_owner_by_name[name_key] = candidates[0][2]
+
     client_rows: list[dict[str, Any]] = []
     for row in aggregate_rows:
         current_revenue = float(row["current_revenue"] or 0.0)
         client_key = normalize_whitespace(row["client_code"])
-        candidate_keys = [
-            normalize_client_key(row["client_name"]),
-            normalize_client_key(row["summary_client_name"]),
-            normalize_client_key(row["trade_name"]),
-        ]
+        # O cliente pode ser encontrado por razão social, nome do resumo ou nome
+        # fantasia. DEDUPLICAR é essencial: quando dois desses campos normalizam
+        # para a mesma chave (o caso comum — razão social igual em ambos), o loop
+        # abaixo somava o MESMO faturamento duas ou três vezes, dobrando a média.
+        candidate_keys = list(dict.fromkeys(
+            key for key in (
+                normalize_client_key(row["client_name"]),
+                normalize_client_key(row["summary_client_name"]),
+                normalize_client_key(row["trade_name"]),
+            ) if key
+        ))
         merged_revenues = [0.0, 0.0, 0.0]
         merged_current_sku_count = 0
         merged_last_purchase_at: datetime | None = None
         merged_detail_c0_revenue = 0.0
+        duplicated_codes: list[str] = []
         for name_key in candidate_keys:
-            if not name_key:
+            # Só o código eleito dono recebe o faturamento daquele nome
+            owner = revenue_owner_by_name.get(name_key)
+            if owner and owner != client_key:
+                duplicated_codes.append(owner)
                 continue
             if name_key in detail_metrics:
                 metrics = detail_metrics[name_key]
@@ -3419,7 +3460,11 @@ def crm_base_client_rows(
         # Usa o maior entre CRM summary e faturamento detalhado scoped por vendedor
         current_revenue = max(current_revenue, merged_detail_c0_revenue)
         previous_revenues = merged_revenues
+        # MÉDIA = soma dos 3 meses ANTERIORES a c0, dividida por 3 (sempre por 3,
+        # inclusive meses sem compra — mede volume médio mensal, não ticket médio).
+        # Base: fact_sales_detail, faturamento total do cliente (todos os vendedores).
         average_revenue = sum(previous_revenues) / 3
+        months_with_purchase = sum(1 for v in previous_revenues if v > 0)
         summary_last_purchase = parse_datetime_flexible(row["last_purchase_at"])
         last_purchase_at = summary_last_purchase
         if merged_last_purchase_at and (last_purchase_at is None or merged_last_purchase_at > last_purchase_at):
@@ -3477,6 +3522,21 @@ def crm_base_client_rows(
                 "trimesterRevenue1": round(previous_revenues[0], 2),
                 "trimesterRevenue2": round(previous_revenues[1], 2),
                 "trimesterRevenue3": round(previous_revenues[2], 2),
+                # Sinaliza cadastro duplicado: o faturamento deste nome está em outro código
+                "duplicateOfCode": duplicated_codes[0] if duplicated_codes else None,
+                # Memória de cálculo da média — permite auditar o número na tela
+                "averageBasis": {
+                    "currentCompetence": c0,
+                    "months": [
+                        {"competence": c1, "revenue": round(previous_revenues[0], 2)},
+                        {"competence": c2, "revenue": round(previous_revenues[1], 2)},
+                        {"competence": c3, "revenue": round(previous_revenues[2], 2)},
+                    ],
+                    "total": round(sum(previous_revenues), 2),
+                    "divisor": 3,
+                    "monthsWithPurchase": months_with_purchase,
+                    "formula": "soma dos 3 meses anteriores ÷ 3",
+                },
                 "dropPct": round(drop_pct, 4),
                 "classCode": class_code,
                 "statusCode": status_code,
