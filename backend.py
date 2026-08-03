@@ -2973,6 +2973,56 @@ def scoped_filters_for_user(conn: sqlite3.Connection, company_id: int, user: sql
     return scoped
 
 
+def crm_allowed_units_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> list[str] | None:
+    """Unidades que o usuário pode ver NO CRM.
+
+    Diferente do dashboard de resultados, a carteira nunca é consolidada: mesmo o
+    perfil "unidade + consolidado" enxerga só as unidades vinculadas. O consolidado
+    serve para comparar números, não para acessar a carteira de outras equipes.
+    Retorna None quando não há restrição.
+    """
+    scope = data_scope_for_user(conn, user)
+    if scope in {"unidade", "unidade_consolidado"}:
+        return linked_units_for_user(user)
+    return None
+
+
+def crm_unit_filter_for_user(
+    conn: sqlite3.Connection, user: sqlite3.Row, requested_unit: str | None
+) -> list[str] | None:
+    """Resolve o filtro de unidade do CRM respeitando o vínculo do usuário."""
+    allowed = crm_allowed_units_for_user(conn, user)
+    requested = normalize_unit(requested_unit) if requested_unit else None
+    if allowed is None:
+        return [requested] if requested else None
+    if not allowed:
+        return ["__NO_ACCESS__"]
+    if requested and requested in allowed:
+        return [requested]
+    return allowed
+
+
+def crm_scoped_filters_for_user(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, filters: dict[str, str | None]
+) -> dict[str, str | None]:
+    """Filtros do CRM. Igual ao dashboard, exceto que NUNCA consolida:
+    o perfil "unidade + consolidado" fica restrito às unidades vinculadas aqui."""
+    scoped = scoped_filters_for_user(conn, company_id, user, filters)
+    allowed = crm_allowed_units_for_user(conn, user)
+    if allowed is None:
+        return scoped
+    if not allowed:
+        scoped["unit_name"] = "__NO_ACCESS__"
+        scoped["allowed_units"] = []
+        return scoped
+    scoped["allowed_units"] = allowed
+    current_unit = normalize_unit(scoped.get("unit_name"))
+    if not current_unit or current_unit not in allowed:
+        # Sem unidade escolhida (ou fora do vínculo): usa a primeira unidade do usuário
+        scoped["unit_name"] = allowed[0]
+    return scoped
+
+
 def crm_base_client_scope_query(
     conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None]
 ) -> tuple[str | None, list[Any], str | None]:
@@ -7533,7 +7583,7 @@ def compute_team_activity_today(
 
 def compute_portfolio_summary_by_seller(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
-    competence: str | None = None, unit_filter: str | None = None,
+    competence: str | None = None, unit_filter: str | list[str] | None = None,
     person_type_filter: str | None = None,
 ) -> dict[str, Any]:
     """Retorna resumo da carteira por vendedor para dashboard gerencial.
@@ -7544,6 +7594,13 @@ def compute_portfolio_summary_by_seller(
     last_sale_at do perfil.
     """
     today = date.today()
+    # unit_filter aceita string única ou lista (gerente pode ter várias unidades).
+    # None = sem restrição.
+    if unit_filter is None:
+        unit_filter_set = None
+    else:
+        values = [unit_filter] if isinstance(unit_filter, str) else list(unit_filter)
+        unit_filter_set = {normalize_unit(v) for v in values if v}
     # Usa a competência mais recente com dados de CRM como padrão
     if not competence:
         competence = crm_summary_latest_competence(conn, company_id) or today.strftime("%Y-%m")
@@ -7605,7 +7662,7 @@ def compute_portfolio_summary_by_seller(
         unit = row["seller_unit"] or ""
 
         # Aplica filtro por unidade no backend (case-insensitive)
-        if unit_filter and unit_filter.strip().lower() != (unit or "").lower():
+        if unit_filter_set is not None and normalize_unit(unit) not in unit_filter_set:
             continue
 
         # Aplica filtro por tipo de pessoa (PJ/PF)
@@ -8075,10 +8132,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": str(exc)}))
                 return
             if path == "/api/crm/portfolio-summary":
+                # Visão de carteira por vendedor: gerente precisa dela. Não é área
+                # administrativa — o recorte por unidade é aplicado abaixo.
                 user = self._require_auth()
                 if not user:
-                    return
-                if not self._require_admin_area(user):
                     return
                 try:
                     query = parse_qs(parsed.query)
@@ -8086,6 +8143,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     req_unit = query.get("unit", [None])[0] or None
                     req_person_type = normalize_upper(query.get("personType", [None])[0]) or None
                     with closing(get_connection()) as conn:
+                        req_unit = crm_unit_filter_for_user(conn, user, req_unit)
                         data = compute_portfolio_summary_by_seller(
                             conn, user["company_id"], user,
                             competence=req_competence, unit_filter=req_unit,
@@ -8104,7 +8162,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
-                    filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
                     data = crm_summary_for_user(conn, user["company_id"], user, filters)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
@@ -8116,7 +8174,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 limit = max(1, min(int(query.get("limit", ["20"])[0]), 50))
                 with closing(get_connection()) as conn:
-                    filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
                     clients = list_crm_clients(conn, user["company_id"], filters, limit, exclude_contacted_today=True)
                 self._set_headers(200)
                 self.wfile.write(
@@ -8135,7 +8193,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
-                    filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
                     clients = query_crm_clients_page(
                         conn,
                         user["company_id"],

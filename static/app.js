@@ -16,6 +16,8 @@ const state = {
     city: "",
   },
   ui: {
+    // Marca que a unidade padrão do usuário já foi aplicada nesta sessão
+    defaultUnitApplied: false,
     loading: {
       dashboard: false,
       crmSummary: false,
@@ -415,6 +417,8 @@ async function bootstrap() {
   if (session.authenticated) {
     state.user = session.user;
     state.activeTab = defaultTabForUser(state.user);
+    // Antes de qualquer carga: quem tem unidade vinculada abre já filtrado nela
+    applyDefaultUnitForUser();
     // Cargas essenciais em paralelo (options não bloqueia mais o restante)
     const loads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
     if (session.user.role === "Vendedor") loads.push(loadSellerScore());
@@ -442,7 +446,24 @@ async function loadOptions() {
     state.filters.competenceEnd = state.options.competences[0];
     state.filters.competenceStart = state.options.competences[0];
   }
+  applyDefaultUnitForUser();
   syncUserEditorOptions();
+}
+
+/**
+ * Ao entrar, quem tem unidades vinculadas abre o dashboard já na própria unidade.
+ * Depois pode trocar livremente (inclusive para "Todas", se o perfil permitir).
+ * Roda só uma vez por sessão para não desfazer a escolha do usuário.
+ */
+function applyDefaultUnitForUser() {
+  if (state.ui.defaultUnitApplied) return;
+  const units = state.user?.linkedUnits || [];
+  if (!units.length) { state.ui.defaultUnitApplied = true; return; }
+  // Prefere uma unidade que exista na lista de opções, se ela já tiver carregado
+  const available = state.options?.units || [];
+  const preferred = (available.length && units.find((u) => available.includes(u))) || units[0];
+  if (preferred) state.filters.unit = preferred;
+  state.ui.defaultUnitApplied = true;
 }
 
 function buildQuery() {
@@ -911,6 +932,8 @@ async function handleLogin(event) {
     });
     state.user = result.user;
     state.activeTab = defaultTabForUser(state.user);
+    state.ui.defaultUnitApplied = false;
+    applyDefaultUnitForUser();
     const loginLoads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
     if (result.user.role === "Vendedor") loginLoads.push(loadSellerScore());
     await Promise.all(loginLoads);
@@ -932,6 +955,8 @@ async function logout() {
   state.activeTab = "executivo";
   state.dashboard = null;
   state.admin = null;
+  state.filters.unit = "";
+  state.ui.defaultUnitApplied = false;  // próximo login volta a abrir na unidade do usuário
   requestRender();
 }
 
@@ -2368,7 +2393,14 @@ function crmAgendaView() {
               <div style="font-size:10px;color:rgba(255,255,255,0.45)">meta ${taLoading ? "…" : number(ta.teamGoal)}</div>
             </div>
             <div style="background:rgba(255,255,255,0.12);border-radius:8px;padding:8px 16px;text-align:center;min-width:90px">
-              <div style="font-size:24px;font-weight:800;color:${taLoading ? "#fff" : ta.goalPct >= 100 ? "#2ecc71" : ta.goalPct >= 60 ? "#f4c25f" : "#e74c3c"};line-height:1.1">${taLoading ? "…" : ta.goalPct + "%"}</div>
+              ${(() => {
+                // Sem meta cadastrada o backend não devolve goalPct — evita "undefined%"
+                const gp = Number(ta.goalPct);
+                const hasGoal = Number.isFinite(gp) && Number(ta.teamGoal || 0) > 0;
+                const color = taLoading || !hasGoal ? "#fff" : gp >= 100 ? "#2ecc71" : gp >= 60 ? "#f4c25f" : "#e74c3c";
+                const label = taLoading ? "…" : hasGoal ? `${Math.round(gp)}%` : "—";
+                return `<div style="font-size:24px;font-weight:800;color:${color};line-height:1.1">${label}</div>`;
+              })()}
               <div style="font-size:10px;color:rgba(255,255,255,0.7);margin-top:2px">da meta</div>
             </div>
             <div style="background:rgba(255,255,255,0.12);border-radius:8px;padding:8px 16px;text-align:center;min-width:90px">
@@ -5025,6 +5057,7 @@ function dashboardView() {
           </div>
           ${filterBar}
           ${messageHtml()}
+          ${!allowed.includes(state.activeTab) ? `<div class="message">Seu perfil não tem acesso a esta tela.</div>` : ""}
           ${state.activeTab === "crm-agenda"    ? crmAgendaView()      : ""}
           ${state.activeTab === "meu-placar"    ? meuPlacarView()      : ""}
           ${state.activeTab === "placar-equipe" ? placardaEquipeView() : ""}
