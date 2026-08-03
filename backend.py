@@ -213,6 +213,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "crm-interacao",  "label": "Registrar interação","group": "CRM"},
     {"id": "meu-placar",     "label": "Meu Placar",         "group": "CRM"},
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
+    {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
     # Resultados
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
@@ -263,7 +264,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -282,7 +283,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
     {
         "name": "Vendedor",
         "description": "Rotina diária de vendas: missão do dia, carteira própria e placar.",
-        "modules": ["crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "meu-placar", "calendario"],
+        "modules": ["crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "meu-placar", "biblioteca", "calendario"],
         "data_scope": "proprio",
         "can_manage_users": 0,
     },
@@ -1154,6 +1155,174 @@ def delete_access_profile(conn: sqlite3.Connection, company_id: int, user_id: in
     audit_log(conn, company_id, user_id, "excluir", "access_profiles", str(profile_id), {"name": row["name"]})
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Biblioteca de conteúdo comercial
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONTENT_CATEGORIES = [
+    {"id": "ligacao",  "label": "Abordagem por telefone", "icon": "📞"},
+    {"id": "whatsapp", "label": "Mensagem de WhatsApp",   "icon": "💬"},
+    {"id": "objecao",  "label": "Tratamento de objeção",  "icon": "🛡"},
+    {"id": "garantia", "label": "Devolução e garantia",   "icon": "📋"},
+]
+CONTENT_CATEGORY_IDS = {c["id"] for c in CONTENT_CATEGORIES}
+
+CONTENT_SITUATIONS = [
+    {"id": "GERAL",          "label": "Qualquer situação"},
+    {"id": "INATIVO",        "label": "Cliente inativo"},
+    {"id": "PRE_INATIVO",    "label": "Cliente pré-inativo"},
+    {"id": "SEM_COMPRA_MES", "label": "Sem compra no mês"},
+    {"id": "QUEDA",          "label": "Queda de faturamento"},
+    {"id": "MIX",            "label": "Ampliar mix"},
+    {"id": "NOVO",           "label": "Cliente novo"},
+]
+CONTENT_SITUATION_IDS = {s["id"] for s in CONTENT_SITUATIONS}
+
+
+def seed_content_library(conn: sqlite3.Connection, company_id: int) -> None:
+    """Popula a biblioteca uma única vez. Edições do usuário não são sobrescritas."""
+    existing = conn.execute(
+        "SELECT COUNT(*) AS n FROM content_library WHERE company_id = ?", (company_id,)
+    ).fetchone()["n"]
+    if existing:
+        return
+    try:
+        from content_seed import CONTENT_SEED
+    except ImportError:
+        print("[content] content_seed.py não encontrado — biblioteca iniciada vazia")
+        return
+    for item in CONTENT_SEED:
+        conn.execute(
+            """
+            INSERT INTO content_library
+                (company_id, category, situation, title, body, hint, sort_order, is_active, is_system, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
+            """,
+            (company_id, item["category"], item["situation"], item["title"],
+             item["body"], item.get("hint"), item.get("sort_order", 0), now_iso()),
+        )
+    conn.commit()
+    print(f"[content] biblioteca iniciada com {len(CONTENT_SEED)} conteúdos")
+
+
+def content_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "category": row["category"],
+        "situation": row["situation"],
+        "title": row["title"],
+        "body": row["body"],
+        "hint": row["hint"] or "",
+        "sortOrder": row["sort_order"],
+        "isActive": bool(row["is_active"]),
+        "isSystem": bool(row["is_system"]),
+    }
+
+
+def list_content_library(
+    conn: sqlite3.Connection, company_id: int, category: str | None = None,
+    situation: str | None = None, only_active: bool = True,
+) -> list[dict[str, Any]]:
+    where = ["company_id = ?"]
+    params: list[Any] = [company_id]
+    if category:
+        where.append("category = ?")
+        params.append(category)
+    if situation:
+        # GERAL sempre acompanha a situação específica
+        where.append("(situation = ? OR situation = 'GERAL')")
+        params.append(situation)
+    if only_active:
+        where.append("is_active = 1")
+    rows = conn.execute(
+        f"SELECT * FROM content_library WHERE {' AND '.join(where)} "
+        "ORDER BY category, CASE situation WHEN 'GERAL' THEN 1 ELSE 0 END, sort_order, id",
+        params,
+    ).fetchall()
+    return [content_row_to_dict(r) for r in rows]
+
+
+def render_content_text(text: str, context: dict[str, Any]) -> str:
+    """Substitui os marcadores {cliente}, {vendedor}, {item}, {dias} etc."""
+    result = text or ""
+    for key, value in context.items():
+        result = result.replace("{" + key + "}", str(value) if value is not None else "")
+    # Marcadores sem valor viram um placeholder visível para o vendedor preencher
+    result = re.sub(r"\{(\w+)\}", lambda m: f"[{m.group(1)}]", result)
+    return result
+
+
+def content_context_for_client(client: dict[str, Any], seller_name: str | None) -> dict[str, Any]:
+    offer = client.get("offerPrimary") or {}
+    dias = client.get("daysWithoutPurchase")
+    return {
+        "cliente": client.get("clientName") or "cliente",
+        "vendedor": seller_name or "",
+        "item": offer.get("title") or "",
+        "dias": dias if dias is not None else "",
+        "unidade": client.get("unitName") or "",
+    }
+
+
+def upsert_content_item(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    category = normalize_whitespace(payload.get("category"))
+    situation = normalize_upper(payload.get("situation")) or "GERAL"
+    title = normalize_whitespace(payload.get("title"))
+    body = (payload.get("body") or "").strip()
+    hint = normalize_whitespace(payload.get("hint"))
+    sort_order = int(payload.get("sortOrder") or 0)
+    is_active = 1 if payload.get("isActive", True) else 0
+    item_id = payload.get("id")
+
+    if category not in CONTENT_CATEGORY_IDS:
+        raise ValueError("Categoria inválida.")
+    if situation not in CONTENT_SITUATION_IDS:
+        raise ValueError("Situação inválida.")
+    if not title or not body:
+        raise ValueError("Título e conteúdo são obrigatórios.")
+
+    if item_id:
+        exists = conn.execute(
+            "SELECT id FROM content_library WHERE id = ? AND company_id = ?", (item_id, company_id)
+        ).fetchone()
+        if not exists:
+            raise ValueError("Conteúdo não encontrado.")
+        conn.execute(
+            """
+            UPDATE content_library
+            SET category = ?, situation = ?, title = ?, body = ?, hint = ?,
+                sort_order = ?, is_active = ?, updated_at = ?
+            WHERE id = ? AND company_id = ?
+            """,
+            (category, situation, title, body, hint, sort_order, is_active, now_iso(), item_id, company_id),
+        )
+        audit_log(conn, company_id, user_id, "editar", "content_library", str(item_id), {"title": title})
+        return {"id": item_id, "created": False}
+
+    cur = conn.execute(
+        """
+        INSERT INTO content_library
+            (company_id, category, situation, title, body, hint, sort_order, is_active, is_system, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """,
+        (company_id, category, situation, title, body, hint, sort_order, is_active, now_iso()),
+    )
+    audit_log(conn, company_id, user_id, "criar", "content_library", str(cur.lastrowid), {"title": title})
+    return {"id": cur.lastrowid, "created": True}
+
+
+def delete_content_item(conn: sqlite3.Connection, company_id: int, user_id: int, item_id: Any) -> None:
+    row = conn.execute(
+        "SELECT * FROM content_library WHERE id = ? AND company_id = ?", (item_id, company_id)
+    ).fetchone()
+    if not row:
+        raise ValueError("Conteúdo não encontrado.")
+    conn.execute("DELETE FROM content_library WHERE id = ? AND company_id = ?", (item_id, company_id))
+    audit_log(conn, company_id, user_id, "excluir", "content_library", str(item_id), {"title": row["title"]})
+
+
 def user_can_manage_users(conn: sqlite3.Connection, user: Any) -> bool:
     profile = get_access_profile_for_user(conn, user)
     if profile:
@@ -1199,6 +1368,26 @@ def init_db() -> None:
                 expires_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
+
+            -- Biblioteca de conteúdo comercial: scripts, mensagens e orientações
+            CREATE TABLE IF NOT EXISTS content_library (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                category TEXT NOT NULL,        -- ligacao | whatsapp | objecao | garantia
+                situation TEXT NOT NULL,       -- INATIVO | PRE_INATIVO | SEM_COMPRA_MES | QUEDA | MIX | NOVO | GERAL
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                hint TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                is_system INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_content_library_lookup
+                ON content_library(company_id, category, situation, is_active);
 
             -- Perfis de acesso configuráveis pela tela (antes as permissões eram fixas no código)
             CREATE TABLE IF NOT EXISTS access_profiles (
@@ -1523,6 +1712,7 @@ def init_db() -> None:
         company_id = company["id"]
 
         seed_access_profiles(conn, company_id)
+        seed_content_library(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -2796,6 +2986,16 @@ def safe_div(numerator: float, denominator: float) -> float:
     return result if math.isfinite(result) else 0.0
 
 
+def brl(value: float | int | None) -> str:
+    """Formata em real brasileiro para textos exibidos ao vendedor."""
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        number = 0.0
+    inteiro = f"{number:,.2f}"
+    return "R$ " + inteiro.replace(",", "@").replace(".", ",").replace("@", ".")
+
+
 def finite_or_none(value: Any) -> float | None:
     """Converte para float finito; devolve None para inf/NaN/valor inválido."""
     if value is None:
@@ -3515,85 +3715,207 @@ def crm_generate_questions(summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def crm_get_offer_suggestions(
-    conn: sqlite3.Connection, company_id: int, client_name: str
+    conn: sqlite3.Connection, company_id: int, client_name: str, city_name: str | None = None
 ) -> dict[str, Any]:
-    latest_competence = crm_latest_competence(conn, company_id)
-    if not latest_competence:
-        return {"primary": None, "secondary": []}
-    prior_rows = conn.execute(
-        """
-        SELECT
-            COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM') AS item_code,
-            SUM(net_value) AS total_value
+    """Sugestões de oferta com contexto para o vendedor conseguir abordar.
+
+    Dois tipos, sempre rotulados:
+      - RECOMPRA: item que o cliente comprava e parou. Traz meses de compra,
+        valor médio e há quanto tempo não pede — dá o gancho da conversa.
+      - OPORTUNIDADE: item que oficinas da mesma praça compram bastante e este
+        cliente nunca comprou. Abre mix novo.
+    """
+    latest = crm_latest_competence(conn, company_id)
+    if not latest:
+        return {"primary": None, "secondary": [], "repurchase": [], "opportunity": []}
+
+    ITEM_EXPR = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+
+    # Histórico do cliente por item (fora do mês corrente)
+    history = conn.execute(
+        f"""
+        SELECT {ITEM_EXPR} AS item_code,
+               COUNT(DISTINCT competence) AS meses,
+               SUM(net_value) AS total,
+               SUM(quantity) AS qtd,
+               MAX(competence) AS ultima_competencia
         FROM fact_sales_detail
-        WHERE company_id = ? AND client_name = ? AND competence <> ?
+        WHERE company_id = ? AND client_name = ? AND competence <> ? AND net_value > 0
         GROUP BY item_code
-        ORDER BY total_value DESC
-        LIMIT 8
+        ORDER BY meses DESC, total DESC
+        LIMIT 25
         """,
-        (company_id, client_name, latest_competence),
+        (company_id, client_name, latest),
     ).fetchall()
+
     current_items = {
-        row["item_code"]
-        for row in conn.execute(
-            """
-            SELECT DISTINCT COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM') AS item_code
-            FROM fact_sales_detail
-            WHERE company_id = ? AND client_name = ? AND competence = ?
-            """,
-            (company_id, client_name, latest_competence),
+        r["item_code"]
+        for r in conn.execute(
+            f"SELECT DISTINCT {ITEM_EXPR} AS item_code FROM fact_sales_detail "
+            "WHERE company_id = ? AND client_name = ? AND competence = ?",
+            (company_id, client_name, latest),
         ).fetchall()
     }
-    repurchase_candidates = [row["item_code"] for row in prior_rows if row["item_code"] not in current_items]
-    if repurchase_candidates:
-        primary = {
-            "title": repurchase_candidates[0],
-            "reason": "Cliente ja comprava esse item e nao comprou no mes atual",
-        }
-        secondary = [
-            {"title": item_code, "reason": "Historico de compra relevante fora do mes atual"}
-            for item_code in repurchase_candidates[1:4]
-        ]
-        return {"primary": primary, "secondary": secondary}
-    current_rows = conn.execute(
-        """
-        SELECT
-            COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM') AS item_code,
-            SUM(net_value) AS total_value
-        FROM fact_sales_detail
-        WHERE company_id = ? AND client_name = ? AND competence = ?
-        GROUP BY item_code
-        ORDER BY total_value DESC
-        LIMIT 4
-        """,
-        (company_id, client_name, latest_competence),
-    ).fetchall()
-    if not current_rows:
-        return {"primary": None, "secondary": []}
-    primary = {
-        "title": current_rows[0]["item_code"],
-        "reason": "Item de maior recorrencia recente para retomada ou ampliacao",
+    all_client_items = {r["item_code"] for r in history} | current_items
+
+    def months_since(competence: str | None) -> int | None:
+        if not competence or len(competence) < 7:
+            return None
+        try:
+            y1, m1 = int(latest[:4]), int(latest[5:7])
+            y2, m2 = int(competence[:4]), int(competence[5:7])
+            return (y1 - y2) * 12 + (m1 - m2)
+        except ValueError:
+            return None
+
+    repurchase: list[dict[str, Any]] = []
+    for r in history:
+        if r["item_code"] in current_items:
+            continue
+        meses = int(r["meses"] or 0)
+        gap = months_since(r["ultima_competencia"])
+        media = float(r["total"] or 0) / max(meses, 1)
+        if meses >= 2:
+            freq = f"comprava em {meses} meses"
+        else:
+            freq = "comprou uma vez"
+        gap_txt = "sem pedido no mês atual" if not gap else f"sem pedido há {gap} {'mês' if gap == 1 else 'meses'}"
+        repurchase.append({
+            "itemCode": r["item_code"],
+            "type": "RECOMPRA",
+            "typeLabel": "Recompra",
+            "title": r["item_code"],
+            "reason": f"{freq} · {gap_txt} · média {brl(media)}/mês",
+            "months": meses,
+            "avgValue": round(media, 2),
+            "monthsSincePurchase": gap,
+        })
+
+    # Oportunidade: itens girando na praça que este cliente nunca comprou
+    opportunity: list[dict[str, Any]] = []
+    if city_name:
+        peer_rows = conn.execute(
+            f"""
+            SELECT {ITEM_EXPR} AS item_code,
+                   COUNT(DISTINCT client_name) AS clientes,
+                   SUM(net_value) AS total
+            FROM fact_sales_detail
+            WHERE company_id = ? AND city_name = ? AND client_name <> ? AND net_value > 0
+              AND competence >= ?
+            GROUP BY item_code
+            HAVING clientes >= 3
+            ORDER BY clientes DESC, total DESC
+            LIMIT 40
+            """,
+            (company_id, normalize_upper(city_name), client_name, shift_competence(latest, -3)),
+        ).fetchall()
+        for r in peer_rows:
+            if r["item_code"] in all_client_items:
+                continue
+            opportunity.append({
+                "itemCode": r["item_code"],
+                "type": "OPORTUNIDADE",
+                "typeLabel": "Oportunidade",
+                "title": r["item_code"],
+                "reason": f"{int(r['clientes'])} oficinas da região compram e ele nunca pediu",
+                "peerClients": int(r["clientes"]),
+            })
+            if len(opportunity) >= 5:
+                break
+
+    # Prioriza recompra: gancho mais forte e conversão mais provável
+    primary = repurchase[0] if repurchase else (opportunity[0] if opportunity else None)
+    secondary = ([o for o in repurchase[1:3]] + [o for o in opportunity[:2]])[:4]
+    return {
+        "primary": primary,
+        "secondary": secondary,
+        "repurchase": repurchase[:5],
+        "opportunity": opportunity[:5],
     }
-    secondary = [
-        {"title": row["item_code"], "reason": "Item com giro recente no cliente"}
-        for row in current_rows[1:4]
-    ]
-    return {"primary": primary, "secondary": secondary}
+
+
+def crm_situation_for_client(summary: dict[str, Any]) -> str:
+    """Traduz o estado do cliente na situação usada pela biblioteca de conteúdo."""
+    status = summary.get("statusCode")
+    if status == "INATIVO":
+        return "INATIVO"
+    if status == "PRE_INATIVO":
+        return "PRE_INATIVO"
+    if float(summary.get("currentRevenue") or 0) <= 0:
+        return "SEM_COMPRA_MES"
+    if float(summary.get("dropPct") or 0) <= -0.1:
+        return "QUEDA"
+    if int(summary.get("currentSkuCount") or 0) <= 2:
+        return "MIX"
+    return "GERAL"
+
+
+def crm_next_action(summary: dict[str, Any]) -> str:
+    """Próxima ação concreta, com número e prazo — não frase genérica."""
+    status = summary.get("statusCode")
+    dias = summary.get("daysWithoutPurchase")
+    offer = (summary.get("offerPrimary") or {}).get("title")
+    media = float(summary.get("averageRevenue") or 0)
+
+    if status == "INATIVO":
+        base = f"Ligar hoje e perguntar por que parou de comprar há {dias} dias" if dias else "Ligar hoje e entender o motivo da parada"
+        if offer:
+            base += f". Oferecer {offer} como gancho"
+        if media > 0:
+            base += f". Cliente valia {brl(media)}/mês"
+        return base + ". Agendar retorno na própria ligação."
+    if status == "PRE_INATIVO":
+        base = "Contato preventivo ainda esta semana"
+        if offer:
+            base += f", puxando {offer} que ele deixou de pedir"
+        return base + ". Fechar pedido pequeno para não perder a frequência."
+    if float(summary.get("currentRevenue") or 0) <= 0:
+        base = "Ligar para reposição do mês"
+        if offer:
+            base += f" — confirmar se {offer} ainda tem em estoque"
+        return base + ". Fechar antes do corte de entrega."
+    if float(summary.get("dropPct") or 0) <= -0.1:
+        queda = abs(float(summary.get("dropPct") or 0)) * 100
+        return (f"Investigar queda de {queda:.0f}% na compra. Perguntar que linha migrou para "
+                "outro fornecedor e cotar 2 ou 3 códigos hoje.")
+    if int(summary.get("currentSkuCount") or 0) <= 2:
+        base = "Cliente compra pouca variedade. Perguntar que serviço a oficina mais faz"
+        if offer:
+            base += f" e oferecer {offer} para teste de giro"
+        return base + "."
+    return "Manter frequência: confirmar reposição e explorar uma linha que ele ainda não compra."
 
 
 def crm_attach_context(
-    conn: sqlite3.Connection, company_id: int, summaries: list[dict[str, Any]]
+    conn: sqlite3.Connection, company_id: int, summaries: list[dict[str, Any]],
+    seller_name: str | None = None, with_scripts: bool = False,
 ) -> list[dict[str, Any]]:
     enriched: list[dict[str, Any]] = []
+    # Carrega a biblioteca uma vez só quando os scripts forem necessários
+    library = list_content_library(conn, company_id) if with_scripts else []
     for summary in summaries:
-        offers = crm_get_offer_suggestions(conn, company_id, summary["clientName"])
+        offers = crm_get_offer_suggestions(
+            conn, company_id, summary["clientName"], summary.get("cityName")
+        )
         questions = crm_generate_questions(summary)
         summary["primaryReason"] = crm_reason_message(summary, summary["primaryReasonCode"])
         summary["secondaryReasons"] = [crm_reason_message(summary, code) for code in summary["secondaryReasonCodes"]]
         summary["offerPrimary"] = offers["primary"]
         summary["offerSecondary"] = offers["secondary"]
+        summary["offerRepurchase"] = offers.get("repurchase", [])
+        summary["offerOpportunity"] = offers.get("opportunity", [])
         summary["questionPrimary"] = questions["primary"]
         summary["questionSecondary"] = questions["secondary"]
+        summary["situationCode"] = crm_situation_for_client(summary)
+        summary["nextAction"] = crm_next_action(summary)
+        if with_scripts:
+            ctx = content_context_for_client(summary, seller_name)
+            situation = summary["situationCode"]
+            summary["scripts"] = [
+                {**item, "body": render_content_text(item["body"], ctx)}
+                for item in library
+                if item["situation"] in {situation, "GERAL"} and item["category"] in {"ligacao", "whatsapp"}
+            ]
         enriched.append(summary)
     return enriched
 
@@ -3779,7 +4101,8 @@ def count_crm_clients(
 
 
 def get_crm_client_summary(
-    conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None], client_key: str
+    conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None], client_key: str,
+    seller_name: str | None = None,
 ) -> dict[str, Any] | None:
     base_summary = next(
         (row for row in list_crm_clients(conn, company_id, filters, attach_context=False) if row["clientKey"] == client_key),
@@ -3787,7 +4110,10 @@ def get_crm_client_summary(
     )
     if not base_summary:
         return None
-    summary = crm_attach_context(conn, company_id, [base_summary])[0]
+    # A ficha traz os scripts prontos, já com o nome do cliente preenchido
+    summary = crm_attach_context(
+        conn, company_id, [base_summary], seller_name=seller_name, with_scripts=True
+    )[0]
     profile = conn.execute(
         """
         SELECT client_code, client_name, city_name, phone, updated_phone, primary_contact_name, contact_notes
@@ -7555,6 +7881,80 @@ def compute_team_score(conn: sqlite3.Connection, company_id: int, user: sqlite3.
     }
 
 
+# Meta diária de contatos por vendedor na Missão do Dia
+DAILY_CONTACT_GOAL = 5
+# Dias sem interação para considerar que a cobertura falhou
+COVERAGE_GAP_DAYS = 7
+
+
+def compute_manager_mission(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    filters: dict[str, str | None], limit: int = 12,
+) -> dict[str, Any]:
+    """Missão do Dia na ótica de gestão: onde a execução está falhando.
+
+    Diferente da visão do vendedor (fila de quem ligar), o gestor recebe dois
+    recortes de risco, ambos com o vendedor responsável ao lado para cobrança:
+      - coverageGap: cliente parou de comprar E ninguém o contatou há dias
+      - highValueDrop: cliente Diamante/Ouro comprando menos
+    """
+    rows = crm_base_client_rows_cached(conn, company_id, filters)
+    today = date.today()
+
+    def days_since(value: Any) -> int | None:
+        dt = parse_datetime_flexible(value) if value else None
+        return (today - dt.date()).days if dt else None
+
+    coverage_gap: list[dict[str, Any]] = []
+    high_value_drop: list[dict[str, Any]] = []
+
+    for row in rows:
+        seller = normalize_whitespace(row.get("assignedSeller")) or "Sem vendedor"
+        days_no_contact = days_since(row.get("lastInteractionAt"))
+        status = row.get("statusCode")
+        item = {
+            "clientKey": row.get("clientKey"),
+            "clientName": row.get("clientName"),
+            "cityName": row.get("cityName"),
+            "unitName": row.get("unitName"),
+            "assignedSeller": seller,
+            "statusCode": status,
+            "classCode": row.get("classCode"),
+            "daysWithoutPurchase": row.get("daysWithoutPurchase"),
+            "daysWithoutContact": days_no_contact,
+            "averageRevenue": row.get("averageRevenue"),
+            "currentRevenue": row.get("currentRevenue"),
+            "dropPct": row.get("dropPct"),
+            "phone": row.get("phone"),
+        }
+        # Bloco 1 — cobertura falha: parou de comprar e ninguém falou com ele
+        if status in {"INATIVO", "PRE_INATIVO"} and (days_no_contact is None or days_no_contact >= COVERAGE_GAP_DAYS):
+            coverage_gap.append(item)
+        # Bloco 2 — cliente grande perdendo volume
+        if row.get("classCode") in {"DIAMANTE", "OURO"} and float(row.get("dropPct") or 0) <= -0.1:
+            high_value_drop.append(item)
+
+    # Prioriza o que dói mais no bolso: maior média histórica primeiro
+    coverage_gap.sort(key=lambda r: float(r.get("averageRevenue") or 0), reverse=True)
+    high_value_drop.sort(key=lambda r: float(r.get("averageRevenue") or 0), reverse=True)
+
+    def by_seller(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        agg: dict[str, int] = defaultdict(int)
+        for i in items:
+            agg[i["assignedSeller"]] += 1
+        return [{"sellerName": k, "count": v} for k, v in sorted(agg.items(), key=lambda x: -x[1])]
+
+    return {
+        "coverageGap": coverage_gap[:limit],
+        "coverageGapTotal": len(coverage_gap),
+        "coverageGapBySeller": by_seller(coverage_gap),
+        "highValueDrop": high_value_drop[:limit],
+        "highValueDropTotal": len(high_value_drop),
+        "highValueDropBySeller": by_seller(high_value_drop),
+        "coverageGapDays": COVERAGE_GAP_DAYS,
+    }
+
+
 def compute_team_activity_today(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 ) -> dict[str, Any]:
@@ -7579,6 +7979,21 @@ def compute_team_activity_today(
         "SELECT seller_name, COUNT(*) AS overdue FROM crm_tasks WHERE company_id = ? AND status = 'ATRASADA' GROUP BY seller_name",
         (company_id,),
     ).fetchall()
+
+    open_rows = conn.execute(
+        "SELECT seller_name, COUNT(*) AS abertas FROM crm_tasks WHERE company_id = ? AND status = 'ABERTA' GROUP BY seller_name",
+        (company_id,),
+    ).fetchall()
+    open_map = {normalize_whitespace(r["seller_name"]): int(r["abertas"]) for r in open_rows}
+
+    # Última vez que cada vendedor registrou qualquer interação
+    last_interaction_map = {
+        normalize_whitespace(r["seller_name"]): r["last_at"]
+        for r in conn.execute(
+            "SELECT seller_name, MAX(occurred_at) AS last_at FROM crm_interactions WHERE company_id = ? GROUP BY seller_name",
+            (company_id,),
+        ).fetchall()
+    }
 
     # Vendedores com meta cadastrada no mês atual. A própria meta guarda a unidade
     # base — usar isso evita depender de people_records estar atualizado.
@@ -7619,18 +8034,24 @@ def compute_team_activity_today(
             "contactsToday": c["active"],
             "totalInteractionsToday": c["total"],
             "overdueTasks": overdue_map.get(seller_name, 0),
+            "openTasks": open_map.get(seller_name, 0),
+            "lastInteractionAt": last_interaction_map.get(seller_name),
+            "dailyGoal": DAILY_CONTACT_GOAL,
         })
 
-    results.sort(key=lambda r: r["contactsToday"], reverse=True)
-    team_goal = len(results) * 5
+    # Quem não trabalhou aparece primeiro — é onde o gerente precisa agir
+    results.sort(key=lambda r: (r["contactsToday"], -r["overdueTasks"]))
+    team_goal = len(results) * DAILY_CONTACT_GOAL
     total_contacts = sum(r["contactsToday"] for r in results)
     return {
         "date": today_str,
         "sellers": results,
         "totalContactsToday": total_contacts,
         "teamGoal": team_goal,
+        "dailyGoalPerSeller": DAILY_CONTACT_GOAL,
         "sellersWithContact": sum(1 for r in results if r["contactsToday"] > 0),
         "sellersWithoutContact": sum(1 for r in results if r["contactsToday"] == 0),
+        "totalOverdueTasks": sum(r["overdueTasks"] for r in results),
         "goalPct": round(total_contacts / team_goal * 100, 1) if team_goal > 0 else 0.0,
     }
 
@@ -8146,14 +8567,24 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": str(_e), "sellers": [], "summary": {"total": 0, "eligible": 0, "inPrizeZone": 0, "fullPrize": 0}, "competence": ""}))
                 return
             if path == "/api/crm/team-activity-today":
+                # Painel de gestão da Missão do Dia. Gerente precisa dele, então não é
+                # tratado como área administrativa — o recorte por unidade já limita.
                 user = self._require_auth()
                 if not user:
                     return
-                if not self._require_admin_area(user):
-                    return
                 try:
                     with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Visão exclusiva de gestão."}))
+                            return
                         data = compute_team_activity_today(conn, user["company_id"], user)
+                        query = parse_qs(parsed.query)
+                        filters = crm_scoped_filters_for_user(
+                            conn, user["company_id"], user, build_filters_from_query(query)
+                        )
+                        data["risk"] = compute_manager_mission(conn, user["company_id"], user, filters)
+                        data["scopeUnits"] = crm_allowed_units_for_user(conn, user)
                     self._set_headers(200)
                     self.wfile.write(json_dumps(data))
                 except Exception as _e:
@@ -8202,6 +8633,30 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/content":
+                # Biblioteca de conteúdo. Leitura liberada a todos os autenticados —
+                # é material de trabalho do vendedor.
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                category = normalize_whitespace(query.get("category", [None])[0]) or None
+                situation = normalize_upper(query.get("situation", [None])[0]) or None
+                include_inactive = query.get("all", ["0"])[0] == "1"
+                with closing(get_connection()) as conn:
+                    can_edit = user_can_manage_users(conn, user)
+                    items = list_content_library(
+                        conn, user["company_id"], category, situation,
+                        only_active=not (include_inactive and can_edit),
+                    )
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "items": items,
+                    "categories": CONTENT_CATEGORIES,
+                    "situations": CONTENT_SITUATIONS,
+                    "canEdit": can_edit,
+                }))
                 return
             if path == "/api/crm/portfolio-summary":
                 # Visão de carteira por vendedor: gerente precisa dela. Não é área
@@ -8318,8 +8773,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": "Informe clientKey"}))
                     return
                 with closing(get_connection()) as conn:
-                    filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
-                    data = get_crm_client_summary(conn, user["company_id"], filters, client_key)
+                    filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    data = get_crm_client_summary(
+                        conn, user["company_id"], filters, client_key,
+                        seller_name=user["full_name"] or user["username"],
+                    )
                 if not data:
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Cliente nao encontrado"}))
@@ -8661,6 +9119,64 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, "result": result}))
                 return
+            if path == "/api/crm/tasks/assign":
+                # Gestor cria uma tarefa atribuída ao vendedor responsável pelo cliente,
+                # transformando a cobrança verbal em pendência rastreável.
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Ação exclusiva de gestão."}))
+                            return
+                        client_key = normalize_whitespace(payload.get("clientKey"))
+                        client_name = normalize_whitespace(payload.get("clientName"))
+                        seller_name = normalize_whitespace(payload.get("sellerName"))
+                        title = normalize_whitespace(payload.get("title")) or "Contatar cliente"
+                        description = normalize_whitespace(payload.get("description"))
+                        due_at = normalize_whitespace(payload.get("dueAt")) or date.today().isoformat()
+                        if not client_key or not seller_name:
+                            self._set_headers(400)
+                            self.wfile.write(json_dumps({"error": "Cliente e vendedor são obrigatórios."}))
+                            return
+                        # Evita duplicar cobrança para o mesmo cliente/vendedor
+                        existing = conn.execute(
+                            "SELECT id FROM crm_tasks WHERE company_id = ? AND client_key = ? "
+                            "AND seller_name = ? AND status IN ('ABERTA','ATRASADA')",
+                            (user["company_id"], client_key, seller_name),
+                        ).fetchone()
+                        if existing:
+                            self._set_headers(200)
+                            self.wfile.write(json_dumps({
+                                "ok": True, "duplicated": True,
+                                "message": f"{seller_name} já tem uma tarefa aberta para este cliente.",
+                            }))
+                            return
+                        conn.execute(
+                            """
+                            INSERT INTO crm_tasks
+                                (company_id, client_key, client_name, seller_name, title, description, due_at, status, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?)
+                            """,
+                            (user["company_id"], client_key, client_name, seller_name,
+                             title, description, due_at, now_iso()),
+                        )
+                        audit_log(conn, user["company_id"], user["id"], "criar", "crm_tasks", client_key,
+                                  {"seller": seller_name, "origem": "cobranca_gestor"})
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({
+                        "ok": True,
+                        "message": f"Tarefa criada para {seller_name}.",
+                    }))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/crm/tasks/complete":
                 user = self._require_auth()
                 if not user:
@@ -8996,6 +9512,43 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/content/save":
+                user = self._require_auth()
+                if not user or not self._require_user_management(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        res = upsert_content_item(conn, user["company_id"], user["id"], payload)
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({
+                        "message": "Conteúdo criado." if res.get("created") else "Conteúdo atualizado.",
+                        **res,
+                    }))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/content/delete":
+                user = self._require_auth()
+                if not user or not self._require_user_management(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        delete_content_item(conn, user["company_id"], user["id"], payload.get("id"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Conteúdo excluído."}))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/admin/profiles":
                 user = self._require_auth()
                 if not user or not self._require_user_management(user):

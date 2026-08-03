@@ -3,6 +3,8 @@ const state = {
   options: { competences: [], units: [], sellers: [], cities: [] },
   dashboard: null,
   admin: null,
+  content: null,          // biblioteca de vendas
+  contentEditor: null,    // item em edição na biblioteca
   sellerScore: null,
   teamScore: null,
   missionProgress: { contactsToday: 0 },
@@ -18,6 +20,8 @@ const state = {
   ui: {
     // Marca que a unidade padrão do usuário já foi aplicada nesta sessão
     defaultUnitApplied: false,
+    openScriptId: null,     // script expandido na ficha do cliente
+    libraryCategory: "",    // categoria ativa na Biblioteca de Vendas
     loading: {
       dashboard: false,
       crmSummary: false,
@@ -148,6 +152,7 @@ const state = {
     },
     modal: null,
     teamActivity: null,
+    missionUnit: "",   // filtro de unidade da Missão do Dia (diretor/admin)
     autoImport: null,
     editingVacationId: null,
     editingVacation: null,
@@ -415,11 +420,18 @@ async function loadTeamScore() {
 
 async function loadTeamActivity() {
   try {
-    state.crm.teamActivity = await api("/api/crm/team-activity-today");
+    // Diretor/Admin podem escolher a unidade; gerente é limitado no backend
+    const qs = state.crm.missionUnit ? `?unit=${encodeURIComponent(state.crm.missionUnit)}` : "";
+    state.crm.teamActivity = await api(`/api/crm/team-activity-today${qs}`);
   } catch (err) {
     state.crm.teamActivity = { error: err.message, sellers: [], totalContactsToday: 0, teamGoal: 0 };
   }
   requestRender();
+}
+
+function setMissionUnit(unit) {
+  state.crm.missionUnit = unit || "";
+  loadTeamActivity();
 }
 
 async function loadPortfolioSummary() {
@@ -2400,6 +2412,12 @@ function crmAgendaView() {
           <div style="width:${pct}%;height:5px;border-radius:4px;background:${color};transition:width .3s"></div>
         </div>
         ${s.overdueTasks > 0 ? `<div style="font-size:11px;color:#e74c3c;margin-top:4px">⚠ ${s.overdueTasks} tarefa${s.overdueTasks > 1 ? "s" : ""} atrasada${s.overdueTasks > 1 ? "s" : ""}</div>` : ""}
+        ${s.contactsToday === 0 && s.lastInteractionAt
+          ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">último contato ${escapeHtml(String(s.lastInteractionAt).slice(0, 10).split("-").reverse().join("/"))}</div>`
+          : ""}
+        ${s.contactsToday === 0 && !s.lastInteractionAt
+          ? `<div style="font-size:10px;color:var(--muted);margin-top:4px">nunca registrou contato</div>`
+          : ""}
       </div>
     `;
   }
@@ -2414,7 +2432,19 @@ function crmAgendaView() {
         <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
           <div>
             <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:2px">📊 Painel Gerencial — Missão do Dia</div>
-            <div style="font-size:13px;color:rgba(255,255,255,0.7)">Acompanhamento da equipe em tempo real</div>
+            <div style="font-size:13px;color:rgba(255,255,255,0.7)">Execução da equipe e riscos que precisam de cobrança</div>
+            ${(() => {
+              // Seletor de unidade: só para quem enxerga mais de uma
+              const scoped = ta?.scopeUnits;
+              const units = (scoped && scoped.length ? scoped : (state.options.units || []));
+              if (units.length < 2) return "";
+              return `
+                <select onchange="setMissionUnit(this.value)"
+                  style="margin-top:8px;background:rgba(255,255,255,0.15);color:#fff;border:1px solid rgba(255,255,255,0.25);border-radius:6px;padding:4px 8px;font-size:12px">
+                  <option value="" ${!state.crm.missionUnit ? "selected" : ""}>Todas as unidades</option>
+                  ${units.map((u) => `<option value="${escapeHtml(u)}" ${state.crm.missionUnit === u ? "selected" : ""} style="color:#0f3044">${escapeHtml(u)}</option>`).join("")}
+                </select>`;
+            })()}
           </div>
           <div style="display:flex;flex-wrap:wrap;gap:8px">
             <div style="background:rgba(255,255,255,0.12);border-radius:8px;padding:8px 16px;text-align:center;min-width:90px">
@@ -2440,6 +2470,10 @@ function crmAgendaView() {
             <div style="background:rgba(255,255,255,0.12);border-radius:8px;padding:8px 16px;text-align:center;min-width:90px">
               <div style="font-size:24px;font-weight:800;color:${taLoading ? "#fff" : ta.sellersWithoutContact > 0 ? "#e74c3c" : "#2ecc71"};line-height:1.1">${taLoading ? "…" : number(ta.sellersWithoutContact)}</div>
               <div style="font-size:10px;color:rgba(255,255,255,0.7);margin-top:2px">Sem contato</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.12);border-radius:8px;padding:8px 16px;text-align:center;min-width:90px">
+              <div style="font-size:24px;font-weight:800;color:${taLoading ? "#fff" : (ta.totalOverdueTasks || 0) > 0 ? "#e74c3c" : "#2ecc71"};line-height:1.1">${taLoading ? "…" : number(ta.totalOverdueTasks || 0)}</div>
+              <div style="font-size:10px;color:rgba(255,255,255,0.7);margin-top:2px">Tarefas atrasadas</div>
             </div>
           </div>
         </div>
@@ -2470,15 +2504,18 @@ function crmAgendaView() {
         </div>
       `).join("") || emptyStateCard("Nenhum vendedor com meta cadastrada neste mês.")}
 
-      <!-- Clientes prioritários + tarefas -->
+      <!-- Risco na carteira: onde a gestão precisa agir -->
+      ${managerRiskBlocks()}
+
+      <!-- Tarefas -->
       <div class="grid-2 crm-grid">
         <div class="table-card">
           <div class="section-title">
-            <div><h3>Clientes prioritários da unidade</h3><div class="text-small">Clientes de maior risco na fila.</div></div>
-            <div class="soft-badge">${number(top5.length)}</div>
+            <div><h3>Retornos de hoje</h3><div class="text-small">Compromissos que a equipe assumiu para hoje.</div></div>
+            <div class="soft-badge">${number(dueToday.length)}</div>
           </div>
-          <div class="stack">
-            ${top5.map((item) => crmAgendaCard(item)).join("") || emptyStateCard("Sem clientes priorizados no momento.")}
+          <div class="timeline-list">
+            ${dueToday.map((row) => `<div class="timeline-item"><strong>${escapeHtml(row.client_name)}</strong><div class="text-small">${escapeHtml(row.seller_name || "")} · ${escapeHtml(row.title || "")}</div></div>`).join("") || '<div class="timeline-item"><div class="text-small">Nenhum retorno vencendo hoje.</div></div>'}
           </div>
         </div>
         <div class="stack">
@@ -2491,19 +2528,390 @@ function crmAgendaView() {
               ${overdue.map((row) => `<div class="timeline-item"><strong>${escapeHtml(row.client_name)}</strong><div class="text-small">${escapeHtml((row.due_at || "").replace("T", " ").slice(0,16))}</div><div class="actions"><button class="btn btn-secondary" onclick="completeCrmTask(${Number(row.id)})">Concluir</button><button class="btn btn-ghost" onclick="openTaskRescheduleModal(${Number(row.id)})">Reagendar</button></div></div>`).join("") || '<div class="timeline-item"><div class="text-small">Nenhuma tarefa atrasada.</div></div>'}
             </div>
           </div>
-          <div class="table-card">
-            <div class="section-title">
-              <div><h3>Retornos de hoje</h3></div>
-              <div class="soft-badge">${number(dueToday.length)}</div>
-            </div>
-            <div class="timeline-list">
-              ${dueToday.map((row) => `<div class="timeline-item"><strong>${escapeHtml(row.client_name)}</strong><div class="text-small">${escapeHtml(row.title || "")}</div></div>`).join("") || '<div class="timeline-item"><div class="text-small">Nenhum retorno vencendo hoje.</div></div>'}
-            </div>
-          </div>
         </div>
       </div>
     </div>
   `;
+}
+
+/**
+ * Blocos de risco da visão gerencial da Missão do Dia.
+ * O gestor não recebe fila de ligações — recebe onde a execução falhou,
+ * sempre com o vendedor responsável ao lado para cobrança direta.
+ */
+function managerRiskBlocks() {
+  const risk = state.crm.teamActivity?.risk;
+  if (!risk) return "";
+
+  function riskCard(item, mode) {
+    const seller = item.assignedSeller || "Sem vendedor";
+    const isGap = mode === "gap";
+    const accent = isGap ? "#e74c3c" : "#e67e22";
+    const motive = isGap
+      ? `${item.daysWithoutPurchase != null ? `${item.daysWithoutPurchase} dias sem comprar` : "Sem compra registrada"} · ${
+          item.daysWithoutContact == null ? "nunca contatado" : `${item.daysWithoutContact} dias sem contato`}`
+      : `Queda de ${pct(Math.abs(Number(item.dropPct || 0)) * 100)} · média ${currency(item.averageRevenue || 0)}`;
+    const classBadge = { DIAMANTE: "💎", OURO: "🥇", PRATA: "🥈", BRONZE: "🥉" }[item.classCode] || "";
+    const payload = encodeURIComponent(JSON.stringify({
+      clientKey: item.clientKey, clientName: item.clientName, sellerName: seller,
+      motive: isGap ? "sem contato" : "queda de faturamento",
+    }));
+    return `
+      <div style="border-left:3px solid ${accent};background:#f7fafc;border-radius:6px;padding:10px 12px;margin-bottom:8px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+          <div style="min-width:0;flex:1">
+            <div style="font-weight:700;font-size:13px">${classBadge} ${escapeHtml(item.clientName || "")}</div>
+            <div class="text-small" style="color:var(--muted)">${escapeHtml(item.cityName || "-")} · ${escapeHtml(motive)}</div>
+            <div style="font-size:11px;margin-top:4px">
+              <span style="background:rgba(15,48,68,0.08);padding:2px 8px;border-radius:4px">👤 ${escapeHtml(seller)}</span>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${escapeHtml(item.clientKey)}', false)">Ficha</button>
+            <button class="btn btn-secondary btn-sm" onclick="assignTaskToSeller('${payload}')">Cobrar</button>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function block(title, hint, items, total, bySeller, mode, emptyMsg) {
+    return `
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>${title}</h3><div class="text-small">${hint}</div></div>
+          <div class="soft-badge" style="${total > 0 ? "background:#fde8e8;color:#e74c3c" : ""}">${number(total)}</div>
+        </div>
+        ${bySeller.length > 1 ? `
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px">
+            ${bySeller.slice(0, 8).map((s) => `<span class="soft-badge" style="font-size:11px">${escapeHtml(s.sellerName.split(" ")[0])}: ${s.count}</span>`).join("")}
+          </div>` : ""}
+        <div>${items.map((i) => riskCard(i, mode)).join("") || emptyStateCard(emptyMsg)}</div>
+        ${total > items.length ? `<div class="text-small" style="text-align:center;color:var(--muted);margin-top:6px">+ ${number(total - items.length)} cliente(s) nesta condição — veja em Carteira</div>` : ""}
+      </div>`;
+  }
+
+  return `
+    <div class="grid-2 crm-grid">
+      ${block(
+        "🔴 Cobertura falha",
+        `Parou de comprar e ninguém contatou há ${risk.coverageGapDays}+ dias.`,
+        risk.coverageGap || [], risk.coverageGapTotal || 0, risk.coverageGapBySeller || [],
+        "gap", "✅ Nenhum cliente em risco sem contato.")}
+      ${block(
+        "🟠 Cliente grande em queda",
+        "Diamante e Ouro comprando menos que a própria média.",
+        risk.highValueDrop || [], risk.highValueDropTotal || 0, risk.highValueDropBySeller || [],
+        "drop", "✅ Nenhum cliente de alto valor em queda.")}
+    </div>
+  `;
+}
+
+/** Cria tarefa de cobrança atribuída ao vendedor responsável pelo cliente. */
+async function assignTaskToSeller(encodedPayload) {
+  let data;
+  try {
+    data = JSON.parse(decodeURIComponent(encodedPayload));
+  } catch (e) {
+    addMessage("error", "Não foi possível identificar o cliente.");
+    return;
+  }
+  if (!data.sellerName || data.sellerName === "Sem vendedor") {
+    addMessage("error", "Este cliente não tem vendedor responsável definido.");
+    return;
+  }
+  if (!confirm(`Criar tarefa para ${data.sellerName} contatar ${data.clientName}?`)) return;
+  try {
+    const result = await api("/api/crm/tasks/assign", {
+      method: "POST",
+      body: JSON.stringify({
+        clientKey: data.clientKey,
+        clientName: data.clientName,
+        sellerName: data.sellerName,
+        title: `Contatar ${data.clientName}`,
+        description: `Cobrança da gestão — ${data.motive}.`,
+      }),
+    });
+    addMessage(result.duplicated ? "warn" : "success", result.message || "Tarefa criada.");
+    await loadCrmData();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+/**
+ * Painel de ação da ficha do cliente.
+ * Substitui o antigo bloco genérico: traz a próxima ação com números concretos,
+ * ofertas rotuladas por motivo e os scripts prontos para copiar.
+ */
+function clientActionPanel(client) {
+  const repurchase = client.offerRepurchase || [];
+  const opportunity = client.offerOpportunity || [];
+  const scripts = client.scripts || [];
+  const openScript = state.ui.openScriptId;
+
+  function offerRow(o) {
+    const isRepurchase = o.type === "RECOMPRA";
+    return `
+      <div style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--line)">
+        <span class="soft-badge" style="background:${isRepurchase ? "#e8f5e9" : "#fff3e0"};color:${isRepurchase ? "#2e7d32" : "#e65100"};white-space:nowrap;font-size:11px">
+          ${isRepurchase ? "🔁 Recompra" : "✨ Oportunidade"}
+        </span>
+        <div style="min-width:0;flex:1">
+          <div style="font-weight:700;font-size:13px">${escapeHtml(o.title)}</div>
+          <div class="text-small" style="color:var(--muted)">${escapeHtml(o.reason || "")}</div>
+        </div>
+      </div>`;
+  }
+
+  const offers = [...repurchase.slice(0, 3), ...opportunity.slice(0, 2)];
+
+  return `
+    <div class="subtle-card padded-card">
+      <div class="section-title">
+        <div><h3>O que fazer agora</h3>
+        <div class="text-small">Ação sugerida com base no histórico deste cliente.</div></div>
+      </div>
+
+      <div style="background:#0f3044;color:#fff;border-radius:8px;padding:12px 14px;margin-bottom:12px">
+        <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em;margin-bottom:4px">PRÓXIMA AÇÃO</div>
+        <div style="font-size:14px;line-height:1.5">${escapeHtml(client.nextAction || crmRecommendedAction(client))}</div>
+      </div>
+
+      ${offers.length ? `
+        <div style="margin-bottom:12px">
+          <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:4px">O QUE OFERECER</div>
+          ${offers.map(offerRow).join("")}
+        </div>` : ""}
+
+      ${client.questionPrimary ? `
+        <div style="margin-bottom:12px">
+          <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:4px">PERGUNTA PARA ABRIR A CONVERSA</div>
+          <div style="font-style:italic;font-size:13px">"${escapeHtml(client.questionPrimary)}"</div>
+        </div>` : ""}
+
+      ${scripts.length ? `
+        <div>
+          <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:6px">
+            SCRIPTS PRONTOS <span class="soft-badge">${scripts.length}</span>
+          </div>
+          ${scripts.map((s) => `
+            <div style="border:1px solid var(--line);border-radius:6px;margin-bottom:6px;overflow:hidden">
+              <div onclick="toggleScript(${s.id})" style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 10px;cursor:pointer;background:#f7fafc">
+                <div style="min-width:0">
+                  <span style="font-size:14px">${s.category === "whatsapp" ? "💬" : "📞"}</span>
+                  <strong style="font-size:12px">${escapeHtml(s.title)}</strong>
+                </div>
+                <span style="color:var(--muted);font-size:12px">${openScript === s.id ? "▲" : "▼"}</span>
+              </div>
+              ${openScript === s.id ? `
+                <div style="padding:10px 12px">
+                  ${s.hint ? `<div class="text-small" style="color:var(--muted);margin-bottom:8px;font-style:italic">${escapeHtml(s.hint)}</div>` : ""}
+                  <pre style="white-space:pre-wrap;font-family:inherit;font-size:13px;line-height:1.6;margin:0">${escapeHtml(s.body)}</pre>
+                  <div class="actions" style="margin-top:10px">
+                    <button class="btn btn-secondary btn-sm" onclick="copyScript(${s.id})">📋 Copiar</button>
+                    ${s.category === "whatsapp" && client.phone ? `<button class="btn btn-primary btn-sm" onclick="openWhatsApp('${escapeHtml(client.phone)}', ${s.id})">Abrir WhatsApp</button>` : ""}
+                  </div>
+                </div>` : ""}
+            </div>`).join("")}
+        </div>` : ""}
+    </div>
+  `;
+}
+
+function toggleScript(id) {
+  state.ui.openScriptId = state.ui.openScriptId === id ? null : id;
+  requestRender();
+}
+
+function currentScriptById(id) {
+  const client = state.crm.selectedClient?.summary;
+  return (client?.scripts || []).find((s) => s.id === id);
+}
+
+async function copyScript(id) {
+  const script = currentScriptById(id);
+  if (!script) return;
+  try {
+    await navigator.clipboard.writeText(script.body);
+    addMessage("success", "Texto copiado.");
+  } catch (e) {
+    addMessage("error", "Não foi possível copiar. Selecione o texto manualmente.");
+  }
+}
+
+function openWhatsApp(phone, scriptId) {
+  const script = currentScriptById(scriptId);
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (!digits) { addMessage("error", "Cliente sem telefone cadastrado."); return; }
+  const withCountry = digits.length <= 11 ? `55${digits}` : digits;
+  const text = script ? encodeURIComponent(script.body) : "";
+  window.open(`https://wa.me/${withCountry}?text=${text}`, "_blank");
+}
+
+// ─── Biblioteca de vendas ───────────────────────────────────────────────────
+
+async function loadContentLibrary() {
+  try {
+    const all = userCanManageUsers() ? "?all=1" : "";
+    state.content = await api(`/api/content${all}`);
+  } catch (e) {
+    state.content = { error: e.message, items: [], categories: [], situations: [] };
+  }
+  requestRender();
+}
+
+function bibliotecaView() {
+  if (!state.content) { loadContentLibrary(); return `<div class="loader panel">Carregando biblioteca…</div>`; }
+  if (state.content.error) return `<div class="message error">${escapeHtml(state.content.error)}</div>`;
+
+  const cats = state.content.categories || [];
+  const sits = state.content.situations || [];
+  const canEdit = Boolean(state.content.canEdit);
+  const activeCat = state.ui.libraryCategory || cats[0]?.id || "ligacao";
+  const items = (state.content.items || []).filter((i) => i.category === activeCat);
+  const sitLabel = (id) => (sits.find((s) => s.id === id) || {}).label || id;
+  const editor = state.contentEditor;
+
+  return `
+    <div class="stack">
+      <div class="form-card" style="padding:12px 18px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          ${cats.map((c) => `
+            <button class="subtab-button ${activeCat === c.id ? "active" : ""}"
+              onclick="state.ui.libraryCategory='${c.id}';requestRender()">
+              ${c.icon} ${escapeHtml(c.label)}
+              <span class="soft-badge" style="margin-left:4px">${(state.content.items || []).filter((i) => i.category === c.id).length}</span>
+            </button>`).join("")}
+          ${canEdit ? `<button class="btn btn-primary btn-sm" style="margin-left:auto" onclick="startContentEdit(null)">+ Novo conteúdo</button>` : ""}
+        </div>
+      </div>
+
+      ${canEdit && editor ? contentEditorCard() : ""}
+
+      ${items.length ? items.map((item) => `
+        <div class="form-card ${item.isActive ? "" : "muted"}" style="${item.isActive ? "" : "opacity:.55"}">
+          <div class="section-title">
+            <div>
+              <h3 style="font-size:15px">${escapeHtml(item.title)}</h3>
+              <div class="text-small">
+                <span class="soft-badge">${escapeHtml(sitLabel(item.situation))}</span>
+                ${item.isSystem ? ' <span class="soft-badge">padrão</span>' : ""}
+                ${item.isActive ? "" : ' <span class="soft-badge" style="background:#fde8e8;color:#e74c3c">inativo</span>'}
+              </div>
+            </div>
+            <div style="display:flex;gap:6px">
+              <button class="btn btn-ghost btn-sm" onclick="copyLibraryText(${item.id})">📋 Copiar</button>
+              ${canEdit ? `<button class="btn btn-ghost btn-sm" onclick="startContentEdit(${item.id})">Editar</button>` : ""}
+              ${canEdit && !item.isSystem ? `<button class="btn btn-ghost btn-sm" onclick="deleteContent(${item.id})">Excluir</button>` : ""}
+            </div>
+          </div>
+          ${item.hint ? `<div class="message" style="font-size:12px;font-style:italic;margin-bottom:8px">${escapeHtml(item.hint)}</div>` : ""}
+          <pre style="white-space:pre-wrap;font-family:inherit;font-size:13px;line-height:1.65;margin:0">${escapeHtml(item.body)}</pre>
+        </div>`).join("") : emptyStateCard("Nenhum conteúdo nesta categoria ainda.")}
+
+      <div class="message" style="font-size:12px">
+        Os marcadores <strong>{cliente}</strong>, <strong>{vendedor}</strong>, <strong>{item}</strong> e
+        <strong>{dias}</strong> são preenchidos automaticamente quando o script aparece na ficha do cliente.
+      </div>
+    </div>
+  `;
+}
+
+function contentEditorCard() {
+  const e = state.contentEditor;
+  const cats = state.content.categories || [];
+  const sits = state.content.situations || [];
+  return `
+    <div class="form-card" id="content-editor">
+      <div class="section-title">
+        <div><h3>${e.id ? "Editar conteúdo" : "Novo conteúdo"}</h3></div>
+        <button class="btn btn-ghost btn-sm" onclick="cancelContentEdit()">Cancelar</button>
+      </div>
+      <form onsubmit="saveContent(event)" class="stack">
+        <div class="two-column-form">
+          <div class="field"><label>Categoria</label>
+            <select onchange="state.contentEditor.category=this.value">
+              ${cats.map((c) => `<option value="${c.id}" ${e.category === c.id ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Situação</label>
+            <select onchange="state.contentEditor.situation=this.value">
+              ${sits.map((s) => `<option value="${s.id}" ${e.situation === s.id ? "selected" : ""}>${escapeHtml(s.label)}</option>`).join("")}
+            </select></div>
+          <div class="field field-span-2"><label>Título</label>
+            <input value="${escapeHtml(e.title)}" oninput="state.contentEditor.title=this.value" required /></div>
+          <div class="field field-span-2"><label>Dica para o vendedor (opcional)</label>
+            <input value="${escapeHtml(e.hint)}" oninput="state.contentEditor.hint=this.value" placeholder="Objetivo da abordagem, o que evitar" /></div>
+          <div class="field field-span-2"><label>Conteúdo</label>
+            <textarea rows="14" style="font-family:inherit;line-height:1.6" oninput="state.contentEditor.body=this.value" required>${escapeHtml(e.body)}</textarea></div>
+          <div class="field field-span-2">
+            <label class="checkbox-item" style="cursor:pointer">
+              <input type="checkbox" ${e.isActive ? "checked" : ""} onchange="state.contentEditor.isActive=this.checked" />
+              <span>Ativo (aparece para os vendedores)</span>
+            </label></div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">Salvar</button>
+          <button class="btn btn-ghost" type="button" onclick="cancelContentEdit()">Cancelar</button>
+        </div>
+      </form>
+    </div>`;
+}
+
+function startContentEdit(id) {
+  const item = id ? (state.content.items || []).find((i) => i.id === id) : null;
+  state.contentEditor = item
+    ? { ...item }
+    : { id: "", category: state.ui.libraryCategory || "ligacao", situation: "GERAL",
+        title: "", body: "", hint: "", isActive: true };
+  requestRender();
+  document.getElementById("content-editor")?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function cancelContentEdit() {
+  state.contentEditor = null;
+  requestRender();
+}
+
+async function saveContent(event) {
+  if (event) event.preventDefault();
+  const e = state.contentEditor;
+  if (!e.title?.trim() || !e.body?.trim()) { addMessage("error", "Título e conteúdo são obrigatórios."); return; }
+  try {
+    const r = await api("/api/content/save", {
+      method: "POST",
+      body: JSON.stringify({
+        id: e.id || undefined, category: e.category, situation: e.situation,
+        title: e.title, body: e.body, hint: e.hint, isActive: e.isActive,
+      }),
+    });
+    addMessage("success", r.message || "Conteúdo salvo.");
+    state.contentEditor = null;
+    await loadContentLibrary();
+  } catch (err) {
+    addMessage("error", err.message);
+  }
+}
+
+async function deleteContent(id) {
+  if (!confirm("Excluir este conteúdo?")) return;
+  try {
+    await api("/api/content/delete", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", "Conteúdo excluído.");
+    await loadContentLibrary();
+  } catch (err) {
+    addMessage("error", err.message);
+  }
+}
+
+async function copyLibraryText(id) {
+  const item = (state.content.items || []).find((i) => i.id === id);
+  if (!item) return;
+  try {
+    await navigator.clipboard.writeText(item.body);
+    addMessage("success", "Texto copiado.");
+  } catch (e) {
+    addMessage("error", "Não foi possível copiar automaticamente.");
+  }
 }
 
 function crmFilterToolbar() {
@@ -2962,14 +3370,7 @@ function clientDrawerView() {
                 <div><span>Motivo principal</span><strong>${escapeHtml(client.primaryReason || "-")}</strong></div>
               </div>
             </div>
-            <div class="subtle-card padded-card">
-              <div class="section-title"><h3>Ação recomendada</h3></div>
-              <div class="crm-mini-grid crm-detail-grid">
-                <div><span>Oferta sugerida</span><strong>${escapeHtml(client.offerPrimary?.title || "-")}</strong></div>
-                <div><span>Pergunta sugerida</span><strong>${escapeHtml(client.questionPrimary || "-")}</strong></div>
-                <div><span>Próxima melhor ação</span><strong>${escapeHtml(crmRecommendedAction(client))}</strong></div>
-              </div>
-            </div>
+            ${clientActionPanel(client)}
             <div class="table-card">
               <div class="section-title">
                 <div>
@@ -4849,6 +5250,7 @@ function topbarTitle() {
     "placar-equipe":  { title: "Placar da Equipe",        description: "Ranking de vendedores, zonas de premiação e alertas." },
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
+    "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
   };
   return map[state.activeTab] || { title: "Dashboard", description: "Visão geral." };
@@ -4996,6 +5398,7 @@ function dashboardView() {
     { id: "placar-equipe", title: "Placar Equipe",    desc: "Ranking e alertas",        icon: "🏆" },
     { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
+    { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
@@ -5094,6 +5497,7 @@ function dashboardView() {
           ${state.activeTab === "placar-equipe" ? placardaEquipeView() : ""}
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
+          ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
           ${state.activeTab === "vendedores"    ? vendedoresView()     : ""}
