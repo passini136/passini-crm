@@ -44,8 +44,10 @@ ROOT_DIR = Path(__file__).resolve().parent
 LEGACY_APPDATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(ROOT_DIR / "runtime_data"))) / "PassiniDashboard"
 STATIC_DIR = ROOT_DIR / "static"
 DEFAULT_COMPANY = "Passini Distribuidora de Autopeças"
-DEFAULT_ADMIN_USER = "admin"
-DEFAULT_ADMIN_PASSWORD = "Passini@2026"
+DEFAULT_ADMIN_USER = os.environ.get("PASSINI_ADMIN_USER", "admin")
+# Semente usada APENAS na criação do banco. Pode ser definida em crm.env
+# (PASSINI_ADMIN_PASSWORD). Não é exibida em nenhuma tela.
+DEFAULT_ADMIN_PASSWORD = os.environ.get("PASSINI_ADMIN_PASSWORD", "Passini@2026")
 
 # ── Cache para competências fechadas (não mudam após importação) ─────────────
 import threading as _threading

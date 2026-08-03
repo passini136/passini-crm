@@ -45,8 +45,8 @@ const state = {
     clientDrawerError: "",
   },
   login: {
-    username: "admin",
-    password: "Passini@2026",
+    username: "",
+    password: "",
   },
   userEditor: {
     id: "",
@@ -967,22 +967,20 @@ function loginView() {
         <form class="login-form" onsubmit="handleLogin(event)">
           <div>
             <h2>Entrar</h2>
-            <p class="hint">Use o usuário padrão para o primeiro acesso. Depois você pode criar novos perfis administrativos.</p>
+            <p class="hint">Informe suas credenciais de acesso.</p>
           </div>
           ${messageHtml()}
           <div class="field">
             <label>Usuário</label>
-            <input value="${escapeHtml(state.login.username)}" oninput="state.login.username=this.value" />
+            <input autocomplete="username" value="${escapeHtml(state.login.username)}" oninput="state.login.username=this.value" required />
           </div>
           <div class="field">
             <label>Senha</label>
-            <input type="password" value="${escapeHtml(state.login.password)}" oninput="state.login.password=this.value" />
+            <input type="password" autocomplete="current-password" value="${escapeHtml(state.login.password)}" oninput="state.login.password=this.value" required />
           </div>
           <button class="btn btn-primary" type="submit">Entrar no dashboard</button>
-          <div class="credentials-box">
-            <strong>Credencial inicial</strong>
-            <div class="text-small">Usuário: <strong>admin</strong></div>
-            <div class="text-small">Senha padrão: <strong>Passini@2026</strong></div>
+          <div class="text-small" style="text-align:center;color:var(--muted);margin-top:4px">
+            Esqueceu a senha? Fale com o administrador do sistema.
           </div>
         </form>
       </div>
