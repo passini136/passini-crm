@@ -6424,6 +6424,55 @@ def build_integrity_audit(conn: sqlite3.Connection, company_id: int, competence:
     }
 
 
+def filter_admin_data_for_user(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, data: dict[str, Any]
+) -> dict[str, Any]:
+    """Aplica o recorte por unidade nos cadastros administrativos.
+
+    Um gerente só administra a própria unidade: metas de vendedor da equipe dele,
+    meta da unidade dele e férias das pessoas da unidade dele. Quem tem escopo
+    "todos" não sofre restrição.
+    """
+    scope = data_scope_for_user(conn, user)
+    if scope not in {"unidade", "unidade_consolidado"}:
+        return data
+    allowed = set(linked_units_for_user(user))
+    if not allowed:
+        for key in ("goalsSeller", "goalsUnit", "vacations", "people"):
+            data[key] = []
+        return data
+
+    # Mapa pessoa -> unidade base, para filtrar férias e metas sem base_unit gravada
+    person_unit: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT person_name, base_unit FROM people_records WHERE company_id = ? ORDER BY valid_from DESC",
+        (company_id,),
+    ).fetchall():
+        key = normalize_whitespace(r["person_name"])
+        if key and key not in person_unit:
+            person_unit[key] = normalize_unit(r["base_unit"])
+
+    def unit_of_person(name: str | None) -> str:
+        return person_unit.get(normalize_whitespace(name), "")
+
+    data["goalsSeller"] = [
+        g for g in data.get("goalsSeller", [])
+        if (normalize_unit(g.get("base_unit")) or unit_of_person(g.get("seller_name"))) in allowed
+    ]
+    data["goalsUnit"] = [
+        g for g in data.get("goalsUnit", []) if normalize_unit(g.get("unit_name")) in allowed
+    ]
+    data["vacations"] = [
+        v for v in data.get("vacations", []) if unit_of_person(v.get("person_name")) in allowed
+    ]
+    data["people"] = [
+        p for p in data.get("people", []) if normalize_unit(p.get("base_unit")) in allowed
+    ]
+    # Configuração de score é exclusiva de quem administra o sistema
+    data["scoreConfigs"] = []
+    return data
+
+
 def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
     sanitize_unit_goals(conn, company_id)
     conn.commit()
@@ -7531,9 +7580,11 @@ def compute_team_activity_today(
         (company_id,),
     ).fetchall()
 
-    # Vendedores com meta cadastrada no mês atual — cruzado com people_records para unidade.
+    # Vendedores com meta cadastrada no mês atual. A própria meta guarda a unidade
+    # base — usar isso evita depender de people_records estar atualizado.
     seller_rows = conn.execute(
-        "SELECT DISTINCT seller_name FROM goals_seller WHERE company_id = ? AND competence = ?",
+        "SELECT seller_name, MAX(base_unit) AS base_unit FROM goals_seller "
+        "WHERE company_id = ? AND competence = ? GROUP BY seller_name",
         (company_id, competence),
     ).fetchall()
 
@@ -7546,7 +7597,9 @@ def compute_team_activity_today(
         if key and key not in seller_unit_map:
             seller_unit_map[key] = normalize_unit(r["base_unit"]) or ""
 
-    allowed_units = linked_units_for_user(user) if user["role"] in {"Gerente", "Analista"} else []
+    # Escopo pelo perfil (não pelo nome do papel): a Missão do Dia é uma visão de CRM,
+    # então mesmo "unidade + consolidado" fica restrito às unidades vinculadas.
+    allowed_units = crm_allowed_units_for_user(conn, user) or []
     contacts_map = {normalize_whitespace(r["seller_name"]): {"total": int(r["total"]), "active": int(r["active"])} for r in contacts_rows}
     overdue_map = {normalize_whitespace(r["seller_name"]): int(r["overdue"]) for r in tasks_rows}
 
@@ -7555,7 +7608,8 @@ def compute_team_activity_today(
         seller_name = normalize_whitespace(row["seller_name"])
         if not seller_name:
             continue
-        unit = seller_unit_map.get(seller_name, "")
+        # Unidade da meta tem prioridade; people_records é o complemento
+        unit = normalize_unit(row["base_unit"]) or seller_unit_map.get(seller_name, "")
         if allowed_units and unit not in allowed_units:
             continue
         c = contacts_map.get(seller_name, {"total": 0, "active": 0})
@@ -7846,6 +7900,24 @@ class AppHandler(BaseHTTPRequestHandler):
             self.wfile.write(json_dumps({"error": "Perfil sem acesso a area administrativa"}))
             return False
         return True
+
+    def _require_unit_allowed(self, user: dict[str, Any] | None, unit_name: str | None) -> bool:
+        """Impede gravar dados de unidade fora do vínculo do usuário."""
+        if not user:
+            return False
+        with closing(get_connection()) as conn:
+            scope = data_scope_for_user(conn, user)
+            if scope not in {"unidade", "unidade_consolidado"}:
+                return True
+            allowed = linked_units_for_user(user)
+        target = normalize_unit(unit_name)
+        if target and target in allowed:
+            return True
+        self._set_headers(403)
+        self.wfile.write(json_dumps(
+            {"error": f"Seu perfil só permite alterar dados de: {', '.join(allowed) or 'nenhuma unidade'}."}
+        ))
+        return False
 
     def _require_user_management(self, user: dict[str, Any] | None) -> bool:
         """Gestão de usuários e perfis é restrita a quem tem a permissão no perfil."""
@@ -8424,6 +8496,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         self.wfile.write(json_dumps({"error": "Perfil sem acesso a esses dados."}))
                         return
                     data = list_admin_data(conn, user["company_id"])
+                    data = filter_admin_data_for_user(conn, user["company_id"], user, data)
                     if not user_can_manage_users(conn, user):
                         for sensitive in ("users", "profiles", "audit"):
                             data[sensitive] = []
@@ -8650,6 +8723,8 @@ class AppHandler(BaseHTTPRequestHandler):
                             self._set_headers(400)
                             self.wfile.write(json_dumps({"error": "Vendedor obrigatório"}))
                             return
+                        if not self._require_unit_allowed(user, base_unit):
+                            return
                         conn.execute(
                             """
                             INSERT INTO goals_seller
@@ -8670,6 +8745,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         if not unit_name:
                             self._set_headers(400)
                             self.wfile.write(json_dumps({"error": "Unidade obrigatória"}))
+                            return
+                        if not self._require_unit_allowed(user, unit_name):
                             return
                         conn.execute(
                             """

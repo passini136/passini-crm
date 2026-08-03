@@ -346,19 +346,44 @@ function defaultTabForUser(user) {
   return preference.find((tab) => allowed.includes(tab)) || allowed[0] || "executivo";
 }
 
+// Telas que dependem do score — escondidas enquanto SCORE_ENABLED for false
+const SCORE_TABS = ["meu-placar", "placar-equipe"];
+
 function allowedTabsForUser(user) {
   if (!user) return ["executivo"];
+  const withoutScore = (tabs) => (scoreEnabled() ? tabs : tabs.filter((t) => !SCORE_TABS.includes(t)));
   // Fonte de verdade: os módulos do perfil de acesso (configurável pela tela).
-  if (Array.isArray(user.modules) && user.modules.length) return user.modules;
+  if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return ["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "calendario"];
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "calendario"]);
   }
-  return ["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"];
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
   return Boolean(state.user?.canManageUsers);
+}
+
+/**
+ * Score/placar desativado por decisão de negócio (31/07/2026).
+ * Para reativar, basta trocar para `true` — as telas e cálculos continuam no código.
+ */
+const SCORE_ENABLED = false;
+
+/**
+ * Selo de status do vendedor (Destaque / Boa rota / Acompanhar / Intervir).
+ * Em standby junto com o score na primeira versão. Quando reativado, aparece
+ * para todos os perfis MENOS o vendedor — é uma leitura de gestão, não do vendedor.
+ */
+const SELLER_STATUS_ENABLED = false;
+
+function scoreEnabled() {
+  return SCORE_ENABLED;
+}
+
+function showSellerStatus() {
+  return SELLER_STATUS_ENABLED && !roleIsSeller();
 }
 
 function ensureActiveTabForUser(user) {
@@ -421,12 +446,12 @@ async function bootstrap() {
     applyDefaultUnitForUser();
     // Cargas essenciais em paralelo (options não bloqueia mais o restante)
     const loads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
-    if (session.user.role === "Vendedor") loads.push(loadSellerScore());
+    if (session.user.role === "Vendedor" && scoreEnabled()) loads.push(loadSellerScore());
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
       loadAdmin();
-      loadTeamScore();
+      if (scoreEnabled()) loadTeamScore();
       loadTeamActivity();
       loadPortfolioSummary();
     }
@@ -935,11 +960,11 @@ async function handleLogin(event) {
     state.ui.defaultUnitApplied = false;
     applyDefaultUnitForUser();
     const loginLoads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
-    if (result.user.role === "Vendedor") loginLoads.push(loadSellerScore());
+    if (result.user.role === "Vendedor" && scoreEnabled()) loginLoads.push(loadSellerScore());
     await Promise.all(loginLoads);
     if (state.user.role !== "Vendedor") {
       loadAdmin();
-      loadTeamScore();
+      if (scoreEnabled()) loadTeamScore();
       loadTeamActivity();
       loadPortfolioSummary();
     }
@@ -1080,7 +1105,7 @@ function sellerRows(rows) {
         <td>${currency(row.returnsValue)}</td>
         <td>${pct(row.returnRatioPct)}</td>
         <td>${pct(row.discountPct || 0)}</td>
-        <td><span class="score-chip">${row.score}</span></td>
+        ${scoreEnabled() ? `<td><span class="score-chip">${row.score}</span></td>` : ''}
       </tr>
     `
     )
@@ -1249,7 +1274,7 @@ function vendedoresViewTableOnly() {
                   <th>Devolução</th>
                   <th>% Dev.</th>
                   <th>Margem</th>
-                  <th>Score</th>
+                  ${scoreEnabled() ? '<th>Score</th>' : ''}
             </tr>
           </thead>
           <tbody>
@@ -1274,7 +1299,7 @@ function vendedoresViewTableOnly() {
                   <td>${currency(row.returnsValue)}</td>
                   <td>${pct(row.returnRatioPct || 0)}</td>
                   <td>${marginText(row.marginValue)}</td>
-                  <td><span class="score-chip">${row.score}</span></td>
+                  ${scoreEnabled() ? `<td><span class="score-chip">${row.score}</span></td>` : ''}
                 </tr>
               `
               )
@@ -1340,12 +1365,15 @@ function vendedoresView() {
             const score = Number(row.score || 0);
             const actualBar = Math.max(0, Math.min(100, (actualPct / 120) * 100));
             const projectedBar = Math.max(0, Math.min(100, (projectedPct / 120) * 100));
+            // Status calculado por meta, devolução e desconto. O score entra apenas
+            // como reforço quando está ativo, para o selo funcionar sozinho depois.
             let statusLabel = "Acompanhar";
             let statusTone = "warn";
-            if (actualPct >= 100 && score >= 85 && returnPct <= 3) {
+            const scoreOk = (min) => !scoreEnabled() || score >= min;
+            if (actualPct >= 100 && returnPct <= 3 && scoreOk(85)) {
               statusLabel = "Destaque";
               statusTone = "good";
-            } else if (projectedPct >= 100 && score >= 75) {
+            } else if (projectedPct >= 100 && scoreOk(75)) {
               statusLabel = "Boa rota";
               statusTone = "good";
             } else if (actualPct < 80 || returnPct > 4 || discountPct > 25) {
@@ -1360,8 +1388,8 @@ function vendedoresView() {
                     <span>${escapeHtml(row.baseUnit || "-")}${row.pendingMapping ? " · pendente de mapeamento" : ""}</span>
                   </div>
                   <div class="seller-visual-badges">
-                    <span class="status-tag ${statusTone}">${statusLabel}</span>
-                    <span class="score-chip">${row.score}</span>
+                    ${showSellerStatus() ? `<span class="status-tag ${statusTone}">${statusLabel}</span>` : ""}
+                    ${scoreEnabled() ? `<span class="score-chip">${row.score}</span>` : ""}
                   </div>
                 </div>
                 <div class="seller-visual-mini-grid">
@@ -2212,7 +2240,9 @@ function sellerHomeCards() {
   return `
     <div class="grid-2">
       ${kpiCard("Meu resultado comercial", currency(seller.revenueNet), "Meta", currency(seller.revenueGoal))}
-      ${kpiCard("Meus indicadores detalhados", pct(seller.goalAttainmentPct), "Score", seller.score)}
+      ${scoreEnabled()
+        ? kpiCard("Meus indicadores detalhados", pct(seller.goalAttainmentPct), "Score", seller.score)
+        : kpiCard("Atingimento da meta", pct(seller.goalAttainmentPct), "Ticket médio", currency(seller.ticketAverage || 0))}
     </div>
   `;
 }
@@ -3468,7 +3498,7 @@ async function submitCrmInteraction() {
       }),
     });
     // Atualizar placar de ligações em background
-    if (roleIsSeller()) loadSellerScore();
+    if (roleIsSeller() && scoreEnabled()) loadSellerScore();
     const resultLabel = {
       GEROU_PEDIDO: "🎉 Venda registrada!",
       GEROU_ORCAMENTO: "📋 Orçamento registrado!",
@@ -3567,7 +3597,7 @@ function managerExecutiveView() {
           </div>
         </div>
       </div>
-      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>Score</th></tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
+      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Líquido</th><th>Meta</th><th>% Meta</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
       ${executiveExpandSection("units", "Ver performance por unidade", `<div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Devolução</th><th>% Dev.</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead><tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody></table></div>`)}
     </div>
   `;
@@ -4400,6 +4430,7 @@ Cancelar edição
               </div>
             </form>
 
+            ${scoreEnabled() && userCanManageUsers() ? `
             <form onsubmit="saveScoreConfig(event)" class="stack">
               <strong>Pesos do score</strong>
               <div class="two-column-form">
@@ -4411,7 +4442,7 @@ Cancelar edição
                 <div class="field"><label>Devolução</label><input id="score-returns" type="number" step="0.01" value="25" required /></div>
               </div>
               <button class="btn btn-primary" type="submit">Salvar score</button>
-            </form>
+            </form>` : ""}
           </div>
         </div>
       </div>
@@ -4430,7 +4461,7 @@ Cancelar edição
           </div>
         </div>
         <div class="stack">
-          ${adminTableCard("Configuração do score", ["valid_from_competence", "weight_goal", "weight_ticket", "weight_clients", "weight_mix", "weight_returns"], state.admin.scoreConfigs)}
+          ${scoreEnabled() && userCanManageUsers() ? adminTableCard("Configuração do score", ["valid_from_competence", "weight_goal", "weight_ticket", "weight_clients", "weight_mix", "weight_returns"], state.admin.scoreConfigs) : ""}
           ${sellerGoalsTableCard()}
           ${unitGoalsTableCard()}
           ${adminTableCard("Feriados", ["holiday_date", "holiday_name", "scope"], state.admin.holidays || [])}
@@ -4894,7 +4925,7 @@ function executivoView() {
       ${executiveExpandSection("details", "Ver ranking de vendedores", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Devolução</th><th>% Dev.</th><th>% Desc.</th><th>Score</th></tr></thead>
+            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Devolução</th><th>% Dev.</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
             <tbody>${sellerRows(ranking)}</tbody>
           </table>
         </div>
@@ -4907,7 +4938,7 @@ function executivoView() {
           </table>
         </div>
       `)}
-      ${executiveExpandSection("ranking", "Ver quadrante de vendedores", quadrantHtml(state.dashboard.quadrant))}
+      ${scoreEnabled() ? executiveExpandSection("ranking", "Ver quadrante de vendedores", quadrantHtml(state.dashboard.quadrant)) : ""}
       ${executiveExpandSection("comparisons", "Ver comparativos de período", `
         <div class="kpi-grid">
           ${summaryDiffCard("Receita do grupo", comp.group)}
@@ -4934,7 +4965,7 @@ function descontosView() {
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Vendedor</th><th>Unidade</th><th>% Desconto</th><th>Líquido</th><th>% Meta</th><th>Score</th></tr>
+            <tr><th>Vendedor</th><th>Unidade</th><th>% Desconto</th><th>Líquido</th><th>% Meta</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr>
           </thead>
           <tbody>
             ${rows.map((row) => `
@@ -4944,7 +4975,7 @@ function descontosView() {
                 <td>${pct(row.discountPct || 0)}</td>
                 <td>${currency(row.revenueNet)}</td>
                 <td>${pct(row.goalAttainmentPct)}</td>
-                <td><span class="score-chip">${row.score}</span></td>
+                ${scoreEnabled() ? `<td><span class="score-chip">${row.score}</span></td>` : ''}
               </tr>
             `).join("")}
           </tbody>
@@ -5013,7 +5044,7 @@ function dashboardView() {
   `;
 
   // Score resumido no sidebar para vendedor
-  const sidebarScore = roleIsSeller() && state.sellerScore ? `
+  const sidebarScore = scoreEnabled() && roleIsSeller() && state.sellerScore ? `
     <div style="padding:10px 12px;background:linear-gradient(135deg,#0f3044,#1a5276);border-radius:12px;margin-top:8px;cursor:pointer" onclick="switchTab('meu-placar')">
       <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em">MEU PLACAR</div>
       <div style="display:flex;align-items:baseline;gap:6px;margin-top:4px">
