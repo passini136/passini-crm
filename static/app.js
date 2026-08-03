@@ -55,8 +55,18 @@ const state = {
     linkedPersonName: "",
     linkedUnits: [],
     role: "Administrador",
+    profileId: "",
     password: "",
     isActive: true,
+  },
+  profileEditor: {
+    id: "",
+    name: "",
+    description: "",
+    modules: [],
+    dataScope: "todos",
+    canManageUsers: false,
+    isSystem: false,
   },
   goalEditors: {
     seller: {
@@ -326,23 +336,27 @@ function addMessage(type, text) {
 }
 
 function defaultTabForUser(user) {
-  if (user?.role === "Vendedor") return "crm-agenda";
-  if (user?.role === "Gerente") return "executivo";
-  return "executivo";
+  const allowed = allowedTabsForUser(user);
+  // Primeira aba disponível seguindo a preferência natural de cada perfil
+  const preference = user?.dataScope === "proprio"
+    ? ["crm-agenda", "meu-placar", "crm-clientes", "executivo"]
+    : ["executivo", "crm-agenda", "crm-clientes", "acessos"];
+  return preference.find((tab) => allowed.includes(tab)) || allowed[0] || "executivo";
 }
 
 function allowedTabsForUser(user) {
   if (!user) return ["executivo"];
+  // Fonte de verdade: os módulos do perfil de acesso (configurável pela tela).
+  if (Array.isArray(user.modules) && user.modules.length) return user.modules;
+  // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return ["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "calendario"];
+    return ["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "calendario"];
   }
-  if (user.role === "Gerente") {
-    return ["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes"];
-  }
-  if (user.role === "Analista") {
-    return ["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes"];
-  }
-  return ["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes"];
+  return ["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"];
+}
+
+function userCanManageUsers() {
+  return Boolean(state.user?.canManageUsers);
 }
 
 function ensureActiveTabForUser(user) {
@@ -810,14 +824,45 @@ function resetUserEditor() {
     linkedPersonName: "",
     linkedUnits: [],
     role: "Administrador",
+    profileId: "",
     password: "",
     isActive: true,
   };
 }
 
+function resetProfileEditor() {
+  state.profileEditor = {
+    id: "",
+    name: "",
+    description: "",
+    modules: [],
+    dataScope: "todos",
+    canManageUsers: false,
+    isSystem: false,
+  };
+}
+
+function accessProfiles() {
+  return state.admin?.profiles || [];
+}
+
+function accessProfileById(id) {
+  return accessProfiles().find((p) => String(p.id) === String(id)) || null;
+}
+
+/** Escopo do perfil escolhido no editor de usuário — define quais campos aparecem. */
+function selectedUserProfileScope() {
+  const profile = accessProfileById(state.userEditor.profileId);
+  return profile ? profile.dataScope : "todos";
+}
+
 function editUser(userId) {
   const user = (state.admin?.users || []).find((item) => Number(item.id) === Number(userId));
   if (!user) return;
+  // Perfil pelo id gravado; se o usuário é antigo, casa pelo nome do papel
+  const profile = accessProfileById(user.profile_id)
+    || accessProfiles().find((p) => p.name === user.role)
+    || null;
   state.userEditor = {
     id: user.id,
     username: user.username || "",
@@ -825,21 +870,22 @@ function editUser(userId) {
     linkedPersonName: user.linked_person_name || "",
     linkedUnits: [...(user.linked_units || [])],
     role: user.role || "Administrador",
+    profileId: profile ? profile.id : "",
     password: "",
     isActive: Boolean(user.is_active),
   };
   syncUserEditorOptions();
   requestRender();
+  document.getElementById("user-editor-card")?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
 
-function setUserRole(value) {
-  state.userEditor.role = value;
-  if (value !== "Vendedor") {
-    state.userEditor.linkedPersonName = "";
-  }
-  if (!["Gerente", "Analista"].includes(value)) {
-    state.userEditor.linkedUnits = [];
-  }
+function setUserProfile(profileId) {
+  const profile = accessProfileById(profileId);
+  state.userEditor.profileId = profileId;
+  state.userEditor.role = profile ? profile.name : "";
+  const scope = profile ? profile.dataScope : "todos";
+  if (scope !== "proprio") state.userEditor.linkedPersonName = "";
+  if (!["unidade", "unidade_consolidado"].includes(scope)) state.userEditor.linkedUnits = [];
   syncUserEditorOptions();
   requestRender();
 }
@@ -1080,7 +1126,7 @@ async function refreshCurrentTab() {
   if (tab === "importacoes") {
     promises.push(loadAutoImportStatus(), loadAdmin());
   }
-  if (tab === "administracao" || tab === "configuracoes") {
+  if (tab === "administracao" || tab === "configuracoes" || tab === "acessos") {
     promises.push(loadAdmin());
   }
   // Fallback: recarrega tudo
@@ -1921,6 +1967,8 @@ function switchTab(tab) {
   }
   state.activeTab = tab;
   state.ui.actionsMenuOpen = false;
+  // A tela de acessos depende do payload administrativo (usuários e perfis)
+  if (tab === "acessos" && !state.admin) loadAdmin();
   requestRender();
 }
 
@@ -3914,10 +3962,14 @@ administracaoView = function administracaoViewOverride() {
         <div class="section-title"><div><h3>Pendências</h3><div class="text-small">Resolva vínculos e correspondências sem abrir telas gigantes.</div></div></div>
         <div class="stack">${pendingIssueCards()}</div>
       </div>
-      <div class="grid-2">
-        ${userEditorCard()}
-        ${usersAdminTableCard()}
-      </div>
+      ${userCanManageUsers() ? `
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Usuários e permissões</h3>
+          <div class="text-small">A gestão de contas e perfis fica em uma tela dedicada.</div></div>
+          <button class="btn btn-primary btn-sm" onclick="switchTab('acessos')">Abrir Usuários e Perfis →</button>
+        </div>
+      </div>` : ""}
       <div class="grid-2">
         ${personEditorCard()}
         ${adminTableCard("Cadastros de pessoas", ["person_name", "role_classification", "base_unit", "valid_from", "valid_to", "source"], state.admin.people)}
@@ -3936,34 +3988,234 @@ administracaoView = function administracaoViewOverride() {
 
 function userEditorCard() {
   const sellerOptions = sellerPeopleOptions();
-  const userPasswordLabel = state.userEditor.id ? "Nova senha (opcional)" : "Senha inicial";
-  const userSubmitLabel = state.userEditor.id ? "Salvar ajustes do usuário" : "Salvar usuário";
-  const userTitle = state.userEditor.id ? "Editar usuário" : "Criar usuário";
-  const userRole = state.userEditor.role || "Administrador";
+  const profiles = accessProfiles();
+  const editor = state.userEditor;
+  const passwordLabel = editor.id ? "Nova senha (deixe vazio para manter)" : "Senha inicial";
+  const submitLabel = editor.id ? "Salvar ajustes" : "Criar usuário";
+  const title = editor.id ? `Editar usuário: ${escapeHtml(editor.username)}` : "Novo usuário";
+  const scope = selectedUserProfileScope();
+  const chosen = accessProfileById(editor.profileId);
+  const scopeInfo = (state.admin?.dataScopes || []).find((s) => s.id === scope);
+
   return `
-        <div class="form-card">
-          <div class="section-title"><div><h3>Usuários</h3><div class="text-small">Criar e ajustar acesso: vendedor, gerente, analista e administrador.</div></div></div>
-          <form onsubmit="saveUser(event)" class="stack">
-            <input id="user-id" type="hidden" value="${escapeHtml(state.userEditor.id)}" />
-            <strong>${userTitle}</strong>
-            <div class="two-column-form">
-              <div class="field"><label>Usuário</label><input id="user-username" value="${escapeHtml(state.userEditor.username)}" oninput="state.userEditor.username=this.value" required /></div>
-              <div class="field"><label>Nome completo</label><input id="user-full-name" value="${escapeHtml(state.userEditor.fullName)}" oninput="state.userEditor.fullName=this.value" required /></div>
-              <div class="field"><label>Perfil</label><select id="user-role" onchange="setUserRole(this.value)"><option ${userRole === "Administrador" ? "selected" : ""}>Administrador</option><option ${userRole === "Gerente" ? "selected" : ""}>Gerente</option><option ${userRole === "Analista" ? "selected" : ""}>Analista</option><option ${userRole === "Vendedor" ? "selected" : ""}>Vendedor</option></select></div>
-              ${userRole === "Vendedor"
-                ? `<div class="field"><label>Pessoa vinculada</label><select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value"><option value="">Selecione</option>${sellerOptions.map((person) => `<option value="${escapeHtml(person.person_name)}" ${state.userEditor.linkedPersonName === person.person_name ? "selected" : ""}>${escapeHtml(person.person_name)}${person.base_unit ? ` · ${escapeHtml(person.base_unit)}` : ""}</option>`).join("")}</select></div>`
-                : ""}
-              ${["Gerente", "Analista"].includes(userRole)
-                ? `<div class="field field-span-2"><label>Unidades vinculadas</label><div class="checkbox-grid">${(state.options.units || []).map((unit) => `<label class="checkbox-item"><input type="checkbox" ${state.userEditor.linkedUnits.includes(unit) ? "checked" : ""} onchange="toggleUserLinkedUnit('${unit}')" /><span>${escapeHtml(unit)}</span></label>`).join("")}</div></div>`
-                : ""}
-              <div class="field"><label>${userPasswordLabel}</label><input id="user-password" type="password" value="${escapeHtml(state.userEditor.password || "")}" oninput="state.userEditor.password=this.value" ${state.userEditor.id ? "" : "required"} /></div>
+    <div class="form-card" id="user-editor-card">
+      <div class="section-title">
+        <div><h3>${title}</h3>
+        <div class="text-small">O perfil define as telas que a pessoa acessa e o alcance dos dados.</div></div>
+        ${editor.id ? '<button class="btn btn-ghost btn-sm" type="button" onclick="cancelUserEdit()">Cancelar</button>' : ""}
+      </div>
+      <form onsubmit="saveUser(event)" class="stack">
+        <input id="user-id" type="hidden" value="${escapeHtml(editor.id)}" />
+        <div class="two-column-form">
+          <div class="field">
+            <label>Login</label>
+            <input id="user-username" value="${escapeHtml(editor.username)}" oninput="state.userEditor.username=this.value" required />
+          </div>
+          <div class="field">
+            <label>Nome completo</label>
+            <input id="user-full-name" value="${escapeHtml(editor.fullName)}" oninput="state.userEditor.fullName=this.value" required />
+          </div>
+          <div class="field field-span-2">
+            <label>Perfil de acesso</label>
+            <select id="user-profile" onchange="setUserProfile(this.value)" required>
+              <option value="">Selecione o perfil…</option>
+              ${profiles.map((p) => `<option value="${p.id}" ${String(editor.profileId) === String(p.id) ? "selected" : ""}>${escapeHtml(p.name)}</option>`).join("")}
+            </select>
+            ${chosen ? `<div class="text-small" style="margin-top:6px;color:var(--muted)">
+              ${escapeHtml(chosen.description || "")}
+              <br><strong>${chosen.modules.length} tela(s)</strong> · ${escapeHtml(scopeInfo ? scopeInfo.label : scope)}${chosen.canManageUsers ? " · pode gerenciar usuários" : ""}
+            </div>` : ""}
+          </div>
+          ${scope === "proprio" ? `
+          <div class="field field-span-2">
+            <label>Pessoa vinculada (vendedor) <span style="color:var(--bad)">*</span></label>
+            <select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value" required>
+              <option value="">Selecione…</option>
+              ${sellerOptions.map((p) => `<option value="${escapeHtml(p.person_name)}" ${editor.linkedPersonName === p.person_name ? "selected" : ""}>${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}</option>`).join("")}
+            </select>
+            <div class="text-small" style="margin-top:4px;color:var(--muted)">É por este vínculo que o sistema sabe quais clientes são desta pessoa.</div>
+          </div>` : ""}
+          ${["unidade", "unidade_consolidado"].includes(scope) ? `
+          <div class="field field-span-2">
+            <label>Unidades vinculadas <span style="color:var(--bad)">*</span></label>
+            <div class="checkbox-grid">
+              ${(state.options.units || []).map((unit) => `<label class="checkbox-item"><input type="checkbox" ${editor.linkedUnits.includes(unit) ? "checked" : ""} onchange="toggleUserLinkedUnit('${unit}')" /><span>${escapeHtml(unit)}</span></label>`).join("")}
             </div>
-            <div class="actions">
-              <button class="btn btn-primary" type="submit">${userSubmitLabel}</button>
-              ${state.userEditor.id ? '<button class="btn btn-ghost" type="button" onclick="cancelUserEdit()">Cancelar edição</button>' : ""}
-            </div>
-          </form>
+          </div>` : ""}
+          <div class="field field-span-2">
+            <label>${passwordLabel}</label>
+            <input id="user-password" type="password" value="${escapeHtml(editor.password || "")}" oninput="state.userEditor.password=this.value" ${editor.id ? "" : "required"} />
+          </div>
         </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">${submitLabel}</button>
+          ${editor.id ? '<button class="btn btn-ghost" type="button" onclick="cancelUserEdit()">Cancelar edição</button>' : ""}
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function profileEditorCard() {
+  const editor = state.profileEditor;
+  const modules = state.admin?.accessModules || [];
+  const scopes = state.admin?.dataScopes || [];
+  const groups = [...new Set(modules.map((m) => m.group))];
+  const title = editor.id ? `Editar perfil: ${escapeHtml(editor.name)}` : "Novo perfil";
+
+  return `
+    <div class="form-card" id="profile-editor-card">
+      <div class="section-title">
+        <div><h3>${title}</h3>
+        <div class="text-small">Marque as telas que este perfil acessa e defina o alcance dos dados.</div></div>
+        ${editor.id ? '<button class="btn btn-ghost btn-sm" type="button" onclick="cancelProfileEdit()">Cancelar</button>' : ""}
+      </div>
+      <form onsubmit="saveProfile(event)" class="stack">
+        <div class="two-column-form">
+          <div class="field">
+            <label>Nome do perfil</label>
+            <input value="${escapeHtml(editor.name)}" oninput="state.profileEditor.name=this.value"
+              ${editor.isSystem ? "readonly title='Perfil padrão do sistema — o nome não pode mudar'" : ""} required />
+            ${editor.isSystem ? '<div class="text-small" style="margin-top:4px;color:var(--muted)">Perfil padrão: pode editar telas e escopo, mas não renomear nem excluir.</div>' : ""}
+          </div>
+          <div class="field">
+            <label>Descrição</label>
+            <input value="${escapeHtml(editor.description)}" oninput="state.profileEditor.description=this.value" placeholder="Para que serve este perfil" />
+          </div>
+          <div class="field field-span-2">
+            <label>Alcance dos dados</label>
+            <select onchange="state.profileEditor.dataScope=this.value; requestRender()">
+              ${scopes.map((s) => `<option value="${s.id}" ${editor.dataScope === s.id ? "selected" : ""}>${escapeHtml(s.label)}</option>`).join("")}
+            </select>
+            ${(() => { const s = scopes.find((x) => x.id === editor.dataScope); return s ? `<div class="text-small" style="margin-top:4px;color:var(--muted)">${escapeHtml(s.hint)}</div>` : ""; })()}
+          </div>
+          <div class="field field-span-2">
+            <label class="checkbox-item" style="cursor:pointer">
+              <input type="checkbox" ${editor.canManageUsers ? "checked" : ""}
+                onchange="state.profileEditor.canManageUsers=this.checked; requestRender()" />
+              <span>Pode criar e editar usuários e perfis</span>
+            </label>
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Telas acessíveis <span class="soft-badge">${(editor.modules || []).length} selecionada(s)</span></label>
+          ${groups.map((group) => {
+            const groupModules = modules.filter((m) => m.group === group);
+            const allOn = groupModules.every((m) => (editor.modules || []).includes(m.id));
+            return `
+              <div style="margin-top:10px">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+                  <strong style="font-size:12px;color:var(--muted);letter-spacing:0.04em">${escapeHtml(group.toUpperCase())}</strong>
+                  <button type="button" class="btn btn-ghost btn-sm" onclick="toggleProfileModuleGroup('${escapeHtml(group)}')">${allOn ? "Desmarcar todas" : "Marcar todas"}</button>
+                </div>
+                <div class="checkbox-grid">
+                  ${groupModules.map((m) => `
+                    <label class="checkbox-item">
+                      <input type="checkbox" ${(editor.modules || []).includes(m.id) ? "checked" : ""} onchange="toggleProfileModule('${m.id}')" />
+                      <span>${escapeHtml(m.label)}</span>
+                    </label>`).join("")}
+                </div>
+              </div>`;
+          }).join("")}
+        </div>
+
+        <div class="actions">
+          <button class="btn btn-primary" type="submit">${editor.id ? "Salvar perfil" : "Criar perfil"}</button>
+          ${editor.id ? '<button class="btn btn-ghost" type="button" onclick="cancelProfileEdit()">Cancelar</button>' : ""}
+        </div>
+      </form>
+    </div>
+  `;
+}
+
+function acessosView() {
+  if (!state.admin) return `<div class="loader panel">Carregando usuários e perfis...</div>`;
+  if (!userCanManageUsers()) {
+    return `<div class="message">Seu perfil não permite gerenciar usuários. Fale com o Diretor ou Administrador.</div>`;
+  }
+  const users = state.admin.users || [];
+  const profiles = accessProfiles();
+  const scopes = state.admin.dataScopes || [];
+  const scopeLabel = (id) => (scopes.find((s) => s.id === id) || {}).label || id;
+  const usersByProfile = {};
+  users.forEach((u) => {
+    const key = u.profile_name || u.role || "—";
+    usersByProfile[key] = (usersByProfile[key] || 0) + 1;
+  });
+
+  return `
+    <div class="stack">
+      <div class="kpi-grid">
+        ${kpiCard("Usuários ativos", number(users.filter((u) => u.is_active).length), "Total cadastrado", number(users.length))}
+        ${kpiCard("Perfis", number(profiles.length), "Personalizados", number(profiles.filter((p) => !p.isSystem).length))}
+      </div>
+
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Usuários</h3><div class="text-small">Contas de acesso ao sistema.</div></div>
+          <button class="btn btn-primary btn-sm" onclick="cancelUserEdit()">+ Novo usuário</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Login</th><th>Nome</th><th>Perfil</th><th>Vínculo</th><th>Status</th><th style="text-align:right">Ações</th></tr></thead>
+            <tbody>
+              ${users.length ? users.map((row) => {
+                const profile = accessProfileById(row.profile_id) || profiles.find((p) => p.name === row.role);
+                const vinculo = row.linked_person_name
+                  ? escapeHtml(row.linked_person_name)
+                  : (row.linked_units_display ? escapeHtml(row.linked_units_display) : '<span style="color:var(--muted)">Toda a empresa</span>');
+                return `
+                <tr>
+                  <td><strong>${escapeHtml(row.username)}</strong></td>
+                  <td>${escapeHtml(row.full_name || "")}</td>
+                  <td><span class="soft-badge">${escapeHtml(row.profile_name || row.role || "—")}</span>
+                      ${profile ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(scopeLabel(profile.dataScope))}</div>` : ""}</td>
+                  <td class="text-small">${vinculo}</td>
+                  <td>${row.is_active ? '<span style="color:var(--good)">● Ativo</span>' : '<span style="color:var(--muted)">○ Inativo</span>'}</td>
+                  <td style="text-align:right;white-space:nowrap">
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="editUser(${Number(row.id)})">Editar</button>
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="startPasswordChange(${Number(row.id)})">Senha</button>
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="deleteUser(${Number(row.id)})">Excluir</button>
+                  </td>
+                </tr>`;
+              }).join("") : '<tr><td colspan="6" class="text-small">Nenhum usuário cadastrado.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      ${userEditorCard()}
+
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Perfis de acesso</h3><div class="text-small">Cada perfil define telas visíveis e alcance dos dados.</div></div>
+          <button class="btn btn-primary btn-sm" onclick="cancelProfileEdit()">+ Novo perfil</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Perfil</th><th>Telas</th><th>Alcance</th><th>Gerencia usuários</th><th>Usuários</th><th style="text-align:right">Ações</th></tr></thead>
+            <tbody>
+              ${profiles.map((p) => `
+                <tr>
+                  <td><strong>${escapeHtml(p.name)}</strong>${p.isSystem ? ' <span class="soft-badge">padrão</span>' : ""}
+                      ${p.description ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(p.description)}</div>` : ""}</td>
+                  <td>${p.modules.length}</td>
+                  <td class="text-small">${escapeHtml(scopeLabel(p.dataScope))}</td>
+                  <td>${p.canManageUsers ? "Sim" : "Não"}</td>
+                  <td>${number(usersByProfile[p.name] || 0)}</td>
+                  <td style="text-align:right;white-space:nowrap">
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="startProfileEdit(${Number(p.id)})">Editar</button>
+                    ${p.isSystem ? "" : `<button class="btn btn-ghost btn-sm" type="button" onclick="deleteProfile(${Number(p.id)})">Excluir</button>`}
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      ${profileEditorCard()}
+    </div>
   `;
 }
 
@@ -4529,7 +4781,8 @@ function topbarTitle() {
     "calendario":     { title: "Calendário Comercial",    description: "Feriados, dias úteis e distribuição mensal." },
     "importacoes":    { title: "Importações",             description: "Gestão de arquivos, pacotes e auditoria de dados." },
     "administracao":  { title: "Administração",           description: "Pendências, cadastros e integridade dos dados." },
-    "configuracoes":  { title: "Configurações",           description: "Usuários, metas, score e parâmetros operacionais." },
+    "configuracoes":  { title: "Configurações",           description: "Metas, score e parâmetros operacionais." },
+    "acessos":        { title: "Usuários e Perfis",       description: "Contas de acesso e permissões por perfil." },
     "crm-agenda":     { title: "Missão do Dia",            description: "Sua fila de 5 contatos. 1 oferta + 1 pergunta por cliente." },
     "meu-placar":     { title: "Meu Placar",              description: "Seus pontos, indicadores e premiação estimada do mês." },
     "placar-equipe":  { title: "Placar da Equipe",        description: "Ranking de vendedores, zonas de premiação e alertas." },
@@ -4697,7 +4950,8 @@ function dashboardView() {
   const opsTabs = [
     { id: "importacoes",   title: "Importações",    desc: "Arquivos e auditoria",    icon: "📥" },
     { id: "administracao", title: "Administração",  desc: "Pendências e cadastros",  icon: "⚙️" },
-    { id: "configuracoes", title: "Configurações",  desc: "Usuários e metas",        icon: "🔧" },
+    { id: "configuracoes", title: "Configurações",  desc: "Metas e parâmetros",      icon: "🔧" },
+    { id: "acessos",       title: "Usuários e Perfis", desc: "Contas e permissões",  icon: "🔑" },
   ].filter((t) => allowed.includes(t.id));
 
   const filtersLoading = Boolean(state.ui.loading.filters);
@@ -4789,6 +5043,7 @@ function dashboardView() {
           ${state.activeTab === "importacoes"   ? importacoesView()    : ""}
           ${state.activeTab === "administracao" ? administracaoView()  : ""}
           ${state.activeTab === "configuracoes" ? configuracoesView()  : ""}
+          ${state.activeTab === "acessos"       ? acessosView()        : ""}
         </div>
       </div>
       ${crmModalView()}
@@ -5030,22 +5285,118 @@ async function saveUser(event) {
   const username = (document.getElementById("user-username")?.value ?? editor.username ?? "").trim();
   const fullName = (document.getElementById("user-full-name")?.value ?? editor.fullName ?? "").trim();
   const password = document.getElementById("user-password")?.value ?? editor.password ?? "";
-  const role = editor.role || "Administrador";
+  const profile = accessProfileById(editor.profileId);
   if (!username || !fullName) { addMessage("error", "Informe o usuário e o nome completo."); return; }
+  if (!profile) { addMessage("error", "Selecione o perfil de acesso."); return; }
   if (!editor.id && !password) { addMessage("error", "Defina a senha inicial."); return; }
+
+  const scope = profile.dataScope;
+  const linkedPerson = scope === "proprio"
+    ? (document.getElementById("user-linked-person")?.value || editor.linkedPersonName || "")
+    : "";
+  const linkedUnits = ["unidade", "unidade_consolidado"].includes(scope) ? (editor.linkedUnits || []) : [];
+
+  if (scope === "proprio" && !linkedPerson) {
+    addMessage("error", "Este perfil exige vincular a pessoa (vendedor)."); return;
+  }
+  if (["unidade", "unidade_consolidado"].includes(scope) && !linkedUnits.length) {
+    addMessage("error", "Este perfil exige ao menos uma unidade vinculada."); return;
+  }
+
   const payload = {
     id: editor.id || undefined,
     username,
     full_name: fullName,
-    role,
-    linked_person_name: role === "Vendedor" ? (document.getElementById("user-linked-person")?.value || editor.linkedPersonName || "") : "",
-    linked_units: ["Gerente", "Analista"].includes(role) ? (editor.linkedUnits || []) : [],
+    profile_id: profile.id,
+    role: profile.name,
+    linked_person_name: linkedPerson,
+    linked_units: linkedUnits,
     password,
   };
   try {
     const result = await api("/api/admin/users", { method: "POST", body: JSON.stringify(payload) });
     addMessage("success", result.message || "Usuário salvo.");
     resetUserEditor();
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+// ─── Perfis de acesso ───────────────────────────────────────────────────────
+
+function startProfileEdit(profileId) {
+  const profile = accessProfileById(profileId);
+  if (!profile) return;
+  state.profileEditor = {
+    id: profile.id,
+    name: profile.name,
+    description: profile.description || "",
+    modules: [...(profile.modules || [])],
+    dataScope: profile.dataScope || "todos",
+    canManageUsers: Boolean(profile.canManageUsers),
+    isSystem: Boolean(profile.isSystem),
+  };
+  requestRender();
+  document.getElementById("profile-editor-card")?.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function cancelProfileEdit() {
+  resetProfileEditor();
+  requestRender();
+}
+
+function toggleProfileModule(moduleId) {
+  const list = state.profileEditor.modules || [];
+  state.profileEditor.modules = list.includes(moduleId)
+    ? list.filter((m) => m !== moduleId)
+    : [...list, moduleId];
+  requestRender();
+}
+
+function toggleProfileModuleGroup(group) {
+  const groupIds = (state.admin?.accessModules || []).filter((m) => m.group === group).map((m) => m.id);
+  const current = state.profileEditor.modules || [];
+  const allSelected = groupIds.every((id) => current.includes(id));
+  state.profileEditor.modules = allSelected
+    ? current.filter((id) => !groupIds.includes(id))
+    : Array.from(new Set([...current, ...groupIds]));
+  requestRender();
+}
+
+async function saveProfile(event) {
+  if (event) event.preventDefault();
+  const editor = state.profileEditor || {};
+  const name = (editor.name || "").trim();
+  if (!name) { addMessage("error", "Informe o nome do perfil."); return; }
+  if (!(editor.modules || []).length) { addMessage("error", "Selecione ao menos uma tela."); return; }
+  try {
+    const result = await api("/api/admin/profiles", {
+      method: "POST",
+      body: JSON.stringify({
+        id: editor.id || undefined,
+        name,
+        description: editor.description || "",
+        modules: editor.modules,
+        dataScope: editor.dataScope || "todos",
+        canManageUsers: Boolean(editor.canManageUsers),
+      }),
+    });
+    addMessage("success", result.message || "Perfil salvo.");
+    resetProfileEditor();
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function deleteProfile(profileId) {
+  const profile = accessProfileById(profileId);
+  if (!profile) return;
+  if (!confirm(`Excluir o perfil "${profile.name}"?`)) return;
+  try {
+    await api("/api/admin/profiles/delete", { method: "POST", body: JSON.stringify({ id: profileId }) });
+    addMessage("success", "Perfil excluído.");
     await loadAdmin();
   } catch (error) {
     addMessage("error", error.message);

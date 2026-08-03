@@ -199,6 +199,93 @@ UNIT_NORMALIZATION = {
     "XANGRILA": "XANGRILA",
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Módulos (telas) disponíveis para montar perfis de acesso.
+# A ordem aqui define a ordem de exibição na tela de perfis.
+# ─────────────────────────────────────────────────────────────────────────────
+ACCESS_MODULES: list[dict[str, str]] = [
+    # CRM
+    {"id": "crm-agenda",     "label": "Missão do Dia",      "group": "CRM"},
+    {"id": "crm-clientes",   "label": "Carteira",           "group": "CRM"},
+    {"id": "crm-tarefas",    "label": "Tarefas",            "group": "CRM"},
+    {"id": "crm-interacao",  "label": "Registrar interação","group": "CRM"},
+    {"id": "meu-placar",     "label": "Meu Placar",         "group": "CRM"},
+    {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
+    # Resultados
+    {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
+    {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
+    {"id": "unidades",       "label": "Unidades",           "group": "Resultados"},
+    {"id": "clientes",       "label": "Clientes",           "group": "Resultados"},
+    {"id": "cidades",        "label": "Cidades",            "group": "Resultados"},
+    {"id": "descontos",      "label": "Descontos",          "group": "Resultados"},
+    {"id": "calendario",     "label": "Calendário",         "group": "Resultados"},
+    # Operações
+    {"id": "importacoes",    "label": "Importações",        "group": "Operações"},
+    {"id": "administracao",  "label": "Administração",      "group": "Operações"},
+    {"id": "configuracoes",  "label": "Configurações",      "group": "Operações"},
+    {"id": "acessos",        "label": "Usuários e Perfis",  "group": "Operações"},
+]
+ACCESS_MODULE_IDS = {m["id"] for m in ACCESS_MODULES}
+
+# Escopo de dados que o perfil enxerga
+DATA_SCOPES: list[dict[str, str]] = [
+    {"id": "todos", "label": "Todas as unidades",
+     "hint": "Sem restrição — enxerga a empresa inteira."},
+    {"id": "unidade_consolidado", "label": "Unidades vinculadas + consolidado",
+     "hint": "Detalhe das unidades do usuário e também os totais da empresa para comparação."},
+    {"id": "unidade", "label": "Somente unidades vinculadas",
+     "hint": "Restrito às unidades do usuário. Não vê outras unidades nem o consolidado."},
+    {"id": "proprio", "label": "Somente a própria carteira",
+     "hint": "Vendedor: enxerga apenas os próprios clientes e resultados."},
+]
+DATA_SCOPE_IDS = {s["id"] for s in DATA_SCOPES}
+
+# Perfis criados automaticamente na primeira execução. is_system impede exclusão,
+# mas o conteúdo (telas/escopo) continua editável pela tela.
+DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
+    {
+        "name": "Diretor",
+        "description": "Acesso total, incluindo gestão de usuários e perfis.",
+        "modules": [m["id"] for m in ACCESS_MODULES],
+        "data_scope": "todos",
+        "can_manage_users": 1,
+    },
+    {
+        "name": "Administrador",
+        "description": "Acesso total, incluindo gestão de usuários e perfis.",
+        "modules": [m["id"] for m in ACCESS_MODULES],
+        "data_scope": "todos",
+        "can_manage_users": 1,
+    },
+    {
+        "name": "Gerente",
+        "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
+        "modules": [
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe",
+            "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
+        ],
+        "data_scope": "unidade_consolidado",
+        "can_manage_users": 0,
+    },
+    {
+        "name": "Analista",
+        "description": "Consulta de resultados e apoio a importações.",
+        "modules": [
+            "crm-clientes", "executivo", "vendedores", "unidades", "clientes",
+            "cidades", "descontos", "calendario", "importacoes",
+        ],
+        "data_scope": "todos",
+        "can_manage_users": 0,
+    },
+    {
+        "name": "Vendedor",
+        "description": "Rotina diária de vendas: missão do dia, carteira própria e placar.",
+        "modules": ["crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "meu-placar", "calendario"],
+        "data_scope": "proprio",
+        "can_manage_users": 0,
+    },
+]
+
 CSV_FILE_TYPES = {
     "030-relatorioFaturamento detalhado.csv": "faturamento_detalhado",
     "030-relatorioCustoVenda vendedor consolidado.csv": "custo_vendedor",
@@ -892,6 +979,186 @@ def audit_log(conn: sqlite3.Connection, company_id: int, user_id: int | None, ac
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Perfis de acesso
+# ─────────────────────────────────────────────────────────────────────────────
+
+def normalize_module_list(value: Any) -> list[str]:
+    """Aceita lista ou JSON e devolve só ids de módulo válidos, na ordem canônica."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except json.JSONDecodeError:
+            value = []
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    wanted = {normalize_whitespace(str(v)) for v in value}
+    return [m["id"] for m in ACCESS_MODULES if m["id"] in wanted]
+
+
+def seed_access_profiles(conn: sqlite3.Connection, company_id: int) -> None:
+    """Cria os perfis base uma única vez e vincula usuários existentes pelo nome do papel."""
+    for spec in DEFAULT_ACCESS_PROFILES:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO access_profiles
+                (company_id, name, description, modules_json, data_scope, can_manage_users, is_system, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                company_id,
+                spec["name"],
+                spec["description"],
+                json.dumps(spec["modules"], ensure_ascii=False),
+                spec["data_scope"],
+                spec["can_manage_users"],
+                now_iso(),
+            ),
+        )
+    conn.commit()
+    # Usuários criados antes dos perfis: liga cada um ao perfil de mesmo nome do role
+    conn.execute(
+        """
+        UPDATE users
+        SET profile_id = (
+            SELECT p.id FROM access_profiles p
+            WHERE p.company_id = users.company_id AND p.name = users.role
+        )
+        WHERE profile_id IS NULL
+          AND EXISTS (
+            SELECT 1 FROM access_profiles p
+            WHERE p.company_id = users.company_id AND p.name = users.role
+          )
+        """
+    )
+    conn.commit()
+
+
+def access_profile_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "description": row["description"] or "",
+        "modules": normalize_module_list(row["modules_json"]),
+        "dataScope": row["data_scope"] or "todos",
+        "canManageUsers": bool(row["can_manage_users"]),
+        "isSystem": bool(row["is_system"]),
+    }
+
+
+def list_access_profiles(conn: sqlite3.Connection, company_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM access_profiles WHERE company_id = ? ORDER BY is_system DESC, name",
+        (company_id,),
+    ).fetchall()
+    return [access_profile_row_to_dict(r) for r in rows]
+
+
+def get_access_profile_for_user(conn: sqlite3.Connection, user: Any) -> dict[str, Any] | None:
+    """Perfil do usuário. Se não houver vínculo, cai no perfil de mesmo nome do role."""
+    profile_id = None
+    try:
+        profile_id = user["profile_id"]
+    except (KeyError, IndexError, TypeError):
+        profile_id = None
+    row = None
+    if profile_id:
+        row = conn.execute(
+            "SELECT * FROM access_profiles WHERE id = ? AND company_id = ?",
+            (profile_id, user["company_id"]),
+        ).fetchone()
+    if row is None:
+        row = conn.execute(
+            "SELECT * FROM access_profiles WHERE company_id = ? AND name = ?",
+            (user["company_id"], user["role"]),
+        ).fetchone()
+    return access_profile_row_to_dict(row) if row else None
+
+
+def upsert_access_profile(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    name = normalize_whitespace(payload.get("name"))
+    if not name:
+        raise ValueError("Nome do perfil é obrigatório.")
+    modules = normalize_module_list(payload.get("modules"))
+    if not modules:
+        raise ValueError("Selecione ao menos uma tela para o perfil.")
+    data_scope = normalize_whitespace(payload.get("dataScope")) or "todos"
+    if data_scope not in DATA_SCOPE_IDS:
+        raise ValueError("Escopo de dados inválido.")
+    can_manage = 1 if payload.get("canManageUsers") else 0
+    description = normalize_whitespace(payload.get("description"))
+    profile_id = payload.get("id")
+
+    if profile_id:
+        existing = conn.execute(
+            "SELECT * FROM access_profiles WHERE id = ? AND company_id = ?", (profile_id, company_id)
+        ).fetchone()
+        if not existing:
+            raise ValueError("Perfil não encontrado.")
+        # Perfis de sistema podem ser editados, mas não renomeados (usuários referenciam pelo nome)
+        if existing["is_system"] and name != existing["name"]:
+            raise ValueError(f"O perfil '{existing['name']}' é padrão do sistema e não pode ser renomeado.")
+        conn.execute(
+            """
+            UPDATE access_profiles
+            SET name = ?, description = ?, modules_json = ?, data_scope = ?,
+                can_manage_users = ?, updated_at = ?
+            WHERE id = ? AND company_id = ?
+            """,
+            (name, description, json.dumps(modules, ensure_ascii=False), data_scope,
+             can_manage, now_iso(), profile_id, company_id),
+        )
+        audit_log(conn, company_id, user_id, "editar", "access_profiles", str(profile_id),
+                  {"name": name, "modules": len(modules), "dataScope": data_scope})
+        created = False
+    else:
+        duplicate = conn.execute(
+            "SELECT id FROM access_profiles WHERE company_id = ? AND name = ?", (company_id, name)
+        ).fetchone()
+        if duplicate:
+            raise ValueError(f"Já existe um perfil chamado '{name}'.")
+        cursor = conn.execute(
+            """
+            INSERT INTO access_profiles
+                (company_id, name, description, modules_json, data_scope, can_manage_users, is_system, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (company_id, name, description, json.dumps(modules, ensure_ascii=False),
+             data_scope, can_manage, now_iso()),
+        )
+        profile_id = cursor.lastrowid
+        audit_log(conn, company_id, user_id, "criar", "access_profiles", str(profile_id),
+                  {"name": name, "modules": len(modules), "dataScope": data_scope})
+        created = True
+    return {"id": profile_id, "created": created}
+
+
+def delete_access_profile(conn: sqlite3.Connection, company_id: int, user_id: int, profile_id: Any) -> None:
+    row = conn.execute(
+        "SELECT * FROM access_profiles WHERE id = ? AND company_id = ?", (profile_id, company_id)
+    ).fetchone()
+    if not row:
+        raise ValueError("Perfil não encontrado.")
+    if row["is_system"]:
+        raise ValueError(f"O perfil '{row['name']}' é padrão do sistema e não pode ser excluído.")
+    in_use = conn.execute(
+        "SELECT COUNT(*) AS n FROM users WHERE company_id = ? AND profile_id = ?", (company_id, profile_id)
+    ).fetchone()["n"]
+    if in_use:
+        raise ValueError(f"Há {in_use} usuário(s) usando este perfil. Troque o perfil deles antes de excluir.")
+    conn.execute("DELETE FROM access_profiles WHERE id = ? AND company_id = ?", (profile_id, company_id))
+    audit_log(conn, company_id, user_id, "excluir", "access_profiles", str(profile_id), {"name": row["name"]})
+
+
+def user_can_manage_users(conn: sqlite3.Connection, user: Any) -> bool:
+    profile = get_access_profile_for_user(conn, user)
+    if profile:
+        return profile["canManageUsers"]
+    return user["role"] in {"Administrador", "Diretor"}
+
+
 def init_db() -> None:
     ensure_dirs()
     with closing(get_connection()) as conn:
@@ -929,6 +1196,22 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 FOREIGN KEY (user_id) REFERENCES users(id)
+            );
+
+            -- Perfis de acesso configuráveis pela tela (antes as permissões eram fixas no código)
+            CREATE TABLE IF NOT EXISTS access_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                modules_json TEXT NOT NULL DEFAULT '[]',
+                data_scope TEXT NOT NULL DEFAULT 'todos',
+                can_manage_users INTEGER NOT NULL DEFAULT 0,
+                is_system INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, name),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
             );
 
             CREATE TABLE IF NOT EXISTS people_records (
@@ -1220,6 +1503,9 @@ def init_db() -> None:
         if "linked_units_json" not in user_columns:
             conn.execute("ALTER TABLE users ADD COLUMN linked_units_json TEXT")
             conn.commit()
+        if "profile_id" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN profile_id INTEGER")
+            conn.commit()
         try:
             conn.execute("UPDATE fact_vendor_summary SET margin_value = margin_value / 100 WHERE margin_value > 100")
             conn.execute("UPDATE fact_unit_summary SET margin_value = margin_value / 100 WHERE margin_value > 100")
@@ -1233,6 +1519,8 @@ def init_db() -> None:
             conn.commit()
             company = conn.execute("SELECT id FROM companies WHERE name = ?", (DEFAULT_COMPANY,)).fetchone()
         company_id = company["id"]
+
+        seed_access_profiles(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -2617,35 +2905,68 @@ def active_mapped_cities_for_units(conn: sqlite3.Connection, company_id: int, un
     return [row["city_name"] for row in rows if row["city_name"]]
 
 
+def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
+    """Escopo de dados vindo do perfil, com fallback pelo nome do papel (legado)."""
+    profile = get_access_profile_for_user(conn, user)
+    if profile:
+        return profile["dataScope"]
+    if user["role"] == "Vendedor":
+        return "proprio"
+    if user["role"] in {"Gerente", "Analista"}:
+        return "unidade"
+    return "todos"
+
+
 def scoped_filters_for_user(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, filters: dict[str, str | None]) -> dict[str, str | None]:
     scoped = dict(filters)
-    if user["role"] == "Vendedor":
+    data_scope = data_scope_for_user(conn, user)
+
+    if data_scope == "todos":
+        return scoped
+
+    if data_scope == "proprio":
         seller_name = seller_identity_for_user(user)
         _, base_unit = current_role_and_unit(conn, company_id, seller_name, selected_primary_competence(scoped, query_competences(conn, company_id)) or date.today().strftime("%Y-%m"))
         scoped["seller_name"] = seller_name
-        if base_unit:
-            scoped["unit_name"] = normalize_unit(base_unit)
+        # Sempre sobrescreve a unidade pedida: o vendedor só enxerga a própria base.
+        # Sem unidade cadastrada, zera o filtro (o recorte por vendedor já delimita).
+        scoped["unit_name"] = normalize_unit(base_unit) if base_unit else None
         return scoped
-    if user["role"] in {"Gerente", "Analista"}:
-        linked_units = linked_units_for_user(user)
+
+    # unidade / unidade_consolidado
+    linked_units = linked_units_for_user(user)
+    if not linked_units:
+        scoped["unit_name"] = "__NO_ACCESS__"
+        scoped["city_name"] = None
+        scoped["seller_name"] = None
+        return scoped
+
+    requested_unit = normalize_unit(scoped.get("unit_name"))
+    requested_city = normalize_upper(scoped.get("city_name"))
+    requested_seller = normalize_whitespace(scoped.get("seller_name"))
+    competence = selected_primary_competence(scoped, query_competences(conn, company_id)) or date.today().strftime("%Y-%m")
+
+    # "unidade + consolidado": pode escolher "Todas" para ver o total da empresa,
+    # mas ao filtrar por uma unidade específica só valem as vinculadas a ele.
+    if data_scope == "unidade_consolidado":
+        scoped["allowed_units"] = []
+        if requested_unit:
+            scoped["unit_name"] = requested_unit if requested_unit in linked_units else linked_units[0]
+    else:
         scoped["allowed_units"] = linked_units
-        requested_unit = normalize_unit(scoped.get("unit_name"))
-        requested_city = normalize_upper(scoped.get("city_name"))
-        requested_seller = normalize_whitespace(scoped.get("seller_name"))
-        competence = selected_primary_competence(scoped, query_competences(conn, company_id)) or date.today().strftime("%Y-%m")
-        if linked_units:
-            if requested_unit:
-                scoped["unit_name"] = requested_unit if requested_unit in linked_units else linked_units[0]
-            valid_cities = set(active_mapped_cities_for_units(conn, company_id, [scoped.get("unit_name")] if scoped.get("unit_name") else linked_units))
-            if requested_city and requested_city not in valid_cities:
-                scoped["city_name"] = None
-            if requested_seller:
-                _, seller_base_unit = current_role_and_unit(conn, company_id, requested_seller, competence)
-                if normalize_unit(seller_base_unit) not in linked_units:
-                    scoped["seller_name"] = None
-        else:
-            scoped["unit_name"] = "__NO_ACCESS__"
+        scoped["unit_name"] = (
+            requested_unit if requested_unit in linked_units else (requested_unit and linked_units[0]) or None
+        )
+
+    # Cidade e vendedor pedidos precisam pertencer ao escopo permitido
+    scope_units = [scoped["unit_name"]] if scoped.get("unit_name") else linked_units
+    if requested_city:
+        valid_cities = set(active_mapped_cities_for_units(conn, company_id, scope_units))
+        if requested_city not in valid_cities:
             scoped["city_name"] = None
+    if requested_seller:
+        _, seller_base_unit = current_role_and_unit(conn, company_id, requested_seller, competence)
+        if normalize_unit(seller_base_unit) not in linked_units:
             scoped["seller_name"] = None
     return scoped
 
@@ -6069,8 +6390,15 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         item["linked_units"] = linked_units
         item["linked_units_display"] = ", ".join(linked_units)
         users.append(item)
+    profiles = list_access_profiles(conn, company_id)
+    profile_name_by_id = {p["id"]: p["name"] for p in profiles}
+    for item in users:
+        item["profile_name"] = profile_name_by_id.get(item.get("profile_id")) or item.get("role") or ""
     return {
         "users": users,
+        "profiles": profiles,
+        "accessModules": ACCESS_MODULES,
+        "dataScopes": DATA_SCOPES,
         "clients": [dict(row) for row in conn.execute("SELECT * FROM client_registry WHERE company_id = ? ORDER BY updated_at DESC, client_name LIMIT 300", (company_id,)).fetchall()],
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
         "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
@@ -6460,20 +6788,46 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
     """Cria ou atualiza um usuário. Faz o hash da senha quando informada."""
     username = normalize_whitespace(payload.get("username"))
     full_name = normalize_whitespace(payload.get("full_name"))
-    role = normalize_whitespace(payload.get("role")) or "Administrador"
-    if role not in ALLOWED_USER_ROLES:
-        raise ValueError("Perfil inválido.")
     if not username or not full_name:
         raise ValueError("Informe o usuário e o nome completo.")
+
+    # O perfil é a fonte de verdade das permissões. A coluna `role` é mantida em
+    # sincronia com o NOME do perfil para compatibilidade com o código legado.
+    profile_id = payload.get("profile_id") or None
+    profile_row = None
+    if profile_id:
+        profile_row = conn.execute(
+            "SELECT * FROM access_profiles WHERE id = ? AND company_id = ?", (profile_id, company_id)
+        ).fetchone()
+        if not profile_row:
+            raise ValueError("Perfil selecionado não existe.")
+        role = profile_row["name"]
+    else:
+        role = normalize_whitespace(payload.get("role")) or "Administrador"
+        profile_row = conn.execute(
+            "SELECT * FROM access_profiles WHERE company_id = ? AND name = ?", (company_id, role)
+        ).fetchone()
+        if not profile_row:
+            raise ValueError("Selecione um perfil de acesso.")
+        profile_id = profile_row["id"]
+
+    data_scope = profile_row["data_scope"] or "todos"
     linked_person = normalize_whitespace(payload.get("linked_person_name")) or None
     linked_units_raw = payload.get("linked_units") or []
     if not isinstance(linked_units_raw, list):
         linked_units_raw = []
     linked_units = [normalize_unit(u) for u in linked_units_raw if u]
-    if role == "Vendedor":
+
+    # Escopo "próprio" exige vínculo com a pessoa; escopos por unidade exigem unidades.
+    if data_scope == "proprio":
         linked_units = []
+        if not linked_person:
+            raise ValueError("Perfis com escopo 'própria carteira' exigem a pessoa vinculada.")
     else:
         linked_person = None
+        if data_scope in {"unidade", "unidade_consolidado"} and not linked_units:
+            raise ValueError("Este perfil exige ao menos uma unidade vinculada.")
+
     linked_units_json = json.dumps(linked_units, ensure_ascii=False) if linked_units else None
     password = (payload.get("password") or "").strip()
     user_id = payload.get("id")
@@ -6486,8 +6840,8 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
         if dup:
             raise ValueError("Já existe um usuário com esse login.")
         conn.execute(
-            "UPDATE users SET username = ?, full_name = ?, role = ?, linked_person_name = ?, linked_units_json = ? WHERE company_id = ? AND id = ?",
-            (username, full_name, role, linked_person, linked_units_json, company_id, user_id),
+            "UPDATE users SET username = ?, full_name = ?, role = ?, profile_id = ?, linked_person_name = ?, linked_units_json = ? WHERE company_id = ? AND id = ?",
+            (username, full_name, role, profile_id, linked_person, linked_units_json, company_id, user_id),
         )
         if password:
             pwd_hash, salt = pbkdf2_hash(password)
@@ -6502,8 +6856,8 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
         raise ValueError("Já existe um usuário com esse login.")
     pwd_hash, salt = pbkdf2_hash(password)
     cur = conn.execute(
-        "INSERT INTO users (company_id, username, full_name, linked_person_name, linked_units_json, password_hash, password_salt, role, is_active, created_at) VALUES (?,?,?,?,?,?,?,?,1,?)",
-        (company_id, username, full_name, linked_person, linked_units_json, pwd_hash, salt, role, now_iso()),
+        "INSERT INTO users (company_id, username, full_name, linked_person_name, linked_units_json, password_hash, password_salt, role, profile_id, is_active, created_at) VALUES (?,?,?,?,?,?,?,?,?,1,?)",
+        (company_id, username, full_name, linked_person, linked_units_json, pwd_hash, salt, role, profile_id, now_iso()),
     )
     audit_log(conn, company_id, actor_user_id, "criar", "users", str(cur.lastrowid), {"username": username, "role": role})
     return {"id": cur.lastrowid, "created": True}
@@ -7411,12 +7765,40 @@ class AppHandler(BaseHTTPRequestHandler):
             return None
         return user
 
+    # Módulos que caracterizam a área administrativa — basta ter um deles no perfil
+    _ADMIN_AREA_MODULES = {"configuracoes", "administracao", "importacoes", "acessos"}
+
     def _require_admin_area(self, user: dict[str, Any] | None) -> bool:
         if not user:
             return False
+        with closing(get_connection()) as conn:
+            profile = get_access_profile_for_user(conn, user)
+        if profile is not None:
+            if not (set(profile["modules"]) & self._ADMIN_AREA_MODULES):
+                self._set_headers(403)
+                self.wfile.write(json_dumps(
+                    {"error": f"O perfil '{profile['name']}' não tem acesso à área administrativa."}
+                ))
+                return False
+            return True
+        # Sem perfil cadastrado: mantém a regra antiga
         if user["role"] == "Vendedor":
             self._set_headers(403)
             self.wfile.write(json_dumps({"error": "Perfil sem acesso a area administrativa"}))
+            return False
+        return True
+
+    def _require_user_management(self, user: dict[str, Any] | None) -> bool:
+        """Gestão de usuários e perfis é restrita a quem tem a permissão no perfil."""
+        if not user:
+            return False
+        with closing(get_connection()) as conn:
+            allowed = user_can_manage_users(conn, user)
+        if not allowed:
+            self._set_headers(403)
+            self.wfile.write(json_dumps(
+                {"error": "Seu perfil não permite gerenciar usuários. Fale com o Diretor ou Administrador."}
+            ))
             return False
         return True
 
@@ -7481,6 +7863,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(200)
                     self.wfile.write(json_dumps({"authenticated": False}))
                     return
+                with closing(get_connection()) as conn:
+                    profile = get_access_profile_for_user(conn, user)
                 self._set_headers(200)
                 self.wfile.write(
                     json_dumps(
@@ -7492,6 +7876,11 @@ class AppHandler(BaseHTTPRequestHandler):
                                 "linkedPersonName": user["linked_person_name"],
                                 "linkedUnits": linked_units_for_user(user),
                                 "role": user["role"],
+                                # Permissões vindas do perfil — a tela usa isso para montar o menu
+                                "profileName": profile["name"] if profile else user["role"],
+                                "modules": profile["modules"] if profile else [],
+                                "dataScope": profile["dataScope"] if profile else "todos",
+                                "canManageUsers": profile["canManageUsers"] if profile else False,
                             },
                         }
                     )
@@ -7964,11 +8353,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": "Metodo nao permitido"}))
                     return
             if path == "/api/admin/all":
+                # Payload usado por várias telas (pessoas, metas, mapeamentos). Perfis sem
+                # gestão de usuários recebem a versão sem dados sensíveis.
                 user = self._require_auth()
-                if not user or not self._require_admin_area(user):
+                if not user:
                     return
                 with closing(get_connection()) as conn:
+                    if data_scope_for_user(conn, user) == "proprio":
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Perfil sem acesso a esses dados."}))
+                        return
                     data = list_admin_data(conn, user["company_id"])
+                    if not user_can_manage_users(conn, user):
+                        for sensitive in ("users", "profiles", "audit"):
+                            data[sensitive] = []
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
                 return
@@ -8051,6 +8449,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     expires_at = (datetime.now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat(timespec="seconds")
                     conn.execute("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", (session_id, user["id"], now_iso(), expires_at))
                     conn.commit()
+                    profile = get_access_profile_for_user(conn, user)
                 headers = {"Set-Cookie": f"{SESSION_COOKIE}={session_id}; HttpOnly; Path=/; SameSite=Lax"}
                 self._set_headers(200, extra_headers=headers)
                 self.wfile.write(
@@ -8063,6 +8462,10 @@ class AppHandler(BaseHTTPRequestHandler):
                                 "linkedPersonName": user["linked_person_name"],
                                 "linkedUnits": linked_units_for_user(user),
                                 "role": user["role"],
+                                "profileName": profile["name"] if profile else user["role"],
+                                "modules": profile["modules"] if profile else [],
+                                "dataScope": profile["dataScope"] if profile else "todos",
+                                "canManageUsers": profile["canManageUsers"] if profile else False,
                             },
                         }
                     )
@@ -8456,9 +8859,50 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/admin/profiles":
+                user = self._require_auth()
+                if not user or not self._require_user_management(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        res = upsert_access_profile(conn, user["company_id"], user["id"], payload)
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({
+                        "message": "Perfil criado." if res.get("created") else "Perfil atualizado.",
+                        **res,
+                    }))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/profiles/delete":
+                user = self._require_auth()
+                if not user or not self._require_user_management(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        delete_access_profile(conn, user["company_id"], user["id"], payload.get("id"))
+                        conn.commit()
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Perfil excluído."}))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/admin/users":
                 user = self._require_auth()
-                if not user or not self._require_admin_area(user):
+                if not user or not self._require_user_management(user):
                     return
                 payload = self._read_json()
                 try:
@@ -8474,7 +8918,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/admin/users/password":
                 user = self._require_auth()
-                if not user or not self._require_admin_area(user):
+                if not user or not self._require_user_management(user):
                     return
                 payload = self._read_json()
                 try:
@@ -8490,7 +8934,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/admin/users/delete":
                 user = self._require_auth()
-                if not user or not self._require_admin_area(user):
+                if not user or not self._require_user_management(user):
                     return
                 payload = self._read_json()
                 try:
