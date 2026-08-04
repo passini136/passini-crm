@@ -153,6 +153,8 @@ const state = {
     modal: null,
     teamActivity: null,
     missionUnit: "",   // filtro de unidade da Missão do Dia (diretor/admin)
+    unassigned: null,  // clientes recorrentes sem vendedor
+    unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
     editingVacation: null,
@@ -1113,6 +1115,8 @@ function sellerRows(rows) {
         <td>${pct(row.projectedGoalAttainmentPct || 0)}</td>
         <td>${currency(row.ticketAverage)}</td>
         <td>${number(row.distinctClients)}</td>
+        <td>${number(row.ownClients || 0)}</td>
+        <td>${number(row.otherClients || 0)}</td>
         <td>${number(row.mixSku)}</td>
         <td>${currency(row.returnsValue)}</td>
         <td>${pct(row.returnRatioPct)}</td>
@@ -1187,6 +1191,9 @@ async function refreshCurrentTab() {
   }
   if (tab === "importacoes") {
     promises.push(loadAutoImportStatus(), loadAdmin());
+  }
+  if (tab === "sem-vendedor") {
+    promises.push(loadUnassignedClients());
   }
   if (tab === "administracao" || tab === "configuracoes" || tab === "acessos") {
     promises.push(loadAdmin());
@@ -1418,6 +1425,11 @@ function vendedoresView() {
                   <div>
                     <span>Clientes</span>
                     <strong>${number(row.distinctClients)}</strong>
+                    ${(row.ownClients != null || row.otherClients != null) ? `
+                      <div style="font-size:10px;color:var(--muted);margin-top:2px;line-height:1.4">
+                        <span style="color:var(--good)">${number(row.ownClients || 0)} carteira</span> ·
+                        <span style="color:#e67e22">${number(row.otherClients || 0)} fora</span>
+                      </div>` : ""}
                   </div>
                   <div>
                     <span>Mix</span>
@@ -2978,6 +2990,98 @@ async function copyLibraryText(id) {
   }
 }
 
+// ─── Clientes recorrentes sem vendedor ──────────────────────────────────────
+
+async function loadUnassignedClients() {
+  const f = state.crm.unassignedFilters || {};
+  try {
+    const qs = new URLSearchParams();
+    if (f.minMonths) qs.set("minMonths", f.minMonths);
+    if (f.window) qs.set("window", f.window);
+    state.crm.unassigned = await api(`/api/crm/unassigned-clients?${qs.toString()}`);
+  } catch (e) {
+    state.crm.unassigned = { error: e.message, items: [], total: 0 };
+  }
+  requestRender();
+}
+
+function semVendedorView() {
+  const data = state.crm.unassigned;
+  if (!data) { loadUnassignedClients(); return `<div class="loader panel">Buscando clientes sem vendedor…</div>`; }
+  if (data.error) return `<div class="message error">${escapeHtml(data.error)}</div>`;
+
+  const f = state.crm.unassignedFilters || { minMonths: 2, window: 6 };
+  const items = data.items || [];
+  const c = data.criteria || {};
+
+  return `
+    <div class="stack">
+      <div class="kpi-grid">
+        ${kpiCard("Clientes sem dono", number(data.total), "Faturamento envolvido", currency(data.totalRevenue || 0))}
+        ${kpiCard("Critério", `${c.minMonths || 2}+ meses`, "Janela analisada", `${escapeHtml(c.windowStart || "")} a ${escapeHtml(c.windowEnd || "")}`)}
+      </div>
+
+      <div class="form-card" style="padding:12px 18px">
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end">
+          <div class="field" style="min-width:150px">
+            <label>Compraram em pelo menos</label>
+            <select onchange="state.crm.unassignedFilters.minMonths=this.value;loadUnassignedClients()">
+              ${[2,3,4,6].map((v) => `<option value="${v}" ${String(f.minMonths) === String(v) ? "selected" : ""}>${v} meses</option>`).join("")}
+            </select>
+          </div>
+          <div class="field" style="min-width:150px">
+            <label>Janela de análise</label>
+            <select onchange="state.crm.unassignedFilters.window=this.value;loadUnassignedClients()">
+              ${[3,6,12].map((v) => `<option value="${v}" ${String(f.window) === String(v) ? "selected" : ""}>últimos ${v} meses</option>`).join("")}
+            </select>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="loadUnassignedClients()">↻ Atualizar</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Clientes que compram com frequência mas não têm vendedor no cadastro do CRM.
+          Sem dono definido, ninguém previne a perda. Use a coluna "Quem atendeu" para decidir a atribuição.
+        </div>
+      </div>
+
+      ${items.length ? `
+        <div class="table-card">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Cliente</th><th>Cidade</th><th>Unidade</th>
+                  <th>Recorrência</th><th>Faturamento</th><th>Média/mês</th>
+                  <th>Última compra</th><th>Quem atendeu</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${items.map((i) => `
+                  <tr>
+                    <td><strong>${escapeHtml(i.clientName)}</strong></td>
+                    <td class="text-small">${escapeHtml(i.cityName || "-")}</td>
+                    <td class="text-small">${escapeHtml(i.unitName || "-")}</td>
+                    <td><span class="soft-badge">${i.months} ${i.months === 1 ? "mês" : "meses"}</span></td>
+                    <td>${currency(i.revenue)}</td>
+                    <td>${currency(i.avgMonthly)}</td>
+                    <td class="text-small">${escapeHtml((i.lastPurchaseAt || "").slice(0, 10))}</td>
+                    <td class="text-small">
+                      ${(i.sellers || []).map((sv) => `
+                        <div style="white-space:nowrap">
+                          ${escapeHtml(sv.sellerName)}
+                          <span style="color:var(--muted)">· ${sv.months}m · ${currency(sv.revenue)}</span>
+                        </div>`).join("") || '<span style="color:var(--muted)">—</span>'}
+                      ${i.sellerCount > 5 ? `<div style="color:var(--muted)">+${i.sellerCount - 5} outros</div>` : ""}
+                    </td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          ${data.total > items.length ? `<div class="text-small" style="text-align:center;color:var(--muted);margin-top:8px">Exibindo ${items.length} de ${number(data.total)}</div>` : ""}
+        </div>` : emptyStateCard("Nenhum cliente recorrente sem vendedor com esse critério. 👏")}
+    </div>
+  `;
+}
+
 function crmFilterToolbar() {
   const filters = state.crm.crmClientFilters;
   const pagination = state.crm.pagination;
@@ -4069,7 +4173,7 @@ function managerExecutiveView() {
           </div>
         </div>
       </div>
-      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
+      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Carteira</th><th>Fora</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
       ${executiveExpandSection("units", "Ver performance por unidade", `<div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead><tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody></table></div>`)}
     </div>
   `;
@@ -5322,6 +5426,7 @@ function topbarTitle() {
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
+    "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
   };
   return map[state.activeTab] || { title: "Dashboard", description: "Visão geral." };
@@ -5387,11 +5492,39 @@ function executivoView() {
         ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal))}
         ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct))}
         ${kpiCard("Ticket médio", currency(s.ticketAverage), "Clientes", number(s.distinctClients))}
+        ${kpiCard("Ticket PJ", currency(s.ticketAveragePj || 0), "Clientes PJ", number(s.pjClients || 0))}
+        ${kpiCard("Ticket PF", currency(s.ticketAveragePf || 0), "Clientes PF", number(s.pfClients || 0))}
         ${kpiCard("Devolução comercial", currency(s.returnsValue), "% Devolução", pct(s.returnRatioPct))}
         ${kpiCard("Devolução em garantia", currency(s.warrantyReturnsValue || 0), "% Garantia", pct(s.warrantyRatioPct || 0))}
         ${kpiCard("Desconto médio", pct(s.discountPct), "Mix SKU", number(s.mixSku))}
         ${kpiCard("Dias úteis", `${number(s.workingDaysElapsed)}/${number(s.workingDaysTotal)}`, "Meta diária", currency(s.dailyRevenueTarget))}
       </div>
+      ${(Number(s.ownClients || 0) + Number(s.otherClients || 0)) > 0 ? `
+        <div class="form-card" style="padding:12px 18px">
+          <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
+            <div>
+              <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em">CLIENTES ATENDIDOS</div>
+              <div class="text-small" style="color:var(--muted)">Carteira = cliente com vendedor definido no cadastro CRM.</div>
+            </div>
+            <div style="display:flex;gap:18px;flex-wrap:wrap">
+              <div><span class="text-small" style="color:var(--muted)">Total</span><br>
+                <strong>${number(s.distinctClients)}</strong>
+                <span class="text-small" style="color:var(--muted)"> · ${currency(s.revenueNet)}</span></div>
+              <div><span class="text-small" style="color:var(--muted)">De carteira</span><br>
+                <strong style="color:var(--good)">${number(s.ownClients || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> · ${currency(s.ownRevenue || 0)} · ticket ${currency(s.ticketAverageOwn || 0)}</span></div>
+              <div><span class="text-small" style="color:var(--muted)">Fora da carteira</span><br>
+                <strong style="color:#e67e22">${number(s.otherClients || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> · ${currency(s.otherRevenue || 0)} · ticket ${currency(s.ticketAverageOther || 0)}</span></div>
+              <div><span class="text-small" style="color:var(--muted)">PJ / PF</span><br>
+                <strong>${number(s.pjClients || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> · ${currency(s.pjRevenue || 0)}</span>
+                &nbsp;|&nbsp;
+                <strong>${number(s.pfClients || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> · ${currency(s.pfRevenue || 0)}</span></div>
+            </div>
+          </div>
+        </div>` : ""}
       ${Number(s.warrantyReturnsValue || 0) > 0 ? `
         <div class="form-card" style="padding:12px 18px">
           <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
@@ -5419,7 +5552,7 @@ function executivoView() {
       ${executiveExpandSection("details", "Ver ranking de vendedores", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
+            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Carteira</th><th>Fora</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
             <tbody>${sellerRows(ranking)}</tbody>
           </table>
         </div>
@@ -5491,6 +5624,7 @@ function dashboardView() {
     { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
+    { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
@@ -5590,6 +5724,7 @@ function dashboardView() {
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
+          ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
           ${state.activeTab === "vendedores"    ? vendedoresView()     : ""}

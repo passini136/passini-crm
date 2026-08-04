@@ -218,6 +218,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "meu-placar",     "label": "Meu Placar",         "group": "CRM"},
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
+    {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
     # Resultados
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
@@ -268,7 +269,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -5280,8 +5281,31 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     ).fetchall():
         warranty_by_unit[normalize_unit(_w["unit_name"])] = float(_w["total"] or 0.0)
 
+    # ── Dono do cliente no cadastro CRM ───────────────────────────────────────
+    # Permite separar o que o vendedor faturou da PRÓPRIA carteira do que faturou
+    # de clientes de outros (ou sem dono). Chave é o nome normalizado, porque o
+    # faturamento não traz o código do cliente.
+    client_owner_map: dict[str, str] = {}
+    for _o in conn.execute(
+        "SELECT client_name, internal_seller_name, external_seller_name "
+        "FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        _key = normalize_client_key(_o["client_name"])
+        if not _key:
+            continue
+        _owner = normalize_whitespace(_o["internal_seller_name"]) or normalize_whitespace(_o["external_seller_name"])
+        if _owner:
+            client_owner_map[_key] = _owner
+
     city_metrics: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set()})
-    detail_by_seller: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set(), "sku": set(), "baseUnit": None})
+    detail_by_seller: dict[str, dict[str, Any]] = defaultdict(lambda: {
+        "revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0,
+        "returnValue": 0.0, "clients": set(), "sku": set(), "baseUnit": None,
+        # Carteira própria x fora da carteira
+        "ownClients": set(), "otherClients": set(),
+        "ownRevenue": 0.0, "otherRevenue": 0.0,
+    })
     detail_by_client: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "cities": set(), "personType": None, "typeSource": None, "typeConfidence": 0.0})
     detail_by_unit: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set()})
     client_top_by_unit_source: dict[str, dict[str, dict[str, Any]]] = defaultdict(lambda: defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0}))
@@ -5352,6 +5376,14 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         detail_by_seller[seller_name]["baseUnit"] = row["seller_base_unit"]
         if client_name:
             detail_by_seller[seller_name]["clients"].add(client_name)
+            # Cliente é da carteira do vendedor se o cadastro CRM aponta para ele
+            owner = client_owner_map.get(normalize_client_key(client_name))
+            if owner and normalize_upper(owner) == normalize_upper(seller_name):
+                detail_by_seller[seller_name]["ownClients"].add(client_name)
+                detail_by_seller[seller_name]["ownRevenue"] += net_value
+            else:
+                detail_by_seller[seller_name]["otherClients"].add(client_name)
+                detail_by_seller[seller_name]["otherRevenue"] += net_value
         if row["sku_key"]:
             detail_by_seller[seller_name]["sku"].add(row["sku_key"])
 
@@ -5536,6 +5568,11 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "qtySold": round(qty_sold, 2),
                 "ticketPerPiece": round(ticket_per_piece, 2),
                 "distinctClients": distinct_clients,
+                # Clientes da própria carteira x atendidos fora dela
+                "ownClients": len(metrics.get("ownClients") or set()),
+                "otherClients": len(metrics.get("otherClients") or set()),
+                "ownRevenue": round(float(metrics.get("ownRevenue") or 0.0), 2),
+                "otherRevenue": round(float(metrics.get("otherRevenue") or 0.0), 2),
                 "mixSku": mix_count,
                 "discountValue": round(metrics["discountValue"], 2),
                 "discountPct": round(discount_pct, 2),
@@ -5624,6 +5661,50 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     detail_totals["ticketAverage"] = safe_div(detail_totals["revenueNet"], detail_totals["distinctClients"])
     detail_totals["discountPct"] = safe_div(detail_totals["discountValue"], detail_totals["grossSalesPct"]) * 100
     detail_totals["returnRatioPct"] = safe_div(detail_totals["returnsValue"], detail_totals["revenueNet"]) * 100 if detail_totals["revenueNet"] else 0.0
+
+    # ── Carteira x fora da carteira e quebra PJ/PF no consolidado ─────────────
+    _own_clients: set[str] = set()
+    _other_clients: set[str] = set()
+    _own_revenue = 0.0
+    _other_revenue = 0.0
+    _pj_clients: set[str] = set()
+    _pf_clients: set[str] = set()
+    _pj_revenue = 0.0
+    _pf_revenue = 0.0
+    for row in detail_rows_scope:
+        _cname = row["client_name"]
+        if not _cname:
+            continue
+        _net = float(row["net_value"] or 0)
+        _ckey = normalize_client_key(_cname)
+        _owner = client_owner_map.get(_ckey)
+        if _owner and normalize_upper(_owner) == normalize_upper(row["seller_name"]):
+            _own_clients.add(_cname)
+            _own_revenue += _net
+        else:
+            _other_clients.add(_cname)
+            _other_revenue += _net
+        _reg = client_registry.get(_ckey)
+        _ptype = _reg["person_type"] if _reg else (infer_person_type_from_name(_cname)[0])
+        if normalize_upper(_ptype) == "PJ":
+            _pj_clients.add(_cname)
+            _pj_revenue += _net
+        elif normalize_upper(_ptype) == "PF":
+            _pf_clients.add(_cname)
+            _pf_revenue += _net
+
+    detail_totals["ownClients"] = len(_own_clients)
+    detail_totals["otherClients"] = len(_other_clients)
+    detail_totals["ownRevenue"] = round(_own_revenue, 2)
+    detail_totals["otherRevenue"] = round(_other_revenue, 2)
+    detail_totals["pjClients"] = len(_pj_clients)
+    detail_totals["pfClients"] = len(_pf_clients)
+    detail_totals["pjRevenue"] = round(_pj_revenue, 2)
+    detail_totals["pfRevenue"] = round(_pf_revenue, 2)
+    detail_totals["ticketAveragePj"] = round(safe_div(_pj_revenue, len(_pj_clients)), 2)
+    detail_totals["ticketAveragePf"] = round(safe_div(_pf_revenue, len(_pf_clients)), 2)
+    detail_totals["ticketAverageOwn"] = round(safe_div(_own_revenue, len(_own_clients)), 2)
+    detail_totals["ticketAverageOther"] = round(safe_div(_other_revenue, len(_other_clients)), 2)
 
     official_totals_vendor = aggregate_official_summary_rows(vendor_summary_rows)
     official_totals_unit = aggregate_official_summary_rows(unit_summary_rows)
@@ -5851,6 +5932,20 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "qtySold": round(summary_qty_sold, 2),
             "ticketPerPiece": summary_ticket_per_piece,
             "distinctClients": summary_distinct_clients,
+            # Clientes atendidos: quantos são de carteira e quantos vieram de fora
+            "ownClients": detail_totals["ownClients"],
+            "otherClients": detail_totals["otherClients"],
+            "ownRevenue": detail_totals["ownRevenue"],
+            "otherRevenue": detail_totals["otherRevenue"],
+            "ticketAverageOwn": detail_totals["ticketAverageOwn"],
+            "ticketAverageOther": detail_totals["ticketAverageOther"],
+            # Quebra por tipo de pessoa
+            "pjClients": detail_totals["pjClients"],
+            "pfClients": detail_totals["pfClients"],
+            "pjRevenue": detail_totals["pjRevenue"],
+            "pfRevenue": detail_totals["pfRevenue"],
+            "ticketAveragePj": detail_totals["ticketAveragePj"],
+            "ticketAveragePf": detail_totals["ticketAveragePf"],
             "marginAverage": round(summary_margin, 2) if summary_margin is not None else None,
             "discountValue": summary_discount_value,
             "discountPct": summary_discount_pct,
@@ -8168,6 +8263,108 @@ DAILY_CONTACT_GOAL = 5
 COVERAGE_GAP_DAYS = 7
 
 
+def compute_unassigned_clients(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    min_months: int = 2, months_window: int = 6, limit: int = 200,
+) -> dict[str, Any]:
+    """Clientes que compram com recorrência mas não têm vendedor no cadastro CRM.
+
+    São clientes "no limpo": ninguém responde por eles, então ninguém previne a
+    perda. O gestor usa esta lista para atribuir dono. Mostra quem já atendeu o
+    cliente, o que ajuda a decidir a atribuição.
+    """
+    latest = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    window_start = shift_competence(latest, -(months_window - 1))
+
+    # Clientes COM dono no cadastro — excluídos do resultado
+    owned: set[str] = set()
+    for row in conn.execute(
+        "SELECT client_name FROM crm_client_profiles WHERE company_id = ? "
+        "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' OR TRIM(COALESCE(external_seller_name,'')) <> '')",
+        (company_id,),
+    ).fetchall():
+        key = normalize_client_key(row["client_name"])
+        if key:
+            owned.add(key)
+
+    allowed_units = crm_allowed_units_for_user(conn, user)
+    city_unit = build_city_unit_map(conn, company_id, latest)
+
+    rows = conn.execute(
+        """
+        SELECT client_name,
+               MAX(city_name) AS city_name,
+               COUNT(DISTINCT competence) AS meses,
+               ROUND(SUM(net_value), 2) AS receita,
+               MAX(issue_date) AS ultima_compra,
+               COUNT(DISTINCT seller_name) AS qtd_vendedores
+        FROM fact_sales_detail
+        WHERE company_id = ? AND competence >= ? AND net_value > 0
+        GROUP BY client_name
+        HAVING meses >= ?
+        ORDER BY receita DESC
+        """,
+        (company_id, window_start, min_months),
+    ).fetchall()
+
+    # Vendedores que atenderam cada cliente, com receita de cada um
+    sellers_by_client: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in conn.execute(
+        """
+        SELECT client_name, seller_name,
+               COUNT(DISTINCT competence) AS meses,
+               ROUND(SUM(net_value), 2) AS receita
+        FROM fact_sales_detail
+        WHERE company_id = ? AND competence >= ? AND net_value > 0
+        GROUP BY client_name, seller_name
+        ORDER BY receita DESC
+        """,
+        (company_id, window_start),
+    ).fetchall():
+        sellers_by_client[normalize_client_key(r["client_name"])].append({
+            "sellerName": normalize_whitespace(r["seller_name"]),
+            "months": int(r["meses"] or 0),
+            "revenue": float(r["receita"] or 0.0),
+        })
+
+    items: list[dict[str, Any]] = []
+    total_revenue = 0.0
+    for r in rows:
+        key = normalize_client_key(r["client_name"])
+        if not key or key in owned:
+            continue
+        unit = city_unit.get(normalize_upper(r["city_name"]))
+        if allowed_units and unit not in allowed_units:
+            continue
+        sellers = sellers_by_client.get(key, [])[:5]
+        receita = float(r["receita"] or 0.0)
+        total_revenue += receita
+        items.append({
+            "clientName": r["client_name"],
+            "cityName": r["city_name"],
+            "unitName": unit,
+            "months": int(r["meses"] or 0),
+            "revenue": round(receita, 2),
+            "avgMonthly": round(safe_div(receita, int(r["meses"] or 1)), 2),
+            "lastPurchaseAt": r["ultima_compra"],
+            "sellerCount": int(r["qtd_vendedores"] or 0),
+            "sellers": sellers,
+            "mainSeller": sellers[0]["sellerName"] if sellers else None,
+        })
+
+    return {
+        "items": items[:limit],
+        "total": len(items),
+        "totalRevenue": round(total_revenue, 2),
+        "criteria": {
+            "minMonths": min_months,
+            "monthsWindow": months_window,
+            "windowStart": window_start,
+            "windowEnd": latest,
+        },
+    }
+
+
 def compute_manager_mission(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     filters: dict[str, str | None], limit: int = 12,
@@ -8914,6 +9111,31 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/crm/unassigned-clients":
+                # Clientes recorrentes sem vendedor no cadastro — visão de gestão
+                user = self._require_auth()
+                if not user:
+                    return
+                try:
+                    query = parse_qs(parsed.query)
+                    min_months = max(1, min(int(query.get("minMonths", ["2"])[0]), 12))
+                    window = max(2, min(int(query.get("window", ["6"])[0]), 24))
+                    with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Visão exclusiva de gestão."}))
+                            return
+                        data = compute_unassigned_clients(
+                            conn, user["company_id"], user,
+                            min_months=min_months, months_window=window,
+                        )
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(data))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(500)
+                    self.wfile.write(json_dumps({"error": str(exc), "items": [], "total": 0}))
                 return
             if path == "/api/content":
                 # Biblioteca de conteúdo. Leitura liberada a todos os autenticados —
