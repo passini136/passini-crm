@@ -1030,6 +1030,29 @@ def seed_access_profiles(conn: sqlite3.Connection, company_id: int) -> None:
             ),
         )
     conn.commit()
+
+    # Módulos novos criados depois da primeira execução não entram pelo INSERT OR IGNORE
+    # acima. Aqui os perfis de sistema recebem as telas que passaram a existir na
+    # especificação. Só ADICIONA — nunca remove, para preservar ajustes feitos na tela.
+    for spec in DEFAULT_ACCESS_PROFILES:
+        row = conn.execute(
+            "SELECT id, modules_json FROM access_profiles "
+            "WHERE company_id = ? AND name = ? AND is_system = 1",
+            (company_id, spec["name"]),
+        ).fetchone()
+        if not row:
+            continue
+        current = normalize_module_list(row["modules_json"])
+        missing = [m for m in spec["modules"] if m not in current]
+        if missing:
+            merged = normalize_module_list(current + missing)
+            conn.execute(
+                "UPDATE access_profiles SET modules_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(merged, ensure_ascii=False), now_iso(), row["id"]),
+            )
+            print(f"[perfis] '{spec['name']}' recebeu novas telas: {', '.join(missing)}")
+    conn.commit()
+
     # Usuários criados antes dos perfis: liga cada um ao perfil de mesmo nome do role
     conn.execute(
         """
