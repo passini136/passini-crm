@@ -153,6 +153,10 @@ AUTO_IMPORT_FOLDERS = [
     {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
      "label": "CRM · Faturamento Consolidado",
      "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
+    {"folder": "devolucao-garantia", "scope": "warranty",
+     "label": "Devolução em Garantia",
+     "hint": "Relatório de devoluções em garantia. A competência sai da data de cada devolução — "
+             "não precisa do mês no nome do arquivo."},
 ]
 
 # Ordem canônica das unidades (inclui unidades sem dados ainda, ex: Zona Norte)
@@ -295,6 +299,7 @@ CSV_FILE_TYPES = {
     "030-relatorioCustoVenda unidade.csv": "custo_unidade",
     "030-relatorioFaturamento conslidado cliente.csv": "faturamento_cliente_consolidado",
     "030-relatorioPessoas.csv": "cadastro_clientes",
+    "030-relatorioDevolucao.csv": "devolucao_garantia",
     "01fat.csv": "faturamento_detalhado",
     "02unidade.csv": "custo_unidade",
     "03vendedor.csv": "custo_vendedor",
@@ -307,6 +312,7 @@ IMPORT_SCOPE_REQUIREMENTS = {
     # Escopos individuais do CRM — cada base é importada de forma independente
     "crm_clients": {"cadastro_clientes"},
     "crm_summary": {"faturamento_cliente_consolidado"},
+    "warranty": {"devolucao_garantia"},
 }
 IMPORT_SCOPE_LABELS = {
     "full": "pacote completo",
@@ -315,6 +321,7 @@ IMPORT_SCOPE_LABELS = {
     "crm": "crm carteira",
     "crm_clients": "cadastro de clientes",
     "crm_summary": "faturamento consolidado por cliente",
+    "warranty": "devolução em garantia",
 }
 IMPORT_SCOPE_TABLES = {
     "faturamento_detalhado": ("fact_sales_detail",),
@@ -322,6 +329,7 @@ IMPORT_SCOPE_TABLES = {
     "custo_unidade": ("fact_unit_summary",),
     "cadastro_clientes": ("crm_client_profiles",),
     "faturamento_cliente_consolidado": ("crm_client_summary",),
+    "devolucao_garantia": ("fact_warranty_returns",),
 }
 UPLOAD_FIELD_TYPE_OVERRIDES = {
     "cost_unit_file": "custo_unidade",
@@ -334,6 +342,8 @@ UPLOAD_FIELD_TYPE_OVERRIDES = {
     "crm_summary_file": "faturamento_cliente_consolidado",
     "import-crm-clients-file": "cadastro_clientes",
     "import-crm-summary-file": "faturamento_cliente_consolidado",
+    "warranty_file": "devolucao_garantia",
+    "import-warranty-file": "devolucao_garantia",
     "files": None,
 }
 
@@ -1369,6 +1379,43 @@ def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(id)
             );
 
+            -- Devoluções em garantia: chegam misturadas no custo/venda e precisam ser
+            -- deduzidas do resultado comercial (defeito de fábrica não é erro de venda)
+            CREATE TABLE IF NOT EXISTS fact_warranty_returns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                competence TEXT NOT NULL,
+                import_id INTEGER NOT NULL,
+                row_hash TEXT NOT NULL,
+                unit_name TEXT NOT NULL,
+                seller_name TEXT NOT NULL,
+                client_name TEXT,
+                city_name TEXT,
+                return_number TEXT,
+                return_date TEXT,
+                reason TEXT,
+                invoice_number TEXT,
+                issue_date TEXT,
+                item_code TEXT,
+                item_type TEXT,
+                item_description TEXT,
+                brand_name TEXT,
+                supplier_name TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                cost_value REAL NOT NULL DEFAULT 0,
+                total_value REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, competence, row_hash),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_warranty_company_competence
+                ON fact_warranty_returns(company_id, competence);
+            CREATE INDEX IF NOT EXISTS idx_warranty_company_comp_seller
+                ON fact_warranty_returns(company_id, competence, seller_name);
+            CREATE INDEX IF NOT EXISTS idx_warranty_company_comp_unit
+                ON fact_warranty_returns(company_id, competence, unit_name);
+
             -- Biblioteca de conteúdo comercial: scripts, mensagens e orientações
             CREATE TABLE IF NOT EXISTS content_library (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2221,6 +2268,7 @@ def detect_file_type(filename: str) -> str | None:
         "030-relatoriofaturamento conslidado cliente": "faturamento_cliente_consolidado",
         "030-relatoriofaturamento consolidado cliente": "faturamento_cliente_consolidado",
         "030-relatoriopessoas": "cadastro_clientes",
+        "030-relatoriodevolucao": "devolucao_garantia",
         "030-relatoriocustovenda unidade": "custo_unidade",
         "030-relatoriocustovenda vendedor consolidado": "custo_vendedor",
     }
@@ -2349,6 +2397,16 @@ def preview_import_package(files_payload: dict[str, bytes] | list[dict[str, Any]
             suggestion = suggest_competence(rows)
             if suggestion:
                 suggested_values.append(suggestion)
+        elif kind == "devolucao_garantia":
+            # Competência mais frequente pela data da devolução
+            counts = Counter()
+            for r in rows:
+                dt = parse_datetime_pt(r.get("Data")) or parse_datetime_flexible(r.get("Data"))
+                comp = competence_from_date(dt)
+                if comp:
+                    counts[comp] += 1
+            if counts:
+                suggested_values.append(counts.most_common(1)[0][0])
 
     detected_file_types = set(file_types)
     if import_scope == "crm":
@@ -2391,9 +2449,12 @@ def delete_competence_data(
         )
     target_tables = set()
     for file_type in selected_file_types:
-        # faturamento_detalhado é APPEND-ONLY: a competência é derivada da data de cada
-        # linha e a deduplicação é feita por row_hash. Nunca apagar o histórico.
-        if file_type in {"cadastro_clientes", "faturamento_cliente_consolidado", "faturamento_detalhado"}:
+        # APPEND-ONLY: competência derivada da data de cada linha e dedupe por row_hash.
+        # Nunca apagar o histórico dessas tabelas.
+        if file_type in {
+            "cadastro_clientes", "faturamento_cliente_consolidado",
+            "faturamento_detalhado", "devolucao_garantia",
+        }:
             continue
         target_tables.update(IMPORT_SCOPE_TABLES.get(file_type, ()))
     for table in target_tables:
@@ -2439,6 +2500,8 @@ def import_package(
     sales_competences_seen: set[str] = set()
     sales_rows_by_competence: Counter = Counter()
     sales_rows_without_date = 0
+    warranty_competences_seen: set[str] = set()
+    warranty_total_value = 0.0
 
     for entry in normalize_upload_entries(files_payload):
         filename = entry["fileName"]
@@ -2464,6 +2527,10 @@ def import_package(
         )
 
         if kind == "faturamento_detalhado":
+            # Duas vendas idênticas no mesmo dia são possíveis (mesma peça, mesmo
+            # cliente, dois atendimentos). O contador de ocorrência evita descartar
+            # a segunda como duplicata, mantendo o dedupe de reimportação.
+            sales_occurrence: Counter = Counter()
             for row in rows:
                 seller_name = normalize_whitespace(row.get("Vendedor"))
                 client_name = normalize_whitespace(row.get("Cliente") or row.get("CLIENTE") or row.get("Razao Social/Nome")) or "CLIENTE NÃO INFORMADO"
@@ -2495,7 +2562,9 @@ def import_package(
                     "net": parse_decimal(row.get("Liquido")),
                     "sale_share": parse_decimal(row.get("%venda")),
                 }
-                row_hash = hash_text(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                _sig = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                sales_occurrence[_sig] += 1
+                row_hash = hash_text(f"{_sig}#{sales_occurrence[_sig]}")
                 try:
                     conn.execute(
                         """
@@ -2695,6 +2764,71 @@ def import_package(
                 role, _ = current_role_and_unit(conn, company_id, seller_name, competence)
                 if role is None:
                     register_issue(conn, company_id, import_id, competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
+        elif kind == "devolucao_garantia":
+            # A competência sai da DATA de cada devolução, linha a linha — o relatório
+            # pode cobrir mais de um mês e cada devolução pertence ao mês em que ocorreu.
+            # Linhas idênticas são LEGÍTIMAS (2 unidades da mesma peça na mesma
+            # devolução vêm em linhas separadas). O contador de ocorrência distingue
+            # essas linhas sem quebrar o dedupe de reimportação do mesmo arquivo.
+            occurrence_counter: Counter = Counter()
+            for row in rows:
+                unit_name = normalize_unit(row.get("Empresa"))
+                seller_name = normalize_whitespace(row.get("Vendedor"))
+                return_dt = parse_datetime_pt(row.get("Data")) or parse_datetime_flexible(row.get("Data"))
+                row_competence = competence_from_date(return_dt) or competence
+                total_value = parse_decimal(row.get("Total"))
+                if not unit_name and not seller_name and not total_value:
+                    continue
+                payload = {
+                    "unit": unit_name,
+                    "seller": seller_name,
+                    "client": normalize_whitespace(row.get("Cliente")),
+                    "return_number": normalize_whitespace(row.get("Devolucao")),
+                    "return_date": return_dt.isoformat() if return_dt else "",
+                    "invoice": normalize_whitespace(row.get("Nota")),
+                    "item": normalize_whitespace(row.get("Codigo")),
+                    "qty": parse_decimal(row.get("Qtd.")),
+                    "cost": parse_decimal(row.get("P. Custo.")),
+                    "total": total_value,
+                }
+                base_signature = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                occurrence_counter[base_signature] += 1
+                row_hash = hash_text(f"{base_signature}#{occurrence_counter[base_signature]}")
+                issue_dt = parse_datetime_pt(row.get("Emissao")) or parse_datetime_flexible(row.get("Emissao"))
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO fact_warranty_returns (
+                            company_id, competence, import_id, row_hash, unit_name, seller_name,
+                            client_name, city_name, return_number, return_date, reason,
+                            invoice_number, issue_date, item_code, item_type, item_description,
+                            brand_name, supplier_name, quantity, cost_value, total_value, created_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            company_id, row_competence, import_id, row_hash, unit_name, seller_name,
+                            normalize_whitespace(row.get("Cliente")),
+                            normalize_upper(row.get("Cidade")),
+                            normalize_whitespace(row.get("Devolucao")),
+                            return_dt.isoformat() if return_dt else None,
+                            normalize_upper(row.get("Motivo")),
+                            normalize_whitespace(row.get("Nota")),
+                            issue_dt.isoformat() if issue_dt else None,
+                            normalize_whitespace(row.get("Codigo")),
+                            normalize_whitespace(row.get("Tipo")),
+                            normalize_whitespace(row.get("Descricao")),
+                            normalize_whitespace(row.get("Marca")),
+                            normalize_whitespace(row.get("Forn. ref.")),
+                            parse_decimal(row.get("Qtd.")),
+                            parse_decimal(row.get("P. Custo.")),
+                            total_value,
+                            now_iso(),
+                        ),
+                    )
+                    warranty_competences_seen.add(row_competence)
+                    warranty_total_value += total_value
+                except sqlite3.IntegrityError:
+                    duplicate_rows_skipped += 1
         elif kind == "custo_unidade":
             for row in rows:
                 unit_name = normalize_unit(row.get("EMPRESA"))
@@ -2780,6 +2914,15 @@ def import_package(
         if sales_rows_without_date:
             _msg += f" | {sales_rows_without_date} sem data usaram {competence}"
         result["message"] = _msg
+
+    if warranty_competences_seen:
+        _wc = sorted(warranty_competences_seen)
+        result["warrantyCompetences"] = _wc
+        result["warrantyTotalValue"] = round(warranty_total_value, 2)
+        result["message"] = (
+            f"Devolução em garantia — {', '.join(_wc)}: {brl(warranty_total_value)} "
+            f"| {duplicate_rows_skipped} linha(s) já existentes ignoradas"
+        )
 
     # Cadastro de clientes: reporta o tamanho da base e alerta se encolheu muito
     # (indício de exportação parcial do Alfa — a base vem em vários arquivos).
@@ -5118,6 +5261,25 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         ).fetchall()
     }
 
+    # ── Devoluções em garantia ────────────────────────────────────────────────
+    # Vêm dentro do total de devoluções do custo/venda, mas são defeito de peça,
+    # não erro de venda. Ficam separadas para não penalizar o resultado comercial.
+    warranty_by_seller: dict[str, float] = {}
+    for _w in conn.execute(
+        "SELECT seller_name, SUM(total_value) AS total FROM fact_warranty_returns "
+        "WHERE company_id = ? AND competence = ? GROUP BY seller_name",
+        (company_id, primary_competence),
+    ).fetchall():
+        warranty_by_seller[normalize_whitespace(_w["seller_name"])] = float(_w["total"] or 0.0)
+
+    warranty_by_unit: dict[str, float] = {}
+    for _w in conn.execute(
+        "SELECT unit_name, SUM(total_value) AS total FROM fact_warranty_returns "
+        "WHERE company_id = ? AND competence = ? GROUP BY unit_name",
+        (company_id, primary_competence),
+    ).fetchall():
+        warranty_by_unit[normalize_unit(_w["unit_name"])] = float(_w["total"] or 0.0)
+
     city_metrics: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set()})
     detail_by_seller: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set(), "sku": set(), "baseUnit": None})
     detail_by_client: dict[str, dict[str, Any]] = defaultdict(lambda: {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "cities": set(), "personType": None, "typeSource": None, "typeConfidence": 0.0})
@@ -5293,9 +5455,14 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     total_company_seller_returns_goal = 0.0
     for seller_name, metrics, official_row, role, base_unit in candidate_sellers:
         gross_sales = float(official_row.get("sale_value") or 0.0)
-        revenue_net = float(official_row.get("net_value") or 0.0)
+        revenue_net_raw = float(official_row.get("net_value") or 0.0)
         gross_sales_pct = float(metrics.get("grossSalesPct") or 0.0)
-        returns_value = float(official_row.get("return_value") or 0.0)
+        returns_total = float(official_row.get("return_value") or 0.0)
+        # Devolução em garantia é defeito de peça, não erro de venda: sai do
+        # resultado comercial e é devolvida ao líquido do vendedor.
+        warranty_value = min(warranty_by_seller.get(seller_name, 0.0), returns_total)
+        returns_value = max(returns_total - warranty_value, 0.0)
+        revenue_net = revenue_net_raw + warranty_value
         qty_sold = float(official_row.get("qty_sold") or 0)
         return_cost = float(official_row.get("return_cost") or 0.0)
         cost_value = float(official_row.get("cost_value") or 0.0)
@@ -5352,6 +5519,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "revenueGoal": round(revenue_goal, 2),
                 "projectedRevenue": projected_revenue,
                 "returnsValue": round(returns_value, 2),
+                "warrantyReturnsValue": round(warranty_value, 2),
+                "returnsTotalValue": round(returns_total, 2),
+                "revenueNetWithWarranty": round(revenue_net_raw, 2),
                 "returnCost": round(return_cost, 2),
                 "revenueGross": round(gross_sales, 2),
                 "costValue": round(cost_value, 2),
@@ -5370,6 +5540,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "discountValue": round(metrics["discountValue"], 2),
                 "discountPct": round(discount_pct, 2),
                 "returnRatioPct": round(return_ratio, 2),
+                "warrantyRatioPct": round(safe_div(warranty_value, revenue_net) * 100 if revenue_net else 0.0, 2),
+                "returnsTotalRatioPct": round(safe_div(returns_total, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "marginValue": (lambda _m: round(_m, 2) if _m is not None else None)(finite_or_none(margin_value)),
                 "score": round(score, 2),
                 "pendingMapping": role is None,
@@ -5390,9 +5562,14 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         unit_goal = goal_by_unit.get(unit_name, {"revenueGoal": 0.0, "returnsGoal": 0.0})
         revenue_goal = float(unit_goal["revenueGoal"] or 0)
         returns_goal = float(unit_goal["returnsGoal"] or 0)
-        revenue_net = float(official_row.get("net_value") or 0.0)
+        revenue_net_raw = float(official_row.get("net_value") or 0.0)
         gross_sales = float(official_row.get("sale_value") or 0.0)
-        returns_value = float(official_row.get("return_value") or 0.0)
+        returns_total = float(official_row.get("return_value") or 0.0)
+        # Garantia sai do resultado comercial: devolução comercial = total − garantia,
+        # e o líquido volta a somar a garantia (que o custo/venda já havia descontado).
+        warranty_value = min(warranty_by_unit.get(unit_name, 0.0), returns_total)
+        returns_value = max(returns_total - warranty_value, 0.0)
+        revenue_net = revenue_net_raw + warranty_value
         qty_sold = float(official_row.get("qty_sold") or 0.0)
         return_cost = float(official_row.get("return_cost") or 0.0)
         cost_value = float(official_row.get("cost_value") or 0.0)
@@ -5414,6 +5591,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "dailyRevenueActual": round(daily_revenue_actual, 2),
                 "dailyGoal": round(daily_goal_value, 2),
                 "returnsValue": round(returns_value, 2),
+                "warrantyReturnsValue": round(warranty_value, 2),
+                "returnsTotalValue": round(returns_total, 2),
+                "revenueNetWithWarranty": round(revenue_net_raw, 2),
                 "returnCost": round(return_cost, 2),
                 "revenueGross": round(gross_sales, 2),
                 "costValue": round(cost_value, 2),
@@ -5421,6 +5601,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "netProfitValue": round(net_profit_value, 2),
                 "returnsGoal": round(returns_goal, 2),
                 "returnRatioPct": round(safe_div(returns_value, revenue_net) * 100 if revenue_net else 0.0, 2),
+                "warrantyRatioPct": round(safe_div(warranty_value, revenue_net) * 100 if revenue_net else 0.0, 2),
+                "returnsTotalRatioPct": round(safe_div(returns_total, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "goalAttainmentPct": round(safe_div(revenue_net, revenue_goal) * 100 if revenue_goal else 0.0, 2),
                 "projectedGoalAttainmentPct": round(safe_div(projected_revenue, revenue_goal) * 100 if revenue_goal else 0.0, 2),
                 "marginValue": round(finite_or_none(official_row.get("margin_value")) or 0, 2) if official_row else None,
@@ -5486,6 +5668,33 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         summary_cost_value = float(official_totals_unit["costValue"] or 0.0)
         summary_profit_value = float(official_totals_unit["profitValue"] or 0.0)
         summary_net_profit_value = float(official_totals_unit["netProfitValue"] or 0.0)
+
+    # ── Dedução da garantia no consolidado ────────────────────────────────────
+    # Aplica o mesmo tratamento do vendedor e da unidade no total do grupo,
+    # respeitando o recorte de vendedor/unidade que estiver ativo.
+    _warranty_conditions = ["company_id = ?", "competence = ?"]
+    _warranty_params: list[Any] = [company_id, primary_competence]
+    if filters.get("seller_name"):
+        _warranty_conditions.append("seller_name = ?")
+        _warranty_params.append(filters["seller_name"])
+    if filters.get("unit_name"):
+        _warranty_conditions.append("unit_name = ?")
+        _warranty_params.append(normalize_unit(filters["unit_name"]))
+    elif scoped_units:
+        _ph = ", ".join("?" for _ in scoped_units)
+        _warranty_conditions.append(f"unit_name IN ({_ph})")
+        _warranty_params.extend(scoped_units)
+    summary_warranty = float(conn.execute(
+        f"SELECT COALESCE(SUM(total_value), 0) AS total FROM fact_warranty_returns "
+        f"WHERE {' AND '.join(_warranty_conditions)}",
+        _warranty_params,
+    ).fetchone()["total"] or 0.0)
+
+    summary_returns_total = summary_returns
+    summary_warranty = min(summary_warranty, summary_returns_total)
+    summary_returns = max(summary_returns_total - summary_warranty, 0.0)
+    summary_revenue_with_warranty = summary_revenue
+    summary_revenue = summary_revenue + summary_warranty
 
     elapsed_days_current = summary_calendar["elapsedWorkingDays"]
     total_days_current = summary_calendar["totalWorkingDays"]
@@ -5619,6 +5828,10 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "revenueGoal": round(summary_goal, 2),
             "projectedRevenue": projection_revenue,
             "returnsValue": round(summary_returns, 2),
+            # Garantia separada do resultado comercial
+            "warrantyReturnsValue": round(summary_warranty, 2),
+            "returnsTotalValue": round(summary_returns_total, 2),
+            "revenueNetWithWarranty": round(summary_revenue_with_warranty, 2),
             "returnCost": round(summary_return_cost, 2),
             "revenueGross": round(summary_gross, 2),
             "costValue": round(summary_cost_value, 2),
@@ -5626,6 +5839,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "netProfitValue": round(summary_net_profit_value, 2),
             "returnsGoal": round(summary_returns_goal, 2),
             "returnRatioPct": round(safe_div(summary_returns, summary_revenue) * 100 if summary_revenue else 0.0, 2),
+            "warrantyRatioPct": round(safe_div(summary_warranty, summary_revenue) * 100 if summary_revenue else 0.0, 2),
+            "returnsTotalRatioPct": round(safe_div(summary_returns_total, summary_revenue) * 100 if summary_revenue else 0.0, 2),
             "goalAttainmentPct": round(safe_div(summary_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
             "projectedGoalAttainmentPct": round(safe_div(projection_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
             "dailyRevenueActual": daily_revenue_actual,
@@ -7502,7 +7717,8 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
         ws.append([key, value])
 
     ws_sellers = wb.create_sheet("Vendedores")
-    ws_sellers.append(["Vendedor", "Unidade Base", "Faturamento Líquido", "Meta", "% Meta", "Ticket", "Clientes", "Mix", "Devolução", "Score"])
+    ws_sellers.append(["Vendedor", "Unidade Base", "Faturamento Líquido", "Meta", "% Meta", "Ticket",
+                       "Clientes", "Mix", "Devolução Comercial", "Devolução Garantia", "Devolução Total", "Score"])
     for row in data["sellerRanking"]:
         ws_sellers.append([
             row["sellerName"],
@@ -7514,13 +7730,18 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
             row["distinctClients"],
             row["mixSku"],
             row["returnsValue"],
+            row.get("warrantyReturnsValue", 0),
+            row.get("returnsTotalValue", row["returnsValue"]),
             row["score"],
         ])
 
     ws_units = wb.create_sheet("Unidades")
-    ws_units.append(["Unidade", "Faturamento Líquido", "Meta", "% Meta", "Devolução", "Margem"])
+    ws_units.append(["Unidade", "Faturamento Líquido", "Meta", "% Meta",
+                     "Devolução Comercial", "Devolução Garantia", "Devolução Total", "Margem"])
     for row in data["unitPerformance"]:
-        ws_units.append([row["unitName"], row["revenueNet"], row["revenueGoal"], row["goalAttainmentPct"], row["returnsValue"], row["marginValue"]])
+        ws_units.append([row["unitName"], row["revenueNet"], row["revenueGoal"], row["goalAttainmentPct"],
+                         row["returnsValue"], row.get("warrantyReturnsValue", 0),
+                         row.get("returnsTotalValue", row["returnsValue"]), row["marginValue"]])
 
     ws_cities = wb.create_sheet("Cidades")
     ws_cities.append(["Cidade", "Faturamento Líquido", "Ticket Médio", "Clientes Distintos", "Desconto"])
@@ -9879,6 +10100,8 @@ def _auto_import_build_payload(files: list[Path], scope: str) -> list[dict[str, 
             field_name = "import-crm-clients-file"
         elif scope == "crm_summary":
             field_name = "import-crm-summary-file"
+        elif scope == "warranty":
+            field_name = "import-warranty-file"
         elif scope == "cost":
             field_name = _auto_import_detect_cost_field(content)
         elif scope == "crm":
@@ -9949,7 +10172,9 @@ def _auto_import_tick_inner() -> None:
             # arquivo ser aplicada a TODOS, gravando dados no mês errado e apagando
             # (import "substituir") o mês correto.
             if no_comp:
-                if scope == "sales":
+                # sales e warranty derivam a competência da data de cada linha,
+                # então dispensam o mês no nome do arquivo.
+                if scope in {"sales", "warranty"}:
                     for _idx, _f in enumerate(no_comp):
                         by_competence[f"_from_content__{_idx}"] = [_f]
                 else:

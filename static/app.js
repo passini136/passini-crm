@@ -1116,6 +1116,7 @@ function sellerRows(rows) {
         <td>${number(row.mixSku)}</td>
         <td>${currency(row.returnsValue)}</td>
         <td>${pct(row.returnRatioPct)}</td>
+        <td>${currency(row.warrantyReturnsValue || 0)}</td>
         <td>${pct(row.discountPct || 0)}</td>
         ${scoreEnabled() ? `<td><span class="score-chip">${row.score}</span></td>` : ''}
       </tr>
@@ -1136,6 +1137,7 @@ function unitRows(rows) {
         <td>${pct(row.projectedGoalAttainmentPct || 0)}</td>
         <td>${currency(row.returnsValue)}</td>
         <td>${pct(row.returnRatioPct || 0)}</td>
+        <td>${currency(row.warrantyReturnsValue || 0)}</td>
         <td>${marginText(row.marginValue)}</td>
         <td>${number(row.qtySold || 0)}</td>
         <td>${currency(row.ticketPerPiece || 0)}</td>
@@ -4011,7 +4013,7 @@ function unitsView() {
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Devolução</th><th>% Dev.</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr>
+            <tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr>
           </thead>
           <tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody>
         </table>
@@ -4067,8 +4069,8 @@ function managerExecutiveView() {
           </div>
         </div>
       </div>
-      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Líquido</th><th>Meta</th><th>% Meta</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
-      ${executiveExpandSection("units", "Ver performance por unidade", `<div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Devolução</th><th>% Dev.</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead><tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody></table></div>`)}
+      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
+      ${executiveExpandSection("units", "Ver performance por unidade", `<div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead><tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody></table></div>`)}
     </div>
   `;
 }
@@ -5385,10 +5387,31 @@ function executivoView() {
         ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal))}
         ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct))}
         ${kpiCard("Ticket médio", currency(s.ticketAverage), "Clientes", number(s.distinctClients))}
-        ${kpiCard("Devolução", currency(s.returnsValue), "% Devolução", pct(s.returnRatioPct))}
+        ${kpiCard("Devolução comercial", currency(s.returnsValue), "% Devolução", pct(s.returnRatioPct))}
+        ${kpiCard("Devolução em garantia", currency(s.warrantyReturnsValue || 0), "% Garantia", pct(s.warrantyRatioPct || 0))}
         ${kpiCard("Desconto médio", pct(s.discountPct), "Mix SKU", number(s.mixSku))}
         ${kpiCard("Dias úteis", `${number(s.workingDaysElapsed)}/${number(s.workingDaysTotal)}`, "Meta diária", currency(s.dailyRevenueTarget))}
       </div>
+      ${Number(s.warrantyReturnsValue || 0) > 0 ? `
+        <div class="form-card" style="padding:12px 18px">
+          <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
+            <div>
+              <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em">COMPOSIÇÃO DAS DEVOLUÇÕES</div>
+              <div class="text-small" style="color:var(--muted)">A garantia não entra no resultado comercial.</div>
+            </div>
+            <div style="display:flex;gap:18px;flex-wrap:wrap">
+              <div><span class="text-small" style="color:var(--muted)">Total devolvido</span><br>
+                <strong>${currency(s.returnsTotalValue || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> (${pct(s.returnsTotalRatioPct || 0)})</span></div>
+              <div><span class="text-small" style="color:var(--muted)">− Garantia</span><br>
+                <strong style="color:#e67e22">${currency(s.warrantyReturnsValue || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> (${pct(s.warrantyRatioPct || 0)})</span></div>
+              <div><span class="text-small" style="color:var(--muted)">= Comercial</span><br>
+                <strong style="color:var(--accent)">${currency(s.returnsValue || 0)}</strong>
+                <span class="text-small" style="color:var(--muted)"> (${pct(s.returnRatioPct || 0)})</span></div>
+            </div>
+          </div>
+        </div>` : ""}
       <div class="grid-2">
         ${summaryDiffCard("Receita líquida — comparativos", comp.group)}
         ${kpiCard("Vendedores ativos", number(ranking.length), "Unidades", number(units.length))}
@@ -5396,7 +5419,7 @@ function executivoView() {
       ${executiveExpandSection("details", "Ver ranking de vendedores", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Devolução</th><th>% Dev.</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
+            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
             <tbody>${sellerRows(ranking)}</tbody>
           </table>
         </div>
@@ -5404,7 +5427,7 @@ function executivoView() {
       ${executiveExpandSection("units", "Ver performance por unidade", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Devolução</th><th>% Dev.</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead>
+            <thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead>
             <tbody>${unitRows(units)}</tbody>
           </table>
         </div>
