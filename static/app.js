@@ -354,12 +354,12 @@ function defaultTabForUser(user) {
   return preference.find((tab) => allowed.includes(tab)) || allowed[0] || "executivo";
 }
 
-// Telas que dependem do score — escondidas enquanto SCORE_ENABLED for false
-const SCORE_TABS = ["meu-placar", "placar-equipe"];
+// Telas da campanha de premiação — seguem PLACAR_ENABLED, não o score
+const PLACAR_TABS = ["meu-placar", "placar-equipe"];
 
 function allowedTabsForUser(user) {
   if (!user) return ["executivo"];
-  const withoutScore = (tabs) => (scoreEnabled() ? tabs : tabs.filter((t) => !SCORE_TABS.includes(t)));
+  const withoutScore = (tabs) => (placarEnabled() ? tabs : tabs.filter((t) => !PLACAR_TABS.includes(t)));
   // Fonte de verdade: os módulos do perfil de acesso (configurável pela tela).
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
@@ -374,10 +374,22 @@ function userCanManageUsers() {
 }
 
 /**
- * Score/placar desativado por decisão de negócio (31/07/2026).
- * Para reativar, basta trocar para `true` — as telas e cálculos continuam no código.
+ * SCORE = índice ponderado 0–100 exibido como chip nas tabelas e cards de vendedor
+ * (meta, ticket, clientes, mix, devolução com pesos configuráveis).
+ * Desativado por decisão de negócio em 31/07/2026.
  */
 const SCORE_ENABLED = false;
+
+/**
+ * PLACAR = campanha de premiação por pontos (meta, margem, itens, positivação,
+ * devolução, ligações) com prêmio estimado em R$. É independente do score acima
+ * e continua ATIVO — é o programa de incentivo da equipe.
+ */
+const PLACAR_ENABLED = true;
+
+function placarEnabled() {
+  return PLACAR_ENABLED;
+}
 
 /**
  * Selo de status do vendedor (Destaque / Boa rota / Acompanhar / Intervir).
@@ -461,12 +473,12 @@ async function bootstrap() {
     applyDefaultUnitForUser();
     // Cargas essenciais em paralelo (options não bloqueia mais o restante)
     const loads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
-    if (session.user.role === "Vendedor" && scoreEnabled()) loads.push(loadSellerScore());
+    if (session.user.role === "Vendedor" && placarEnabled()) loads.push(loadSellerScore());
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
       loadAdmin();
-      if (scoreEnabled()) loadTeamScore();
+      if (placarEnabled()) loadTeamScore();
       loadTeamActivity();
       loadPortfolioSummary();
     }
@@ -975,11 +987,11 @@ async function handleLogin(event) {
     state.ui.defaultUnitApplied = false;
     applyDefaultUnitForUser();
     const loginLoads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
-    if (result.user.role === "Vendedor" && scoreEnabled()) loginLoads.push(loadSellerScore());
+    if (result.user.role === "Vendedor" && placarEnabled()) loginLoads.push(loadSellerScore());
     await Promise.all(loginLoads);
     if (state.user.role !== "Vendedor") {
       loadAdmin();
-      if (scoreEnabled()) loadTeamScore();
+      if (placarEnabled()) loadTeamScore();
       loadTeamActivity();
       loadPortfolioSummary();
     }
@@ -4144,7 +4156,7 @@ async function submitCrmInteraction() {
       }),
     });
     // Atualizar placar de ligações em background
-    if (roleIsSeller() && scoreEnabled()) loadSellerScore();
+    if (roleIsSeller() && placarEnabled()) loadSellerScore();
     const resultLabel = {
       GEROU_PEDIDO: "🎉 Venda registrada!",
       GEROU_ORCAMENTO: "📋 Orçamento registrado!",
@@ -5743,7 +5755,7 @@ function dashboardView() {
   `;
 
   // Score resumido no sidebar para vendedor
-  const sidebarScore = scoreEnabled() && roleIsSeller() && state.sellerScore ? `
+  const sidebarScore = placarEnabled() && roleIsSeller() && state.sellerScore ? `
     <div style="padding:10px 12px;background:linear-gradient(135deg,#0f3044,#1a5276);border-radius:12px;margin-top:8px;cursor:pointer" onclick="switchTab('meu-placar')">
       <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em">MEU PLACAR</div>
       <div style="display:flex;align-items:baseline;gap:6px;margin-top:4px">
