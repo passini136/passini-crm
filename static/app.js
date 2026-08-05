@@ -154,6 +154,7 @@ const state = {
     teamActivity: null,
     missionUnit: "",   // filtro de unidade da Missão do Dia (diretor/admin)
     unassigned: null,  // clientes recorrentes sem vendedor
+    copyFallback: null,  // modal de copia manual (HTTP sem clipboard API)
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -2807,11 +2808,10 @@ function currentScriptById(id) {
 async function copyScript(id) {
   const script = currentScriptById(id);
   if (!script) return;
-  try {
-    await navigator.clipboard.writeText(script.body);
+  if (await copyToClipboard(script.body)) {
     addMessage("success", "Texto copiado.");
-  } catch (e) {
-    addMessage("error", "Não foi possível copiar. Selecione o texto manualmente.");
+  } else {
+    showCopyFallback(script.body, script.title);
   }
 }
 
@@ -2982,11 +2982,10 @@ async function deleteContent(id) {
 async function copyLibraryText(id) {
   const item = (state.content.items || []).find((i) => i.id === id);
   if (!item) return;
-  try {
-    await navigator.clipboard.writeText(item.body);
+  if (await copyToClipboard(item.body)) {
     addMessage("success", "Texto copiado.");
-  } catch (e) {
-    addMessage("error", "Não foi possível copiar automaticamente.");
+  } else {
+    showCopyFallback(item.body, item.title);
   }
 }
 
@@ -3080,6 +3079,77 @@ function semVendedorView() {
         </div>` : emptyStateCard("Nenhum cliente recorrente sem vendedor com esse critério. 👏")}
     </div>
   `;
+}
+
+/**
+ * Copia texto para a área de transferência.
+ *
+ * A API navigator.clipboard só existe em contexto seguro (HTTPS ou localhost).
+ * O servidor é acessado por http://IP na rede local, então ela não está
+ * disponível — daí o fallback com execCommand, que funciona em HTTP.
+ * Retorna true se copiou.
+ */
+async function copyToClipboard(text) {
+  if (!text) return false;
+  // Caminho moderno (HTTPS/localhost)
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch (e) {
+      // cai para o fallback
+    }
+  }
+  // Fallback: textarea temporária fora da tela + execCommand
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-9999px";
+    ta.style.left = "-9999px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    ta.setSelectionRange(0, ta.value.length);  // iOS
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Última alternativa: abre o texto para o usuário selecionar e copiar na mão. */
+function showCopyFallback(text, title) {
+  state.crm.copyFallback = { text, title: title || "Copie o texto" };
+  requestRender();
+}
+
+function closeCopyFallback() {
+  state.crm.copyFallback = null;
+  requestRender();
+}
+
+function copyFallbackModal() {
+  const cf = state.crm.copyFallback;
+  if (!cf) return "";
+  return `
+    <div class="client-drawer-overlay open" onclick="closeCopyFallback()">
+      <div class="panel" style="max-width:640px;margin:8vh auto;padding:20px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${escapeHtml(cf.title)}</h3>
+          <div class="text-small">Selecione o texto abaixo e copie com Ctrl+C.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="closeCopyFallback()">Fechar</button>
+        </div>
+        <textarea readonly onclick="this.select()" rows="14"
+          style="width:100%;font-family:inherit;font-size:13px;line-height:1.6">${escapeHtml(cf.text)}</textarea>
+        <div class="actions" style="margin-top:10px">
+          <button class="btn btn-primary" onclick="document.querySelector('.panel textarea')?.select();document.execCommand('copy');addMessage('success','Texto copiado.');closeCopyFallback()">Selecionar e copiar</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 function crmFilterToolbar() {
@@ -5740,6 +5810,7 @@ function dashboardView() {
         </div>
       </div>
       ${crmModalView()}
+      ${copyFallbackModal()}
       ${clientDrawerView()}
     </div>
   `;
