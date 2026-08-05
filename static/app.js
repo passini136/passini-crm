@@ -5729,7 +5729,20 @@ function dashboardView() {
   const filtersLoading = Boolean(state.ui.loading.filters);
   const dis = filtersLoading ? "disabled" : "";
   const isCrmTab = state.activeTab.startsWith("crm-") || state.activeTab === "meu-placar" || state.activeTab === "placar-equipe";
-  const filterBar = sellerRole || isCrmTab ? "" : `
+  // O vendedor não escolhe unidade nem vendedor (o escopo já força os dele),
+  // mas precisa trocar de mês para acompanhar o próprio histórico.
+  const sellerFilterBar = sellerRole && !isCrmTab ? `
+    <div class="form-card" style="padding:12px 18px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap">COMPETÊNCIA</span>
+        <select onchange="state.filters.competenceStart = state.filters.competenceEnd = this.value; applyMainFilters()" ${dis} style="flex:1;min-width:130px;max-width:220px">
+          ${(state.options.competences || []).map((c) => `<option value="${escapeHtml(c)}" ${state.filters.competenceEnd === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+        </select>
+        ${filtersLoading ? '<span class="text-small" style="color:var(--accent);font-weight:600">Buscando…</span>' : ""}
+      </div>
+    </div>
+  ` : "";
+  const filterBar = sellerRole || isCrmTab ? sellerFilterBar : `
     <div class="form-card" style="padding:12px 18px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap">COMPETÊNCIA</span>

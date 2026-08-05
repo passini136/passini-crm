@@ -287,8 +287,13 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
     },
     {
         "name": "Vendedor",
-        "description": "Rotina diária de vendas: missão do dia, carteira própria e placar.",
-        "modules": ["crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "meu-placar", "biblioteca", "calendario"],
+        "description": "Rotina diária de vendas: missão do dia, carteira própria, resultado e placar.",
+        # "executivo" mostra o resultado do próprio vendedor — o escopo "proprio"
+        # já restringe os dados, então ele vê apenas os números dele.
+        "modules": [
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
+            "meu-placar", "biblioteca", "executivo", "calendario",
+        ],
         "data_scope": "proprio",
         "can_manage_users": 0,
     },
