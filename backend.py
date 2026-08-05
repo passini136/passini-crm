@@ -3087,7 +3087,9 @@ def _calendar_reference_data(
         """,
         (company_id, start.isoformat(), end.isoformat()),
     ).fetchall():
-        vacations_by_person[normalize_whitespace(row["person_name"])].append(dict(row))
+        # Chave em maiúsculas: registros antigos podem ter sido digitados com
+        # capitalização diferente da base de vendedores.
+        vacations_by_person[normalize_upper(row["person_name"])].append(dict(row))
     result = (holidays, dict(vacations_by_person))
     with _calendar_cache_lock:
         _calendar_cache[key] = result
@@ -3108,7 +3110,7 @@ def get_business_calendar(
     vacation_dates = set()
     vacations = []
     if seller_name:
-        for row in vacations_by_person.get(normalize_whitespace(seller_name), []):
+        for row in vacations_by_person.get(normalize_upper(seller_name), []):
             vacations.append(dict(row))
             try:
                 _vs = date.fromisoformat(row["start_date"])

@@ -1613,7 +1613,23 @@ function vacationTableCard() {
       </div>
       <form onsubmit="saveVacation(event)">
         <div class="two-column-form" style="margin-bottom:10px">
-          <div class="field"><label>Nome</label><input id="vac-name" required value="${escapeHtml(ev?.person_name || "")}" /></div>
+          <div class="field">
+            <label>Vendedor</label>
+            ${(() => {
+              // Lista fechada: nome digitado diferente da base quebra o cálculo
+              // ponderado de meta (o vínculo é feito pelo nome exato).
+              const opcoes = sellerPeopleOptions();
+              const atual = ev?.person_name || "";
+              const naLista = opcoes.some((p) => p.person_name === atual);
+              return `
+                <select id="vac-name" required>
+                  <option value="">Selecione o vendedor…</option>
+                  ${opcoes.map((p) => `<option value="${escapeHtml(p.person_name)}" ${atual === p.person_name ? "selected" : ""}>${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}</option>`).join("")}
+                  ${atual && !naLista ? `<option value="${escapeHtml(atual)}" selected>${escapeHtml(atual)} (fora da base)</option>` : ""}
+                </select>
+                ${atual && !naLista ? `<div class="text-small" style="color:#e67e22;margin-top:4px">⚠ Este nome não está na base de vendedores — o cálculo de meta pode não considerar estas férias.</div>` : ""}`;
+            })()}
+          </div>
           <div class="field"><label>Observação</label><input id="vac-notes" value="${escapeHtml(ev?.notes || "")}" /></div>
           <div class="field"><label>Data inicial</label><input id="vac-start" type="date" required value="${escapeHtml(ev?.start_date || "")}" /></div>
           <div class="field"><label>Data final</label><input id="vac-end" type="date" required value="${escapeHtml(ev?.end_date || "")}" /></div>
@@ -1804,9 +1820,82 @@ async function deleteUnitGoal(competence, unitName) {
   }
 }
 
+/**
+ * Vendedores ativos que ainda não têm meta na competência selecionada.
+ * Sem meta, o % de atingimento fica zerado e o vendedor some do Placar e da
+ * Missão do Dia — por isso vale sinalizar antes de o mês avançar.
+ */
+function sellersMissingGoal(competence) {
+  const comp = competence || state.goalEditors?.seller?.competence
+    || state.filters.competenceEnd || state.options.competences?.[0] || "";
+  if (!comp) return { competence: "", pending: [] };
+  const comGoal = new Set(
+    (state.admin?.goalsSeller || [])
+      .filter((g) => g.competence === comp)
+      .map((g) => normalizeName(g.seller_name))
+  );
+  const pending = sellerPeopleOptions()
+    .filter((p) => !comGoal.has(normalizeName(p.person_name)));
+  return { competence: comp, pending };
+}
+
+function normalizeName(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function missingGoalsCard() {
+  const { competence, pending } = sellersMissingGoal();
+  if (!competence) return "";
+  if (!pending.length) {
+    return `<div class="message success" style="font-size:13px">
+      ✅ Todos os vendedores têm meta cadastrada em ${escapeHtml(competence)}.
+    </div>`;
+  }
+  return `
+    <div class="form-card" style="border-left:4px solid #e67e22">
+      <div class="section-title">
+        <div>
+          <h3 style="font-size:15px">⚠ Vendedores sem meta em ${escapeHtml(competence)}</h3>
+          <div class="text-small">Sem meta, o atingimento fica zerado e o vendedor não entra no Placar.</div>
+        </div>
+        <span class="soft-badge" style="background:#fff3e0;color:#e65100">${pending.length}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${pending.map((p) => `
+          <button class="btn btn-ghost btn-sm" type="button"
+            onclick="prefillSellerGoal('${encodeURIComponent(p.person_name)}','${encodeURIComponent(p.base_unit || "")}','${encodeURIComponent(competence)}')"
+            title="Cadastrar meta para ${escapeHtml(p.person_name)}">
+            ${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}
+          </button>`).join("")}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        Clique em um nome para preencher o formulário de meta com esse vendedor.
+      </div>
+    </div>`;
+}
+
+/** Preenche o formulário de meta a partir do card de pendências. */
+function prefillSellerGoal(nameEnc, unitEnc, competenceEnc) {
+  const name = decodeURIComponent(nameEnc);
+  const unit = decodeURIComponent(unitEnc || "");
+  const competence = decodeURIComponent(competenceEnc || "");
+  state.goalEditors.seller = {
+    ...(state.goalEditors.seller || {}),
+    competence,
+    sellerName: name,
+    baseUnit: unit,
+    revenueGoal: "",
+    editing: false,
+  };
+  requestRender();
+  document.getElementById("goal-seller-name")?.scrollIntoView({ behavior: "smooth", block: "center" });
+  setTimeout(() => document.getElementById("goal-seller-revenue")?.focus(), 300);
+}
+
 function sellerGoalsTableCard() {
   const rows = state.admin?.goalsSeller || [];
   return `
+    ${missingGoalsCard()}
     <div class="table-card">
       <div class="section-title"><h3>Metas por vendedor</h3></div>
       <div class="table-wrap">
@@ -5893,7 +5982,9 @@ async function saveVacation(event) {
   const start = document.getElementById("vac-start")?.value;
   const end = document.getElementById("vac-end")?.value;
   const notes = document.getElementById("vac-notes")?.value?.trim();
-  if (!name || !start || !end) { addMessage("error", "Nome, data inicial e data final são obrigatórios."); return; }
+  if (!name) { addMessage("error", "Selecione o vendedor na lista."); return; }
+  if (!start || !end) { addMessage("error", "Data inicial e data final são obrigatórias."); return; }
+  if (end < start) { addMessage("error", "A data final não pode ser anterior à inicial."); return; }
   const editingId = state.crm.editingVacation?.id;
   try {
     if (editingId) {
