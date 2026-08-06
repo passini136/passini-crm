@@ -4705,46 +4705,33 @@ function executiveExpandSection(key, label, content) {
   `;
 }
 
-function managerExecutiveView() {
+/**
+ * Blocos operacionais da gestão: alertas da unidade e clientes em risco.
+ * Ficam no fim do Executivo para quem tem escopo de gestão — são acionáveis
+ * no dia a dia e não existiam na visão consolidada.
+ */
+function managementOperationalBlocks() {
   const alerts = buildManagementAlerts();
   const clientsAtRisk = (state.crm.clients || []).filter((item) => item.statusCode !== "ATIVO").slice(0, 6);
   return `
-    <div class="stack">
-      <div class="panel spotlight-panel">
-        <div>
-          <div class="eyebrow">Resumo da Unidade</div>
-          <h3>Leitura rápida da unidade para tomada de decisão.</h3>
-          <div class="text-small">Resultado da unidade, vendedores, alertas, clientes em risco e tarefas da equipe sem abrir tabelas pesadas primeiro.</div>
+    <div class="grid-2">
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Alertas da unidade</h3><div class="text-small">Pontos que pedem ação da gestão.</div></div>
+          <span class="soft-badge">${number(alerts.length)}</span>
         </div>
-        <div class="actions">
-          <button class="btn btn-secondary" onclick="switchTab('crm-agenda')">CRM da equipe</button>
-          <button class="btn btn-primary" onclick="switchTab('vendedores')">Indicadores detalhados</button>
+        <div class="alert-grid">${alerts.map(managementAlertCard).join("") || emptyStateCard("Nenhum alerta relevante no momento.")}</div>
+      </div>
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Clientes em risco</h3><div class="text-small">Inativos e pré-inativos no recorte atual.</div></div>
+          <span class="soft-badge">${number(clientsAtRisk.length)}</span>
+        </div>
+        <div class="timeline-list">
+          ${clientsAtRisk.map((item) => `<div class="timeline-item"><strong>${escapeHtml(item.clientName)}</strong><div class="text-small">${escapeHtml(item.statusCode)} · ${escapeHtml(item.primaryReason || "-")}</div><div class="actions"><button class="btn btn-secondary" onclick="openCrmClient('${escapeHtml(item.clientKey)}', false)">Ver cliente</button></div></div>`).join("") || '<div class="timeline-item"><div class="text-small">Sem clientes em risco no recorte.</div></div>'}
         </div>
       </div>
-      <div class="kpi-grid">
-        ${kpiCard("Resultado da unidade", currency(state.dashboard.summary.revenueNet), "Meta", currency(state.dashboard.summary.revenueGoal), state.dashboard.summary.farol?.goalAttainment)}
-        ${kpiCard("Atingimento", pct(state.dashboard.summary.goalAttainmentPct), "Proj.", pct(state.dashboard.summary.projectedGoalAttainmentPct), state.dashboard.summary.farol?.goalAttainment)}
-        ${kpiCard("Devolução comercial", currency(state.dashboard.summary.returnsValue || 0), "% Devolução", pct(state.dashboard.summary.returnRatioPct || 0), state.dashboard.summary.farol?.returnRatio)}
-        ${kpiCard("Clientes em risco", number(clientsAtRisk.length), "Tarefas abertas", number(state.crm.summary.openTasks))}
-        ${kpiCard("Alertas da unidade", number(alerts.length), "Vendedores", number((state.dashboard.sellerRanking || []).length))}
-      </div>
-      ${farolLegend(state.dashboard.summary.paceExpectedPct)}
-      <div class="grid-2">
-        <div class="table-card">
-          <div class="section-title"><h3>Alertas da unidade</h3></div>
-          <div class="alert-grid">${alerts.map(managementAlertCard).join("") || emptyStateCard("Nenhum alerta relevante no momento.")}</div>
-        </div>
-        <div class="table-card">
-          <div class="section-title"><h3>Clientes em risco</h3></div>
-          <div class="timeline-list">
-            ${clientsAtRisk.map((item) => `<div class="timeline-item"><strong>${escapeHtml(item.clientName)}</strong><div class="text-small">${escapeHtml(item.statusCode)} · ${escapeHtml(item.primaryReason || "-")}</div><div class="actions"><button class="btn btn-secondary" onclick="openCrmClient('${escapeHtml(item.clientKey)}')">Ver cliente</button></div></div>`).join("") || '<div class="timeline-item"><div class="text-small">Sem clientes em risco no recorte.</div></div>'}
-          </div>
-        </div>
-      </div>
-      ${executiveExpandSection("details", "Ver análise detalhada", `<div class="table-wrap"><table><thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Carteira</th><th>Fora</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead><tbody>${sellerRows((state.dashboard.sellerRanking || []).slice(0, 12))}</tbody></table></div>`)}
-      ${executiveExpandSection("units", "Ver performance por unidade", `<div class="table-wrap"><table><thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead><tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody></table></div>`)}
-    </div>
-  `;
+    </div>`;
 }
 
 function auditBadge(issueCount) {
@@ -5975,8 +5962,14 @@ function meuPlacarView() {
 // ─── FUNÇÕES RECONSTRUÍDAS (após limpeza de overrides) ───────────────────────
 
 function topbarTitle() {
-  if (roleIsSeller()) return { title: "Minha Agenda do Dia", description: "Execução comercial orientada à ação, com foco na sua carteira e nos seus retornos." };
-  if (roleIsManager()) return { title: "Resumo da Unidade", description: "Visão rápida da unidade, da equipe e dos clientes em risco." };
+  // Antes o título ficava travado por perfil em TODAS as abas. Agora o título
+  // acompanha a tela aberta; o perfil só muda o texto da aba inicial.
+  if (roleIsSeller() && state.activeTab === "crm-agenda") {
+    return { title: "Minha Agenda do Dia", description: "Execução comercial orientada à ação, com foco na sua carteira e nos seus retornos." };
+  }
+  if (roleIsManager() && state.activeTab === "executivo") {
+    return { title: "Visão Executiva da Unidade", description: "Resultados, equipe, alertas e clientes em risco da sua unidade." };
+  }
   const map = {
     "executivo":      { title: "Visão Executiva",         description: "Panorama consolidado de resultados, metas e comparativos." },
     "vendedores":     { title: "Análise de Vendedores",   description: "Ranking, score e desempenho individual de vendedores." },
@@ -6049,7 +6042,9 @@ function loadingBanner() {
 
 function executivoView() {
   if (!state.dashboard) return `<div class="loader panel">Carregando dashboard…</div>`;
-  if (roleIsManager()) return managerExecutiveView();
+  // Gerente vê o MESMO Executivo de diretor e admin — os dados já vêm recortados
+  // pela unidade dele. Os blocos operacionais próprios da gestão (alertas e
+  // clientes em risco) são acrescentados no fim, em vez de substituírem a tela.
   const s = state.dashboard.summary || {};
   const comp = state.dashboard.comparisons || {};
   const ranking = state.dashboard.sellerRanking || [];
@@ -6142,6 +6137,7 @@ function executivoView() {
           ${(state.dashboard.unitPerformance || []).slice(0, 4).map((u) => kpiCard(escapeHtml(u.unitName), currency(u.revenueNet), "Meta", currency(u.revenueGoal))).join("")}
         </div>
       `)}
+      ${roleIsManager() ? managementOperationalBlocks() : ""}
     </div>
   `;
 }
