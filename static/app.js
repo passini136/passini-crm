@@ -3,6 +3,7 @@ const state = {
   options: { competences: [], units: [], sellers: [], cities: [] },
   dashboard: null,
   admin: null,
+  kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
   sellerScore: null,
@@ -1146,17 +1147,67 @@ function tabButton(id, title, desc) {
   `;
 }
 
-function kpiCard(title, value, footLeft, footRight) {
+/**
+ * Farol de indicador: cor + ícone + rótulo.
+ *
+ * A cor NUNCA aparece sozinha — cerca de 8% dos homens não distinguem vermelho
+ * de verde. O ícone (▲ ◆ ▼) e o texto garantem a leitura para todos, conforme
+ * as diretrizes de acessibilidade WCAG.
+ */
+function farolBadge(farol, { compact = false } = {}) {
+  if (!farol || !farol.level || farol.level === "neutral") return "";
+  const titulo = farol.detail || farol.hint || farol.label;
+  if (compact) {
+    return `<span title="${escapeHtml(titulo)}" style="color:${farol.color};font-weight:800;margin-left:4px">${farol.icon}</span>`;
+  }
   return `
-    <div class="kpi-card">
-      <span>${title}</span>
-      <strong>${value}</strong>
+    <span title="${escapeHtml(titulo)}"
+      style="display:inline-flex;align-items:center;gap:4px;background:${farol.bg};color:${farol.color};
+             border-radius:12px;padding:2px 8px;font-size:11px;font-weight:800;white-space:nowrap">
+      ${farol.icon} ${escapeHtml(farol.label)}
+    </span>`;
+}
+
+/** Aplica a cor do farol diretamente no número, mantendo o ícone ao lado. */
+function farolValue(value, farol) {
+  if (!farol || !farol.level || farol.level === "neutral") return value;
+  return `<span style="color:${farol.color}" title="${escapeHtml(farol.detail || farol.hint || "")}">${value} ${farol.icon}</span>`;
+}
+
+function kpiCard(title, value, footLeft, footRight, farol) {
+  const temFarol = farol && farol.level && farol.level !== "neutral";
+  return `
+    <div class="kpi-card" ${temFarol ? `style="border-left:4px solid ${farol.color}"` : ""}>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+        <span>${title}</span>
+        ${temFarol ? farolBadge(farol) : ""}
+      </div>
+      <strong ${temFarol ? `style="color:${farol.color}"` : ""}>${value}</strong>
       <div class="kpi-foot">
         <span>${footLeft || ""}</span>
         <span>${footRight || ""}</span>
       </div>
+      ${temFarol && farol.detail ? `<div class="text-small" style="color:var(--muted);margin-top:2px;font-size:10px">${escapeHtml(farol.detail)}</div>` : ""}
     </div>
   `;
+}
+
+/** Legenda do farol — explica o critério para quem olha a tela pela primeira vez. */
+function farolLegend(paceExpectedPct) {
+  return `
+    <div class="form-card" style="padding:10px 16px">
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+        <span style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em">FAROL</span>
+        <span style="display:inline-flex;align-items:center;gap:4px;font-size:12px"><span style="color:#1e8e3e;font-weight:800">▲</span> No ritmo</span>
+        <span style="display:inline-flex;align-items:center;gap:4px;font-size:12px"><span style="color:#b06000;font-weight:800">◆</span> Atenção</span>
+        <span style="display:inline-flex;align-items:center;gap:4px;font-size:12px"><span style="color:#c5221f;font-weight:800">▼</span> Crítico</span>
+        ${paceExpectedPct != null ? `
+          <span class="text-small" style="color:var(--muted);margin-left:auto">
+            A meta é comparada com o <strong>ritmo esperado até hoje</strong> (${pct(paceExpectedPct)} do mês decorrido),
+            não com os 100% do fechamento.
+          </span>` : ""}
+      </div>
+    </div>`;
 }
 
 
@@ -1194,17 +1245,17 @@ function sellerRows(rows) {
         <td>${escapeHtml(row.baseUnit || "-")}</td>
         <td>${currency(row.revenueNet)}</td>
         <td>${currency(row.revenueGoal)}</td>
-        <td>${pct(row.goalAttainmentPct)}</td>
-        <td>${pct(row.projectedGoalAttainmentPct || 0)}</td>
+        <td>${farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)}</td>
+        <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
         <td>${currency(row.ticketAverage)}</td>
         <td>${number(row.distinctClients)}</td>
         <td>${number(row.ownClients || 0)}</td>
         <td>${number(row.otherClients || 0)}</td>
         <td>${number(row.mixSku)}</td>
         <td>${currency(row.returnsValue)}</td>
-        <td>${pct(row.returnRatioPct)}</td>
+        <td>${farolValue(pct(row.returnRatioPct), row.farol?.returnRatio)}</td>
         <td>${currency(row.warrantyReturnsValue || 0)}</td>
-        <td>${pct(row.discountPct || 0)}</td>
+        <td>${farolValue(pct(row.discountPct || 0), row.farol?.discountPct)}</td>
         ${scoreEnabled() ? `<td><span class="score-chip">${row.score}</span></td>` : ''}
       </tr>
     `
@@ -1220,12 +1271,12 @@ function unitRows(rows) {
         <td>${escapeHtml(row.unitName)}</td>
         <td>${currency(row.revenueNet)}</td>
         <td>${currency(row.revenueGoal)}</td>
-        <td>${pct(row.goalAttainmentPct)}</td>
-        <td>${pct(row.projectedGoalAttainmentPct || 0)}</td>
+        <td>${farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)}</td>
+        <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
         <td>${currency(row.returnsValue)}</td>
-        <td>${pct(row.returnRatioPct || 0)}</td>
+        <td>${farolValue(pct(row.returnRatioPct || 0), row.farol?.returnRatio)}</td>
         <td>${currency(row.warrantyReturnsValue || 0)}</td>
-        <td>${marginText(row.marginValue)}</td>
+        <td>${farolValue(marginText(row.marginValue), row.farol?.marginValue)}</td>
         <td>${number(row.qtySold || 0)}</td>
         <td>${currency(row.ticketPerPiece || 0)}</td>
         <td>${currency(row.metaDiaria)}</td>
@@ -1522,8 +1573,8 @@ function vendedoresView() {
                 <div class="seller-visual-bars">
                   <div class="seller-visual-bar-row">
                     <div class="seller-visual-bar-head">
-                      <span>% meta atual</span>
-                      <strong>${pct(actualPct)}</strong>
+                      <span>% meta atual ${farolBadge(row.farol?.goalAttainment, {compact:true})}</span>
+                      <strong ${row.farol?.goalAttainment?.color ? `style="color:${row.farol.goalAttainment.color}"` : ""}>${pct(actualPct)}</strong>
                     </div>
                     <div class="seller-progress">
                       <span style="width:${actualBar}%"></span>
@@ -3365,6 +3416,86 @@ function copyFallbackModal() {
         </div>
       </div>
     </div>`;
+}
+
+// ─── Limites do farol ───────────────────────────────────────────────────────
+
+async function loadKpiThresholds() {
+  try {
+    state.kpiThresholds = await api("/api/kpi-thresholds");
+  } catch (e) {
+    state.kpiThresholds = { error: e.message, metrics: [] };
+  }
+  requestRender();
+}
+
+function kpiThresholdsCard() {
+  if (!userCanManageUsers()) return "";
+  const data = state.kpiThresholds;
+  if (!data) { loadKpiThresholds(); return `<div class="loader panel">Carregando limites do farol…</div>`; }
+  if (data.error) return `<div class="message error">${escapeHtml(data.error)}</div>`;
+
+  const dirLabel = (d) => (d === "higher" ? "quanto maior, melhor" : "quanto menor, melhor");
+  const basisLabel = (b) => (b === "pace" ? "compara com o ritmo esperado" : "valor absoluto");
+
+  return `
+    <div class="form-card">
+      <div class="section-title">
+        <div><h3>Limites do farol</h3>
+        <div class="text-small">Define quando cada indicador fica verde, âmbar ou vermelho.</div></div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Indicador</th><th>Critério</th>
+              <th style="color:#1e8e3e">▲ No ritmo</th>
+              <th style="color:#b06000">◆ Atenção</th>
+              <th>Ativo</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${(data.metrics || []).map((m) => `
+              <tr>
+                <td>
+                  <strong>${escapeHtml(m.label)}</strong>
+                  <div class="text-small" style="color:var(--muted)">${escapeHtml(m.hint || "")}</div>
+                </td>
+                <td class="text-small" style="color:var(--muted)">
+                  ${escapeHtml(dirLabel(m.direction))}<br>${escapeHtml(basisLabel(m.basis))}
+                </td>
+                <td><input id="thr-good-${m.id}" type="number" step="0.01" value="${m.good_at}" style="width:90px" />${m.unit ? ` ${escapeHtml(m.unit)}` : ""}</td>
+                <td><input id="thr-warn-${m.id}" type="number" step="0.01" value="${m.warn_at}" style="width:90px" />${m.unit ? ` ${escapeHtml(m.unit)}` : ""}</td>
+                <td><input id="thr-active-${m.id}" type="checkbox" ${m.is_active ? "checked" : ""} /></td>
+                <td><button class="btn btn-secondary btn-sm" type="button" onclick="saveKpiThreshold('${m.id}')">Salvar</button></td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="message" style="font-size:12px;margin-top:10px">
+        <strong>Como o % de atingimento é avaliado:</strong> não contra os 100% do fechamento,
+        e sim contra o ritmo esperado até hoje. No dia 3 de 21 dias úteis, espera-se 14,3% da meta —
+        então 12,2% equivale a 85% do ritmo, o que é atenção e não crise.
+      </div>
+    </div>`;
+}
+
+async function saveKpiThreshold(metricId) {
+  const goodAt = document.getElementById(`thr-good-${metricId}`)?.value;
+  const warnAt = document.getElementById(`thr-warn-${metricId}`)?.value;
+  const isActive = document.getElementById(`thr-active-${metricId}`)?.checked;
+  if (goodAt === "" || warnAt === "") { addMessage("error", "Preencha os dois limites."); return; }
+  try {
+    const r = await api("/api/kpi-thresholds/save", {
+      method: "POST",
+      body: JSON.stringify({ metricId, goodAt: Number(goodAt), warnAt: Number(warnAt), isActive }),
+    });
+    addMessage("success", r.message || "Limites salvos.");
+    await loadKpiThresholds();
+    await loadDashboard();
+  } catch (e) {
+    addMessage("error", e.message);
+  }
 }
 
 function crmFilterToolbar() {
@@ -5322,6 +5453,7 @@ Cancelar edição
           </div>
         </div>
         <div class="stack">
+          ${kpiThresholdsCard()}
           ${scoreEnabled() && userCanManageUsers() ? adminTableCard("Configuração do score", ["valid_from_competence", "weight_goal", "weight_ticket", "weight_clients", "weight_mix", "weight_returns"], state.admin.scoreConfigs) : ""}
           ${sellerGoalsTableCard()}
           ${unitGoalsTableCard()}
@@ -5774,16 +5906,17 @@ function executivoView() {
     <div class="stack">
       ${loadingBanner()}
       <div class="kpi-grid">
-        ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal))}
-        ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct))}
+        ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal), s.farol?.goalAttainment)}
+        ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct), s.farol?.goalAttainment)}
         ${kpiCard("Ticket médio", currency(s.ticketAverage), "Clientes", number(s.distinctClients))}
         ${kpiCard("Ticket PJ", currency(s.ticketAveragePj || 0), "Clientes PJ", number(s.pjClients || 0))}
         ${kpiCard("Ticket PF", currency(s.ticketAveragePf || 0), "Clientes PF", number(s.pfClients || 0))}
-        ${kpiCard("Devolução comercial", currency(s.returnsValue), "% Devolução", pct(s.returnRatioPct))}
+        ${kpiCard("Devolução comercial", currency(s.returnsValue), "% Devolução", pct(s.returnRatioPct), s.farol?.returnRatio)}
         ${kpiCard("Devolução em garantia", currency(s.warrantyReturnsValue || 0), "% Garantia", pct(s.warrantyRatioPct || 0))}
-        ${kpiCard("Desconto médio", pct(s.discountPct), "Mix SKU", number(s.mixSku))}
+        ${kpiCard("Desconto médio", pct(s.discountPct), "Mix SKU", number(s.mixSku), s.farol?.discountPct)}
         ${kpiCard("Dias úteis", `${number(s.workingDaysElapsed)}/${number(s.workingDaysTotal)}`, "Meta diária", currency(s.dailyRevenueTarget))}
       </div>
+      ${farolLegend(s.paceExpectedPct)}
       ${(Number(s.ownClients || 0) + Number(s.otherClients || 0)) > 0 ? `
         <div class="form-card" style="padding:12px 18px">
           <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">

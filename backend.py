@@ -299,6 +299,139 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
     },
 ]
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Faróis dos indicadores
+#
+# Decisões de projeto (pesquisadas com o Felipe em 04/08/2026):
+#
+# 1. RITMO, não valor absoluto. Avaliar "% atingimento" contra 100% no dia 3 de
+#    21 pinta tudo de vermelho e treina a equipe a ignorar o alerta. A base é
+#    quanto deveria estar HOJE: (dias decorridos / dias totais).
+#
+# 2. COR NUNCA SOZINHA. Cerca de 8% dos homens não distinguem vermelho de verde.
+#    Toda cor vem acompanhada de ícone e rótulo — exigência de acessibilidade
+#    (WCAG 1.4.1). Quem não vê a cor lê o símbolo.
+#
+# 3. POLARIDADE por indicador. Faturamento: maior é melhor. Devolução e
+#    desconto: menor é melhor. O motor precisa saber a direção.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FAROL_LEVELS = {
+    "good":    {"id": "good",    "label": "No ritmo",  "icon": "▲", "color": "#1e8e3e", "bg": "#e6f4ea"},
+    "warn":    {"id": "warn",    "label": "Atenção",   "icon": "◆", "color": "#b06000", "bg": "#fef7e0"},
+    "bad":     {"id": "bad",     "label": "Crítico",   "icon": "▼", "color": "#c5221f", "bg": "#fce8e6"},
+    "neutral": {"id": "neutral", "label": "Sem base",  "icon": "–", "color": "#5f6368", "bg": "#f1f3f4"},
+}
+
+# direction: "higher" = quanto maior melhor | "lower" = quanto menor melhor
+# basis: "pace" = compara com o ritmo esperado no mês | "absolute" = valor direto
+KPI_METRICS: list[dict[str, Any]] = [
+    {"id": "goal_attainment", "label": "% Atingimento da meta", "direction": "higher",
+     "basis": "pace", "good_at": 95.0, "warn_at": 80.0, "unit": "%",
+     "hint": "Percentual do ritmo esperado até hoje. 100% = exatamente em dia."},
+    {"id": "projected_attainment", "label": "% Projeção da meta", "direction": "higher",
+     "basis": "absolute", "good_at": 100.0, "warn_at": 90.0, "unit": "%",
+     "hint": "Projeção de fechamento do mês no ritmo atual."},
+    {"id": "return_ratio", "label": "% Devolução comercial", "direction": "lower",
+     "basis": "absolute", "good_at": 3.0, "warn_at": 4.5, "unit": "%",
+     "hint": "Devolução comercial sobre o líquido. Garantia não entra."},
+    {"id": "discount_pct", "label": "% Desconto médio", "direction": "lower",
+     "basis": "absolute", "good_at": 20.0, "warn_at": 28.0, "unit": "%",
+     "hint": "Desconto médio concedido sobre o bruto."},
+    {"id": "margin_value", "label": "Margem", "direction": "higher",
+     "basis": "absolute", "good_at": 1.55, "warn_at": 1.50, "unit": "x",
+     "hint": "Multiplicador de margem da unidade."},
+    {"id": "positivacao", "label": "% Positivação", "direction": "higher",
+     "basis": "absolute", "good_at": 85.0, "warn_at": 50.0, "unit": "%",
+     "hint": "Clientes da carteira que compraram no mês."},
+    {"id": "contacts_day", "label": "Contatos no dia", "direction": "higher",
+     "basis": "absolute", "good_at": 5.0, "warn_at": 3.0, "unit": "",
+     "hint": "Contatos registrados pelo vendedor hoje."},
+]
+KPI_METRIC_BY_ID = {m["id"]: m for m in KPI_METRICS}
+
+
+def seed_kpi_thresholds(conn: sqlite3.Connection, company_id: int) -> None:
+    """Cria os limites padrão uma única vez; ajustes feitos na tela são preservados."""
+    for metric in KPI_METRICS:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO kpi_thresholds
+                (company_id, metric_id, good_at, warn_at, is_active, created_at)
+            VALUES (?, ?, ?, ?, 1, ?)
+            """,
+            (company_id, metric["id"], metric["good_at"], metric["warn_at"], now_iso()),
+        )
+    conn.commit()
+
+
+def load_kpi_thresholds(conn: sqlite3.Connection, company_id: int) -> dict[str, dict[str, Any]]:
+    """Limites efetivos: o que está no banco sobrescreve o padrão do código."""
+    result: dict[str, dict[str, Any]] = {}
+    for metric in KPI_METRICS:
+        result[metric["id"]] = {**metric}
+    for row in conn.execute(
+        "SELECT metric_id, good_at, warn_at, is_active FROM kpi_thresholds WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        mid = row["metric_id"]
+        if mid in result:
+            result[mid]["good_at"] = float(row["good_at"])
+            result[mid]["warn_at"] = float(row["warn_at"])
+            result[mid]["is_active"] = bool(row["is_active"])
+    for metric in result.values():
+        metric.setdefault("is_active", True)
+    return result
+
+
+def evaluate_farol(
+    metric_id: str, value: float | None, thresholds: dict[str, dict[str, Any]],
+    pace_pct: float | None = None,
+) -> dict[str, Any]:
+    """Classifica um número em No ritmo / Atenção / Crítico.
+
+    Para métricas com basis="pace", `value` é o % de atingimento acumulado e
+    `pace_pct` é o % do mês já decorrido. O que se avalia é a razão entre os dois:
+    12,20% de meta no dia 3 de 21 (14,3% decorrido) = 85% do ritmo.
+    """
+    metric = thresholds.get(metric_id) or KPI_METRIC_BY_ID.get(metric_id)
+    if not metric or value is None or not metric.get("is_active", True):
+        return {"level": "neutral", **FAROL_LEVELS["neutral"], "metricId": metric_id}
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return {"level": "neutral", **FAROL_LEVELS["neutral"], "metricId": metric_id}
+    if not math.isfinite(numeric):
+        return {"level": "neutral", **FAROL_LEVELS["neutral"], "metricId": metric_id}
+
+    compared = numeric
+    detail = None
+    if metric.get("basis") == "pace":
+        if not pace_pct or pace_pct <= 0:
+            return {"level": "neutral", **FAROL_LEVELS["neutral"], "metricId": metric_id,
+                    "hint": "Mês ainda não começou."}
+        compared = numeric / pace_pct * 100
+        detail = f"{compared:.0f}% do ritmo esperado ({numeric:.1f}% de {pace_pct:.1f}%)"
+
+    good_at = float(metric["good_at"])
+    warn_at = float(metric["warn_at"])
+    if metric["direction"] == "higher":
+        level = "good" if compared >= good_at else ("warn" if compared >= warn_at else "bad")
+    else:
+        level = "good" if compared <= good_at else ("warn" if compared <= warn_at else "bad")
+
+    return {
+        "level": level,
+        **FAROL_LEVELS[level],
+        "metricId": metric_id,
+        "value": round(numeric, 2),
+        "compared": round(compared, 2),
+        "detail": detail,
+        "hint": metric.get("hint", ""),
+    }
+
+
 CSV_FILE_TYPES = {
     "030-relatorioFaturamento detalhado.csv": "faturamento_detalhado",
     "030-relatorioCustoVenda vendedor consolidado.csv": "custo_vendedor",
@@ -1445,6 +1578,20 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_warranty_company_comp_unit
                 ON fact_warranty_returns(company_id, competence, unit_name);
 
+            -- Faróis: limites de cor por indicador, ajustáveis pela tela
+            CREATE TABLE IF NOT EXISTS kpi_thresholds (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                metric_id TEXT NOT NULL,
+                good_at REAL NOT NULL,
+                warn_at REAL NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, metric_id),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
             -- Biblioteca de conteúdo comercial: scripts, mensagens e orientações
             CREATE TABLE IF NOT EXISTS content_library (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1789,6 +1936,7 @@ def init_db() -> None:
 
         seed_access_profiles(conn, company_id)
         seed_content_library(conn, company_id)
+        seed_kpi_thresholds(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -5486,6 +5634,14 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         reference_today=competence_state["today"],
         include_current_day=False,
     )
+    # ── Faróis ────────────────────────────────────────────────────────────────
+    # Percentual do mês já decorrido: base para avaliar ritmo em vez de valor cheio.
+    farol_thresholds = load_kpi_thresholds(conn, company_id)
+    pace_pct = (
+        safe_div(summary_calendar["elapsedWorkingDays"], summary_calendar["totalWorkingDays"]) * 100
+        if summary_calendar["totalWorkingDays"] else 0.0
+    )
+
     score_config = get_score_config(conn, company_id, primary_competence)
     max_ticket = 1.0
     max_clients = 1.0
@@ -5607,6 +5763,12 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "discountValue": round(metrics["discountValue"], 2),
                 "discountPct": round(discount_pct, 2),
                 "returnRatioPct": round(return_ratio, 2),
+                "farol": {
+                    "goalAttainment": evaluate_farol("goal_attainment", goal_attainment if revenue_goal else None, farol_thresholds, pace_pct),
+                    "projectedAttainment": evaluate_farol("projected_attainment", projected_goal_attainment if revenue_goal else None, farol_thresholds),
+                    "returnRatio": evaluate_farol("return_ratio", return_ratio, farol_thresholds),
+                    "discountPct": evaluate_farol("discount_pct", discount_pct, farol_thresholds),
+                },
                 "warrantyRatioPct": round(safe_div(warranty_value, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "returnsTotalRatioPct": round(safe_div(returns_total, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "marginValue": (lambda _m: round(_m, 2) if _m is not None else None)(finite_or_none(margin_value)),
@@ -5668,6 +5830,22 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "netProfitValue": round(net_profit_value, 2),
                 "returnsGoal": round(returns_goal, 2),
                 "returnRatioPct": round(safe_div(returns_value, revenue_net) * 100 if revenue_net else 0.0, 2),
+                "farol": {
+                    "goalAttainment": evaluate_farol(
+                        "goal_attainment",
+                        safe_div(revenue_net, revenue_goal) * 100 if revenue_goal else None,
+                        farol_thresholds, pace_pct),
+                    "projectedAttainment": evaluate_farol(
+                        "projected_attainment",
+                        safe_div(projected_revenue, revenue_goal) * 100 if revenue_goal else None,
+                        farol_thresholds),
+                    "returnRatio": evaluate_farol(
+                        "return_ratio",
+                        safe_div(returns_value, revenue_net) * 100 if revenue_net else None,
+                        farol_thresholds),
+                    "marginValue": evaluate_farol(
+                        "margin_value", finite_or_none(official_row.get("margin_value")), farol_thresholds),
+                },
                 "warrantyRatioPct": round(safe_div(warranty_value, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "returnsTotalRatioPct": round(safe_div(returns_total, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "goalAttainmentPct": round(safe_div(revenue_net, revenue_goal) * 100 if revenue_goal else 0.0, 2),
@@ -5982,6 +6160,24 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "scoreAverage": score_average,
             "workingDaysTotal": total_days_current,
             "workingDaysElapsed": elapsed_days_current,
+            # Ritmo do mês e faróis prontos para a tela
+            "paceExpectedPct": round(pace_pct, 2),
+            "farol": {
+                "goalAttainment": evaluate_farol(
+                    "goal_attainment",
+                    safe_div(summary_revenue, summary_goal) * 100 if summary_goal else None,
+                    farol_thresholds, pace_pct),
+                "projectedAttainment": evaluate_farol(
+                    "projected_attainment",
+                    safe_div(projection_revenue, summary_goal) * 100 if summary_goal else None,
+                    farol_thresholds),
+                "returnRatio": evaluate_farol(
+                    "return_ratio",
+                    safe_div(summary_returns, summary_revenue) * 100 if summary_revenue else None,
+                    farol_thresholds),
+                "discountPct": evaluate_farol(
+                    "discount_pct", detail_totals["discountPct"], farol_thresholds),
+            },
             "dailyRevenueTarget": daily_goal,
         },
         "debugProjection": debug_projection,
@@ -9167,6 +9363,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(exc), "items": [], "total": 0}))
                 return
+            if path == "/api/kpi-thresholds":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    thresholds = load_kpi_thresholds(conn, user["company_id"])
+                    can_edit = user_can_manage_users(conn, user)
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "metrics": [thresholds[m["id"]] for m in KPI_METRICS if m["id"] in thresholds],
+                    "levels": FAROL_LEVELS,
+                    "canEdit": can_edit,
+                }))
+                return
             if path == "/api/content":
                 # Biblioteca de conteúdo. Leitura liberada a todos os autenticados —
                 # é material de trabalho do vendedor.
@@ -10045,6 +10255,52 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/kpi-thresholds/save":
+                user = self._require_auth()
+                if not user or not self._require_user_management(user):
+                    return
+                payload = self._read_json()
+                try:
+                    metric_id = normalize_whitespace(payload.get("metricId"))
+                    if metric_id not in KPI_METRIC_BY_ID:
+                        raise ValueError("Indicador desconhecido.")
+                    good_at = float(payload.get("goodAt"))
+                    warn_at = float(payload.get("warnAt"))
+                    direction = KPI_METRIC_BY_ID[metric_id]["direction"]
+                    # Coerência: em "maior é melhor" o limite verde fica ACIMA do amarelo;
+                    # em "menor é melhor", abaixo. Sem isso o farol nunca acende verde.
+                    if direction == "higher" and good_at <= warn_at:
+                        raise ValueError("Para este indicador, o limite de 'No ritmo' deve ser maior que o de 'Atenção'.")
+                    if direction == "lower" and good_at >= warn_at:
+                        raise ValueError("Para este indicador, o limite de 'No ritmo' deve ser menor que o de 'Atenção'.")
+                    with closing(get_connection()) as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO kpi_thresholds (company_id, metric_id, good_at, warn_at, is_active, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(company_id, metric_id) DO UPDATE SET
+                                good_at = excluded.good_at,
+                                warn_at = excluded.warn_at,
+                                is_active = excluded.is_active,
+                                updated_at = ?
+                            """,
+                            (user["company_id"], metric_id, good_at, warn_at,
+                             1 if payload.get("isActive", True) else 0, now_iso(), now_iso()),
+                        )
+                        audit_log(conn, user["company_id"], user["id"], "editar", "kpi_thresholds",
+                                  metric_id, {"goodAt": good_at, "warnAt": warn_at})
+                        conn.commit()
+                        invalidate_dashboard_cache(user["company_id"])
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"message": "Limites atualizados."}))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
             if path == "/api/content/save":
                 user = self._require_auth()
                 if not user or not self._require_user_management(user):
