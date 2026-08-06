@@ -4113,10 +4113,24 @@ def crm_get_offer_suggestions(
 
     ITEM_EXPR = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
 
+    def item_label(codigo: str | None, gtin: str | None) -> str:
+        """Código do fabricante com o código interno entre parênteses.
+
+        O vendedor procura a peça pelo código interno no sistema, mas conversa
+        com o mecânico usando a referência do fabricante — os dois precisam
+        aparecer. O interno vem da coluna sem cabeçalho do relatório (coluna E).
+        """
+        cod = normalize_whitespace(codigo)
+        g = normalize_whitespace(gtin)
+        if g and g != cod:
+            return f"{cod} ({g})"
+        return cod or g or "ITEM"
+
     # Histórico do cliente por item (fora do mês corrente)
     history = conn.execute(
         f"""
         SELECT {ITEM_EXPR} AS item_code,
+               MAX(NULLIF(gtin_value, '')) AS gtin,
                COUNT(DISTINCT competence) AS meses,
                SUM(net_value) AS total,
                SUM(quantity) AS qtd,
@@ -4164,9 +4178,10 @@ def crm_get_offer_suggestions(
         gap_txt = "sem pedido no mês atual" if not gap else f"sem pedido há {gap} {'mês' if gap == 1 else 'meses'}"
         repurchase.append({
             "itemCode": r["item_code"],
+            "gtin": normalize_whitespace(r["gtin"]),
             "type": "RECOMPRA",
             "typeLabel": "Recompra",
-            "title": r["item_code"],
+            "title": item_label(r["item_code"], r["gtin"]),
             "reason": f"{freq} · {gap_txt} · média {brl(media)}/mês",
             "months": meses,
             "avgValue": round(media, 2),
@@ -4179,6 +4194,7 @@ def crm_get_offer_suggestions(
         peer_rows = conn.execute(
             f"""
             SELECT {ITEM_EXPR} AS item_code,
+                   MAX(NULLIF(gtin_value, '')) AS gtin,
                    COUNT(DISTINCT client_name) AS clientes,
                    SUM(net_value) AS total
             FROM fact_sales_detail
@@ -4196,9 +4212,10 @@ def crm_get_offer_suggestions(
                 continue
             opportunity.append({
                 "itemCode": r["item_code"],
+                "gtin": normalize_whitespace(r["gtin"]),
                 "type": "OPORTUNIDADE",
                 "typeLabel": "Oportunidade",
-                "title": r["item_code"],
+                "title": item_label(r["item_code"], r["gtin"]),
                 "reason": f"{int(r['clientes'])} oficinas da região compram e ele nunca pediu",
                 "peerClients": int(r["clientes"]),
             })
