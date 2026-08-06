@@ -23,6 +23,7 @@ const state = {
     defaultUnitApplied: false,
     openScriptId: null,     // script expandido na ficha do cliente
     libraryCategory: "",    // categoria ativa na Biblioteca de Vendas
+    tableSort: {},          // ordenação escolhida por tabela (cidades, clientes, vendedores...)
     loading: {
       dashboard: false,
       crmSummary: false,
@@ -1295,6 +1296,77 @@ function unitRows(rows) {
     .join("");
 }
 
+// ─── Ordenação de tabelas por clique no cabeçalho ───────────────────────────
+
+/**
+ * Estado de ordenação por tabela. Cada tabela tem uma chave própria, então a
+ * escolha feita em Cidades não interfere em Clientes.
+ */
+function tableSort(tableKey) {
+  return state.ui.tableSort[tableKey] || null;
+}
+
+/** Alterna a coluna: primeiro clique ordena, segundo inverte, terceiro limpa. */
+function toggleTableSort(tableKey, field, defaultDir) {
+  const atual = state.ui.tableSort[tableKey];
+  if (!atual || atual.field !== field) {
+    state.ui.tableSort[tableKey] = { field, dir: defaultDir || "desc" };
+  } else if (atual.dir === (defaultDir || "desc")) {
+    state.ui.tableSort[tableKey] = { field, dir: atual.dir === "desc" ? "asc" : "desc" };
+  } else {
+    delete state.ui.tableSort[tableKey];   // volta à ordem original
+  }
+  requestRender();
+}
+
+/**
+ * Cabeçalho clicável. `field` é a propriedade do objeto; `type` define o
+ * comparador (número ou texto) e a direção inicial — números começam do maior,
+ * textos do A ao Z, que é o que se espera em cada caso.
+ */
+function sortableTh(tableKey, label, field, type = "number", extraStyle = "") {
+  const s = tableSort(tableKey);
+  const ativo = s && s.field === field;
+  const seta = ativo ? (s.dir === "asc" ? "▲" : "▼") : "⇅";
+  const cor = ativo ? "var(--accent)" : "var(--muted)";
+  const defaultDir = type === "text" ? "asc" : "desc";
+  return `
+    <th style="cursor:pointer;user-select:none;white-space:nowrap;${extraStyle}"
+        onclick="toggleTableSort('${tableKey}','${field}','${defaultDir}')"
+        title="Clique para ordenar. Clique de novo para inverter.">
+      ${escapeHtml(label)} <span style="color:${cor};font-size:10px">${seta}</span>
+    </th>`;
+}
+
+/** Aplica a ordenação escolhida. Sem escolha, devolve a ordem que veio do servidor. */
+function applyTableSort(rows, tableKey) {
+  const s = tableSort(tableKey);
+  if (!s || !Array.isArray(rows)) return rows || [];
+  const mult = s.dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const va = a?.[s.field];
+    const vb = b?.[s.field];
+    // Vazios sempre no fim, independente da direção
+    const aVazio = va === null || va === undefined || va === "";
+    const bVazio = vb === null || vb === undefined || vb === "";
+    if (aVazio && bVazio) return 0;
+    if (aVazio) return 1;
+    if (bVazio) return -1;
+    if (typeof va === "number" || typeof vb === "number") {
+      return (Number(va) - Number(vb)) * mult;
+    }
+    return String(va).localeCompare(String(vb), "pt-BR") * mult;
+  });
+}
+
+/** Aviso discreto de que a tabela está reordenada, com botão de limpar. */
+function sortHint(tableKey, labelPadrao) {
+  const s = tableSort(tableKey);
+  if (!s) return "";
+  return `<span class="soft-badge" style="cursor:pointer" onclick="delete state.ui.tableSort['${tableKey}'];requestRender()"
+    title="Voltar à ordem padrão">ordenado ✕</span>`;
+}
+
 function cityRows(rows) {
   return rows
     .map(
@@ -1484,23 +1556,24 @@ function cidadesView() {
       <div class="section-title">
         <div>
           <h3>Ranking por cidade</h3>
-          <div class="text-small">Visão com faturamento líquido, ticket médio e clientes distintos.</div>
+          <div class="text-small">Clique em qualquer coluna para reordenar.</div>
         </div>
+        ${sortHint("cidades")}
       </div>
       <div class="table-wrap">
         <table>
           <thead>
               <tr>
-                <th>Cidade</th>
-                <th>Faturamento líquido</th>
-                <th>Ticket médio</th>
-                <th>Clientes distintos</th>
-                <th>R$ Desconto</th>
-                <th>% Desconto</th>
-                <th>Devolução</th>
+                ${sortableTh("cidades", "Cidade", "cityName", "text")}
+                ${sortableTh("cidades", "Faturamento líquido", "revenueNet")}
+                ${sortableTh("cidades", "Ticket médio", "ticketAverage")}
+                ${sortableTh("cidades", "Clientes distintos", "distinctClients")}
+                ${sortableTh("cidades", "R$ Desconto", "discountValue")}
+                ${sortableTh("cidades", "% Desconto", "discountPct")}
+                ${sortableTh("cidades", "Devolução", "returnsValue")}
               </tr>
           </thead>
-          <tbody>${cityRows(state.dashboard.cityRanking)}</tbody>
+          <tbody>${cityRows(applyTableSort(state.dashboard.cityRanking, "cidades"))}</tbody>
         </table>
       </div>
     </div>
@@ -1628,24 +1701,27 @@ function clientesView() {
         <div class="section-title">
           <div>
             <h3>Ranking de clientes</h3>
-            <div class="text-small">Faturamento, devolução, desconto e classificação PF/PJ por cliente.</div>
+            <div class="text-small">Clique em qualquer coluna para reordenar.</div>
           </div>
-          <div class="soft-badge">Exibindo Top 100 clientes por faturamento</div>
+          <div style="display:flex;gap:6px;align-items:center">
+            ${sortHint("clientes")}
+            <div class="soft-badge">${tableSort("clientes") ? "Top 100 pela coluna escolhida" : "Top 100 por faturamento"}</div>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Cliente</th>
-                <th>Tipo</th>
-                <th>Faturamento líquido</th>
-                <th>R$ Desconto</th>
-                <th>% Desconto</th>
-                <th>Devolução</th>
+                ${sortableTh("clientes", "Cliente", "clientName", "text")}
+                ${sortableTh("clientes", "Tipo", "personType", "text")}
+                ${sortableTh("clientes", "Faturamento líquido", "revenueNet")}
+                ${sortableTh("clientes", "R$ Desconto", "discountValue")}
+                ${sortableTh("clientes", "% Desconto", "discountPct")}
+                ${sortableTh("clientes", "Devolução", "returnsValue")}
               </tr>
             </thead>
             <tbody>
-              ${state.dashboard.clientRanking
+              ${applyTableSort(state.dashboard.clientRanking, "clientes")
                 .slice(0, 100)
                 .map((row) => `<tr><td>${escapeHtml(row.clientName)}</td><td>${escapeHtml(row.personType || "-")}</td><td>${currency(row.revenueNet)}</td><td>${currency(row.discountValue)}</td><td>${pct(row.discountPct || 0)}</td><td>${currency(row.returnsValue || 0)}</td></tr>`)
                 .join("")}
@@ -4685,7 +4761,7 @@ function unitsView() {
           <thead>
             <tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr>
           </thead>
-          <tbody>${unitRows(state.dashboard.unitPerformance || [])}</tbody>
+          <tbody>${unitRows(applyTableSort(state.dashboard.unitPerformance || [], "unidades"))}</tbody>
         </table>
       </div>
     </div>
@@ -6117,16 +6193,46 @@ function executivoView() {
       ${executiveExpandSection("details", "Ver ranking de vendedores", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Vendedor</th><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Ticket</th><th>Clientes</th><th>Carteira</th><th>Fora</th><th>Mix</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>% Desc.</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr></thead>
-            <tbody>${sellerRows(ranking)}</tbody>
+            <thead><tr>
+              ${sortableTh("vendedores","Vendedor","sellerName","text")}
+              ${sortableTh("vendedores","Unidade","baseUnit","text")}
+              ${sortableTh("vendedores","Líquido","revenueNet")}
+              ${sortableTh("vendedores","Meta","revenueGoal")}
+              ${sortableTh("vendedores","% Meta","goalAttainmentPct")}
+              ${sortableTh("vendedores","% Proj.","projectedGoalAttainmentPct")}
+              ${sortableTh("vendedores","Ticket","ticketAverage")}
+              ${sortableTh("vendedores","Clientes","distinctClients")}
+              ${sortableTh("vendedores","Carteira","ownClients")}
+              ${sortableTh("vendedores","Fora","otherClients")}
+              ${sortableTh("vendedores","Mix","mixSku")}
+              ${sortableTh("vendedores","Dev. comercial","returnsValue")}
+              ${sortableTh("vendedores","% Dev.","returnRatioPct")}
+              ${sortableTh("vendedores","Dev. garantia","warrantyReturnsValue")}
+              ${sortableTh("vendedores","% Desc.","discountPct")}
+              ${scoreEnabled() ? sortableTh("vendedores","Score","score") : ''}
+            </tr></thead>
+            <tbody>${sellerRows(applyTableSort(ranking, "vendedores"))}</tbody>
           </table>
         </div>
       `)}
       ${executiveExpandSection("units", "Ver performance por unidade", `
         <div class="table-wrap">
           <table>
-            <thead><tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr></thead>
-            <tbody>${unitRows(units)}</tbody>
+            <thead><tr>
+              ${sortableTh("unidades","Unidade","unitName","text")}
+              ${sortableTh("unidades","Líquido","revenueNet")}
+              ${sortableTh("unidades","Meta","revenueGoal")}
+              ${sortableTh("unidades","% Meta","goalAttainmentPct")}
+              ${sortableTh("unidades","% Proj.","projectedGoalAttainmentPct")}
+              ${sortableTh("unidades","Dev. comercial","returnsValue")}
+              ${sortableTh("unidades","% Dev.","returnRatioPct")}
+              ${sortableTh("unidades","Dev. garantia","warrantyReturnsValue")}
+              ${sortableTh("unidades","Margem","marginValue")}
+              ${sortableTh("unidades","Qtd. Peças","qtySold")}
+              ${sortableTh("unidades","Ticket/Peça","ticketPerPiece")}
+              ${sortableTh("unidades","Meta diária","metaDiaria")}
+            </tr></thead>
+            <tbody>${unitRows(applyTableSort(units, "unidades"))}</tbody>
           </table>
         </div>
       `)}
@@ -6152,16 +6258,24 @@ function descontosView() {
       <div class="section-title">
         <div>
           <h3>Política de Descontos</h3>
-          <div class="text-small">Desconto médio por vendedor, ordenado do maior para o menor.</div>
+          <div class="text-small">Clique em qualquer coluna para reordenar.</div>
         </div>
+        ${sortHint("descontos")}
       </div>
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Vendedor</th><th>Unidade</th><th>% Desconto</th><th>Líquido</th><th>% Meta</th>${scoreEnabled() ? '<th>Score</th>' : ''}</tr>
+            <tr>
+              ${sortableTh("descontos","Vendedor","sellerName","text")}
+              ${sortableTh("descontos","Unidade","baseUnit","text")}
+              ${sortableTh("descontos","% Desconto","discountPct")}
+              ${sortableTh("descontos","Líquido","revenueNet")}
+              ${sortableTh("descontos","% Meta","goalAttainmentPct")}
+              ${scoreEnabled() ? sortableTh("descontos","Score","score") : ''}
+            </tr>
           </thead>
           <tbody>
-            ${rows.map((row) => `
+            ${applyTableSort(rows, "descontos").map((row) => `
               <tr>
                 <td>${escapeHtml(row.sellerName)}</td>
                 <td>${escapeHtml(row.baseUnit || "-")}</td>
