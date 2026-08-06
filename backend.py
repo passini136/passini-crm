@@ -9098,11 +9098,34 @@ class AppHandler(BaseHTTPRequestHandler):
         return files, fields
 
     def _serve_file(self, file_path: Path, content_type: str) -> None:
+        """Serve arquivo estático com validação de cache.
+
+        Sem estes cabeçalhos o navegador guardava app.js indefinidamente e a
+        tela continuava na versão antiga depois do deploy — era preciso pedir
+        Ctrl+Shift+R para cada usuário. O ETag usa data e tamanho do arquivo:
+        enquanto nada muda o navegador reaproveita (resposta 304, leve), e no
+        instante em que o arquivo é atualizado a nova versão desce sozinha.
+        """
         if not file_path.exists():
             self._set_headers(404)
             self.wfile.write(json_dumps({"error": "Arquivo não encontrado"}))
             return
-        self._set_headers(200, content_type)
+        stat = file_path.stat()
+        etag = f'"{int(stat.st_mtime)}-{stat.st_size}"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", "no-cache, must-revalidate")
+            self.end_headers()
+            return
+        # Cabeçalhos escritos direto: _set_headers força "no-store", que faria o
+        # navegador rebaixar o arquivo inteiro toda vez. Com no-cache + ETag ele
+        # revalida e recebe 304 quando nada mudou.
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-cache, must-revalidate")
+        self.end_headers()
         self.wfile.write(file_path.read_bytes())
 
     def _current_user(self) -> dict[str, Any] | None:
