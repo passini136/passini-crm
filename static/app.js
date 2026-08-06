@@ -216,15 +216,23 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+// O tipo de tela é decidido pelo ESCOPO DE DADOS do perfil, não pelo nome do
+// papel. Assim perfis personalizados ("Supervisor", "Coordenador") herdam o
+// comportamento correto sem precisar entrar numa lista fixa.
 function roleIsSeller() {
+  if (state.user?.dataScope) return state.user.dataScope === "proprio";
   return state.user?.role === "Vendedor";
 }
 
 function roleIsManager() {
+  if (state.user?.dataScope) {
+    return ["unidade", "unidade_consolidado"].includes(state.user.dataScope);
+  }
   return state.user?.role === "Gerente";
 }
 
 function roleIsAdminLike() {
+  if (state.user?.dataScope) return state.user.dataScope !== "proprio";
   return ["Administrador", "Analista", "Gerente"].includes(state.user?.role);
 }
 
@@ -4709,11 +4717,13 @@ function managerExecutiveView() {
         </div>
       </div>
       <div class="kpi-grid">
-        ${kpiCard("Resultado da unidade", currency(state.dashboard.summary.revenueNet), "Meta", currency(state.dashboard.summary.revenueGoal))}
-        ${kpiCard("Atingimento", pct(state.dashboard.summary.goalAttainmentPct), "Proj.", pct(state.dashboard.summary.projectedGoalAttainmentPct))}
+        ${kpiCard("Resultado da unidade", currency(state.dashboard.summary.revenueNet), "Meta", currency(state.dashboard.summary.revenueGoal), state.dashboard.summary.farol?.goalAttainment)}
+        ${kpiCard("Atingimento", pct(state.dashboard.summary.goalAttainmentPct), "Proj.", pct(state.dashboard.summary.projectedGoalAttainmentPct), state.dashboard.summary.farol?.goalAttainment)}
+        ${kpiCard("Devolução comercial", currency(state.dashboard.summary.returnsValue || 0), "% Devolução", pct(state.dashboard.summary.returnRatioPct || 0), state.dashboard.summary.farol?.returnRatio)}
         ${kpiCard("Clientes em risco", number(clientsAtRisk.length), "Tarefas abertas", number(state.crm.summary.openTasks))}
         ${kpiCard("Alertas da unidade", number(alerts.length), "Vendedores", number((state.dashboard.sellerRanking || []).length))}
       </div>
+      ${farolLegend(state.dashboard.summary.paceExpectedPct)}
       <div class="grid-2">
         <div class="table-card">
           <div class="section-title"><h3>Alertas da unidade</h3></div>
