@@ -862,16 +862,86 @@ async function runAutoImportNow() {
   }
 }
 
-function sellerPeopleOptions() {
-  const fromPeople = (state.admin?.people || [])
-    .filter((person) => person.role_classification === "Vendedor" && !person.valid_to)
-    .map((person) => ({ person_name: person.person_name, base_unit: person.base_unit || "" }));
-  const known = new Set(fromPeople.map((p) => p.person_name));
-  const fromSales = (state.admin?.salesSellers || [])
-    .filter((name) => name && !known.has(name))
-    .map((name) => ({ person_name: name, base_unit: "" }));
-  return [...fromPeople, ...fromSales]
-    .sort((left, right) => String(left.person_name || "").localeCompare(String(right.person_name || ""), "pt-BR"));
+/**
+ * Chave para casar a mesma pessoa entre as fontes.
+ * O faturamento traz o sufixo do setor — "FULANO (VENDAS)", "FULANO (TELEVENDAS)" —
+ * e o cadastro manual frequentemente não traz. Sem remover o sufixo, a mesma
+ * pessoa aparece duas vezes na lista.
+ */
+function personMatchKey(name) {
+  return String(name || "")
+    .replace(/\([^)]*\)/g, " ")   // remove (VENDAS), (TELEVENDAS)...
+    .replace(/\s+/g, " ")
+    .trim()
+    .toUpperCase();
+}
+
+/**
+ * Pessoas do cadastro indexadas pela chave de casamento, sem duplicar.
+ * Quando há mais de um registro para a mesma pessoa (vigências diferentes),
+ * vence o que tem unidade preenchida.
+ */
+function peopleByMatchKey() {
+  const map = new Map();
+  (state.admin?.people || [])
+    .filter((person) => !person.valid_to)
+    .forEach((person) => {
+      const key = personMatchKey(person.person_name);
+      if (!key) return;
+      const atual = map.get(key);
+      if (!atual || (!atual.base_unit && person.base_unit)) {
+        map.set(key, {
+          person_name: person.person_name,
+          base_unit: person.base_unit || "",
+          role_classification: person.role_classification || "",
+        });
+      }
+    });
+  return map;
+}
+
+/**
+ * Lista para os seletores (metas, férias, usuários).
+ * Inclui quem está no cadastro E quem só aparece emitindo venda, mas nunca
+ * repete a mesma pessoa. O nome exibido prioriza o que vem do faturamento,
+ * porque é por ele que metas e férias são vinculadas.
+ */
+function sellerPeopleOptions({ onlySellers = false } = {}) {
+  const cadastro = peopleByMatchKey();
+  const resultado = new Map();
+
+  // 1) Nomes que aparecem no faturamento — são a referência para vínculo
+  (state.admin?.salesSellers || []).forEach((name) => {
+    if (!name) return;
+    const key = personMatchKey(name);
+    if (!key) return;
+    const info = cadastro.get(key);
+    resultado.set(key, {
+      person_name: name,
+      base_unit: info?.base_unit || "",
+      role_classification: info?.role_classification || "",
+      inSales: true,
+    });
+  });
+
+  // 2) Cadastrados que ainda não emitiram venda
+  cadastro.forEach((info, key) => {
+    if (!resultado.has(key)) {
+      resultado.set(key, { ...info, inSales: false });
+    }
+  });
+
+  let lista = [...resultado.values()];
+  if (onlySellers) {
+    lista = lista.filter((p) => p.role_classification === "Vendedor");
+  }
+  return lista.sort((a, b) =>
+    String(a.person_name || "").localeCompare(String(b.person_name || ""), "pt-BR"));
+}
+
+/** Pessoas que emitem venda mas ainda não foram classificadas no cadastro. */
+function unclassifiedSellers() {
+  return sellerPeopleOptions().filter((p) => p.inSales && !p.role_classification);
 }
 
 function syncUserEditorOptions() {
@@ -1832,15 +1902,13 @@ function sellersMissingGoal(competence) {
   const comGoal = new Set(
     (state.admin?.goalsSeller || [])
       .filter((g) => g.competence === comp)
-      .map((g) => normalizeName(g.seller_name))
+      .map((g) => personMatchKey(g.seller_name))
   );
-  const pending = sellerPeopleOptions()
-    .filter((p) => !comGoal.has(normalizeName(p.person_name)));
+  // Só quem está classificado como Vendedor. Quem emite venda mas é de outra
+  // função (balcão, caixa, administrativo) não tem meta e não deve poluir a lista.
+  const pending = sellerPeopleOptions({ onlySellers: true })
+    .filter((p) => !comGoal.has(personMatchKey(p.person_name)));
   return { competence: comp, pending };
-}
-
-function normalizeName(value) {
-  return String(value || "").trim().toUpperCase();
 }
 
 function missingGoalsCard() {
@@ -1892,10 +1960,56 @@ function prefillSellerGoal(nameEnc, unitEnc, competenceEnc) {
   setTimeout(() => document.getElementById("goal-seller-revenue")?.focus(), 300);
 }
 
+/**
+ * Quem emite venda mas ainda não tem função definida no cadastro.
+ * Enquanto não for classificado, não entra na lista de metas pendentes nem no
+ * Placar — e é justamente por isso que precisa ser sinalizado.
+ */
+function unclassifiedSellersCard() {
+  const pendentes = unclassifiedSellers();
+  if (!pendentes.length) return "";
+  return `
+    <div class="form-card" style="border-left:4px solid #8e44ad">
+      <div class="section-title">
+        <div>
+          <h3 style="font-size:15px">👤 Pessoas sem função definida</h3>
+          <div class="text-small">Emitem venda mas não estão classificadas. Marque como Vendedor
+          para entrarem nas metas, ou como Outro se não forem da equipe comercial.</div>
+        </div>
+        <span class="soft-badge" style="background:#f3e5f5;color:#6a1b9a">${pendentes.length}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${pendentes.map((p) => `
+          <button class="btn btn-ghost btn-sm" type="button"
+            onclick="prefillPersonClassification('${encodeURIComponent(p.person_name)}')"
+            title="Classificar ${escapeHtml(p.person_name)}">
+            ${escapeHtml(p.person_name)}
+          </button>`).join("")}
+      </div>
+    </div>`;
+}
+
+/** Leva o nome para o formulário de cadastro de pessoa. */
+function prefillPersonClassification(nameEnc) {
+  const name = decodeURIComponent(nameEnc);
+  requestRender();
+  setTimeout(() => {
+    const campo = document.getElementById("person-name");
+    if (campo) {
+      campo.value = name;
+      campo.scrollIntoView({ behavior: "smooth", block: "center" });
+      document.getElementById("person-role")?.focus();
+    } else {
+      addMessage("info", `Cadastre "${name}" em Administração › Cadastro de pessoa.`);
+    }
+  }, 100);
+}
+
 function sellerGoalsTableCard() {
   const rows = state.admin?.goalsSeller || [];
   return `
     ${missingGoalsCard()}
+    ${unclassifiedSellersCard()}
     <div class="table-card">
       <div class="section-title"><h3>Metas por vendedor</h3></div>
       <div class="table-wrap">
