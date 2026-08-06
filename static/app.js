@@ -3325,7 +3325,7 @@ function semVendedorView() {
                 <tr>
                   <th>Cliente</th><th>Cidade</th><th>Unidade</th>
                   <th>Recorrência</th><th>Faturamento</th><th>Média/mês</th>
-                  <th>Última compra</th><th>Quem atendeu</th>
+                  <th>Última compra</th><th>Quem atendeu</th><th style="text-align:right">Ações</th>
                 </tr>
               </thead>
               <tbody>
@@ -3345,6 +3345,11 @@ function semVendedorView() {
                           <span style="color:var(--muted)">· ${sv.months}m · ${currency(sv.revenue)}</span>
                         </div>`).join("") || '<span style="color:var(--muted)">—</span>'}
                       ${i.sellerCount > 5 ? `<div style="color:var(--muted)">+${i.sellerCount - 5} outros</div>` : ""}
+                    </td>
+                    <td style="text-align:right;white-space:nowrap">
+                      ${i.clientKey
+                        ? `<button class="btn btn-ghost btn-sm" type="button" onclick="openCrmClient('${escapeHtml(i.clientKey)}', false)">Ficha</button>`
+                        : `<span class="text-small" style="color:var(--muted)" title="Cliente não encontrado no cadastro do CRM — só aparece no faturamento">sem cadastro</span>`}
                     </td>
                   </tr>`).join("")}
               </tbody>

@@ -8566,6 +8566,19 @@ def compute_unassigned_clients(
         if key:
             owned.add(key)
 
+    # Código do cliente por nome — a ficha é aberta pelo código, mas esta lista
+    # nasce do faturamento, que só tem o nome. Cliente sem cadastro fica sem
+    # código e, nesse caso, a tela não oferece o botão de ficha.
+    code_by_name: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT client_code, client_name FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        key = normalize_client_key(row["client_name"])
+        code = normalize_whitespace(row["client_code"])
+        if key and code and key not in code_by_name:
+            code_by_name[key] = code
+
     allowed_units = crm_allowed_units_for_user(conn, user)
     city_unit = build_city_unit_map(conn, company_id, latest)
 
@@ -8619,6 +8632,7 @@ def compute_unassigned_clients(
         receita = float(r["receita"] or 0.0)
         total_revenue += receita
         items.append({
+            "clientKey": code_by_name.get(key),
             "clientName": r["client_name"],
             "cityName": r["city_name"],
             "unitName": unit,
