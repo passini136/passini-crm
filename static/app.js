@@ -156,6 +156,7 @@ const state = {
     missionUnit: "",   // filtro de unidade da Missão do Dia (diretor/admin)
     unassigned: null,  // clientes recorrentes sem vendedor
     copyFallback: null,  // modal de copia manual (HTTP sem clipboard API)
+    assignTask: null,    // modal de cobrar contato (gestao)
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -3498,6 +3499,136 @@ async function saveKpiThreshold(metricId) {
   }
 }
 
+// ─── Cobrar contato a partir da ficha do cliente ────────────────────────────
+
+/**
+ * Abre o modal de cobrança. Se o cliente já tem vendedor no cadastro, ele vem
+ * pré-selecionado; se não tem, o gestor escolhe entre os vendedores da unidade.
+ */
+function openAssignTaskModal(clientKey) {
+  const detail = state.crm.selectedClient;
+  const client = detail?.summary || {};
+  if (!clientKey || !detail?.canAssignTask) return;
+
+  const sugerido = client.assignedSeller || "";
+  const hoje = new Date();
+  hoje.setDate(hoje.getDate() + 1);      // vencimento padrão: amanhã
+  const venc = hoje.toISOString().slice(0, 10);
+
+  state.crm.assignTask = {
+    clientKey,
+    clientName: client.clientName || clientKey,
+    sellerName: sugerido,
+    hadSeller: Boolean(sugerido),
+    dueAt: venc,
+    reason: sugerirMotivoCobranca(client),
+    saving: false,
+  };
+  requestRender();
+}
+
+/** Motivo pré-preenchido conforme a situação do cliente. */
+function sugerirMotivoCobranca(client) {
+  const dias = client.daysWithoutPurchase;
+  if (client.statusCode === "INATIVO") return `Cliente inativo há ${dias || "?"} dias — entender o motivo da parada`;
+  if (client.statusCode === "PRE_INATIVO") return "Cliente espaçando pedidos — contato preventivo";
+  if (Number(client.currentRevenue || 0) <= 0) return "Sem compra neste mês — provocar reposição";
+  if (Number(client.dropPct || 0) <= -0.1) return "Queda de faturamento — investigar";
+  return "Contato de acompanhamento";
+}
+
+function closeAssignTaskModal() {
+  state.crm.assignTask = null;
+  requestRender();
+}
+
+function assignTaskModal() {
+  const t = state.crm.assignTask;
+  if (!t) return "";
+  const vendedores = state.crm.selectedClient?.assignableSellers || [];
+  const preferidos = vendedores.filter((v) => v.preferred);
+  const demais = vendedores.filter((v) => !v.preferred);
+
+  return `
+    <div class="client-drawer-overlay open" onclick="closeAssignTaskModal()">
+      <div class="panel" style="max-width:520px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>📣 Cobrar contato</h3>
+            <div class="text-small">${escapeHtml(t.clientName)}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="closeAssignTaskModal()">Fechar</button>
+        </div>
+
+        ${!t.hadSeller ? `
+          <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px">
+            ⚠ Este cliente não tem vendedor no cadastro. Escolha quem deve fazer o contato.
+          </div>` : ""}
+
+        <div class="field" style="margin-top:12px">
+          <label>Vendedor responsável ${!t.hadSeller ? '<span style="color:var(--bad)">*</span>' : ""}</label>
+          <select onchange="state.crm.assignTask.sellerName=this.value;requestRender()" required>
+            <option value="">Selecione o vendedor…</option>
+            ${t.hadSeller && !vendedores.some((v) => v.sellerName === t.sellerName)
+              ? `<option value="${escapeHtml(t.sellerName)}" selected>${escapeHtml(t.sellerName)} (do cadastro)</option>` : ""}
+            ${preferidos.length ? `<optgroup label="Unidade que atende a cidade">
+              ${preferidos.map((v) => `<option value="${escapeHtml(v.sellerName)}" ${t.sellerName === v.sellerName ? "selected" : ""}>${escapeHtml(v.sellerName)}${v.baseUnit ? ` · ${escapeHtml(v.baseUnit)}` : ""}</option>`).join("")}
+            </optgroup>` : ""}
+            ${demais.length ? `<optgroup label="${preferidos.length ? "Outras unidades" : "Vendedores"}">
+              ${demais.map((v) => `<option value="${escapeHtml(v.sellerName)}" ${t.sellerName === v.sellerName ? "selected" : ""}>${escapeHtml(v.sellerName)}${v.baseUnit ? ` · ${escapeHtml(v.baseUnit)}` : ""}</option>`).join("")}
+            </optgroup>` : ""}
+          </select>
+          ${!vendedores.length ? '<div class="text-small" style="color:var(--muted);margin-top:4px">Nenhum vendedor cadastrado nas suas unidades. Verifique o cadastro de pessoas.</div>' : ""}
+        </div>
+
+        <div class="field">
+          <label>Motivo da cobrança</label>
+          <input value="${escapeHtml(t.reason)}" oninput="state.crm.assignTask.reason=this.value"
+            placeholder="O que o vendedor precisa fazer" />
+        </div>
+
+        <div class="field">
+          <label>Prazo</label>
+          <input type="date" value="${escapeHtml(t.dueAt)}" oninput="state.crm.assignTask.dueAt=this.value" />
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-primary" ${t.saving || !t.sellerName ? "disabled" : ""} onclick="confirmAssignTask()">
+            ${t.saving ? "Criando…" : "Criar tarefa"}
+          </button>
+          <button class="btn btn-ghost" onclick="closeAssignTaskModal()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function confirmAssignTask() {
+  const t = state.crm.assignTask;
+  if (!t || !t.sellerName) { addMessage("error", "Selecione o vendedor."); return; }
+  state.crm.assignTask.saving = true;
+  requestRender();
+  try {
+    const r = await api("/api/crm/tasks/assign", {
+      method: "POST",
+      body: JSON.stringify({
+        clientKey: t.clientKey,
+        clientName: t.clientName,
+        sellerName: t.sellerName,
+        title: `Contatar ${t.clientName}`,
+        description: `Cobrança da gestão — ${t.reason}`,
+        dueAt: t.dueAt,
+      }),
+    });
+    addMessage(r.duplicated ? "warn" : "success", r.message || "Tarefa criada.");
+    closeAssignTaskModal();
+    await loadCrmData();
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.crm.assignTask) state.crm.assignTask.saving = false;
+    requestRender();
+  }
+}
+
 function crmFilterToolbar() {
   const filters = state.crm.crmClientFilters;
   const pagination = state.crm.pagination;
@@ -3925,6 +4056,12 @@ function clientDrawerView() {
         <div class="client-drawer-actions">
           <button class="btn btn-primary" ${client.clientKey ? "" : "disabled"} onclick="prefillInteractionFromAgenda('${escapeHtml(client.clientKey || "")}')">Registrar contato</button>
           <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"} onclick="openContactUpdateModal('${escapeHtml(client.clientKey || "")}')">Atualizar contato</button>
+          ${detail?.canAssignTask ? `
+            <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
+              onclick="openAssignTaskModal('${escapeHtml(client.clientKey || "")}')"
+              title="Criar tarefa de contato para o vendedor responsável">
+              📣 Cobrar contato
+            </button>` : ""}
         </div>
         ${state.ui.loading.clientDrawer ? `<div class="message success">Carregando ficha do cliente...</div>` : ""}
         ${state.ui.clientDrawerError ? `<div class="message error">Não foi possível abrir a ficha do cliente.</div>` : ""}
@@ -6172,6 +6309,7 @@ function dashboardView() {
       </div>
       ${crmModalView()}
       ${copyFallbackModal()}
+      ${assignTaskModal()}
       ${clientDrawerView()}
     </div>
   `;

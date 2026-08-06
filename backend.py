@@ -8489,6 +8489,59 @@ DAILY_CONTACT_GOAL = 5
 COVERAGE_GAP_DAYS = 7
 
 
+def sellers_available_for_assignment(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    client_city: str | None = None,
+) -> list[dict[str, Any]]:
+    """Vendedores que o gestor pode escolher ao cobrar um contato.
+
+    Restrito às unidades do usuário. Quando a cidade do cliente é conhecida, os
+    vendedores da unidade que atende aquela cidade vêm primeiro — é a escolha
+    mais provável.
+    """
+    competence = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    comp_day = first_day_of_competence(competence).isoformat()
+    allowed = crm_allowed_units_for_user(conn, user)
+
+    rows = conn.execute(
+        """
+        SELECT person_name, base_unit
+        FROM people_records
+        WHERE company_id = ? AND role_classification = 'Vendedor'
+          AND date(valid_from) <= date(?)
+          AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
+        ORDER BY person_name
+        """,
+        (company_id, comp_day, comp_day),
+    ).fetchall()
+
+    # Unidade sugerida pela cidade do cliente
+    preferred_unit = None
+    if client_city:
+        preferred_unit = resolve_city_unit(conn, company_id, client_city, competence)
+
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        name = normalize_whitespace(r["person_name"])
+        key = normalize_upper(name)
+        if not name or key in seen:
+            continue
+        unit = normalize_unit(r["base_unit"])
+        if allowed and unit not in allowed:
+            continue
+        seen.add(key)
+        result.append({
+            "sellerName": name,
+            "baseUnit": unit,
+            "preferred": bool(preferred_unit and unit == preferred_unit),
+        })
+
+    # Vendedores da unidade da cidade primeiro
+    result.sort(key=lambda s: (not s["preferred"], s["sellerName"]))
+    return result
+
+
 def compute_unassigned_clients(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     min_months: int = 2, months_window: int = 6, limit: int = 200,
@@ -9521,6 +9574,17 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn, user["company_id"], filters, client_key,
                         seller_name=user["full_name"] or user["username"],
                     )
+                    if data:
+                        # Gestão pode cobrar contato de qualquer cliente da ficha.
+                        # A lista de vendedores acompanha para o caso de o cliente
+                        # não ter dono definido.
+                        is_manager = data_scope_for_user(conn, user) != "proprio"
+                        data["canAssignTask"] = is_manager
+                        if is_manager:
+                            data["assignableSellers"] = sellers_available_for_assignment(
+                                conn, user["company_id"], user,
+                                (data.get("summary") or {}).get("cityName"),
+                            )
                 if not data:
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Cliente nao encontrado"}))
@@ -9881,6 +9945,19 @@ class AppHandler(BaseHTTPRequestHandler):
                         title = normalize_whitespace(payload.get("title")) or "Contatar cliente"
                         description = normalize_whitespace(payload.get("description"))
                         due_at = normalize_whitespace(payload.get("dueAt")) or date.today().isoformat()
+                        # O vendedor escolhido precisa estar nas unidades do gestor —
+                        # sem isso, um gerente poderia criar tarefa para outra equipe.
+                        if seller_name:
+                            permitidos = {
+                                normalize_upper(s["sellerName"])
+                                for s in sellers_available_for_assignment(conn, user["company_id"], user)
+                            }
+                            if permitidos and normalize_upper(seller_name) not in permitidos:
+                                self._set_headers(403)
+                                self.wfile.write(json_dumps(
+                                    {"error": f"{seller_name} não está entre os vendedores que você gerencia."}
+                                ))
+                                return
                         if not client_key or not seller_name:
                             self._set_headers(400)
                             self.wfile.write(json_dumps({"error": "Cliente e vendedor são obrigatórios."}))
