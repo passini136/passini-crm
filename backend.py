@@ -3157,6 +3157,8 @@ def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | Non
         "growth": normalize_upper(query.get("growth", [None])[0]),
         "classCode": normalize_upper(query.get("classCode", [None])[0]),
         "personType": normalize_upper(query.get("personType", [None])[0]),
+        # Busca por item: aceita código do fabricante ou interno
+        "itemCode": normalize_whitespace(query.get("itemCode", [None])[0]),
         "search": normalize_whitespace(query.get("search", [None])[0]),
     }
 
@@ -4410,7 +4412,40 @@ def crm_matches_search(row: dict[str, Any], search_value: str) -> bool:
     return search_value.lower() in haystack
 
 
-def filter_crm_client_rows(rows: list[dict[str, Any]], filters: dict[str, str | None]) -> list[dict[str, Any]]:
+def clients_who_bought_item(
+    conn: sqlite3.Connection, company_id: int, item_code: str, months_window: int = 12
+) -> set[str] | None:
+    """Nomes normalizados dos clientes que compraram determinado item.
+
+    Busca no código do fabricante E no código interno (a coluna sem cabeçalho do
+    relatório) — o vendedor nem sempre tem em mãos o mesmo código que digitaria.
+    Aceita correspondência parcial para funcionar com código digitado incompleto.
+    Devolve None quando não há filtro a aplicar.
+    """
+    termo = normalize_whitespace(item_code)
+    if not termo:
+        return None
+    latest = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    inicio = shift_competence(latest, -(months_window - 1))
+    padrao = f"%{termo.upper()}%"
+    rows = conn.execute(
+        """
+        SELECT DISTINCT client_name
+        FROM fact_sales_detail
+        WHERE company_id = ? AND competence >= ? AND net_value > 0
+          AND (UPPER(COALESCE(manufacturer_sku, '')) LIKE ?
+            OR UPPER(COALESCE(gtin_value, '')) LIKE ?
+            OR UPPER(COALESCE(sku_key, '')) LIKE ?)
+        """,
+        (company_id, inicio, padrao, padrao, padrao),
+    ).fetchall()
+    return {normalize_client_key(r["client_name"]) for r in rows if r["client_name"]}
+
+
+def filter_crm_client_rows(
+    rows: list[dict[str, Any]], filters: dict[str, str | None],
+    item_buyers: set[str] | None = None,
+) -> list[dict[str, Any]]:
     status_filter = normalize_upper(filters.get("status"))
     purchase_filter = normalize_upper(filters.get("purchaseMonth"))
     growth_filter = normalize_upper(filters.get("growth"))
@@ -4442,6 +4477,14 @@ def filter_crm_client_rows(rows: list[dict[str, Any]], filters: dict[str, str | 
             continue
         if search_filter and not crm_matches_search(row, search_filter):
             continue
+        if item_buyers is not None:
+            chaves = {
+                normalize_client_key(row.get("clientName")),
+                normalize_client_key(row.get("summaryClientName")),
+                normalize_client_key(row.get("tradeName")),
+            }
+            if not (chaves & item_buyers):
+                continue
         filtered.append(row)
     return filtered
 
@@ -4454,7 +4497,8 @@ def query_crm_clients_page(
     page_size: int,
 ) -> dict[str, Any]:
     all_rows = list_crm_clients(conn, company_id, filters, attach_context=False)
-    filtered_rows = filter_crm_client_rows(all_rows, filters)
+    item_buyers = clients_who_bought_item(conn, company_id, filters.get("itemCode"))
+    filtered_rows = filter_crm_client_rows(all_rows, filters, item_buyers)
     total = len(filtered_rows)
     safe_page_size = min(max(int(page_size or 50), 1), 100)
     total_pages = max(math.ceil(total / safe_page_size), 1) if total else 1

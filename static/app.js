@@ -109,6 +109,7 @@ const state = {
       classCode: "",
       personType: "",
       search: "",
+      itemCode: "",     // busca por peça comprada (código fabricante ou interno)
       unit: "",
       seller: "",
     },
@@ -638,6 +639,7 @@ async function loadCrmClients({ renderAfterLoad = true, reason = "reload", pageA
   if (filters.classCode) query.set("classCode", filters.classCode);
   if (filters.personType) query.set("personType", filters.personType);
   if (filters.search) query.set("search", filters.search);
+  if (filters.itemCode) query.set("itemCode", filters.itemCode);
   // Vendedor vê toda a carteira de uma vez (sem paginação) para agrupar por status
   const isSeller = roleIsSeller();
   query.set("page", isSeller ? "1" : String(state.crm.pagination.page || 1));
@@ -702,6 +704,7 @@ async function clearCrmClientFilters() {
     classCode: "",
     personType: "",
     search: "",
+    itemCode: "",
     unit: "",
     seller: "",
   };
@@ -3827,6 +3830,127 @@ function crmFilterToolbar() {
   `;
 }
 
+/** Valor curto em milhares: 11882 -> "11,9k". Mantém a linha do card enxuta. */
+function shortMoney(value) {
+  const n = Number(value || 0);
+  if (n === 0) return "0";
+  if (Math.abs(n) < 1000) return String(Math.round(n));
+  const k = n / 1000;
+  return (Math.abs(k) >= 100 ? Math.round(k) : k.toFixed(1).replace(".", ",")) + "k";
+}
+
+/**
+ * Trajetória de faturamento em UMA linha: 3 meses anteriores + mês atual.
+ * O vendedor lê a tendência pela sequência dos números, sem precisar abrir nada.
+ * Card cresce uma linha, não quatro — com 50+ clientes na fila isso importa.
+ */
+function revenueTrendLine(item) {
+  const meses = item.averageBasis?.months;
+  if (!meses || !meses.length) return "";
+  const ordenados = [...meses].sort((a, b) => String(a.competence).localeCompare(String(b.competence)));
+  const atual = { competence: item.averageBasis.currentCompetence, revenue: Number(item.currentRevenue || 0) };
+  const serie = [...ordenados, atual];
+
+  const g = Number(item.growthPct || 0);
+  const tend = g > 0.03
+    ? { icon: "▲", cor: "#1e8e3e", txt: `+${Math.round(g * 100)}%` }
+    : g < -0.03
+      ? { icon: "▼", cor: "#c5221f", txt: `${Math.round(g * 100)}%` }
+      : { icon: "=", cor: "#5f6368", txt: "estável" };
+
+  return `
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:11px;margin-bottom:8px;
+                background:#f7fafc;border-radius:6px;padding:5px 8px"
+         title="Faturamento dos 3 meses anteriores e do mês atual">
+      ${serie.map((m, i) => {
+        const ultimo = i === serie.length - 1;
+        const zerado = Number(m.revenue || 0) <= 0;
+        return `${i > 0 ? '<span style="color:var(--line)">→</span>' : ""}
+          <span style="white-space:nowrap;${ultimo ? "font-weight:800" : ""};${zerado && ultimo ? "color:#c5221f" : "color:var(--muted)"}">
+            ${escapeHtml(competenceShort(m.competence))} <strong style="color:${zerado ? (ultimo ? "#c5221f" : "var(--muted)") : "var(--text)"}">${shortMoney(m.revenue)}</strong>
+          </span>`;
+      }).join("")}
+      <span style="margin-left:auto;color:${tend.cor};font-weight:800;white-space:nowrap">${tend.icon} ${tend.txt}</span>
+    </div>`;
+}
+
+// ─── Filtros rápidos da carteira do vendedor ────────────────────────────────
+
+/**
+ * Chips de um toque. Reaproveitam os filtros que já existem no backend
+ * (status, com/sem compra, classe, PJ/PF) — nada de regra nova.
+ * A ordem dos blocos da carteira NÃO muda: os chips só reduzem o conjunto.
+ */
+const SELLER_FILTER_CHIPS = [
+  { group: "purchaseMonth", value: "SEM_COMPRA", label: "Sem compra no mês", icon: "○" },
+  { group: "status",     value: "INATIVO",     label: "Inativos",     icon: "🔴" },
+  { group: "status",     value: "PRE_INATIVO", label: "Pré-inativos", icon: "🟡" },
+  { group: "status",     value: "ATIVO",       label: "Ativos",       icon: "🟢" },
+  { group: "classCode",  value: "DIAMANTE",    label: "Diamante",     icon: "💎" },
+  { group: "classCode",  value: "OURO",        label: "Ouro",         icon: "🥇" },
+  { group: "classCode",  value: "PRATA",       label: "Prata",        icon: "🥈" },
+  { group: "classCode",  value: "BRONZE",      label: "Bronze",       icon: "🥉" },
+  { group: "personType", value: "PJ",          label: "PJ",           icon: "🏢" },
+  { group: "personType", value: "PF",          label: "PF",           icon: "👤" },
+];
+
+function toggleSellerChip(group, value) {
+  const f = state.crm.crmClientFilters;
+  f[group] = f[group] === value ? "" : value;   // clicar de novo desliga
+  runCrmClientSearch();
+}
+
+function activeSellerFilterCount() {
+  const f = state.crm.crmClientFilters || {};
+  return ["purchaseMonth", "status", "classCode", "personType", "itemCode"]
+    .filter((k) => f[k]).length;
+}
+
+function clearSellerFilters() {
+  const f = state.crm.crmClientFilters;
+  ["purchaseMonth", "status", "classCode", "personType", "itemCode", "search"].forEach((k) => { f[k] = ""; });
+  runCrmClientSearch();
+}
+
+function sellerFilterBar() {
+  const f = state.crm.crmClientFilters || {};
+  const ativos = activeSellerFilterCount();
+  return `
+    <div class="form-card" style="padding:12px 18px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <input style="flex:1;min-width:200px" placeholder="Buscar por nome, código ou cidade"
+          value="${escapeHtml(f.search || "")}"
+          oninput="state.crm.crmClientFilters.search=this.value"
+          onkeydown="if(event.key==='Enter'){runCrmClientSearch();}" />
+        <input style="flex:1;min-width:170px" placeholder="🔧 Comprou o item (código)"
+          title="Digite o código do fabricante ou o interno para ver quem comprou essa peça"
+          value="${escapeHtml(f.itemCode || "")}"
+          oninput="state.crm.crmClientFilters.itemCode=this.value"
+          onkeydown="if(event.key==='Enter'){runCrmClientSearch();}" />
+        <button class="btn btn-secondary btn-sm" onclick="runCrmClientSearch()">Buscar</button>
+        ${ativos ? `<button class="btn btn-ghost btn-sm" onclick="clearSellerFilters()">Limpar (${ativos})</button>` : ""}
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        ${SELLER_FILTER_CHIPS.map((c) => {
+          const on = f[c.group] === c.value;
+          return `
+            <button type="button" onclick="toggleSellerChip('${c.group}','${c.value}')"
+              style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
+                     background:${on ? "var(--accent)" : "#fff"};
+                     color:${on ? "#fff" : "var(--text)"};
+                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;
+                     cursor:pointer;white-space:nowrap;transition:all .15s">
+              ${c.icon} ${escapeHtml(c.label)}
+            </button>`;
+        }).join("")}
+      </div>
+      ${f.itemCode ? `
+        <div class="text-small" style="color:var(--accent);margin-top:8px;font-weight:600">
+          🔧 Mostrando apenas quem comprou "${escapeHtml(f.itemCode)}" nos últimos 12 meses.
+        </div>` : ""}
+    </div>`;
+}
+
 function sellerClientCard(item) {
   const classBadge = { DIAMANTE: "💎", OURO: "🥇", PRATA: "🥈", BRONZE: "🥉" }[item.classCode] || "⚪";
   const hasPurchase = Number(item.currentRevenue || 0) > 0;
@@ -3839,6 +3963,7 @@ function sellerClientCard(item) {
         </div>
         ${crmStatusBadge(item.statusCode)}
       </div>
+      ${revenueTrendLine(item)}
       <div style="display:flex;gap:8px;font-size:12px;color:var(--muted);margin-bottom:10px">
         <span>📞 ${escapeHtml(item.phone || "Sem tel.")}</span>
         <span style="color:${hasPurchase ? "var(--good)" : "#e67e22"}">${hasPurchase ? "✅ Comprou" : "○ Sem compra"}</span>
@@ -3879,18 +4004,13 @@ function crmClientsView() {
 
     return `
       <div class="stack">
-        <div class="form-card" style="padding:12px 18px">
-          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <span style="font-size:12px;font-weight:700;color:var(--muted)">BUSCAR</span>
-            <input style="flex:1;min-width:200px" placeholder="Nome, código ou cidade"
-              value="${escapeHtml(state.crm.crmClientFilters.search || "")}"
-              oninput="state.crm.crmClientFilters.search=this.value"
-              onkeydown="if(event.key==='Enter'){runCrmClientSearch();}" />
-            <button class="btn btn-secondary btn-sm" onclick="runCrmClientSearch()">Buscar</button>
-            <button class="btn btn-ghost btn-sm" onclick="clearCrmClientFilters()">Limpar</button>
-          </div>
-        </div>
+        ${sellerFilterBar()}
         ${isLoading ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">⏳ Atualizando carteira…</div>` : ""}
+        ${activeSellerFilterCount() > 0 ? `
+          <div class="message" style="font-size:12px;background:rgba(15,48,68,0.06)">
+            Filtro ativo — mostrando ${number(rows.length)} cliente(s) da sua carteira.
+            A ordem dos blocos continua a mesma: urgentes primeiro.
+          </div>` : ""}
         ${groupSection("🔴 Urgente — Contatar agora", "#e74c3c", urgent, "✅ Nenhum pré-inativo ou inativo.")}
         ${groupSection("🟡 Ativos sem compra este mês", "#f39c12", noSale, "✅ Todos os ativos já compraram este mês.")}
         ${groupSection("🟢 Ativos com compra", "#27ae60", active, "Nenhum ativo com compra este mês.")}
