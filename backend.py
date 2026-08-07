@@ -5501,6 +5501,37 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         ).fetchall()
     }
 
+    # ── Código do cliente e histórico trimestral ──────────────────────────────
+    # O ranking nasce do faturamento, que só tem o NOME. O código vem do cadastro
+    # e é o que permite abrir a ficha. O trimestre anterior serve de base para
+    # dizer se o cliente está crescendo, estável ou caindo.
+    client_code_map: dict[str, str] = {}
+    for _c in conn.execute(
+        "SELECT client_code, client_name FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        _k = normalize_client_key(_c["client_name"])
+        _code = normalize_whitespace(_c["client_code"])
+        if _k and _code and _k not in client_code_map:
+            client_code_map[_k] = _code
+
+    _pc1 = shift_competence(primary_competence, -1)
+    _pc2 = shift_competence(primary_competence, -2)
+    _pc3 = shift_competence(primary_competence, -3)
+    client_prev_quarter: dict[str, float] = {}
+    for _r in conn.execute(
+        """
+        SELECT client_name, SUM(net_value) AS total
+        FROM fact_sales_detail
+        WHERE company_id = ? AND competence IN (?, ?, ?)
+        GROUP BY client_name
+        """,
+        (company_id, _pc1, _pc2, _pc3),
+    ).fetchall():
+        _k = normalize_client_key(_r["client_name"])
+        if _k:
+            client_prev_quarter[_k] = float(_r["total"] or 0.0)
+
     # ── Devoluções em garantia ────────────────────────────────────────────────
     # Vêm dentro do total de devoluções do custo/venda, mas são defeito de peça,
     # não erro de venda. Ficam separadas para não penalizar o resultado comercial.
@@ -5648,17 +5679,30 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         person_type = metrics["personType"] or "Nao classificado"
         client_type_summary[person_type]["revenueNet"] += metrics["revenueNet"]
         client_type_summary[person_type]["clients"] += 1
+        # Comparativo com a média mensal do trimestre anterior
+        _ckey = normalize_client_key(client_name)
+        _prev_total = client_prev_quarter.get(_ckey, 0.0)
+        _prev_avg = _prev_total / 3
+        _current = float(metrics["revenueNet"] or 0.0)
+        _variation = safe_div(_current - _prev_avg, _prev_avg) * 100 if _prev_avg > 0 else None
         client_ranking.append(
             {
                 "clientName": client_name,
+                # Código do cadastro — sem ele não dá para abrir a ficha
+                "clientKey": client_code_map.get(_ckey),
                 "personType": person_type,
                 "typeSource": metrics["typeSource"],
                 "typeConfidence": round(float(metrics["typeConfidence"] or 0), 2),
-                "revenueNet": round(metrics["revenueNet"], 2),
+                "revenueNet": round(_current, 2),
                 "discountValue": round(metrics["discountValue"], 2),
                 "discountPct": round(safe_div(metrics["discountValue"], metrics["grossSalesPct"]) * 100, 2),
                 "returnsValue": round(metrics["returnValue"], 2),
                 "citiesCount": len(metrics["cities"]),
+                # Tendência contra a média mensal dos 3 meses anteriores
+                "quarterAverage": round(_prev_avg, 2),
+                "quarterTotal": round(_prev_total, 2),
+                "quarterVariationPct": round(_variation, 1) if _variation is not None else None,
+                "quarterMonths": [_pc3, _pc2, _pc1],
             }
         )
     client_ranking.sort(key=lambda item: item["revenueNet"], reverse=True)

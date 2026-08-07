@@ -24,6 +24,7 @@ const state = {
     openScriptId: null,     // script expandido na ficha do cliente
     libraryCategory: "",    // categoria ativa na Biblioteca de Vendas
     tableSort: {},          // ordenação escolhida por tabela (cidades, clientes, vendedores...)
+    clientRankingSearch: "", // busca por nome/código no ranking de clientes
     loading: {
       dashboard: false,
       crmSummary: false,
@@ -1690,6 +1691,113 @@ function vendedoresView() {
   `;
 }
 
+/**
+ * Indicador de tendência do cliente: mês atual contra a média mensal do
+ * trimestre anterior. Vem em coluna própria, ao lado do faturamento, para
+ * não competir com o valor em si.
+ */
+function quarterTrendBadge(row) {
+  const v = row.quarterVariationPct;
+  if (v === null || v === undefined) {
+    return `<span class="text-small" style="color:var(--muted)" title="Sem faturamento no trimestre anterior para comparar">—</span>`;
+  }
+  const media = currency(row.quarterAverage || 0);
+  const meses = (row.quarterMonths || []).map(competenceShort).join(", ");
+  const titulo = `Média mensal do trimestre anterior (${meses}): ${media}`;
+  const cfg = v > 5
+    ? { icon: "▲", cor: "#1e8e3e" }
+    : v < -5
+      ? { icon: "▼", cor: "#c5221f" }
+      : { icon: "=", cor: "#5f6368" };
+  const sinal = v > 0 ? "+" : "";
+  return `<span style="color:${cfg.cor};font-weight:700;white-space:nowrap" title="${escapeHtml(titulo)}">
+    ${cfg.icon} ${sinal}${v.toFixed(0)}%
+  </span>`;
+}
+
+/** Filtra o ranking por nome ou código digitado na busca. */
+function filteredClientRanking() {
+  const termo = String(state.ui.clientRankingSearch || "").trim().toLowerCase();
+  const base = state.dashboard.clientRanking || [];
+  if (!termo) return base;
+  return base.filter((r) =>
+    String(r.clientName || "").toLowerCase().includes(termo) ||
+    String(r.clientKey || "").toLowerCase().includes(termo));
+}
+
+function clientRankingCard() {
+  const termo = state.ui.clientRankingSearch || "";
+  const filtrados = filteredClientRanking();
+  const ordenados = applyTableSort(filtrados, "clientes");
+  const exibidos = ordenados.slice(0, 100);
+  const total = state.dashboard.clientRanking?.length || 0;
+
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div>
+          <h3>Ranking de clientes</h3>
+          <div class="text-small">Clique em qualquer coluna para reordenar.</div>
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          ${sortHint("clientes")}
+          <div class="soft-badge">${termo
+            ? `${number(filtrados.length)} de ${number(total)}`
+            : (tableSort("clientes") ? "Top 100 pela coluna escolhida" : "Top 100 por faturamento")}</div>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
+        <input style="flex:1;min-width:240px" placeholder="🔍 Buscar por nome ou código do cliente"
+          value="${escapeHtml(termo)}"
+          oninput="state.ui.clientRankingSearch=this.value;requestRender()" />
+        ${termo ? `<button class="btn btn-ghost btn-sm" onclick="state.ui.clientRankingSearch='';requestRender()">Limpar</button>` : ""}
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              ${sortableTh("clientes", "Cliente", "clientName", "text")}
+              ${sortableTh("clientes", "Código", "clientKey", "text")}
+              ${sortableTh("clientes", "Tipo", "personType", "text")}
+              ${sortableTh("clientes", "Faturamento líquido", "revenueNet")}
+              ${sortableTh("clientes", "vs trimestre", "quarterVariationPct")}
+              ${sortableTh("clientes", "R$ Desconto", "discountValue")}
+              ${sortableTh("clientes", "% Desconto", "discountPct")}
+              ${sortableTh("clientes", "Devolução", "returnsValue")}
+              <th style="text-align:right">Ações</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${exibidos.length ? exibidos.map((row) => `
+              <tr>
+                <td><strong>${escapeHtml(row.clientName)}</strong></td>
+                <td class="text-small">${escapeHtml(row.clientKey || "-")}</td>
+                <td>${escapeHtml(row.personType || "-")}</td>
+                <td>${currency(row.revenueNet)}</td>
+                <td>${quarterTrendBadge(row)}</td>
+                <td>${currency(row.discountValue)}</td>
+                <td>${pct(row.discountPct || 0)}</td>
+                <td>${currency(row.returnsValue || 0)}</td>
+                <td style="text-align:right;white-space:nowrap">
+                  ${row.clientKey
+                    ? `<button class="btn btn-ghost btn-sm" onclick="openCrmClient('${escapeHtml(row.clientKey)}', false)">Ficha</button>`
+                    : `<span class="text-small" style="color:var(--muted)" title="Cliente sem cadastro no CRM — só aparece no faturamento">sem cadastro</span>`}
+                </td>
+              </tr>`).join("")
+              : `<tr><td colspan="9" class="text-small" style="text-align:center;padding:20px;color:var(--muted)">
+                   Nenhum cliente encontrado para "${escapeHtml(termo)}".
+                 </td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      ${ordenados.length > 100 ? `<div class="text-small" style="text-align:center;color:var(--muted);margin-top:8px">
+        Exibindo 100 de ${number(ordenados.length)}. Use a busca para encontrar um cliente específico.
+      </div>` : ""}
+    </div>`;
+}
+
 function clientesView() {
   if (!state.dashboard) return `<div class="loader panel">Carregando clientes...</div>`;
   const typeSummary = state.dashboard.clientTypeSummary || {};
@@ -1700,38 +1808,7 @@ function clientesView() {
         ${kpiCard("Clientes PJ", number(typeSummary.PJ?.clients || 0), "Faturamento", currency(typeSummary.PJ?.revenueNet || 0))}
         ${kpiCard("Não classificados", number(typeSummary["Nao classificado"]?.clients || 0), "Faturamento", currency(typeSummary["Nao classificado"]?.revenueNet || 0))}
       </div>
-      <div class="table-card">
-        <div class="section-title">
-          <div>
-            <h3>Ranking de clientes</h3>
-            <div class="text-small">Clique em qualquer coluna para reordenar.</div>
-          </div>
-          <div style="display:flex;gap:6px;align-items:center">
-            ${sortHint("clientes")}
-            <div class="soft-badge">${tableSort("clientes") ? "Top 100 pela coluna escolhida" : "Top 100 por faturamento"}</div>
-          </div>
-        </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                ${sortableTh("clientes", "Cliente", "clientName", "text")}
-                ${sortableTh("clientes", "Tipo", "personType", "text")}
-                ${sortableTh("clientes", "Faturamento líquido", "revenueNet")}
-                ${sortableTh("clientes", "R$ Desconto", "discountValue")}
-                ${sortableTh("clientes", "% Desconto", "discountPct")}
-                ${sortableTh("clientes", "Devolução", "returnsValue")}
-              </tr>
-            </thead>
-            <tbody>
-              ${applyTableSort(state.dashboard.clientRanking, "clientes")
-                .slice(0, 100)
-                .map((row) => `<tr><td>${escapeHtml(row.clientName)}</td><td>${escapeHtml(row.personType || "-")}</td><td>${currency(row.revenueNet)}</td><td>${currency(row.discountValue)}</td><td>${pct(row.discountPct || 0)}</td><td>${currency(row.returnsValue || 0)}</td></tr>`)
-                .join("")}
-            </tbody>
-          </table>
-        </div>
-      </div>
+      ${clientRankingCard()}
       <div class="stack">
         ${state.dashboard.clientTopByUnit
           .map((group) => `
