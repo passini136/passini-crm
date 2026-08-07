@@ -3908,6 +3908,22 @@ function crmFilterToolbar() {
 }
 
 /** Valor curto em milhares: 11882 -> "11,9k". Mantém a linha do card enxuta. */
+/**
+ * Data e hora LOCAIS no formato aceito pelo input datetime-local.
+ * Nunca usar toISOString(): ela converte para UTC e, no Brasil (UTC-3),
+ * qualquer registro após as 21h cai no dia seguinte.
+ */
+function localDateTimeInput() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** Mesma data e hora locais, no formato que o servidor grava. */
+function localDateTimeString() {
+  return localDateTimeInput().replace("T", " ") + ":00";
+}
+
 function shortMoney(value) {
   const n = Number(value || 0);
   if (n === 0) return "0";
@@ -4863,7 +4879,9 @@ function prefillInteractionFromAgenda(clientKey) {
     contactNotes: source.contactNotes || "",
     contactTypeCode: "LIGACAO",
     resultCode: "FALOU_CLIENTE",
-    occurredAt: new Date().toISOString().slice(0, 16),
+    // Horário LOCAL, não UTC. toISOString() devolve UTC e um contato feito
+    // às 21h no Brasil virava "amanhã", nunca saindo da fila do dia.
+    occurredAt: localDateTimeInput(),
     notes: "",
     questionUsed: source.questionPrimary || "",
     hadProgress: false,
@@ -4907,7 +4925,7 @@ async function submitCrmInteraction() {
       body: JSON.stringify({
         ...form,
         clientKey: form.clientCode || form.clientKey,
-        occurredAt: form.occurredAt ? form.occurredAt.replace("T", " ") : now.toISOString().replace("T", " ").slice(0, 19),
+        occurredAt: form.occurredAt ? form.occurredAt.replace("T", " ") : localDateTimeString(),
         followupDueAt: form.followupDueAt ? form.followupDueAt.replace("T", " ") : "",
         hadProgress: form.resultCode === "GEROU_PEDIDO" || form.resultCode === "GEROU_ORCAMENTO",
       }),
@@ -4922,11 +4940,18 @@ async function submitCrmInteraction() {
       NAO_ATENDEU: "✅ Tentativa registrada.",
     }[form.resultCode] || "✅ Contato registrado!";
     addMessage("success", resultLabel);
-    // Remover cliente da Missão do Dia imediatamente (sem esperar reload)
-    const contactedKey = form.clientCode || form.clientKey;
+    // Remove da fila na hora, sem esperar o reload. A comparação normaliza os
+    // códigos do mesmo jeito que o servidor faz — comparar as strings cruas
+    // deixava o cliente na lista quando havia diferença de espaço ou zero à esquerda.
+    const norm = (v) => String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const contactedKey = norm(form.clientCode || form.clientKey);
     if (state.crm.agenda) {
-      state.crm.agenda.top5 = (state.crm.agenda.top5 || []).filter((c) => c.clientKey !== contactedKey);
-      state.crm.agenda.extended = (state.crm.agenda.extended || []).filter((c) => c.clientKey !== contactedKey);
+      state.crm.agenda.top5 = (state.crm.agenda.top5 || []).filter((c) => norm(c.clientKey) !== contactedKey);
+      state.crm.agenda.extended = (state.crm.agenda.extended || []).filter((c) => norm(c.clientKey) !== contactedKey);
+    }
+    if (Array.isArray(state.crm.clients)) {
+      state.crm.clients = state.crm.clients.map((c) =>
+        norm(c.clientKey) === contactedKey ? { ...c, lastInteractionAt: localDateTimeString() } : c);
     }
     // Atualizar contador do summary imediatamente
     const _noCountForSummary = ["NAO_ATENDEU", "PEDIU_RETORNO"];

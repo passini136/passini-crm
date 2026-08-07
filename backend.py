@@ -4365,19 +4365,32 @@ def list_crm_clients(
     seller_name = normalize_whitespace(filters.get("seller_name"))
     rows = crm_base_client_rows_cached(conn, company_id, filters)
     action_map = crm_agenda_action_map(conn, company_id, seller_name) if seller_name else {}
-    # Clientes já contactados hoje por este vendedor (só usado na Missão do Dia)
+    # ── Clientes já contactados hoje ──────────────────────────────────────────
+    # Três correções aplicadas aqui, todas causa de o cliente não sair da fila:
+    #  1. Nome do vendedor comparado sem diferenciar maiúsculas — o cadastro e o
+    #     registro da interação nem sempre gravam a mesma capitalização.
+    #  2. Data avaliada no fuso de São Paulo. O navegador enviava horário UTC:
+    #     um contato feito às 21h30 virava "amanhã" e nunca casava com hoje.
+    #  3. Sem vendedor no filtro (visão do gerente) a exclusão simplesmente não
+    #     rodava. Agora considera o contato de QUALQUER vendedor do escopo.
     contacted_today: set[str] = set()
-    if exclude_contacted_today and seller_name:
-        today_str = date.today().isoformat()
-        rows_today = conn.execute(
-            """SELECT DISTINCT client_key FROM crm_interactions
-               WHERE company_id = ? AND seller_name = ?
-                 AND substr(occurred_at, 1, 10) = ?""",
-            (company_id, seller_name, today_str),
-        ).fetchall()
+    if exclude_contacted_today:
+        today_str = today_in_brazil().isoformat()
+        if seller_name:
+            rows_today = conn.execute(
+                """SELECT DISTINCT client_key FROM crm_interactions
+                   WHERE company_id = ? AND UPPER(seller_name) = ?
+                     AND date(substr(replace(occurred_at, 'T', ' '), 1, 10)) = date(?)""",
+                (company_id, normalize_upper(seller_name), today_str),
+            ).fetchall()
+        else:
+            rows_today = conn.execute(
+                """SELECT DISTINCT client_key FROM crm_interactions
+                   WHERE company_id = ?
+                     AND date(substr(replace(occurred_at, 'T', ' '), 1, 10)) = date(?)""",
+                (company_id, today_str),
+            ).fetchall()
         contacted_today = {normalize_client_key(r["client_key"]) for r in rows_today}
-        with open("debug_agenda.log", "a", encoding="utf-8") as _dbg:
-            _dbg.write(f"seller={seller_name!r} today={today_str} contacted={contacted_today}\n")
     visible_rows: list[dict[str, Any]] = []
     now_dt = datetime.now()
     for row in rows:
@@ -10031,6 +10044,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 try:
                     with closing(get_connection()) as conn:
                         result = create_crm_interaction(conn, user["company_id"], user, payload)
+                    # Derruba o cache para o cliente sair da fila imediatamente,
+                    # tanto para o vendedor quanto para a visão do gerente.
+                    invalidate_crm_cache(user["company_id"])
                 except ValueError as exc:
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
