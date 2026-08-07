@@ -2678,6 +2678,48 @@ function managementAlertCard(item) {
   `;
 }
 
+/**
+ * Texto seguro dentro de um onclick="...('AQUI')".
+ * escapeHtml não trata aspas simples, e nome de cliente com apóstrofo
+ * (D'ALESSANDRO, D'AVILA) quebrava o handler inteiro.
+ */
+function jsAttr(valor) {
+  return String(valor ?? "")
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;");
+}
+
+function goToTab(tab) {
+  state.activeTab = tab;
+  requestRender();
+}
+
+/**
+ * Linha de tarefa com ação direta: registrar o contato, concluir ou reagendar
+ * sem sair da Missão do Dia. Sem o botão de registrar, o vendedor precisava
+ * caçar o cliente na carteira para lançar o retorno que ele mesmo agendou.
+ */
+function taskQuickRow(row, mostrarPrazo) {
+  const clientKey = row.client_key || "";
+  const nome = row.client_name || row.title || "Cliente";
+  const prazo = (row.due_at || "").replace("T", " ").slice(0, 16);
+  return `
+    <div class="timeline-item">
+      <strong>${escapeHtml(nome)}</strong>
+      <div class="text-small">${escapeHtml(mostrarPrazo ? prazo : (row.title || ""))}</div>
+      ${row.description ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(row.description)}</div>` : ""}
+      <div class="actions" style="gap:6px">
+        <button class="btn btn-primary btn-sm" ${clientKey ? "" : "disabled"}
+          onclick="prefillInteractionFromAgenda('${jsAttr(clientKey)}','${jsAttr(nome)}')">📞 Registrar contato</button>
+        <button class="btn btn-secondary btn-sm" onclick="completeCrmTask(${Number(row.id)})">Concluir</button>
+        <button class="btn btn-ghost btn-sm" onclick="openTaskRescheduleModal(${Number(row.id)})">Reagendar</button>
+        ${clientKey ? `<button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(clientKey)}', false)">Ficha</button>` : ""}
+      </div>
+    </div>`;
+}
+
 function crmAgendaCard(item) {
   const expanded = Boolean(state.ui.crmAgendaExpanded[item.clientKey]);
   return `
@@ -2732,7 +2774,9 @@ function sellerHomeCards() {
 
 function todayTaskGroups() {
   const rows = state.crm.taskRows || [];
-  const today = new Date().toISOString().slice(0, 10);
+  // Data LOCAL. toISOString() devolve UTC e, depois das 21h no Brasil, os
+  // retornos de hoje sumiam da tela por já ser "amanhã" em UTC.
+  const today = dateInDays(0);
   return {
     overdue: rows.filter((row) => row.status === "ATRASADA"),
     dueToday: rows.filter((row) => String(row.due_at || "").slice(0, 10) === today && row.status !== "CONCLUIDA"),
@@ -2819,7 +2863,7 @@ function crmAgendaView() {
               <div class="soft-badge" style="background:#fde8e8;color:#e74c3c">${overdue.length}</div>
             </div>
             <div class="timeline-list">
-              ${overdue.map((row) => `<div class="timeline-item"><strong>${escapeHtml(row.client_name)}</strong><div class="text-small">${escapeHtml((row.due_at || "").replace("T", " ").slice(0,16))}</div><div class="actions"><button class="btn btn-secondary" onclick="completeCrmTask(${Number(row.id)})">Concluir</button><button class="btn btn-ghost" onclick="openTaskRescheduleModal(${Number(row.id)})">Reagendar</button></div></div>`).join("")}
+              ${overdue.map((row) => taskQuickRow(row, true)).join("")}
             </div>
           </div>
         ` : ""}
@@ -2827,11 +2871,17 @@ function crmAgendaView() {
         ${dueToday.length > 0 ? `
           <div class="table-card" style="border-left:4px solid #f39c12">
             <div class="section-title">
-              <div><h3>📅 Retornos de hoje</h3></div>
-              <div class="soft-badge">${dueToday.length}</div>
+              <div>
+                <h3>📅 Retornos de hoje</h3>
+                <div class="text-small">Compromissos que você assumiu para hoje.</div>
+              </div>
+              <div style="display:flex;align-items:center;gap:8px">
+                <button class="btn btn-ghost btn-sm" onclick="goToTab('crm-tarefas')">Ver todas as tarefas →</button>
+                <div class="soft-badge">${dueToday.length}</div>
+              </div>
             </div>
             <div class="timeline-list">
-              ${dueToday.map((row) => `<div class="timeline-item"><strong>${escapeHtml(row.client_name)}</strong><div class="text-small">${escapeHtml(row.title || "")}</div></div>`).join("")}
+              ${dueToday.map((row) => taskQuickRow(row, false)).join("")}
             </div>
           </div>
         ` : ""}
@@ -5092,11 +5142,19 @@ async function openCrmClient(clientKey, switchToClientsTab = true, renderAfterLo
   }).catch(() => {});
 }
 
-function prefillInteractionFromAgenda(clientKey) {
+/**
+ * Abre o formulário de interação já preenchido com os dados do cliente.
+ *
+ * `fallbackName` existe para os atalhos vindos de tarefas: o cliente da tarefa
+ * pode não estar na página de carteira carregada no momento, e sem isso a função
+ * saía calada — o botão parecia quebrado.
+ */
+function prefillInteractionFromAgenda(clientKey, fallbackName) {
   const source = state.crm.clients.find((item) => item.clientKey === clientKey)
     || state.crm.agenda.top5.find((item) => item.clientKey === clientKey)
     || state.crm.agenda.extended.find((item) => item.clientKey === clientKey)
-    || state.crm.selectedClient?.summary;
+    || (state.crm.selectedClient?.summary?.clientKey === clientKey ? state.crm.selectedClient.summary : null)
+    || (clientKey ? { clientKey, clientName: fallbackName || clientKey } : null);
   if (!source) return;
   state.crm.interactionForm = {
     clientKey: source.clientKey,
@@ -5181,6 +5239,13 @@ async function submitCrmInteraction() {
     if (Array.isArray(state.crm.clients)) {
       state.crm.clients = state.crm.clients.map((c) =>
         norm(c.clientKey) === contactedKey ? { ...c, lastInteractionAt: localDateTimeString() } : c);
+    }
+    // O backend conclui as tarefas abertas desse cliente ao registrar o contato;
+    // marca aqui também para o retorno sumir da Missão do Dia sem piscar.
+    if (Array.isArray(state.crm.taskRows)) {
+      state.crm.taskRows = state.crm.taskRows.map((t) =>
+        norm(t.client_key) === contactedKey && t.status !== "CONCLUIDA"
+          ? { ...t, status: "CONCLUIDA" } : t);
     }
     // Atualizar contador do summary imediatamente
     const _noCountForSummary = ["NAO_ATENDEU", "PEDIU_RETORNO"];

@@ -5149,6 +5149,19 @@ def create_crm_interaction(
         ),
     )
     interaction_id = cursor.lastrowid
+
+    # Registrar o contato encerra as tarefas abertas daquele cliente para aquele
+    # vendedor. Sem isso o retorno continuava aparecendo em "Retornos de hoje"
+    # depois do vendedor já ter feito a ligação — mesma queixa do TOP 5.
+    conn.execute(
+        """
+        UPDATE crm_tasks SET status = 'CONCLUIDA', completed_at = ?
+        WHERE company_id = ? AND client_key = ? AND UPPER(seller_name) = ?
+          AND status IN ('ABERTA', 'ATRASADA', 'REAGENDADA')
+        """,
+        (now_iso(), company_id, client_key, normalize_upper(seller_name)),
+    )
+
     task_id = None
     if result["generates_followup"] and followup_due_at:
         task_cursor = conn.execute(
