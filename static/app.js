@@ -159,7 +159,8 @@ const state = {
     missionUnit: "",   // filtro de unidade da Missão do Dia (diretor/admin)
     unassigned: null,  // clientes recorrentes sem vendedor
     copyFallback: null,  // modal de copia manual (HTTP sem clipboard API)
-    assignTask: null,    // modal de cobrar contato (gestao)
+    assignTask: null,      // modal de cobrar contato (gestao)
+    scheduleContact: null, // modal de agendar contato (vendedor, para si mesmo)
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -3822,6 +3823,160 @@ async function confirmAssignTask() {
   }
 }
 
+// ─── Agendar contato (vendedor, para si mesmo) ─────────────────────────────
+//
+// Atalho da ficha do cliente: o vendedor marca uma ligação futura e ela vira
+// tarefa dele em Tarefas. Usa o mesmo endpoint da cobrança do gestor, mas o
+// backend força o nome do vendedor logado — ninguém agenda para outro.
+
+/** Data de hoje + N dias no fuso local (toISOString devolveria UTC). */
+function dateInDays(dias) {
+  const d = new Date();
+  d.setDate(d.getDate() + dias);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+const SCHEDULE_PRESETS = [
+  { label: "Amanhã", dias: 1 },
+  { label: "Em 3 dias", dias: 3 },
+  { label: "Em 7 dias", dias: 7 },
+  { label: "Em 15 dias", dias: 15 },
+];
+
+const SCHEDULE_MOTIVOS = [
+  "Retomar negociação",
+  "Cliente pediu para ligar depois",
+  "Enviar cotação / orçamento",
+  "Conferir se o pedido chegou",
+  "Oferecer itens da sugestão",
+];
+
+function openScheduleContactModal(clientKey) {
+  const client = state.crm.selectedClient?.summary || {};
+  if (!clientKey) return;
+  state.crm.scheduleContact = {
+    clientKey,
+    clientName: client.clientName || clientKey,
+    phone: client.updatedPhone || client.phone || "",
+    date: dateInDays(1),
+    time: "09:00",
+    reason: sugerirMotivoAgendamento(client),
+    saving: false,
+  };
+  requestRender();
+}
+
+/** Motivo sugerido conforme a situação do cliente — o vendedor pode trocar. */
+function sugerirMotivoAgendamento(client) {
+  const dias = client.daysWithoutPurchase;
+  if (client.statusCode === "INATIVO") return `Retomar contato — inativo há ${dias || "?"} dias`;
+  if (client.statusCode === "PRE_INATIVO") return "Contato preventivo — cliente espaçando pedidos";
+  if (Number(client.currentRevenue || 0) <= 0) return "Sem compra no mês — provocar reposição";
+  return "Retomar negociação";
+}
+
+function closeScheduleContactModal() {
+  state.crm.scheduleContact = null;
+  requestRender();
+}
+
+function setSchedulePreset(dias) {
+  if (!state.crm.scheduleContact) return;
+  state.crm.scheduleContact.date = dateInDays(dias);
+  requestRender();
+}
+
+/** Recebe o índice, não o texto — evita quebrar o HTML com aspas no motivo. */
+function setScheduleReason(indice) {
+  if (!state.crm.scheduleContact) return;
+  state.crm.scheduleContact.reason = SCHEDULE_MOTIVOS[indice] || state.crm.scheduleContact.reason;
+  requestRender();
+}
+
+function scheduleContactModal() {
+  const s = state.crm.scheduleContact;
+  if (!s) return "";
+  const hoje = dateInDays(0);
+
+  return `
+    <div class="client-drawer-overlay open" onclick="closeScheduleContactModal()">
+      <div class="panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>📅 Agendar contato</h3>
+            <div class="text-small">${escapeHtml(s.clientName)}${s.phone ? ` · ${escapeHtml(s.phone)}` : ""}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="closeScheduleContactModal()">Fechar</button>
+        </div>
+
+        <div class="field" style="margin-top:12px">
+          <label>Quando voltar a falar</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+            ${SCHEDULE_PRESETS.map((p) => `
+              <button class="btn btn-sm ${s.date === dateInDays(p.dias) ? "btn-primary" : "btn-ghost"}"
+                onclick="setSchedulePreset(${p.dias})">${p.label}</button>`).join("")}
+          </div>
+          <div style="display:flex;gap:8px">
+            <input type="date" style="flex:2" min="${hoje}" value="${escapeHtml(s.date)}"
+              oninput="state.crm.scheduleContact.date=this.value" />
+            <input type="time" style="flex:1" value="${escapeHtml(s.time)}"
+              oninput="state.crm.scheduleContact.time=this.value" />
+          </div>
+        </div>
+
+        <div class="field">
+          <label>Motivo do contato</label>
+          <input value="${escapeHtml(s.reason)}" oninput="state.crm.scheduleContact.reason=this.value"
+            placeholder="O que você precisa tratar com o cliente" />
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+            ${SCHEDULE_MOTIVOS.map((m, i) => `
+              <button class="btn btn-ghost btn-sm" style="font-size:11px"
+                onclick="setScheduleReason(${i})">${escapeHtml(m)}</button>`).join("")}
+          </div>
+        </div>
+
+        <div class="text-small" style="color:var(--muted);margin-top:4px">
+          A tarefa aparece em <strong>Tarefas</strong> e vira pendência de follow-up na data marcada.
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-primary" ${s.saving || !s.date ? "disabled" : ""} onclick="confirmScheduleContact()">
+            ${s.saving ? "Agendando…" : "Agendar"}
+          </button>
+          <button class="btn btn-ghost" onclick="closeScheduleContactModal()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function confirmScheduleContact() {
+  const s = state.crm.scheduleContact;
+  if (!s || !s.date) { addMessage("error", "Escolha a data do contato."); return; }
+  state.crm.scheduleContact.saving = true;
+  requestRender();
+  try {
+    const r = await api("/api/crm/tasks/assign", {
+      method: "POST",
+      body: JSON.stringify({
+        clientKey: s.clientKey,
+        clientName: s.clientName,
+        // sellerName vai vazio de propósito: o backend preenche com o vendedor logado.
+        title: `Contatar ${s.clientName}`,
+        description: `Agendado pelo vendedor — ${s.reason}${s.time ? ` (${s.time})` : ""}`,
+        dueAt: s.time ? `${s.date} ${s.time}:00` : s.date,
+      }),
+    });
+    addMessage(r.duplicated ? "warn" : "success", r.message || "Contato agendado.");
+    closeScheduleContactModal();
+    await loadCrmData();
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.crm.scheduleContact) state.crm.scheduleContact.saving = false;
+    requestRender();
+  }
+}
+
 function crmFilterToolbar() {
   const filters = state.crm.crmClientFilters;
   const pagination = state.crm.pagination;
@@ -4382,6 +4537,12 @@ function clientDrawerView() {
         <div class="client-drawer-actions">
           <button class="btn btn-primary" ${client.clientKey ? "" : "disabled"} onclick="prefillInteractionFromAgenda('${escapeHtml(client.clientKey || "")}')">Registrar contato</button>
           <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"} onclick="openContactUpdateModal('${escapeHtml(client.clientKey || "")}')">Atualizar contato</button>
+          ${roleIsSeller() ? `
+            <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
+              onclick="openScheduleContactModal('${escapeHtml(client.clientKey || "")}')"
+              title="Criar uma tarefa para você voltar a falar com este cliente">
+              📅 Agendar contato
+            </button>` : ""}
           ${detail?.canAssignTask ? `
             <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
               onclick="openAssignTaskModal('${escapeHtml(client.clientKey || "")}')"
@@ -6681,6 +6842,7 @@ function dashboardView() {
       ${crmModalView()}
       ${copyFallbackModal()}
       ${assignTaskModal()}
+      ${scheduleContactModal()}
       ${clientDrawerView()}
     </div>
   `;

@@ -10093,10 +10093,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = self._read_json()
                 try:
                     with closing(get_connection()) as conn:
-                        if data_scope_for_user(conn, user) == "proprio":
-                            self._set_headers(403)
-                            self.wfile.write(json_dumps({"error": "Ação exclusiva de gestão."}))
-                            return
+                        # Vendedor pode agendar contato para SI MESMO; a gestão pode
+                        # atribuir a qualquer vendedor da unidade. O nome é forçado
+                        # no caso do vendedor para ele não criar tarefa para outro.
+                        is_seller = data_scope_for_user(conn, user) == "proprio"
+                        if is_seller:
+                            payload["sellerName"] = seller_identity_for_user(user)
                         client_key = normalize_whitespace(payload.get("clientKey"))
                         client_name = normalize_whitespace(payload.get("clientName"))
                         seller_name = normalize_whitespace(payload.get("sellerName"))
@@ -10105,7 +10107,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         due_at = normalize_whitespace(payload.get("dueAt")) or date.today().isoformat()
                         # O vendedor escolhido precisa estar nas unidades do gestor —
                         # sem isso, um gerente poderia criar tarefa para outra equipe.
-                        if seller_name:
+                        if seller_name and not is_seller:
                             permitidos = {
                                 normalize_upper(s["sellerName"])
                                 for s in sellers_available_for_assignment(conn, user["company_id"], user)
@@ -10130,7 +10132,9 @@ class AppHandler(BaseHTTPRequestHandler):
                             self._set_headers(200)
                             self.wfile.write(json_dumps({
                                 "ok": True, "duplicated": True,
-                                "message": f"{seller_name} já tem uma tarefa aberta para este cliente.",
+                                "message": ("Você já tem uma tarefa aberta para este cliente."
+                                            if is_seller
+                                            else f"{seller_name} já tem uma tarefa aberta para este cliente."),
                             }))
                             return
                         conn.execute(
@@ -10143,12 +10147,14 @@ class AppHandler(BaseHTTPRequestHandler):
                              title, description, due_at, now_iso()),
                         )
                         audit_log(conn, user["company_id"], user["id"], "criar", "crm_tasks", client_key,
-                                  {"seller": seller_name, "origem": "cobranca_gestor"})
+                                  {"seller": seller_name,
+                                   "origem": "agendamento_vendedor" if is_seller else "cobranca_gestor"})
                         conn.commit()
                     self._set_headers(200)
                     self.wfile.write(json_dumps({
                         "ok": True,
-                        "message": f"Tarefa criada para {seller_name}.",
+                        "message": ("Contato agendado. A tarefa está em Tarefas."
+                                    if is_seller else f"Tarefa criada para {seller_name}."),
                     }))
                 except Exception as exc:
                     traceback.print_exc()
