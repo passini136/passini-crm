@@ -1725,6 +1725,28 @@ function filteredClientRanking() {
     String(r.clientKey || "").toLowerCase().includes(termo));
 }
 
+/**
+ * Aplica a busca só no Enter ou no botão.
+ * Buscar a cada tecla obrigava a redesenhar a tabela inteira, o campo perdia o
+ * foco e não dava para terminar de digitar.
+ */
+function applyClientRankingSearch() {
+  const campo = document.getElementById("client-ranking-search");
+  state.ui.clientRankingSearch = campo ? campo.value.trim() : "";
+  requestRender();
+  // Devolve o foco ao campo depois do redesenho
+  setTimeout(() => {
+    const novo = document.getElementById("client-ranking-search");
+    if (novo) { novo.focus(); novo.setSelectionRange(novo.value.length, novo.value.length); }
+  }, 0);
+}
+
+function clearClientRankingSearch() {
+  state.ui.clientRankingSearch = "";
+  requestRender();
+  setTimeout(() => document.getElementById("client-ranking-search")?.focus(), 0);
+}
+
 function clientRankingCard() {
   const termo = state.ui.clientRankingSearch || "";
   const filtrados = filteredClientRanking();
@@ -1748,10 +1770,12 @@ function clientRankingCard() {
       </div>
 
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px;flex-wrap:wrap">
-        <input style="flex:1;min-width:240px" placeholder="🔍 Buscar por nome ou código do cliente"
+        <input id="client-ranking-search" style="flex:1;min-width:240px"
+          placeholder="🔍 Buscar por nome ou código — Enter para buscar"
           value="${escapeHtml(termo)}"
-          oninput="state.ui.clientRankingSearch=this.value;requestRender()" />
-        ${termo ? `<button class="btn btn-ghost btn-sm" onclick="state.ui.clientRankingSearch='';requestRender()">Limpar</button>` : ""}
+          onkeydown="if(event.key==='Enter'){event.preventDefault();applyClientRankingSearch();}" />
+        <button class="btn btn-secondary btn-sm" onclick="applyClientRankingSearch()">Buscar</button>
+        ${termo ? `<button class="btn btn-ghost btn-sm" onclick="clearClientRankingSearch()">Limpar</button>` : ""}
       </div>
 
       <div class="table-wrap">
