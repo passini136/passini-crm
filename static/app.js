@@ -4223,6 +4223,49 @@ function sellerFilterBar() {
     </div>`;
 }
 
+const MONTH_ABBR = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+
+/** "2026-07-12" ou "2026-07" → "12/07/26" / "jul/26". Aguenta data vazia. */
+function shortDate(valor) {
+  const texto = String(valor || "").slice(0, 10);
+  const partes = texto.split("-");
+  if (partes.length >= 3) return `${partes[2]}/${partes[1]}/${partes[0].slice(2)}`;
+  if (partes.length === 2) return `${MONTH_ABBR[Number(partes[1]) - 1] || partes[1]}/${partes[0].slice(2)}`;
+  return texto || "-";
+}
+
+/** Quantidade sem casas decimais quando é inteira — "4 un" e não "4,00 un". */
+function qtyLabel(valor) {
+  const n = Number(valor || 0);
+  const texto = Number.isInteger(n) ? String(n) : n.toLocaleString("pt-BR", { maximumFractionDigits: 2 });
+  return `${texto} un`;
+}
+
+/**
+ * Faixa com o histórico do item pesquisado — só aparece quando há filtro de peça.
+ * Uma linha com a última compra (quando/quanto/por quanto) e, se houve mais de
+ * uma, uma segunda linha discreta com o acumulado dos 12 meses.
+ */
+function itemPurchaseLine(item) {
+  const c = item.itemPurchase;
+  if (!c) return "";
+  const preco = c.lastUnitPrice != null ? `${currency(c.lastUnitPrice)}/un` : "preço n/d";
+  const repetiu = Number(c.purchaseCount || 0) > 1;
+  return `
+    <div style="border-left:3px solid var(--accent);background:#f5f9ff;border-radius:0 6px 6px 0;
+                padding:6px 10px;margin-bottom:8px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+        <span style="font-weight:700;color:var(--accent)">🔧 ${escapeHtml(c.itemCode || "Item")}</span>
+        <span style="font-weight:600">${shortDate(c.lastPurchaseAt)} · ${qtyLabel(c.lastQuantity)} · ${preco}</span>
+      </div>
+      ${repetiu ? `
+        <div style="color:var(--muted);margin-top:2px">
+          ${number(c.purchaseCount)} compras em 12m · ${qtyLabel(c.totalQuantity)} · ${currency(c.totalValue)}
+          ${c.avgUnitPrice != null ? ` · média ${currency(c.avgUnitPrice)}/un` : ""}
+        </div>` : ""}
+    </div>`;
+}
+
 function sellerClientCard(item) {
   const classBadge = { DIAMANTE: "💎", OURO: "🥇", PRATA: "🥈", BRONZE: "🥉" }[item.classCode] || "⚪";
   const hasPurchase = Number(item.currentRevenue || 0) > 0;
@@ -4236,6 +4279,7 @@ function sellerClientCard(item) {
         ${crmStatusBadge(item.statusCode)}
       </div>
       ${revenueTrendLine(item)}
+      ${itemPurchaseLine(item)}
       <div style="display:flex;gap:8px;font-size:12px;color:var(--muted);margin-bottom:10px">
         <span>📞 ${escapeHtml(item.phone || "Sem tel.")}</span>
         <span style="color:${hasPurchase ? "var(--good)" : "#e67e22"}">${hasPurchase ? "✅ Comprou" : "○ Sem compra"}</span>

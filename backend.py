@@ -4438,21 +4438,70 @@ def clients_who_bought_item(
     termo = normalize_whitespace(item_code)
     if not termo:
         return None
+    detalhes = item_purchase_details(conn, company_id, item_code, months_window)
+    return None if detalhes is None else set(detalhes.keys())
+
+
+def item_purchase_details(
+    conn: sqlite3.Connection, company_id: int, item_code: str, months_window: int = 12
+) -> dict[str, dict[str, Any]] | None:
+    """Quando, quanto e por quanto cada cliente comprou o item pesquisado.
+
+    Devolve, por cliente: a data da ÚLTIMA compra do item, a quantidade e o preço
+    unitário praticado nessa compra, mais o acumulado da janela (total de peças e
+    quantas compras). O preço unitário sai do líquido dividido pela quantidade —
+    é o que o cliente efetivamente pagou, já com desconto e devolução.
+
+    Devolve None quando não há filtro de item a aplicar.
+    """
+    termo = normalize_whitespace(item_code)
+    if not termo:
+        return None
     latest = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
     inicio = shift_competence(latest, -(months_window - 1))
     padrao = f"%{termo.upper()}%"
     rows = conn.execute(
         """
-        SELECT DISTINCT client_name
+        SELECT client_name,
+               COALESCE(NULLIF(issue_date, ''), competence) AS purchase_at,
+               COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, '')) AS item_code,
+               SUM(quantity) AS quantity,
+               SUM(net_value) AS net_value
         FROM fact_sales_detail
         WHERE company_id = ? AND competence >= ? AND net_value > 0
           AND (UPPER(COALESCE(manufacturer_sku, '')) LIKE ?
             OR UPPER(COALESCE(gtin_value, '')) LIKE ?
             OR UPPER(COALESCE(sku_key, '')) LIKE ?)
+        GROUP BY client_name, purchase_at, item_code
+        ORDER BY purchase_at ASC
         """,
         (company_id, inicio, padrao, padrao, padrao),
     ).fetchall()
-    return {normalize_client_key(r["client_name"]) for r in rows if r["client_name"]}
+
+    detalhes: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        chave = normalize_client_key(row["client_name"])
+        if not chave:
+            continue
+        qtd = float(row["quantity"] or 0.0)
+        valor = float(row["net_value"] or 0.0)
+        atual = detalhes.setdefault(chave, {
+            "lastPurchaseAt": "", "lastQuantity": 0.0, "lastUnitPrice": None,
+            "totalQuantity": 0.0, "totalValue": 0.0, "purchaseCount": 0, "itemCode": "",
+        })
+        atual["totalQuantity"] += qtd
+        atual["totalValue"] += valor
+        atual["purchaseCount"] += 1
+        # Rows vêm em ordem crescente de data, então a última iteração é a compra mais recente.
+        atual["lastPurchaseAt"] = normalize_whitespace(row["purchase_at"])
+        atual["lastQuantity"] = qtd
+        atual["lastUnitPrice"] = finite_or_none(valor / qtd) if qtd > 0 else None
+        atual["itemCode"] = normalize_whitespace(row["item_code"]) or atual["itemCode"]
+
+    for valores in detalhes.values():
+        total_qtd = valores["totalQuantity"]
+        valores["avgUnitPrice"] = finite_or_none(valores["totalValue"] / total_qtd) if total_qtd > 0 else None
+    return detalhes
 
 
 def filter_crm_client_rows(
@@ -4510,7 +4559,8 @@ def query_crm_clients_page(
     page_size: int,
 ) -> dict[str, Any]:
     all_rows = list_crm_clients(conn, company_id, filters, attach_context=False)
-    item_buyers = clients_who_bought_item(conn, company_id, filters.get("itemCode"))
+    item_details = item_purchase_details(conn, company_id, filters.get("itemCode"))
+    item_buyers = None if item_details is None else set(item_details.keys())
     filtered_rows = filter_crm_client_rows(all_rows, filters, item_buyers)
     total = len(filtered_rows)
     safe_page_size = min(max(int(page_size or 50), 1), 100)
@@ -4519,6 +4569,14 @@ def query_crm_clients_page(
     offset = (safe_page - 1) * safe_page_size
     visible_rows = filtered_rows[offset : offset + safe_page_size]
     rows = crm_attach_context(conn, company_id, visible_rows)
+    # Só nos clientes da página visível — não faz sentido carregar o detalhe de quem não aparece.
+    if item_details:
+        for row in rows:
+            for candidata in (row.get("clientName"), row.get("summaryClientName"), row.get("tradeName")):
+                detalhe = item_details.get(normalize_client_key(candidata))
+                if detalhe:
+                    row["itemPurchase"] = detalhe
+                    break
     print(
         "[CRM CLIENTS PAGE DEBUG]",
         {
