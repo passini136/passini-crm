@@ -4098,6 +4098,25 @@ def crm_generate_questions(summary: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ── Parâmetros das sugestões de oferta ──────────────────────────────────────
+# Ficam juntos e nomeados de propósito: são regras comerciais que mudam com o
+# tempo e precisam ser ajustáveis sem caçar número solto no meio da query.
+
+# Janela em que uma parada de compra ainda é "recompra". Item que o cliente
+# largou há mais tempo que isso vira histórico morto e não gera gancho.
+OFFER_REPURCHASE_WINDOW_MONTHS = 12
+# Janela usada para medir o giro do item na praça (competência atual + 3 anteriores).
+OFFER_PEER_WINDOW_MONTHS = 4
+# Mínimo de oficinas distintas comprando o item na cidade para virar oportunidade.
+OFFER_PEER_MIN_CLIENTS = 3
+# Quantas sugestões de cada tipo devolver.
+OFFER_MAX_SUGGESTIONS = 5
+# Teto de itens no histórico exibido. NÃO usar esse recorte para decidir o que o
+# cliente já comprou — foi exatamente esse erro que fez um item comprado ser
+# anunciado como "nunca pediu".
+OFFER_HISTORY_DISPLAY_LIMIT = 25
+
+
 def crm_get_offer_suggestions(
     conn: sqlite3.Connection, company_id: int, client_name: str, city_name: str | None = None
 ) -> dict[str, Any]:
@@ -4128,7 +4147,10 @@ def crm_get_offer_suggestions(
             return f"{cod} ({g})"
         return cod or g or "ITEM"
 
-    # Histórico do cliente por item (fora do mês corrente)
+    # Histórico do cliente por item dentro da janela de recompra (fora do mês corrente).
+    # Este recorte serve para MONTAR A LISTA DE RECOMPRA — nunca para decidir se o
+    # cliente já comprou um item.
+    inicio_recompra = shift_competence(latest, -(OFFER_REPURCHASE_WINDOW_MONTHS - 1))
     history = conn.execute(
         f"""
         SELECT {ITEM_EXPR} AS item_code,
@@ -4138,12 +4160,13 @@ def crm_get_offer_suggestions(
                SUM(quantity) AS qtd,
                MAX(competence) AS ultima_competencia
         FROM fact_sales_detail
-        WHERE company_id = ? AND client_name = ? AND competence <> ? AND net_value > 0
+        WHERE company_id = ? AND client_name = ? AND competence <> ?
+          AND competence >= ? AND net_value > 0
         GROUP BY item_code
         ORDER BY meses DESC, total DESC
-        LIMIT 25
+        LIMIT {OFFER_HISTORY_DISPLAY_LIMIT}
         """,
-        (company_id, client_name, latest),
+        (company_id, client_name, latest, inicio_recompra),
     ).fetchall()
 
     current_items = {
@@ -4154,7 +4177,21 @@ def crm_get_offer_suggestions(
             (company_id, client_name, latest),
         ).fetchall()
     }
-    all_client_items = {r["item_code"] for r in history} | current_items
+
+    # Tudo que o cliente já comprou, sem janela e SEM LIMITE. É esta lista — e não
+    # o histórico exibido — que impede anunciar como novidade um item que ele já
+    # levou. O bug anterior: o histórico vinha com LIMIT 25 ordenado por valor, e
+    # um item barato comprado uma vez ficava de fora, virando "nunca pediu".
+    ever_bought_rows = conn.execute(
+        f"""
+        SELECT DISTINCT {ITEM_EXPR} AS item_code
+        FROM fact_sales_detail
+        WHERE company_id = ? AND client_name = ? AND net_value > 0
+        """,
+        (company_id, client_name),
+    ).fetchall()
+    all_client_items = {r["item_code"] for r in ever_bought_rows} | current_items
+    client_has_history = bool(all_client_items)
 
     def months_since(competence: str | None) -> int | None:
         if not competence or len(competence) < 7:
@@ -4203,25 +4240,30 @@ def crm_get_offer_suggestions(
             WHERE company_id = ? AND city_name = ? AND client_name <> ? AND net_value > 0
               AND competence >= ?
             GROUP BY item_code
-            HAVING clientes >= 3
+            HAVING clientes >= ?
             ORDER BY clientes DESC, total DESC
             LIMIT 40
             """,
-            (company_id, normalize_upper(city_name), client_name, shift_competence(latest, -3)),
+            (company_id, normalize_upper(city_name), client_name,
+             shift_competence(latest, -(OFFER_PEER_WINDOW_MONTHS - 1)), OFFER_PEER_MIN_CLIENTS),
         ).fetchall()
         for r in peer_rows:
             if r["item_code"] in all_client_items:
                 continue
+            # Só afirma "nunca pediu" quando existe histórico de compra do cliente
+            # para comparar. Sem histórico, a frase seria um chute com cara de dado.
+            complemento = ("ele nunca pediu" if client_has_history
+                           else "não há registro de compra dele")
             opportunity.append({
                 "itemCode": r["item_code"],
                 "gtin": normalize_whitespace(r["gtin"]),
                 "type": "OPORTUNIDADE",
                 "typeLabel": "Oportunidade",
                 "title": item_label(r["item_code"], r["gtin"]),
-                "reason": f"{int(r['clientes'])} oficinas da região compram e ele nunca pediu",
+                "reason": f"{int(r['clientes'])} oficinas da região compram e {complemento}",
                 "peerClients": int(r["clientes"]),
             })
-            if len(opportunity) >= 5:
+            if len(opportunity) >= OFFER_MAX_SUGGESTIONS:
                 break
 
     # Prioriza recompra: gancho mais forte e conversão mais provável
@@ -4230,8 +4272,8 @@ def crm_get_offer_suggestions(
     return {
         "primary": primary,
         "secondary": secondary,
-        "repurchase": repurchase[:5],
-        "opportunity": opportunity[:5],
+        "repurchase": repurchase[:OFFER_MAX_SUGGESTIONS],
+        "opportunity": opportunity[:OFFER_MAX_SUGGESTIONS],
     }
 
 
