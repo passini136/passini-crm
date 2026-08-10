@@ -3568,39 +3568,65 @@ def short_person_key(value: Any) -> str:
     return " ".join(partes[:2]) if len(partes) >= 2 else (partes[0] if partes else "")
 
 
-def user_person_keys(user: sqlite3.Row) -> list[str]:
-    """Todas as chaves pelas quais este usuário pode aparecer numa lista de presença."""
-    candidatos = [user["full_name"], user["username"]]
+def user_person_keys(user: sqlite3.Row | dict[str, Any]) -> list[str]:
+    """Todas as chaves pelas quais este usuário pode aparecer numa lista de presença.
+
+    `linked_person_name` vem primeiro porque é o vínculo que o gestor declarou
+    ao criar a conta — é informação explícita, não dedução por semelhança.
+    """
+    def valor(campo: str) -> Any:
+        try:
+            return user[campo]
+        except (KeyError, IndexError):
+            return None
+
     chaves: list[str] = []
-    for valor in candidatos:
-        if not normalize_whitespace(valor):
+    for campo in ("linked_person_name", "full_name", "username"):
+        bruto = valor(campo)
+        if not normalize_whitespace(bruto):
             continue
-        chaves.append(person_key(valor))
-        chaves.append(short_person_key(valor))
+        chaves.append(person_key(bruto))
+        chaves.append(short_person_key(bruto))
     return [k for k in dict.fromkeys(chaves) if k]
 
 
 def resolve_user_for_person(conn: sqlite3.Connection, company_id: int, nome: str) -> int | None:
     """Conta de login correspondente a um nome da lista de presença, se houver.
 
-    Tenta o nome completo primeiro; só então o recorte de dois tokens. Se dois
-    usuários casarem pelo recorte curto, devolve None — melhor não notificar
-    ninguém do que notificar a pessoa errada.
+    Ordem de tentativa, da informação mais confiável para a menos:
+      1. `linked_person_name` — o vínculo explícito feito no cadastro do usuário.
+      2. nome completo do usuário ou o próprio login.
+      3. nome + primeiro sobrenome, para as divergências de nome do meio.
+
+    Em caso de empate no passo 3, devolve None: melhor não notificar ninguém do
+    que mandar a pendência para a pessoa errada.
     """
     alvo_completo = person_key(nome)
     alvo_curto = short_person_key(nome)
     if not alvo_completo:
         return None
+
     usuarios = conn.execute(
-        "SELECT id, full_name, username FROM users WHERE company_id = ? AND is_active = 1",
+        "SELECT id, full_name, username, linked_person_name FROM users "
+        "WHERE company_id = ? AND COALESCE(is_active, 1) = 1",
         (company_id,),
     ).fetchall()
+
+    vinculados = [u["id"] for u in usuarios if person_key(u["linked_person_name"]) == alvo_completo]
+    if len(vinculados) == 1:
+        return vinculados[0]
+
     exatos = [u["id"] for u in usuarios
               if alvo_completo in {person_key(u["full_name"]), person_key(u["username"])}]
     if len(exatos) == 1:
         return exatos[0]
+
+    if not alvo_curto:
+        return None
     curtos = [u["id"] for u in usuarios
-              if alvo_curto and alvo_curto in {short_person_key(u["full_name"]), short_person_key(u["username"])}]
+              if alvo_curto in {short_person_key(u["linked_person_name"]),
+                                short_person_key(u["full_name"]),
+                                short_person_key(u["username"])}]
     return curtos[0] if len(curtos) == 1 else None
 
 
