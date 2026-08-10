@@ -4418,7 +4418,8 @@ function ataEditorModal() {
 
   return `
     <div class="client-drawer-overlay open" onclick="fecharAtaEditor()">
-      <div class="panel" style="max-width:900px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
+      <div class="panel" data-keep-scroll="ata-editor"
+           style="max-width:900px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -4488,7 +4489,8 @@ function ataEditorModal() {
               <button class="btn btn-ghost btn-sm" onclick="limparPresentes()">Limpar</button>
             </div>
           </div>
-          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-height:180px;overflow:auto">
+          <div data-keep-scroll="ata-presentes"
+               style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-height:180px;overflow:auto">
             ${pessoas.map((p) => {
               const on = marcados.has(p.personKey);
               const ciente = e.participants.find((x) => x.personKey === p.personKey)?.acknowledgedAt;
@@ -4548,7 +4550,8 @@ function ataDetalheModal() {
 
   return `
     <div class="client-drawer-overlay open" onclick="fecharAta()">
-      <div class="panel" style="max-width:820px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
+      <div class="panel" data-keep-scroll="ata-detalhe"
+           style="max-width:820px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -7569,14 +7572,27 @@ function dashboardView() {
 }
 
 function render() {
-  // Preserva scroll do drawer antes de reconstruir o DOM
+  // Cada render reconstrói o DOM inteiro, e o navegador zera o scroll dos
+  // elementos novos. Em telas longas dentro de modal (ata de reunião, por
+  // exemplo) qualquer clique que atualize o estado jogava a pessoa de volta
+  // ao topo. Qualquer elemento com data-keep-scroll tem a posição restaurada.
+  const posicoes = new Map();
+  document.querySelectorAll("[data-keep-scroll]").forEach((el) => {
+    if (el.scrollTop > 0) posicoes.set(el.getAttribute("data-keep-scroll"), el.scrollTop);
+  });
   const drawerEl = document.querySelector(".client-drawer");
   const drawerScroll = drawerEl ? drawerEl.scrollTop : 0;
+
   app.innerHTML = state.user ? dashboardView() : loginView();
+
   if (drawerScroll > 0) {
     const newDrawer = document.querySelector(".client-drawer");
     if (newDrawer) newDrawer.scrollTop = drawerScroll;
   }
+  posicoes.forEach((topo, chave) => {
+    const el = document.querySelector(`[data-keep-scroll="${chave}"]`);
+    if (el) el.scrollTop = topo;
+  });
 }
 
 async function ignoreIssue(issueId) {
