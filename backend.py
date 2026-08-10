@@ -10512,12 +10512,17 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps({"error": "Arquivo removido do servidor."}))
                     return
                 conteudo = caminho.read_bytes()
+                # inline=1 abre no navegador (PDF e imagem); sem o parâmetro, baixa.
+                # Ler a apostila sem precisar salvar o arquivo importa no celular,
+                # onde o vendedor abre a ata durante a reunião.
+                query_anexo = parse_qs(parsed.query)
+                disposicao = "inline" if query_anexo.get("inline", ["0"])[0] == "1" else "attachment"
                 self.send_response(200)
                 self.send_header("Content-Type", row["content_type"] or "application/octet-stream")
                 self.send_header("Content-Length", str(len(conteudo)))
                 self.send_header(
                     "Content-Disposition",
-                    f'attachment; filename="{Path(row["file_name"]).name}"',
+                    f'{disposicao}; filename="{Path(row["file_name"]).name}"',
                 )
                 self.end_headers()
                 self.wfile.write(conteudo)

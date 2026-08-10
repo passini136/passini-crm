@@ -4244,6 +4244,49 @@ async function removerAnexo(attachmentId) {
   } catch (e) { addMessage("error", e.message); }
 }
 
+/** Extensões que o navegador consegue exibir sem baixar. */
+const ANEXO_VISUALIZAVEL = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".txt"];
+
+function anexoPodeAbrir(nome) {
+  const n = String(nome || "").toLowerCase();
+  return ANEXO_VISUALIZAVEL.some((ext) => n.endsWith(ext));
+}
+
+/**
+ * Baixa o anexo via fetch em vez de link direto.
+ *
+ * O <a target="_blank"> com Content-Disposition: attachment abre uma aba que
+ * fecha no mesmo instante — quando algo dava errado (sessão, permissão), o
+ * vendedor via exatamente nada e concluía que não tinha acesso. Assim, ou o
+ * arquivo baixa, ou aparece o motivo na tela.
+ */
+async function baixarAnexo(attachmentId, fileName) {
+  try {
+    const resp = await fetch(`/api/meetings/attachment/${attachmentId}`, { credentials: "same-origin" });
+    if (!resp.ok) {
+      let motivo = `Não foi possível baixar (erro ${resp.status}).`;
+      try { motivo = (await resp.json()).error || motivo; } catch (_) { /* resposta não-JSON */ }
+      addMessage("error", motivo);
+      return;
+    }
+    const blob = await resp.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName || "anexo";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) {
+    addMessage("error", `Falha ao baixar o anexo: ${e.message}`);
+  }
+}
+
+function abrirAnexo(attachmentId) {
+  window.open(`/api/meetings/attachment/${attachmentId}?inline=1`, "_blank", "noopener");
+}
+
 function fileSizeLabel(bytes) {
   const n = Number(bytes || 0);
   if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
@@ -4540,10 +4583,14 @@ function ataEditorModal() {
           <input type="file" multiple onchange="enviarAnexos(this)" style="margin-top:8px" />
           <div class="stack" style="margin-top:8px">
             ${(e.attachments || []).map((a) => `
-              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;
-                          padding:6px 10px;background:#f8f9fa;border-radius:6px">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
+                          font-size:12px;padding:6px 10px;background:#f8f9fa;border-radius:6px">
                 <span>📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted)">${fileSizeLabel(a.sizeBytes)}</span></span>
-                <button class="btn btn-ghost btn-sm" onclick="removerAnexo(${a.id})">Remover</button>
+                <span style="display:flex;gap:6px">
+                  ${anexoPodeAbrir(a.fileName)
+                    ? `<button class="btn btn-ghost btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : ""}
+                  <button class="btn btn-ghost btn-sm" onclick="removerAnexo(${a.id})">Remover</button>
+                </span>
               </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhum anexo.</div>'}
           </div>
         </div>
@@ -4602,13 +4649,22 @@ function ataDetalheModal() {
         ${bloco("DECISÕES E ENCAMINHAMENTOS", m.decisions)}
 
         ${(m.attachments || []).length ? `
-          <div style="margin-top:12px">
-            <div class="eyebrow">MATERIAL</div>
-            ${m.attachments.map((a) => `
-              <a href="/api/meetings/attachment/${a.id}" target="_blank"
-                 style="display:block;font-size:13px;padding:6px 0;color:var(--accent);font-weight:600">
-                📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted);font-weight:400">${fileSizeLabel(a.sizeBytes)}</span>
-              </a>`).join("")}
+          <div class="subtle-card padded-card" style="margin-top:12px">
+            <div class="section-title"><div><h3>📎 Material</h3>
+              <div class="text-small">${m.attachments.length} arquivo(s) desta ${m.kind === "TREINAMENTO" ? "capacitação" : "reunião"}</div></div></div>
+            <div class="stack" style="margin-top:8px">
+              ${m.attachments.map((a) => `
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
+                            font-size:13px;padding:8px 10px;background:#f8f9fa;border-radius:6px">
+                  <span style="font-weight:600">📎 ${escapeHtml(a.fileName)}
+                    <span style="color:var(--muted);font-weight:400">${fileSizeLabel(a.sizeBytes)}</span></span>
+                  <span style="display:flex;gap:6px">
+                    ${anexoPodeAbrir(a.fileName)
+                      ? `<button class="btn btn-secondary btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : ""}
+                    <button class="btn btn-ghost btn-sm" onclick="baixarAnexo(${a.id}, '${jsAttr(a.fileName)}')">Baixar</button>
+                  </span>
+                </div>`).join("")}
+            </div>
           </div>` : ""}
 
         <div class="subtle-card padded-card" style="margin-top:14px">
