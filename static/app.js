@@ -4083,7 +4083,7 @@ function clearMeetingFilters() {
 function novaAtaModal(kind) {
   state.meetingEditor = {
     id: null, kind: kind || "REUNIAO", title: "", topic: "",
-    unitName: (state.meetings?.units || [])[0] || "",
+    unitName: state.meetings?.defaultUnit || (state.meetings?.units || [])[0] || "",
     occurredAt: localDateTimeInput(), durationMin: 60, location: "",
     agenda: "", summary: "", decisions: "",
     organizerName: state.meetings?.myName || "",
@@ -4450,11 +4450,17 @@ function ataEditorModal() {
             <input type="number" min="0" step="15" value="${Number(e.durationMin || 0)}"
               oninput="state.meetingEditor.durationMin=Number(this.value)" /></div>
           <div class="field"><label>Unidade</label>
-            <select onchange="state.meetingEditor.unitName=this.value">
-              <option value="">Corporativa (todas)</option>
-              ${(state.meetings?.units || []).map((u) => `
-                <option value="${escapeHtml(u)}" ${e.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
-            </select></div>
+            ${(state.meetings?.units || []).length === 1 && !state.meetings?.canBeCorporate
+              ? `<input value="${escapeHtml(state.meetings.units[0])}" disabled
+                   title="Você registra atas apenas para a sua unidade" />`
+              : `<select onchange="state.meetingEditor.unitName=this.value">
+                  ${state.meetings?.canBeCorporate ? `<option value="" ${!e.unitName ? "selected" : ""}>Corporativa (todas)</option>` : ""}
+                  ${(state.meetings?.units || []).map((u) => `
+                    <option value="${escapeHtml(u)}" ${e.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+                </select>`}
+            ${!state.meetings?.canBeCorporate && !(state.meetings?.units || []).length
+              ? '<div class="text-small" style="color:var(--bad);margin-top:4px">Seu usuário não tem unidade vinculada. Peça ao administrador para vincular.</div>'
+              : ""}</div>
           <div class="field"><label>Local</label>
             <input value="${escapeHtml(e.location)}" oninput="state.meetingEditor.location=this.value"
               placeholder="Sala, loja, online" /></div>

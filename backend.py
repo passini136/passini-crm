@@ -3584,7 +3584,10 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
         if not nome or not chave or chave in vistos:
             continue
         unidade = normalize_unit(r["base_unit"])
-        if allowed and unidade and unidade not in allowed:
+        # `allowed is not None` = usuário restrito. Nesse caso, pessoa sem unidade
+        # cadastrada também fica de fora: antes ela escapava do filtro e o gerente
+        # via gente de outras equipes na lista de presença.
+        if allowed is not None and unidade not in allowed:
             continue
         vistos.add(chave)
         pessoas.append({
@@ -3594,6 +3597,32 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
             "role": normalize_whitespace(r["role_classification"]) or "Outros",
         })
     return pessoas
+
+
+def meeting_units_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
+    """Unidades que o usuário pode atribuir a uma ata.
+
+    Gerente registra reunião só para a equipe dele — não escolhe outra unidade
+    nem marca a ata como corporativa. Diretoria e admin, sem restrição, podem os
+    dois. Devolve também a unidade padrão, para o formulário já abrir certo.
+    """
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is None:
+        todas = [
+            normalize_unit(r["base_unit"])
+            for r in conn.execute(
+                "SELECT DISTINCT base_unit FROM people_records "
+                "WHERE company_id = ? AND base_unit IS NOT NULL AND base_unit <> '' "
+                "ORDER BY base_unit",
+                (user["company_id"],),
+            ).fetchall()
+        ]
+        return {"units": [u for u in dict.fromkeys(todas) if u], "canBeCorporate": True, "defaultUnit": ""}
+    return {
+        "units": list(permitidas),
+        "canBeCorporate": False,
+        "defaultUnit": permitidas[0] if permitidas else "",
+    }
 
 
 def meeting_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -3784,10 +3813,22 @@ def save_meeting(
     if not occurred_at:
         raise ValueError("Informe a data do encontro.")
 
+    # Unidade validada no servidor: o gerente não registra ata de outra equipe
+    # nem publica ata corporativa, mesmo forjando a requisição.
+    escopo_unidades = meeting_units_for_user(conn, user)
+    unidade = normalize_unit(payload.get("unitName")) or ""
+    if not escopo_unidades["canBeCorporate"]:
+        if not escopo_unidades["units"]:
+            raise ValueError(
+                "Seu usuário não tem unidade vinculada. Peça ao administrador para vincular antes de registrar atas."
+            )
+        if unidade not in escopo_unidades["units"]:
+            unidade = escopo_unidades["defaultUnit"]
+
     campos = (
         kind, title,
         normalize_whitespace(payload.get("topic")),
-        normalize_unit(payload.get("unitName")) or None,
+        unidade or None,
         occurred_at,
         int(payload.get("durationMin") or 0),
         normalize_whitespace(payload.get("location")),
@@ -10290,6 +10331,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         only_mine=query.get("mine", ["0"])[0] == "1",
                     )
                     pode_gerir = user_can_manage_meetings(conn, user)
+                    escopo = meeting_units_for_user(conn, user) if pode_gerir else {
+                        "units": [], "canBeCorporate": False, "defaultUnit": ""
+                    }
                     payload = {
                         "meetings": itens,
                         "kinds": MEETING_KINDS,
@@ -10297,7 +10341,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         "pendingCount": count_pending_acknowledgements(conn, user["company_id"], user),
                         "myName": meeting_person_identity(user),
                         "people": list_meeting_people(conn, user["company_id"], user) if pode_gerir else [],
-                        "units": crm_allowed_units_for_user(conn, user) or [],
+                        "units": escopo["units"],
+                        "canBeCorporate": escopo["canBeCorporate"],
+                        "defaultUnit": escopo["defaultUnit"],
                         "maxAttachmentMb": MEETING_ATTACHMENT_MAX_BYTES // (1024 * 1024),
                     }
                 self._set_headers(200)
