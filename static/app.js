@@ -5168,7 +5168,7 @@ function feedbackView() {
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           <span style="font-size:12px;font-weight:700;color:var(--muted)">COMPETÊNCIA</span>
           <select style="min-width:130px" onchange="setFeedbackCompetence(this.value)">
-            ${(state.feedback.competences || []).slice().reverse().map((c) => `
+            ${(state.feedback.competences || []).map((c) => `
               <option value="${escapeHtml(c)}" ${f.competence === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
           </select>
           ${(state.feedback.kinds || []).map((k) => `
@@ -5308,7 +5308,7 @@ function feedbackEditorModal() {
           </div>
           <div class="field"><label>Competência</label>
             <select onchange="state.feedbackEditor.competence=this.value;carregarPreviaFeedback()">
-              ${(state.feedback?.competences || []).slice().reverse().map((c) => `
+              ${(state.feedback?.competences || []).map((c) => `
                 <option value="${escapeHtml(c)}" ${e.competence === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
             </select>
           </div>

@@ -11317,8 +11317,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         "myName": meeting_person_identity(user),
                         "people": list_meeting_people(conn, user["company_id"], user) if pode_dar else [],
                         "units": meeting_units_for_user(conn, user)["units"] if pode_dar else [],
+                        # query_competences já devolve da mais recente para a mais
+                        # antiga — a atual é a PRIMEIRA, não a última.
                         "competences": competencias,
-                        "latestCompetence": competencias[-1] if competencias else "",
+                        "latestCompetence": competencias[0] if competencias else "",
                     }
                 self._set_headers(200)
                 self.wfile.write(json_dumps(payload))
