@@ -1713,6 +1713,34 @@ def init_db() -> None:
                 FOREIGN KEY (feedback_id) REFERENCES feedbacks(id) ON DELETE CASCADE
             );
 
+            -- Registro pontual: a conversa que não espera o fechamento do mês.
+            -- O MEC (item 7) prevê "orienta e combina a correção; se repetir,
+            -- registra o fato e o combinado". É isso — leve, datado, e vira
+            -- memória do feedback mensal para o gerente não escrever de cabeça.
+            CREATE TABLE IF NOT EXISTS feedback_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                person_key TEXT NOT NULL,
+                person_user_id INTEGER,
+                unit_name TEXT,
+                occurred_at TEXT NOT NULL,        -- data do fato
+                competence TEXT NOT NULL,         -- derivada da data, para casar com o mensal
+                kind TEXT NOT NULL,               -- RECONHECIMENTO | ORIENTACAO | CORRECAO | ACOMPANHAMENTO
+                summary TEXT NOT NULL,            -- o que aconteceu
+                agreement TEXT,                   -- o que ficou combinado
+                requires_ack INTEGER NOT NULL DEFAULT 0,
+                acknowledged_at TEXT,
+                person_note TEXT,
+                author_name TEXT NOT NULL,
+                author_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_notes_person
+                ON feedback_notes(company_id, person_key, competence);
+
             -- PDI vivo: o item pertence à PESSOA e atravessa os feedbacks.
             -- Amarrar o plano a um único feedback faria o desenvolvimento
             -- recomeçar do zero todo mês.
@@ -4645,6 +4673,9 @@ def load_feedback(
     fb["script"] = (_mec_content().FEEDBACK_SCRIPT_MANAGER if fb["kind"] == "GERENTE"
                     else _mec_content().FEEDBACK_SCRIPT_SELLER)
     fb["pdi"] = list_pdi_items(conn, company_id, fb["personKey"])
+    # Registros pontuais do mesmo mês: viram a memória da conversa. Sem isso o
+    # gerente escreve de cabeça e só lembra da última semana.
+    fb["notes"] = list_feedback_notes(conn, company_id, user, fb["personKey"], fb["competence"])
 
     # A confidencial NÃO acompanha o objeto por padrão. Só quem tem direito recebe.
     if user_can_read_confidential(conn, user):
@@ -4912,6 +4943,210 @@ def delete_feedback(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
     conn.execute("DELETE FROM feedback_ratings WHERE feedback_id = ?", (feedback_id,))
     conn.execute("DELETE FROM feedbacks WHERE company_id = ? AND id = ?", (company_id, feedback_id))
     audit_log(conn, company_id, user["id"], "excluir", "feedbacks", str(feedback_id), {})
+    conn.commit()
+
+
+# ── Registro pontual ─────────────────────────────────────────────────────────
+#
+# Complementa o feedback mensal, não substitui. Dura um minuto de digitação e
+# resolve o caso do dia 12: algo aconteceu, precisa ser dito e combinado agora.
+#
+# A ciência é opcional por decisão de projeto: reconhecimento e orientação do
+# dia a dia não precisam virar pendência. Correção precisa — é o que transforma
+# a conversa em comprovação de que a orientação foi dada.
+
+FEEDBACK_NOTE_KINDS = [
+    {"id": "RECONHECIMENTO", "label": "Reconhecimento", "icon": "👏", "color": "#1e8e3e", "bg": "#e6f4ea",
+     "hint": "Algo que merece ser dito na hora, não daqui a três semanas.",
+     "defaultAck": False},
+    {"id": "ORIENTACAO", "label": "Orientação", "icon": "🧭", "color": "#1a5276", "bg": "#e8f0fe",
+     "hint": "Ajuste de rota do dia a dia. Ensina sem precisar formalizar.",
+     "defaultAck": False},
+    {"id": "CORRECAO", "label": "Correção", "icon": "⚠️", "color": "#c5221f", "bg": "#fce8e6",
+     "hint": "Falha que precisa parar de acontecer. Já vem com ciência marcada.",
+     "defaultAck": True},
+    {"id": "ACOMPANHAMENTO", "label": "Acompanhamento", "icon": "🔁", "color": "#b06000", "bg": "#fef7e0",
+     "hint": "Checagem do que foi combinado ou do PDI, no meio do caminho.",
+     "defaultAck": False},
+]
+FEEDBACK_NOTE_KIND_IDS = {k["id"] for k in FEEDBACK_NOTE_KINDS}
+
+
+def feedback_note_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    cfg = next((k for k in FEEDBACK_NOTE_KINDS if k["id"] == row["kind"]), None)
+    return {
+        "id": int(row["id"]),
+        "personName": row["person_name"],
+        "personKey": row["person_key"],
+        "unitName": row["unit_name"] or "",
+        "occurredAt": row["occurred_at"],
+        "competence": row["competence"],
+        "kind": row["kind"],
+        "kindLabel": cfg["label"] if cfg else row["kind"],
+        "kindIcon": cfg["icon"] if cfg else "•",
+        "summary": row["summary"],
+        "agreement": row["agreement"] or "",
+        "requiresAck": bool(row["requires_ack"]),
+        "acknowledgedAt": row["acknowledged_at"] or "",
+        "personNote": row["person_note"] or "",
+        "authorName": row["author_name"],
+        "createdAt": row["created_at"],
+    }
+
+
+def list_feedback_notes(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    person_key_value: str = "", competence: str = "", limit: int = 200,
+) -> list[dict[str, Any]]:
+    scope = data_scope_for_user(conn, user)
+    minhas = user_person_keys(user)
+    marcadores = ",".join("?" for _ in minhas) or "''"
+
+    sql = "SELECT * FROM feedback_notes WHERE company_id = ?"
+    params: list[Any] = [company_id]
+
+    if scope == "proprio":
+        sql += f" AND (person_user_id = ? OR person_key IN ({marcadores}))"
+        params.append(user["id"])
+        params.extend(minhas)
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas:
+            unidades = ",".join("?" for _ in permitidas)
+            sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
+            params.extend(permitidas)
+            params.extend(minhas)
+
+    if person_key_value:
+        sql += " AND person_key = ?"
+        params.append(person_key_value)
+    if competence:
+        sql += " AND competence = ?"
+        params.append(competence)
+
+    sql += " ORDER BY date(occurred_at) DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+
+    resultado = []
+    for row in conn.execute(sql, params).fetchall():
+        nota = feedback_note_row_to_dict(row)
+        nota["isMe"] = nota["personKey"] in set(minhas) or (
+            row["person_user_id"] is not None and row["person_user_id"] == user["id"]
+        )
+        resultado.append(nota)
+    return resultado
+
+
+def count_pending_note_ack(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row) -> int:
+    chaves = user_person_keys(user)
+    marcadores = ",".join("?" for _ in chaves) or "''"
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) n FROM feedback_notes
+        WHERE company_id = ? AND requires_ack = 1
+          AND (person_user_id = ? OR person_key IN ({marcadores}))
+          AND (acknowledged_at IS NULL OR acknowledged_at = '')
+        """,
+        (company_id, user["id"], *chaves),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def save_feedback_note(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão registra acompanhamento.")
+
+    person_name = normalize_whitespace(payload.get("personName"))
+    if not person_name:
+        raise ValueError("Selecione a pessoa.")
+    resumo = normalize_whitespace(payload.get("summary"))
+    if not resumo:
+        raise ValueError("Descreva o que aconteceu.")
+    kind = normalize_upper(payload.get("kind")) or "ORIENTACAO"
+    if kind not in FEEDBACK_NOTE_KIND_IDS:
+        raise ValueError("Tipo de registro inválido.")
+
+    ocorrido = normalize_whitespace(payload.get("occurredAt")) or today_in_brazil().isoformat()
+    competence = ocorrido[:7]
+    unidade = normalize_unit(payload.get("unitName")) or None
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is not None:
+        if not permitidas:
+            raise ValueError("Seu usuário não tem unidade vinculada. Peça ao administrador para vincular.")
+        if unidade not in permitidas:
+            unidade = permitidas[0]
+
+    exige = 1 if payload.get("requiresAck") else 0
+    note_id = payload.get("id")
+
+    if note_id:
+        conn.execute(
+            """
+            UPDATE feedback_notes SET person_name=?, person_key=?, unit_name=?, occurred_at=?,
+                   competence=?, kind=?, summary=?, agreement=?, requires_ack=?
+            WHERE company_id = ? AND id = ?
+            """,
+            (person_name, person_key(person_name), unidade, ocorrido, competence, kind, resumo,
+             normalize_whitespace(payload.get("agreement")), exige, company_id, int(note_id)),
+        )
+        novo_id = int(note_id)
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO feedback_notes (company_id, person_name, person_key, person_user_id,
+                unit_name, occurred_at, competence, kind, summary, agreement, requires_ack,
+                author_name, author_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (company_id, person_name, person_key(person_name),
+             resolve_user_for_person(conn, company_id, person_name), unidade, ocorrido, competence,
+             kind, resumo, normalize_whitespace(payload.get("agreement")), exige,
+             meeting_person_identity(user), user["id"], now_iso()),
+        )
+        novo_id = int(cursor.lastrowid)
+
+    audit_log(conn, company_id, user["id"], "salvar", "feedback_notes", str(novo_id),
+              {"pessoa": person_name, "tipo": kind, "exigeCiencia": bool(exige)})
+    conn.commit()
+    return {"noteId": novo_id, "requiresAck": bool(exige)}
+
+
+def acknowledge_feedback_note(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, note_id: int, note: str = ""
+) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT * FROM feedback_notes WHERE company_id = ? AND id = ?", (company_id, note_id)
+    ).fetchone()
+    if not row:
+        raise ValueError("Registro não encontrado.")
+    minhas = set(user_person_keys(user))
+    if not (row["person_key"] in minhas
+            or (row["person_user_id"] is not None and row["person_user_id"] == user["id"])):
+        raise ValueError("Este registro não é seu.")
+
+    texto = normalize_whitespace(note)
+    conn.execute(
+        """
+        UPDATE feedback_notes
+        SET acknowledged_at = COALESCE(NULLIF(acknowledged_at, ''), ?),
+            person_note     = CASE WHEN ? <> '' THEN ? ELSE person_note END
+        WHERE id = ?
+        """,
+        (now_iso(), texto, texto, note_id),
+    )
+    conn.commit()
+    return {"acknowledged": True, "hasNote": bool(texto)}
+
+
+def delete_feedback_note(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, note_id: int
+) -> None:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão exclui registro.")
+    conn.execute("DELETE FROM feedback_notes WHERE company_id = ? AND id = ?", (company_id, note_id))
+    audit_log(conn, company_id, user["id"], "excluir", "feedback_notes", str(note_id), {})
     conn.commit()
 
 
@@ -11306,14 +11541,20 @@ class AppHandler(BaseHTTPRequestHandler):
                             competence=normalize_whitespace(query.get("competence", [""])[0]),
                             person=normalize_whitespace(query.get("person", [""])[0]),
                         ),
+                        "notes": list_feedback_notes(
+                            conn, user["company_id"], user,
+                            competence=normalize_whitespace(query.get("competence", [""])[0])),
                         "kinds": FEEDBACK_KINDS,
+                        "noteKinds": FEEDBACK_NOTE_KINDS,
                         "levels": _mec_content().FEEDBACK_LEVELS,
                         "pdiStatuses": PDI_STATUSES,
                         "pdiMaxActive": PDI_MAX_ACTIVE,
                         "canGive": pode_dar,
                         "canGiveManagerFeedback": user_can_manage_users(conn, user),
                         "canReadConfidential": user_can_read_confidential(conn, user),
-                        "pendingCount": count_pending_feedback_ack(conn, user["company_id"], user),
+                        "pendingCount": (count_pending_feedback_ack(conn, user["company_id"], user)
+                                         + count_pending_note_ack(conn, user["company_id"], user)),
+                        "pendingFeedbackCount": count_pending_feedback_ack(conn, user["company_id"], user),
                         "myName": meeting_person_identity(user),
                         "people": list_meeting_people(conn, user["company_id"], user) if pode_dar else [],
                         "units": meeting_units_for_user(conn, user)["units"] if pode_dar else [],
@@ -12386,7 +12627,8 @@ class AppHandler(BaseHTTPRequestHandler):
             if path in ("/api/feedback/save", "/api/feedback/publish", "/api/feedback/detail",
                         "/api/feedback/acknowledge", "/api/feedback/delete",
                         "/api/feedback/pdi/save", "/api/feedback/pdi/delete",
-                        "/api/feedback/preview"):
+                        "/api/feedback/preview", "/api/feedback/note/save",
+                        "/api/feedback/note/acknowledge", "/api/feedback/note/delete"):
                 user = self._require_auth()
                 if not user:
                     return
@@ -12423,6 +12665,15 @@ class AppHandler(BaseHTTPRequestHandler):
                         elif path == "/api/feedback/pdi/delete":
                             delete_pdi_item(conn, user["company_id"], user, int(payload.get("pdiId") or 0))
                             resultado = {}
+                        elif path == "/api/feedback/note/save":
+                            resultado = save_feedback_note(conn, user["company_id"], user, payload)
+                        elif path == "/api/feedback/note/acknowledge":
+                            resultado = acknowledge_feedback_note(
+                                conn, user["company_id"], user,
+                                int(payload.get("noteId") or 0), payload.get("note") or "")
+                        elif path == "/api/feedback/note/delete":
+                            delete_feedback_note(conn, user["company_id"], user, int(payload.get("noteId") or 0))
+                            resultado = {}
                         else:
                             # Prévia dos indicadores antes de abrir o feedback: o gerente
                             # olha os números da pessoa sem precisar criar registro.
@@ -12444,6 +12695,9 @@ class AppHandler(BaseHTTPRequestHandler):
                                 "pdi": list_pdi_items(
                                     conn, user["company_id"],
                                     person_key(payload.get("personName") or "")),
+                                "notes": list_feedback_notes(
+                                    conn, user["company_id"], user,
+                                    person_key(payload.get("personName") or ""), competence),
                             }
                 except PermissionError as exc:
                     self._set_headers(403)

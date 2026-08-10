@@ -14,6 +14,7 @@ const state = {
   feedbackEditor: null,   // feedback em edição (gestão)
   feedbackDetail: null,   // feedback aberto para leitura/ciência
   pdiEditor: null,        // ponto de desenvolvimento em edição
+  noteEditor: null,       // registro pontual em edição
   feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
   teamScore: null,
@@ -4806,7 +4807,8 @@ async function carregarPreviaFeedback() {
     });
     Object.assign(e, {
       indicators: r.indicators || {}, guidance: r.guidance || [],
-      items: r.items || [], groups: r.groups || [], script: r.script || [], pdi: r.pdi || [],
+      items: r.items || [], groups: r.groups || [], script: r.script || [],
+      pdi: r.pdi || [], notes: r.notes || [],
       loading: false,
     });
   } catch (err) {
@@ -4828,7 +4830,8 @@ async function editarFeedback(feedbackId) {
       agreements: fb.agreements, tacticalGoal: fb.tacticalGoal, tacticalReality: fb.tacticalReality,
       tacticalOptions: fb.tacticalOptions, tacticalWill: fb.tacticalWill,
       ratings: fb.ratings || {}, indicators: fb.indicators || {}, guidance: fb.guidance || [],
-      items: fb.items || [], groups: fb.groups || [], script: fb.script || [], pdi: fb.pdi || [],
+      items: fb.items || [], groups: fb.groups || [], script: fb.script || [],
+      pdi: fb.pdi || [], notes: fb.notes || [],
       status: fb.status, saving: false, loading: false, tab: "conversa",
     };
     requestRender();
@@ -5130,6 +5133,191 @@ function painelPdi(itens, personName, unitName, feedbackId, podeEditar) {
     </div>`;
 }
 
+// ─── Registro pontual ───────────────────────────────────────────────────────
+//
+// A conversa que não espera o fechamento do mês. Rápido de escrever e datado,
+// para virar memória do feedback mensal em vez de se perder.
+
+function novoRegistro(personName, unitName, kind) {
+  const tipo = kind || "ORIENTACAO";
+  const cfg = (state.feedback?.noteKinds || []).find((k) => k.id === tipo);
+  state.noteEditor = {
+    id: null, personName: personName || "", unitName: unitName || "",
+    occurredAt: dateInDays(0), kind: tipo, summary: "", agreement: "",
+    requiresAck: Boolean(cfg?.defaultAck), saving: false,
+  };
+  requestRender();
+}
+
+function editarRegistro(nota) {
+  state.noteEditor = { ...nota, saving: false };
+  requestRender();
+}
+
+function fecharRegistro() { state.noteEditor = null; requestRender(); }
+
+/** Trocar o tipo reposiciona a ciência no padrão daquele tipo — correção já vem marcada. */
+function setNoteKind(kind) {
+  const n = state.noteEditor;
+  if (!n) return;
+  const cfg = (state.feedback?.noteKinds || []).find((k) => k.id === kind);
+  n.kind = kind;
+  if (!n.id) n.requiresAck = Boolean(cfg?.defaultAck);
+  requestRender();
+}
+
+async function salvarRegistro() {
+  const n = state.noteEditor;
+  if (!n) return;
+  if (!n.personName) { addMessage("error", "Selecione a pessoa."); return; }
+  if (!n.summary.trim()) { addMessage("error", "Descreva o que aconteceu."); return; }
+  n.saving = true; requestRender();
+  try {
+    const r = await api("/api/feedback/note/save", { method: "POST", body: JSON.stringify(n) });
+    addMessage("success", r.requiresAck
+      ? `Registro salvo. ${n.personName} recebeu a pendência de ciência.`
+      : "Registro salvo.");
+    state.noteEditor = null;
+    if (state.feedbackEditor) await carregarPreviaFeedback();
+    await loadFeedback(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.noteEditor) state.noteEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirRegistro(noteId) {
+  if (!confirm("Excluir este registro?")) return;
+  try {
+    await api("/api/feedback/note/delete", { method: "POST", body: JSON.stringify({ noteId }) });
+    if (state.feedbackEditor) await carregarPreviaFeedback();
+    await loadFeedback(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function darCienciaRegistro(noteId) {
+  const campo = document.getElementById(`note-reply-${noteId}`);
+  try {
+    await api("/api/feedback/note/acknowledge", {
+      method: "POST",
+      body: JSON.stringify({ noteId, note: campo ? campo.value.trim() : "" }),
+    });
+    addMessage("success", "Ciência registrada.");
+    await loadFeedback(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function noteKindCfg(kind) {
+  return (state.feedback?.noteKinds || []).find((k) => k.id === kind)
+    || { label: kind, icon: "•", color: "#5f6368", bg: "#f1f3f4" };
+}
+
+function registroCard(n, podeEditar, compacto) {
+  const cfg = noteKindCfg(n.kind);
+  const pendente = n.isMe && n.requiresAck && !n.acknowledgedAt;
+  return `
+    <div style="border-left:3px solid ${cfg.color};background:${compacto ? "#fafbfc" : "#fff"};
+                border-radius:0 6px 6px 0;padding:8px 12px;${compacto ? "" : "border:1px solid var(--line);border-left-width:3px"}">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:start">
+        <div style="flex:1;min-width:220px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+            <span class="status-tag" style="background:${cfg.bg};color:${cfg.color}">${cfg.icon} ${escapeHtml(cfg.label)}</span>
+            <span class="text-small" style="color:var(--muted)">${shortDate(n.occurredAt)}</span>
+            ${!compacto ? `<strong style="font-size:13px">${escapeHtml(n.personName)}</strong>` : ""}
+            ${n.requiresAck ? (n.acknowledgedAt
+              ? '<span class="status-tag good">✓ Ciente</span>'
+              : '<span class="status-tag warn">Aguardando ciência</span>') : ""}
+          </div>
+          <div style="font-size:13px;line-height:1.5;white-space:pre-wrap">${escapeHtml(n.summary)}</div>
+          ${n.agreement ? `<div style="font-size:12px;margin-top:4px"><strong>Combinado:</strong> ${escapeHtml(n.agreement)}</div>` : ""}
+          ${n.personNote ? `<div style="font-size:12px;margin-top:4px;color:var(--accent)">💬 ${escapeHtml(n.personNote)}</div>` : ""}
+          <div class="text-small" style="color:var(--muted);margin-top:2px">por ${escapeHtml(n.authorName)}</div>
+        </div>
+        ${podeEditar ? `
+          <div style="display:flex;gap:4px">
+            <button class="btn btn-ghost btn-sm" onclick='editarRegistro(${JSON.stringify(n).replace(/'/g, "&#39;")})'>Editar</button>
+            <button class="btn btn-ghost btn-sm" onclick="excluirRegistro(${n.id})">Excluir</button>
+          </div>` : ""}
+      </div>
+      ${pendente ? `
+        <div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--line)">
+          <input id="note-reply-${n.id}" style="font-size:12px" placeholder="Quer responder algo? (opcional)" />
+          <div class="actions" style="margin-top:6px">
+            <button class="btn btn-primary btn-sm" onclick="darCienciaRegistro(${n.id})">Estou ciente</button>
+          </div>
+        </div>` : ""}
+    </div>`;
+}
+
+function registroEditorModal() {
+  const n = state.noteEditor;
+  const cfg = noteKindCfg(n.kind);
+  const pessoas = state.feedback?.people || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharRegistro()" style="z-index:60">
+      <div class="panel modal-panel" style="max-width:620px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${n.id ? "Editar" : "Novo"} registro de acompanhamento</h3>
+            <div class="text-small">Rápido e datado. Vira memória do feedback mensal.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharRegistro()">Fechar</button>
+        </div>
+
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+          ${(state.feedback?.noteKinds || []).map((k) => `
+            <button type="button" onclick="setNoteKind('${k.id}')" title="${escapeHtml(k.hint)}"
+              style="border:1px solid ${n.kind === k.id ? k.color : "var(--line)"};
+                     background:${n.kind === k.id ? k.bg : "#fff"};
+                     color:${n.kind === k.id ? k.color : "var(--muted)"};
+                     border-radius:14px;padding:5px 12px;font-size:12px;
+                     font-weight:${n.kind === k.id ? "700" : "500"};cursor:pointer">
+              ${k.icon} ${escapeHtml(k.label)}
+            </button>`).join("")}
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:6px">${escapeHtml(cfg.hint || "")}</div>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:12px">
+          <div class="field"><label>Pessoa <span style="color:var(--bad)">*</span></label>
+            ${n.id ? `<input value="${escapeHtml(n.personName)}" disabled />`
+              : `<select onchange="state.noteEditor.personName=this.value;
+                    state.noteEditor.unitName=(this.selectedOptions[0]||{}).dataset?.unit||''">
+                  <option value="">Selecione…</option>
+                  ${pessoas.map((p) => `<option value="${escapeHtml(p.personName)}" data-unit="${escapeHtml(p.unitName || "")}"
+                    ${n.personName === p.personName ? "selected" : ""}>${escapeHtml(p.personName)}</option>`).join("")}
+                </select>`}
+          </div>
+          <div class="field"><label>Data do fato</label>
+            <input type="date" value="${escapeHtml(n.occurredAt)}" oninput="state.noteEditor.occurredAt=this.value" /></div>
+        </div>
+
+        <div class="field"><label>O que aconteceu <span style="color:var(--bad)">*</span></label>
+          <textarea rows="3" style="font-family:inherit" oninput="state.noteEditor.summary=this.value"
+            placeholder="Descreva o fato, não o julgamento. 'O orçamento do dia 12 ficou sem retorno e o cliente comprou fora.'">${escapeHtml(n.summary)}</textarea></div>
+
+        <div class="field"><label>O que ficou combinado</label>
+          <input value="${escapeHtml(n.agreement)}" oninput="state.noteEditor.agreement=this.value"
+            placeholder="A ação e o prazo, se houve" /></div>
+
+        <label class="text-small" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px">
+          <input type="checkbox" ${n.requiresAck ? "checked" : ""}
+            onchange="state.noteEditor.requiresAck=this.checked;requestRender()" />
+          Exigir ciência da pessoa
+        </label>
+        <div class="text-small" style="color:var(--muted);margin-top:2px">
+          ${n.requiresAck
+            ? "Vira pendência na tela dela, com espaço para responder. Use em correção."
+            : "Fica só no histórico, sem notificar. Suficiente para reconhecimento e orientação do dia a dia."}
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${n.saving ? "disabled" : ""} onclick="salvarRegistro()">
+            ${n.saving ? "Salvando…" : "Salvar registro"}</button>
+          <button class="btn btn-ghost" onclick="fecharRegistro()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function feedbackView() {
   if (!state.feedback) { loadFeedback(); return `<div class="loader panel">Carregando feedback…</div>`; }
   if (state.feedback.error) return `<div class="message error">${escapeHtml(state.feedback.error)}</div>`;
@@ -5137,6 +5325,9 @@ function feedbackView() {
   const podeDar = Boolean(state.feedback.canGive);
   const f = state.feedbackFilters;
   const itens = state.feedback.feedbacks || [];
+  const notas = state.feedback.notes || [];
+  const notasPendentes = notas.filter((n) => n.isMe && n.requiresAck && !n.acknowledgedAt);
+  const notasDemais = notas.filter((n) => !notasPendentes.includes(n));
   const pendentes = itens.filter((x) => x.isMe && x.status === "PUBLICADO" && !x.acknowledgedAt);
   const meus = itens.filter((x) => x.isMe && !pendentes.includes(x));
   const daEquipe = itens.filter((x) => !x.isMe);
@@ -5151,6 +5342,19 @@ function feedbackView() {
       ${state.feedbackEditor ? feedbackEditorModal() : ""}
       ${state.feedbackDetail ? feedbackDetalheModal() : ""}
       ${state.pdiEditor ? pdiEditorModal() : ""}
+      ${state.noteEditor ? registroEditorModal() : ""}
+
+      ${notasPendentes.length ? `
+        <div class="table-card" style="border-left:4px solid #e74c3c">
+          <div class="section-title">
+            <div><h3>✋ Registros aguardando sua ciência</h3>
+              <div class="text-small">Conversas do dia a dia que o gestor registrou. Confirme e responda se quiser.</div></div>
+            <div class="soft-badge" style="background:#fde8e8;color:#e74c3c">${notasPendentes.length}</div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${notasPendentes.map((n) => registroCard(n, false, false)).join("")}
+          </div>
+        </div>` : ""}
 
       ${pendentes.length ? `
         <div class="table-card" style="border-left:4px solid #f39c12">
@@ -5184,6 +5388,8 @@ function feedbackView() {
               value="${escapeHtml(f.person)}"
               onkeydown="if(event.key==='Enter'){event.preventDefault();applyFeedbackPersonSearch();}" />
             <button class="btn btn-secondary btn-sm" onclick="applyFeedbackPersonSearch()">Buscar</button>` : ""}
+          ${podeDar ? `
+            <button class="btn btn-primary btn-sm" onclick="novoRegistro('','','ORIENTACAO')">＋ Registro rápido</button>` : ""}
           ${state.feedback.canGiveManagerFeedback ? `
             <button class="btn btn-secondary btn-sm" onclick="novoFeedback('GERENTE','','')">🎯 Feedback de gerente</button>` : ""}
         </div>
@@ -5201,6 +5407,18 @@ function feedbackView() {
               <button class="btn btn-ghost btn-sm" onclick="novoFeedback('VENDEDOR','${jsAttr(p.personName)}','${jsAttr(p.unitName || "")}')">
                 ＋ ${escapeHtml(p.personName)}
               </button>`).join("")}
+          </div>
+        </div>` : ""}
+
+      ${notasDemais.length ? `
+        <div class="table-card">
+          <div class="section-title">
+            <div><h3>📌 Registros de ${escapeHtml(f.competence || "—")}</h3>
+              <div class="text-small">A linha do tempo do mês. Vira memória na hora do feedback mensal.</div></div>
+            <div class="soft-badge">${notasDemais.length}</div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${notasDemais.map((n) => registroCard(n, podeDar && !n.isMe, false)).join("")}
           </div>
         </div>` : ""}
 
@@ -5262,6 +5480,7 @@ function feedbackCard(x, podeDar) {
           ${pendente ? "✋ Ler e dar ciência" : "Abrir"}
         </button>
         ${podeDar && !x.isMe ? `
+          <button class="btn btn-ghost btn-sm" onclick="novoRegistro('${jsAttr(x.personName)}','${jsAttr(x.unitName || "")}','ORIENTACAO')">＋ Registro</button>
           <button class="btn btn-ghost btn-sm" onclick="editarFeedback(${x.id})">Editar</button>
           <button class="btn btn-ghost btn-sm" onclick="excluirFeedback(${x.id})">Excluir</button>` : ""}
       </div>
@@ -5276,6 +5495,7 @@ function feedbackEditorModal() {
   const abas = [
     { id: "conversa", label: "Conversa" },
     { id: "avaliacao", label: `Avaliação (${avaliados}/${total})` },
+    { id: "registros", label: `Registros do mês (${(e.notes || []).length})` },
     { id: "pdi", label: `PDI (${(e.pdi || []).filter((i) => ["ABERTO","EVOLUINDO"].includes(i.status)).length})` },
     { id: "guia", label: "Guia do gestor" },
   ];
@@ -5404,6 +5624,20 @@ function feedbackEditorModal() {
             </div>`).join("")}
         ` : ""}
 
+        ${e.tab === "registros" ? `
+          <div class="text-small" style="color:var(--muted);margin-top:10px">
+            O que você registrou sobre ${escapeHtml(e.personName || "esta pessoa")} durante ${escapeHtml(e.competence || "o mês")}.
+            Use como base para escrever a conversa — assim o feedback cobre o mês inteiro, não só a última semana.
+          </div>
+          <div class="actions" style="margin-top:8px">
+            <button class="btn btn-secondary btn-sm"
+              onclick="novoRegistro('${jsAttr(e.personName)}','${jsAttr(e.unitName || "")}','ORIENTACAO')">＋ Novo registro</button>
+          </div>
+          <div class="stack" style="margin-top:8px">
+            ${(e.notes || []).map((n) => registroCard(n, true, true)).join("")
+              || '<div class="text-small" style="color:var(--muted)">Nenhum registro neste mês. Os fatos do dia a dia se perdem quando não são anotados na hora.</div>'}
+          </div>` : ""}
+
         ${e.tab === "pdi" ? painelPdi(e.pdi, e.personName, e.unitName, e.id, true) : ""}
 
         ${e.tab === "guia" ? `
@@ -5484,6 +5718,15 @@ function feedbackDetalheModal() {
               }).join("")}
             </div>`).join("")}
         </div>
+
+        ${(d.notes || []).length ? `
+          <div class="subtle-card padded-card" style="margin-top:10px">
+            <div class="section-title"><div><h3>📌 Registros de ${escapeHtml(d.competence)}</h3>
+              <div class="text-small">As conversas do dia a dia que originaram este feedback.</div></div></div>
+            <div class="stack" style="margin-top:8px">
+              ${d.notes.map((n) => registroCard(n, false, true)).join("")}
+            </div>
+          </div>` : ""}
 
         ${painelPdi(d.pdi, d.personName, d.unitName, d.id, podeDar && !d.isMe)}
 
