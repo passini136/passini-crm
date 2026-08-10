@@ -971,11 +971,12 @@ function unclassifiedSellers() {
 function syncUserEditorOptions() {
   const availableUnits = state.options.units || [];
   state.userEditor.linkedUnits = (state.userEditor.linkedUnits || []).filter((unit) => availableUnits.includes(unit));
+  const people = sellerPeopleOptions();
+  if (state.userEditor.linkedPersonName
+      && !people.some((person) => person.person_name === state.userEditor.linkedPersonName)) {
+    state.userEditor.linkedPersonName = "";
+  }
   if (state.userEditor.role === "Vendedor") {
-    const people = sellerPeopleOptions();
-    if (!people.some((person) => person.person_name === state.userEditor.linkedPersonName)) {
-      state.userEditor.linkedPersonName = "";
-    }
     state.userEditor.linkedUnits = [];
   }
   if (!["Gerente", "Analista"].includes(state.userEditor.role)) {
@@ -1051,7 +1052,9 @@ function setUserProfile(profileId) {
   state.userEditor.profileId = profileId;
   state.userEditor.role = profile ? profile.name : "";
   const scope = profile ? profile.dataScope : "todos";
-  if (scope !== "proprio") state.userEditor.linkedPersonName = "";
+  // O vínculo vale para qualquer perfil: é ele que liga o gerente ao nome do
+  // cadastro na lista de presença das atas. Antes era apagado ao trocar de
+  // perfil e o gerente ficava sem vínculo, sem opção de corrigir na tela.
   if (!["unidade", "unidade_consolidado"].includes(scope)) state.userEditor.linkedUnits = [];
   syncUserEditorOptions();
   requestRender();
@@ -6440,15 +6443,18 @@ function userEditorCard() {
               <br><strong>${chosen.modules.length} tela(s)</strong> · ${escapeHtml(scopeInfo ? scopeInfo.label : scope)}${chosen.canManageUsers ? " · pode gerenciar usuários" : ""}
             </div>` : ""}
           </div>
-          ${scope === "proprio" ? `
           <div class="field field-span-2">
-            <label>Pessoa vinculada (vendedor) <span style="color:var(--bad)">*</span></label>
-            <select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value" required>
-              <option value="">Selecione…</option>
+            <label>Pessoa vinculada ${scope === "proprio" ? '<span style="color:var(--bad)">*</span>' : '<span style="color:var(--muted);font-weight:400">(recomendado)</span>'}</label>
+            <select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value" ${scope === "proprio" ? "required" : ""}>
+              <option value="">${scope === "proprio" ? "Selecione…" : "Sem vínculo"}</option>
               ${sellerOptions.map((p) => `<option value="${escapeHtml(p.person_name)}" ${editor.linkedPersonName === p.person_name ? "selected" : ""}>${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}</option>`).join("")}
             </select>
-            <div class="text-small" style="margin-top:4px;color:var(--muted)">É por este vínculo que o sistema sabe quais clientes são desta pessoa.</div>
-          </div>` : ""}
+            <div class="text-small" style="margin-top:4px;color:var(--muted)">
+              ${scope === "proprio"
+                ? "É por este vínculo que o sistema sabe quais clientes são desta pessoa e que ela participou de uma reunião."
+                : "Liga a conta ao nome do cadastro. Sem isso, a pessoa não recebe a ciência quando é marcada como presente numa ata."}
+            </div>
+          </div>
           ${["unidade", "unidade_consolidado"].includes(scope) ? `
           <div class="field field-span-2">
             <label>Unidades vinculadas <span style="color:var(--bad)">*</span></label>
@@ -7848,9 +7854,10 @@ async function saveUser(event) {
   if (!editor.id && !password) { addMessage("error", "Defina a senha inicial."); return; }
 
   const scope = profile.dataScope;
-  const linkedPerson = scope === "proprio"
-    ? (document.getElementById("user-linked-person")?.value || editor.linkedPersonName || "")
-    : "";
+  // Lê o vínculo para qualquer perfil — obrigatório só para vendedor, mas
+  // salvo sempre: é o que liga a conta ao nome nas listas de presença das atas.
+  const linkedPerson = document.getElementById("user-linked-person")?.value
+    || editor.linkedPersonName || "";
   const linkedUnits = ["unidade", "unidade_consolidado"].includes(scope) ? (editor.linkedUnits || []) : [];
 
   if (scope === "proprio" && !linkedPerson) {

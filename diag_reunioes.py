@@ -70,12 +70,47 @@ for p in pessoas:
     print(f"      chave={backend.person_key(nome)!r}  curta={backend.short_person_key(nome)!r}")
 
 print(f"\nResumo: {len(pessoas) - len(sem_login)} de {len(pessoas)} pessoas ligadas a uma conta.")
-if sem_login:
-    print("Sem conta (não recebem pendência de ciência):")
-    for n in sem_login:
-        print(f"  - {n}")
-    print("\nPara resolver: em Usuários e Perfis, edite a conta da pessoa e preencha")
-    print("'pessoa vinculada' com exatamente o nome que aparece acima.")
+print("(É normal a maioria ficar sem conta — só quem usa o CRM precisa de login.)")
+
+# ── Problemas que exigem ação ────────────────────────────────────────────
+print("\n\nO QUE PRECISA DE AJUSTE")
+achou_problema = False
+
+# 1. Conta sem vínculo cujo nome não casa com nenhuma pessoa do cadastro
+nomes_pessoas = [p["person_name"] for p in pessoas]
+for u in usuarios:
+    if u["linked_person_name"] or u["username"] == "admin":
+        continue
+    candidatos = [
+        n for n in nomes_pessoas
+        if backend.short_person_key(n) == backend.short_person_key(u["full_name"])
+        or backend.person_key(n).startswith(backend.person_key(u["full_name"]).split()[0])
+    ]
+    unicos = list(dict.fromkeys(candidatos))[:5]
+    if unicos:
+        achou_problema = True
+        print(f"\n  Conta '{u['username']}' ({u['full_name']}) está SEM pessoa vinculada.")
+        print("  Candidatos no cadastro:")
+        for c in unicos:
+            print(f"     - {c}")
+
+# 2. Duas contas apontando para a mesma pessoa
+from collections import Counter as _Counter  # noqa: E402
+duplicadas = _Counter(
+    backend.person_key(u["linked_person_name"]) for u in usuarios if u["linked_person_name"]
+)
+for chave, quantas in duplicadas.items():
+    if quantas > 1:
+        achou_problema = True
+        contas = [u["username"] for u in usuarios if backend.person_key(u["linked_person_name"]) == chave]
+        print(f"\n  {quantas} contas vinculadas à MESMA pessoa ({chave}): {', '.join(contas)}")
+        print("  O sistema se recusa a escolher e não notifica ninguém.")
+        print("  Desative ou apague a conta que não é usada.")
+
+if not achou_problema:
+    print("  Nada a ajustar — todas as contas em uso estão vinculadas corretamente.")
+else:
+    print("\n  Onde corrigir: Usuários e Perfis -> editar a conta -> campo 'Pessoa vinculada'.")
 
 # ── Atas e presentes ─────────────────────────────────────────────────────
 print("\n\nATAS REGISTRADAS")
