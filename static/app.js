@@ -4997,10 +4997,28 @@ function indicadorLinha(rotulo, valor, referencia, ok) {
 
 function painelIndicadores(ind, kind) {
   if (!ind || !ind.found) {
-    return `<div class="message" style="font-size:12px">
-      Sem números para esta competência. O feedback pode ser feito assim mesmo, mas a conversa fica sem base.
-    </div>`;
+    // Mostra COM QUEM tentou casar. "Sem dados" sozinho faz o gerente achar que
+    // o vendedor não faturou, quando o problema é o nome estar grafado diferente
+    // no cadastro e no faturamento.
+    const nomes = ind?.availableNames || [];
+    return `
+      <div class="message" style="font-size:12px">
+        <strong>Sem números para ${escapeHtml(ind?.competence || "esta competência")}.</strong>
+        ${ind?.reason ? ` ${escapeHtml(ind.reason)}` : ""}
+        <div style="margin-top:6px">O feedback pode ser feito assim mesmo, mas a conversa fica sem base.</div>
+        ${nomes.length ? `
+          <details style="margin-top:6px">
+            <summary style="cursor:pointer">Nomes que faturaram nesta competência (${nomes.length})</summary>
+            <div style="margin-top:4px;line-height:1.6">${nomes.map((n) => escapeHtml(n)).join(" · ")}</div>
+            <div style="margin-top:4px">Se o nome da pessoa aparece aqui com outra grafia, o vínculo precisa
+              ser corrigido em Usuários e Perfis ou no cadastro de pessoas.</div>
+          </details>` : ""}
+      </div>`;
   }
+  const aviso = ind.matchedName ? `
+    <div class="text-small" style="color:var(--muted);margin-bottom:6px">
+      Números de <strong>${escapeHtml(ind.matchedName)}</strong>, como o nome aparece no faturamento.
+    </div>` : "";
   if (kind === "GERENTE") {
     const ritos = ind.feedbacksExpected
       ? `${ind.feedbacksDone} de ${ind.feedbacksExpected} vendedores` : "—";
@@ -5019,6 +5037,7 @@ function painelIndicadores(ind, kind) {
   const metaCalls = Number(ind.callsTarget || 60);
   return `
     <div>
+      ${aviso}
       ${indicadorLinha("Faturamento líquido", currency(ind.revenueNet), `meta ${currency(ind.revenueGoal)}`)}
       ${indicadorLinha("Atingimento", pct(ind.goalAttainmentPct), "", Number(ind.goalAttainmentPct) >= 95)}
       ${indicadorLinha("Ligações no mês", `${number(ind.calls)}`, `mínimo do MEC: ${metaCalls}`, Number(ind.calls) >= metaCalls)}

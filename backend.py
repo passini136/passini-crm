@@ -4319,6 +4319,59 @@ def user_can_read_confidential(conn: sqlite3.Connection, user: sqlite3.Row) -> b
 
 # ── Indicadores do avaliado no mês ───────────────────────────────────────────
 
+def safe_feedback_indicators(
+    conn: sqlite3.Connection, company_id: int, kind: str,
+    person_name: str, unit_name: str, competence: str,
+) -> dict[str, Any]:
+    """Indicadores com rede de proteção.
+
+    Falha ao ler número NÃO pode impedir o gerente de registrar a conversa —
+    o feedback continua valendo sem o painel. Devolve o motivo para a tela
+    mostrar em vez de ficar em branco.
+    """
+    try:
+        if kind == "GERENTE":
+            return unit_indicators_for_feedback(conn, company_id, unit_name, competence)
+        return seller_indicators_for_feedback(conn, company_id, person_name, competence)
+    except Exception as exc:
+        print(f"[feedback] indicadores indisponíveis ({kind} / {person_name} / {competence}): {exc}", flush=True)
+        traceback.print_exc()
+        return {
+            "found": False,
+            "competence": competence,
+            "sellerName": person_name,
+            "reason": f"Não foi possível calcular os indicadores ({exc}).",
+        }
+
+
+def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str) -> list[str]:
+    """Todas as grafias do mesmo vendedor que existem nas tabelas.
+
+    O faturamento grava "THIELLY HENRIQUES ROCHA (VENDAS)", o CRM grava o nome
+    que está no cadastro do usuário, e o cadastro de pessoas pode ter uma
+    terceira variação. Contar ligações comparando uma grafia só devolvia zero.
+    A comparação usa person_key, que ignora acento, pontuação e o sufixo entre
+    parênteses — sem recorte curto, para não somar a atividade de outra pessoa.
+    """
+    chaves = {person_key(n) for n in nomes if normalize_whitespace(n)}
+    chaves.discard("")
+    if not chaves:
+        return []
+    encontrados = {normalize_whitespace(n) for n in nomes if normalize_whitespace(n)}
+    for tabela in ("crm_interactions", "crm_client_summary", "fact_sales_detail"):
+        try:
+            linhas = conn.execute(
+                f"SELECT DISTINCT seller_name FROM {tabela} WHERE company_id = ?", (company_id,)
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        for r in linhas:
+            nome = normalize_whitespace(r["seller_name"])
+            if nome and person_key(nome) in chaves:
+                encontrados.add(nome)
+    return sorted(encontrados)
+
+
 def seller_indicators_for_feedback(
     conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str
 ) -> dict[str, Any]:
@@ -4333,14 +4386,35 @@ def seller_indicators_for_feedback(
     filtros["competence_end"] = competence
     dados = get_dashboard_data_cached(conn, company_id, filtros)
 
-    alvo_key = normalize_upper(seller_name)
-    linha = next(
-        (r for r in dados.get("sellerRanking", []) if normalize_upper(r["sellerName"]) == alvo_key),
-        None,
-    )
-    if not linha:
-        return {"found": False, "competence": competence, "sellerName": seller_name}
+    # O nome do cadastro de pessoas e o nome que aparece no faturamento raramente
+    # são idênticos ("THIELLY HENRIQUES ROCHA (VENDAS)" x "THIELLY HENRIQUES
+    # ROCHA"). Comparar string crua devolvia "sem dados" mesmo com o vendedor
+    # faturando no mês. A comparação usa a chave normalizada, com o recorte de
+    # dois tokens como último recurso.
+    ranking = dados.get("sellerRanking", [])
+    alvo_completo = person_key(seller_name)
+    alvo_curto = short_person_key(seller_name)
 
+    linha = next((r for r in ranking if person_key(r["sellerName"]) == alvo_completo), None)
+    if not linha and alvo_curto:
+        candidatos = [r for r in ranking if short_person_key(r["sellerName"]) == alvo_curto]
+        linha = candidatos[0] if len(candidatos) == 1 else None
+
+    if not linha:
+        return {
+            "found": False,
+            "competence": competence,
+            "sellerName": seller_name,
+            # Devolve com quem tentou casar: sem isso o gerente vê "sem dados"
+            # e não tem como descobrir que o problema é divergência de nome.
+            "reason": "Este nome não aparece no faturamento desta competência.",
+            "availableNames": sorted(r["sellerName"] for r in ranking
+                                     if float(r.get("revenueNet") or 0) > 0)[:40],
+        }
+
+    # A partir daqui, usa o nome COMO ESTÁ NO FATURAMENTO para as demais
+    # consultas — é ele que está gravado em interações e na carteira.
+    nome_vendas = linha["sellerName"]
     unidade = normalize_unit(linha.get("baseUnit"))
     pares = [r for r in dados.get("sellerRanking", [])
              if normalize_unit(r.get("baseUnit")) == unidade and float(r.get("revenueNet") or 0) > 0]
@@ -4352,39 +4426,50 @@ def seller_indicators_for_feedback(
     # Ligações registradas no mês (mínimo do MEC: 3/dia, 60/mês)
     inicio = first_day_of_competence(competence).isoformat()
     fim = last_day_of_competence(competence).isoformat()
+    variantes = seller_name_variants(conn, company_id, seller_name, nome_vendas)
+    marcadores = ",".join("?" for _ in variantes) or "''"
+    nomes_upper = [normalize_upper(v) for v in variantes]
+
     ligacoes = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) n FROM crm_interactions
-        WHERE company_id = ? AND UPPER(seller_name) = ? AND contact_type_code = 'LIGACAO'
+        WHERE company_id = ? AND UPPER(seller_name) IN ({marcadores})
+          AND contact_type_code = 'LIGACAO'
           AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
         """,
-        (company_id, alvo_key, inicio, fim),
+        (company_id, *nomes_upper, inicio, fim),
     ).fetchone()["n"]
     contatos = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) n FROM crm_interactions
-        WHERE company_id = ? AND UPPER(seller_name) = ?
+        WHERE company_id = ? AND UPPER(seller_name) IN ({marcadores})
           AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
         """,
-        (company_id, alvo_key, inicio, fim),
+        (company_id, *nomes_upper, inicio, fim),
     ).fetchone()["n"]
 
-    # Situação da carteira
-    carteira = conn.execute(
-        """
-        SELECT status_code, COUNT(*) n FROM crm_client_summary
-        WHERE company_id = ? AND competence = ? AND UPPER(seller_name) = ?
-        GROUP BY status_code
-        """,
-        (company_id, competence, alvo_key),
-    ).fetchall()
-    por_status = {r["status_code"]: int(r["n"]) for r in carteira}
+    # Situação da carteira. O status (ATIVO / PRÉ-INATIVO / INATIVO) é CALCULADO
+    # a partir dos dias sem compra — não existe coluna no banco. Reaproveita a
+    # mesma função que monta a tela de Carteira, para o feedback mostrar
+    # exatamente o número que o vendedor vê lá.
+    filtros_carteira = build_filters_from_query({})
+    filtros_carteira["competence_start"] = competence
+    filtros_carteira["competence_end"] = competence
+    filtros_carteira["seller_name"] = nome_vendas
+    por_status: dict[str, int] = {}
+    try:
+        for cliente in list_crm_clients(conn, company_id, filtros_carteira, attach_context=False):
+            codigo = normalize_upper(cliente.get("statusCode")) or "SEM_STATUS"
+            por_status[codigo] = por_status.get(codigo, 0) + 1
+    except Exception as exc:  # carteira indisponível não pode derrubar o feedback
+        print(f"[feedback] carteira indisponível para {nome_vendas}: {exc}", flush=True)
     total_carteira = sum(por_status.values())
 
     return {
         "found": True,
         "competence": competence,
-        "sellerName": linha["sellerName"],
+        "sellerName": nome_vendas,
+        "matchedName": nome_vendas if person_key(nome_vendas) != person_key(seller_name) else "",
         "unitName": unidade,
         "revenueNet": linha.get("revenueNet"),
         "revenueGoal": linha.get("revenueGoal"),
@@ -4679,10 +4764,7 @@ def save_feedback(
     # Foto dos indicadores no momento do feedback. Guardada junto porque o
     # dashboard muda com novas importações — e a conversa precisa continuar
     # fazendo sentido daqui a seis meses.
-    if kind == "VENDEDOR":
-        indicadores = seller_indicators_for_feedback(conn, company_id, person_name, competence)
-    else:
-        indicadores = unit_indicators_for_feedback(conn, company_id, unidade or "", competence)
+    indicadores = safe_feedback_indicators(conn, company_id, kind, person_name, unidade or "", competence)
 
     existente = conn.execute(
         "SELECT id, status FROM feedbacks WHERE company_id = ? AND kind = ? AND competence = ? AND person_key = ?",
@@ -12346,14 +12428,10 @@ class AppHandler(BaseHTTPRequestHandler):
                                 raise PermissionError("Apenas gestão consulta a prévia.")
                             kind = normalize_upper(payload.get("kind")) or "VENDEDOR"
                             competence = normalize_whitespace(payload.get("competence"))
-                            if kind == "GERENTE":
-                                indicadores = unit_indicators_for_feedback(
-                                    conn, user["company_id"],
-                                    normalize_whitespace(payload.get("unitName")), competence)
-                            else:
-                                indicadores = seller_indicators_for_feedback(
-                                    conn, user["company_id"],
-                                    normalize_whitespace(payload.get("personName")), competence)
+                            indicadores = safe_feedback_indicators(
+                                conn, user["company_id"], kind,
+                                normalize_whitespace(payload.get("personName")),
+                                normalize_whitespace(payload.get("unitName")), competence)
                             resultado = {
                                 "indicators": indicadores,
                                 "guidance": feedback_guidance(indicadores) if kind == "VENDEDOR" else [],
