@@ -1002,6 +1002,13 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if "contact_updated_by_user_id" not in profile_columns:
         conn.execute("ALTER TABLE crm_client_profiles ADD COLUMN contact_updated_by_user_id INTEGER")
 
+    # Presente ligado à conta de login. O nome sozinho não bastava: o cadastro de
+    # pessoas traz "Thielly Henrique da Silva" e o usuário se chama "Thielly
+    # Henrique", então a pendência de ciência nunca chegava a ela.
+    participant_columns = {row["name"] for row in conn.execute("PRAGMA table_info(meeting_participants)").fetchall()}
+    if participant_columns and "user_id" not in participant_columns:
+        conn.execute("ALTER TABLE meeting_participants ADD COLUMN user_id INTEGER")
+
 
 def seed_crm_catalogs(conn: sqlite3.Connection) -> None:
     for code, label in CRM_CONTACT_TYPES:
@@ -1630,6 +1637,7 @@ def init_db() -> None:
                 meeting_id INTEGER NOT NULL,
                 person_name TEXT NOT NULL,
                 person_key TEXT NOT NULL,        -- nome normalizado, casa com o login
+                user_id INTEGER,                 -- conta resolvida, quando a pessoa tem login
                 unit_name TEXT,
                 acknowledged_at TEXT,
                 feedback TEXT,
@@ -2000,6 +2008,7 @@ def init_db() -> None:
         seed_access_profiles(conn, company_id)
         seed_content_library(conn, company_id)
         seed_kpi_thresholds(conn, company_id)
+        backfill_meeting_participant_users(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -3546,6 +3555,55 @@ def person_key(value: Any) -> str:
     return re.sub(r"[^A-Z0-9]+", " ", texto).strip()
 
 
+def short_person_key(value: Any) -> str:
+    """Nome + primeiro sobrenome, normalizado.
+
+    Existe porque o cadastro de pessoas e o cadastro de usuários quase nunca
+    escrevem o nome igual: "THIELLY HENRIQUE DA SILVA" no faturamento e
+    "Thielly Henrique" no login. Comparar o nome inteiro dava sempre falso e a
+    vendedora não recebia a pendência de ciência. Dois tokens é o recorte que
+    resolve o caso comum sem misturar pessoas diferentes.
+    """
+    partes = person_key(value).split()
+    return " ".join(partes[:2]) if len(partes) >= 2 else (partes[0] if partes else "")
+
+
+def user_person_keys(user: sqlite3.Row) -> list[str]:
+    """Todas as chaves pelas quais este usuário pode aparecer numa lista de presença."""
+    candidatos = [user["full_name"], user["username"]]
+    chaves: list[str] = []
+    for valor in candidatos:
+        if not normalize_whitespace(valor):
+            continue
+        chaves.append(person_key(valor))
+        chaves.append(short_person_key(valor))
+    return [k for k in dict.fromkeys(chaves) if k]
+
+
+def resolve_user_for_person(conn: sqlite3.Connection, company_id: int, nome: str) -> int | None:
+    """Conta de login correspondente a um nome da lista de presença, se houver.
+
+    Tenta o nome completo primeiro; só então o recorte de dois tokens. Se dois
+    usuários casarem pelo recorte curto, devolve None — melhor não notificar
+    ninguém do que notificar a pessoa errada.
+    """
+    alvo_completo = person_key(nome)
+    alvo_curto = short_person_key(nome)
+    if not alvo_completo:
+        return None
+    usuarios = conn.execute(
+        "SELECT id, full_name, username FROM users WHERE company_id = ? AND is_active = 1",
+        (company_id,),
+    ).fetchall()
+    exatos = [u["id"] for u in usuarios
+              if alvo_completo in {person_key(u["full_name"]), person_key(u["username"])}]
+    if len(exatos) == 1:
+        return exatos[0]
+    curtos = [u["id"] for u in usuarios
+              if alvo_curto and alvo_curto in {short_person_key(u["full_name"]), short_person_key(u["username"])}]
+    return curtos[0] if len(curtos) == 1 else None
+
+
 def user_can_manage_meetings(conn: sqlite3.Connection, user: sqlite3.Row) -> bool:
     """Registra ata quem tem visão de equipe. Vendedor só dá ciência."""
     return data_scope_for_user(conn, user) != "proprio"
@@ -3595,8 +3653,35 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
             "personKey": chave,
             "unitName": unidade,
             "role": normalize_whitespace(r["role_classification"]) or "Outros",
+            # O gestor precisa ver, na hora de montar a lista, quem realmente vai
+            # receber a pendência. Sem isso a falha é silenciosa.
+            "hasLogin": resolve_user_for_person(conn, company_id, nome) is not None,
         })
     return pessoas
+
+
+def backfill_meeting_participant_users(conn: sqlite3.Connection, company_id: int) -> None:
+    """Liga à conta de login os presentes gravados antes de existir a coluna user_id.
+
+    Roda no boot e é barato: só toca linhas com user_id nulo.
+    """
+    pendentes = conn.execute(
+        """
+        SELECT p.id, p.person_name FROM meeting_participants p
+        JOIN meetings m ON m.id = p.meeting_id
+        WHERE m.company_id = ? AND p.user_id IS NULL
+        """,
+        (company_id,),
+    ).fetchall()
+    vinculados = 0
+    for linha in pendentes:
+        user_id = resolve_user_for_person(conn, company_id, linha["person_name"])
+        if user_id:
+            conn.execute("UPDATE meeting_participants SET user_id = ? WHERE id = ?", (user_id, linha["id"]))
+            vinculados += 1
+    if vinculados:
+        conn.commit()
+        print(f"[reunioes] {vinculados} presente(s) vinculado(s) a contas de login")
 
 
 def meeting_units_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> dict[str, Any]:
@@ -3658,6 +3743,8 @@ def load_meeting(conn: sqlite3.Connection, company_id: int, meeting_id: int) -> 
             "id": int(p["id"]),
             "personName": p["person_name"],
             "personKey": p["person_key"],
+            "userId": p["user_id"],
+            "hasLogin": p["user_id"] is not None,
             "unitName": p["unit_name"] or "",
             "acknowledgedAt": p["acknowledged_at"] or "",
             "feedback": p["feedback"] or "",
@@ -3703,13 +3790,18 @@ def list_meetings(
     sql = "SELECT m.* FROM meetings m WHERE m.company_id = ?"
     params: list[Any] = [company_id]
 
+    minhas_chaves = user_person_keys(user)
+    marcadores_chave = ",".join("?" for _ in minhas_chaves) or "''"
+
     if scope == "proprio":
         sql += (
             " AND m.status = 'PUBLICADA'"
             " AND EXISTS (SELECT 1 FROM meeting_participants p"
-            "             WHERE p.meeting_id = m.id AND p.person_key = ?)"
+            f"             WHERE p.meeting_id = m.id"
+            f"               AND (p.user_id = ? OR p.person_key IN ({marcadores_chave})))"
         )
-        params.append(person_key(meeting_person_identity(user)))
+        params.append(user["id"])
+        params.extend(minhas_chaves)
     else:
         allowed = crm_allowed_units_for_user(conn, user)
         if allowed:
@@ -3746,7 +3838,6 @@ def list_meetings(
     linhas = conn.execute(sql, params).fetchall()
 
     resultado: list[dict[str, Any]] = []
-    minha_chave = person_key(meeting_person_identity(user))
     for row in linhas:
         ata = meeting_row_to_dict(row)
         contagem = conn.execute(
@@ -3765,8 +3856,8 @@ def list_meetings(
         ).fetchone()["n"] or 0)
         minha = conn.execute(
             "SELECT acknowledged_at, feedback FROM meeting_participants "
-            "WHERE meeting_id = ? AND person_key = ?",
-            (ata["id"], minha_chave),
+            f"WHERE meeting_id = ? AND (user_id = ? OR person_key IN ({marcadores_chave}))",
+            (ata["id"], user["id"], *minhas_chaves),
         ).fetchone()
         ata["iAmParticipant"] = bool(minha)
         ata["myAcknowledgedAt"] = (minha["acknowledged_at"] or "") if minha else ""
@@ -3777,16 +3868,18 @@ def list_meetings(
 
 def count_pending_acknowledgements(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row) -> int:
     """Quantas atas publicadas ainda esperam a ciência deste usuário."""
+    chaves = user_person_keys(user)
+    marcadores = ",".join("?" for _ in chaves) or "''"
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) n
         FROM meeting_participants p
         JOIN meetings m ON m.id = p.meeting_id
         WHERE m.company_id = ? AND m.status = 'PUBLICADA'
-          AND p.person_key = ?
+          AND (p.user_id = ? OR p.person_key IN ({marcadores}))
           AND (p.acknowledged_at IS NULL OR p.acknowledged_at = '')
         """,
-        (company_id, person_key(meeting_person_identity(user))),
+        (company_id, user["id"], *chaves),
     ).fetchone()
     return int(row["n"] or 0)
 
@@ -3877,13 +3970,15 @@ def save_meeting(
         unidade = normalize_unit(item.get("unitName")) if isinstance(item, dict) else ""
         conn.execute(
             """
-            INSERT INTO meeting_participants (meeting_id, person_name, person_key, unit_name, created_at)
-            VALUES (?,?,?,?,?)
+            INSERT INTO meeting_participants (meeting_id, person_name, person_key, user_id, unit_name, created_at)
+            VALUES (?,?,?,?,?,?)
             ON CONFLICT(meeting_id, person_key) DO UPDATE SET
                 person_name = excluded.person_name,
+                user_id     = excluded.user_id,
                 unit_name   = excluded.unit_name
             """,
-            (meeting_id, nome, chave, unidade or None, now_iso()),
+            (meeting_id, nome, chave, resolve_user_for_person(conn, company_id, nome),
+             unidade or None, now_iso()),
         )
     if chaves_enviadas:
         marcadores = ",".join("?" for _ in chaves_enviadas)
@@ -3944,10 +4039,12 @@ def acknowledge_meeting(
     if ata["status"] != "PUBLICADA":
         raise ValueError("Esta ata ainda não foi publicada.")
 
-    chave = person_key(meeting_person_identity(user))
+    chaves = user_person_keys(user)
+    marcadores = ",".join("?" for _ in chaves) or "''"
     participante = conn.execute(
-        "SELECT id, acknowledged_at FROM meeting_participants WHERE meeting_id = ? AND person_key = ?",
-        (meeting_id, chave),
+        "SELECT id, acknowledged_at FROM meeting_participants "
+        f"WHERE meeting_id = ? AND (user_id = ? OR person_key IN ({marcadores}))",
+        (meeting_id, user["id"], *chaves),
     ).fetchone()
     if not participante:
         raise ValueError("Você não consta na lista de presença desta reunião.")
@@ -10372,9 +10469,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     # Vendedor só baixa anexo de ata publicada em que ele consta.
                     liberado = bool(row)
                     if row and data_scope_for_user(conn, user) == "proprio":
+                        chaves = user_person_keys(user)
+                        marcadores = ",".join("?" for _ in chaves) or "''"
                         liberado = row["status"] == "PUBLICADA" and bool(conn.execute(
-                            "SELECT 1 FROM meeting_participants WHERE meeting_id = ? AND person_key = ?",
-                            (row["meeting_id"], person_key(meeting_person_identity(user))),
+                            "SELECT 1 FROM meeting_participants "
+                            f"WHERE meeting_id = ? AND (user_id = ? OR person_key IN ({marcadores}))",
+                            (row["meeting_id"], user["id"], *chaves),
                         ).fetchone())
                 if not row or not liberado:
                     self._set_headers(404)
@@ -11421,15 +11521,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 with closing(get_connection()) as conn:
                     ata = load_meeting(conn, user["company_id"], meeting_id)
                     if ata and data_scope_for_user(conn, user) == "proprio":
-                        minha = person_key(meeting_person_identity(user))
-                        participo = any(p["personKey"] == minha for p in ata["participants"])
+                        minhas = set(user_person_keys(user))
+                        sou_eu = lambda p: p["personKey"] in minhas or p.get("userId") == user["id"]
+                        participo = any(sou_eu(p) for p in ata["participants"])
                         if ata["status"] != "PUBLICADA" or not participo:
                             ata = None
                         else:
                             # O vendedor não enxerga o feedback dos colegas — o canal
                             # é dele com o gestor, não um mural público.
                             ata["participants"] = [
-                                {**p, "feedback": p["feedback"] if p["personKey"] == minha else ""}
+                                {**p, "isMe": sou_eu(p),
+                                 "feedback": p["feedback"] if sou_eu(p) else ""}
                                 for p in ata["participants"]
                             ]
                 if not ata:

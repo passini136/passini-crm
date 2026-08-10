@@ -4168,6 +4168,11 @@ async function salvarAta(depoisPublicar) {
       await api("/api/meetings/publish", {
         method: "POST", body: JSON.stringify({ meetingId: r.meetingId }),
       });
+      const comLogin = e.participants.filter((p) =>
+        (state.meetings?.people || []).find((x) => x.personKey === p.personKey)?.hasLogin).length;
+      if (comLogin < e.participants.length) {
+        addMessage("warn", `${comLogin} de ${e.participants.length} presentes têm login e receberão a pendência.`);
+      }
       addMessage("success", "Ata publicada. A equipe já recebeu a pendência de ciência.");
       state.meetingEditor = null;
     } else {
@@ -4495,6 +4500,18 @@ function ataEditorModal() {
               <button class="btn btn-ghost btn-sm" onclick="limparPresentes()">Limpar</button>
             </div>
           </div>
+          ${(() => {
+            const semLogin = e.participants.filter((p) =>
+              !(state.meetings?.people || []).find((x) => x.personKey === p.personKey)?.hasLogin);
+            return semLogin.length ? `
+              <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px;margin-top:8px">
+                ⚠ ${semLogin.map((p) => escapeHtml(p.personName)).join(", ")}
+                ${semLogin.length === 1 ? "não tem" : "não têm"} login no CRM.
+                ${semLogin.length === 1 ? "Fica registrado" : "Ficam registrados"} como
+                ${semLogin.length === 1 ? "presente" : "presentes"}, mas
+                ${semLogin.length === 1 ? "não recebe" : "não recebem"} a pendência de ciência.
+              </div>` : "";
+          })()}
           <div data-keep-scroll="ata-presentes"
                style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-height:180px;overflow:auto">
             ${pessoas.map((p) => {
@@ -4502,11 +4519,11 @@ function ataEditorModal() {
               const ciente = e.participants.find((x) => x.personKey === p.personKey)?.acknowledgedAt;
               return `
                 <button type="button" onclick="togglePresente('${jsAttr(p.personKey)}')"
-                  title="${escapeHtml(p.role)}${p.unitName ? " · " + escapeHtml(p.unitName) : ""}"
+                  title="${escapeHtml(p.role)}${p.unitName ? " · " + escapeHtml(p.unitName) : ""}${p.hasLogin ? " · recebe a pendência de ciência" : " · sem login no CRM"}"
                   style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
                          background:${on ? "var(--accent)" : "#fff"};color:${on ? "#fff" : "var(--text)"};
                          border-radius:14px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer">
-                  ${ciente ? "✓ " : on ? "● " : "○ "}${escapeHtml(p.personName)}
+                  ${ciente ? "✓ " : on ? "● " : "○ "}${escapeHtml(p.personName)}${p.hasLogin ? "" : " ⚠"}
                 </button>`;
             }).join("") || '<div class="text-small">Nenhuma pessoa ativa nas suas unidades. Verifique o cadastro em Administração.</div>'}
           </div>
