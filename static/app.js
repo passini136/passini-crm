@@ -4563,8 +4563,12 @@ function ataEditorModal() {
 
 function ataDetalheModal() {
   const m = state.meetingDetail;
-  const jaCiente = Boolean((m.participants || []).find((p) => p.personName === state.meetings?.myName)?.acknowledgedAt);
-  const souParticipante = (m.participants || []).some((p) => p.personName === state.meetings?.myName);
+  // Quem sou eu na lista vem marcado do servidor (isMe). Comparar pelo nome do
+  // login aqui não funcionava: o cadastro tem "THIELLY HENRIQUES ROCHA (VENDAS)"
+  // e o login é "Thielly Rocha" — o botão de ciência nunca aparecia.
+  const euNaLista = (m.participants || []).find((p) => p.isMe);
+  const souParticipante = Boolean(euNaLista);
+  const jaCiente = Boolean(euNaLista?.acknowledgedAt);
   const podeGerir = Boolean(state.meetings?.canManage);
   const feedbacks = (m.participants || []).filter((p) => p.feedback);
 
@@ -4615,8 +4619,9 @@ function ataDetalheModal() {
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
             ${(m.participants || []).map((p) => `
               <span class="status-tag ${p.acknowledgedAt ? "good" : ""}"
+                style="${p.isMe ? "outline:2px solid var(--accent);outline-offset:1px" : ""}"
                 title="${p.acknowledgedAt ? "Ciente em " + escapeHtml(p.acknowledgedAt.slice(0, 16).replace("T", " ")) : "Pendente"}">
-                ${p.acknowledgedAt ? "✓" : "○"} ${escapeHtml(p.personName)}
+                ${p.acknowledgedAt ? "✓" : "○"} ${escapeHtml(p.personName)}${p.isMe ? " (você)" : ""}
               </span>`).join("")}
           </div>
         </div>
@@ -4646,6 +4651,11 @@ function ataDetalheModal() {
                 ${m.saving ? "Registrando…" : "Estou ciente"}
               </button>
             </div>
+          </div>` : ""}
+
+        ${!souParticipante && m.status === "PUBLICADA" && !state.meetings?.canManage ? `
+          <div class="message" style="margin-top:14px">
+            Você não consta na lista de presença desta reunião, então não há ciência a dar.
           </div>` : ""}
 
         ${jaCiente ? `

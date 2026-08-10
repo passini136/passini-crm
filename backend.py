@@ -11546,20 +11546,30 @@ class AppHandler(BaseHTTPRequestHandler):
                 meeting_id = int(payload.get("meetingId") or 0)
                 with closing(get_connection()) as conn:
                     ata = load_meeting(conn, user["company_id"], meeting_id)
-                    if ata and data_scope_for_user(conn, user) == "proprio":
+                    if ata:
+                        # Quem é "eu" nesta lista é decidido AQUI, comparando chaves e
+                        # a conta vinculada. A tela não tem como fazer isso: ela só
+                        # conhece o nome do login, que quase nunca é igual ao nome do
+                        # cadastro — era por isso que o botão de ciência não aparecia.
                         minhas = set(user_person_keys(user))
-                        sou_eu = lambda p: p["personKey"] in minhas or p.get("userId") == user["id"]
-                        participo = any(sou_eu(p) for p in ata["participants"])
-                        if ata["status"] != "PUBLICADA" or not participo:
-                            ata = None
-                        else:
-                            # O vendedor não enxerga o feedback dos colegas — o canal
-                            # é dele com o gestor, não um mural público.
-                            ata["participants"] = [
-                                {**p, "isMe": sou_eu(p),
-                                 "feedback": p["feedback"] if sou_eu(p) else ""}
-                                for p in ata["participants"]
-                            ]
+                        def sou_eu(p: dict[str, Any]) -> bool:
+                            return p["personKey"] in minhas or p.get("userId") == user["id"]
+
+                        ata["participants"] = [{**p, "isMe": sou_eu(p)} for p in ata["participants"]]
+                        ata["iAmParticipant"] = any(p["isMe"] for p in ata["participants"])
+                        ata["myAcknowledgedAt"] = next(
+                            (p["acknowledgedAt"] for p in ata["participants"] if p["isMe"]), ""
+                        )
+                        if data_scope_for_user(conn, user) == "proprio":
+                            if ata["status"] != "PUBLICADA" or not ata["iAmParticipant"]:
+                                ata = None
+                            else:
+                                # O vendedor não enxerga o feedback dos colegas — o
+                                # canal é dele com o gestor, não um mural público.
+                                ata["participants"] = [
+                                    {**p, "feedback": p["feedback"] if p["isMe"] else ""}
+                                    for p in ata["participants"]
+                                ]
                 if not ata:
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Ata não encontrada."}))
