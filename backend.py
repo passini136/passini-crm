@@ -221,7 +221,9 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
-    {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "CRM"},
+    # Desenvolvimento
+    {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Desenvolvimento"},
+    {"id": "feedback",       "label": "Feedback e PDI",      "group": "Desenvolvimento"},
     # Resultados
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
@@ -273,7 +275,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
-            "reunioes",
+            "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -296,7 +298,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "reunioes", "executivo", "calendario",
+            "meu-placar", "biblioteca", "reunioes", "feedback", "executivo", "calendario",
         ],
         "data_scope": "proprio",
         "can_manage_users": 0,
@@ -1662,6 +1664,81 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
+
+            -- Feedback estruturado (gerente x vendedor e diretor x gerente)
+            CREATE TABLE IF NOT EXISTS feedbacks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,                -- VENDEDOR | GERENTE
+                competence TEXT NOT NULL,          -- mês de referência (AAAA-MM)
+                person_name TEXT NOT NULL,         -- avaliado
+                person_key TEXT NOT NULL,
+                person_user_id INTEGER,
+                unit_name TEXT,
+                author_name TEXT NOT NULL,         -- quem conduziu
+                author_user_id INTEGER,
+                indicators_json TEXT,              -- foto dos números no dia do feedback
+                highlights TEXT,                   -- o que foi bem
+                improvements TEXT,                 -- o que precisa evoluir
+                agreements TEXT,                   -- o que ficou combinado
+                tactical_goal TEXT,                -- GROW: objetivo (feedback de gerente)
+                tactical_reality TEXT,             -- GROW: realidade
+                tactical_options TEXT,             -- GROW: caminhos
+                tactical_will TEXT,                -- GROW: compromisso e apoio pedido
+                status TEXT NOT NULL DEFAULT 'RASCUNHO',
+                published_at TEXT,
+                acknowledged_at TEXT,
+                person_note TEXT,                  -- observação do avaliado PARA O GESTOR
+                confidential_note TEXT,            -- observação do avaliado para RH/Diretoria
+                note_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, kind, competence, person_key),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_feedbacks_company_person
+                ON feedbacks(company_id, person_key, competence);
+            CREATE INDEX IF NOT EXISTS idx_feedbacks_company_unit
+                ON feedbacks(company_id, unit_name, competence);
+
+            -- Nota de cada item avaliado
+            CREATE TABLE IF NOT EXISTS feedback_ratings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feedback_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                level TEXT NOT NULL,               -- SUPERA | ATENDE | EVOLUIR
+                comment TEXT,
+                UNIQUE(feedback_id, item_id),
+                FOREIGN KEY (feedback_id) REFERENCES feedbacks(id) ON DELETE CASCADE
+            );
+
+            -- PDI vivo: o item pertence à PESSOA e atravessa os feedbacks.
+            -- Amarrar o plano a um único feedback faria o desenvolvimento
+            -- recomeçar do zero todo mês.
+            CREATE TABLE IF NOT EXISTS pdi_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                person_key TEXT NOT NULL,
+                unit_name TEXT,
+                title TEXT NOT NULL,               -- o que desenvolver
+                why TEXT,                          -- por que importa
+                action TEXT,                       -- como, na prática
+                support TEXT,                      -- quem apoia
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'ABERTO',   -- ABERTO | EVOLUINDO | CONCLUIDO | CANCELADO
+                progress_note TEXT,
+                origin_feedback_id INTEGER,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                closed_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pdi_company_person
+                ON pdi_items(company_id, person_key, status);
 
             -- Biblioteca de conteúdo comercial: scripts, mensagens e orientações
             CREATE TABLE IF NOT EXISTS content_library (
@@ -4169,6 +4246,699 @@ def delete_meeting(
     conn.execute("DELETE FROM meeting_participants WHERE meeting_id = ?", (meeting_id,))
     conn.execute("DELETE FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id))
     audit_log(conn, company_id, user["id"], "excluir", "meetings", str(meeting_id), {})
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feedback e PDI
+#
+# Conceito: o feedback não inventa critério. Ele lê os números que o CRM já tem
+# e os confronta com o que o MEC define como execução esperada. O gerente marca
+# três níveis por item, escreve pouco e sai com no máximo 2 pontos de PDI.
+#
+# Decisões que moldam o resto:
+#
+# 1. UM feedback por pessoa por competência (UNIQUE). Editar o do mês corrige;
+#    não cria um segundo registro. Histórico limpo para comparar evolução.
+#
+# 2. PDI é da PESSOA, não do feedback. Item aberto em março continua vivo em
+#    maio, com o histórico de evolução. Amarrar ao feedback faria o
+#    desenvolvimento recomeçar do zero todo mês.
+#
+# 3. Duas caixas de observação para quem recebe: uma vai para o gestor, outra
+#    NÃO. A confidencial só é lida por quem gerencia usuários (Diretor/Admin).
+#    Sem esse canal separado, ninguém escreve o que realmente pensa.
+# ─────────────────────────────────────────────────────────────────────────────
+
+FEEDBACK_KINDS = [
+    {"id": "VENDEDOR", "label": "Vendedor", "icon": "👤",
+     "hint": "Gerente × vendedor. Execução do MEC, indicadores do mês e comportamento."},
+    {"id": "GERENTE", "label": "Gerente", "icon": "🎯",
+     "hint": "Diretor × gerente. Resultado da unidade, gestão da equipe e direcionamento tático."},
+]
+FEEDBACK_KIND_IDS = {k["id"] for k in FEEDBACK_KINDS}
+
+PDI_STATUSES = [
+    {"id": "ABERTO",    "label": "Aberto",     "color": "#5f6368", "bg": "#f1f3f4"},
+    {"id": "EVOLUINDO", "label": "Evoluindo",  "color": "#b06000", "bg": "#fef7e0"},
+    {"id": "CONCLUIDO", "label": "Concluído",  "color": "#1e8e3e", "bg": "#e6f4ea"},
+    {"id": "CANCELADO", "label": "Cancelado",  "color": "#5f6368", "bg": "#f1f3f4"},
+]
+PDI_STATUS_IDS = {s["id"] for s in PDI_STATUSES}
+
+# Teto de itens ativos por pessoa. Plano com cinco frentes não sai do lugar —
+# o limite é a própria regra de gestão, não uma restrição técnica.
+PDI_MAX_ACTIVE = 3
+
+
+def _mec_content() -> Any:
+    """Carrega o catálogo do MEC. Falha explícita: sem ele o módulo não faz sentido."""
+    import mec_feedback
+    return mec_feedback
+
+
+def feedback_items_for_kind(kind: str) -> list[dict[str, Any]]:
+    mec = _mec_content()
+    return mec.FEEDBACK_ITEMS_MANAGER if kind == "GERENTE" else mec.FEEDBACK_ITEMS_SELLER
+
+
+def feedback_groups_for_kind(kind: str) -> list[str]:
+    mec = _mec_content()
+    return mec.FEEDBACK_ITEM_GROUPS_MANAGER if kind == "GERENTE" else mec.FEEDBACK_ITEM_GROUPS_SELLER
+
+
+def user_can_give_feedback(conn: sqlite3.Connection, user: sqlite3.Row) -> bool:
+    """Dá feedback quem tem visão de equipe. Vendedor apenas recebe."""
+    return data_scope_for_user(conn, user) != "proprio"
+
+
+def user_can_read_confidential(conn: sqlite3.Connection, user: sqlite3.Row) -> bool:
+    """Lê a observação confidencial quem gerencia usuários — Diretor e Admin."""
+    return user_can_manage_users(conn, user)
+
+
+# ── Indicadores do avaliado no mês ───────────────────────────────────────────
+
+def seller_indicators_for_feedback(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str
+) -> dict[str, Any]:
+    """Números do vendedor na competência, já comparados com a unidade dele.
+
+    A comparação com a unidade importa mais que o valor absoluto: ticket de
+    R$ 300 pode ser bom ou ruim dependendo da praça. Sem referência, o gerente
+    discute o número em vez de discutir a causa.
+    """
+    filtros = build_filters_from_query({})
+    filtros["competence_start"] = competence
+    filtros["competence_end"] = competence
+    dados = get_dashboard_data_cached(conn, company_id, filtros)
+
+    alvo_key = normalize_upper(seller_name)
+    linha = next(
+        (r for r in dados.get("sellerRanking", []) if normalize_upper(r["sellerName"]) == alvo_key),
+        None,
+    )
+    if not linha:
+        return {"found": False, "competence": competence, "sellerName": seller_name}
+
+    unidade = normalize_unit(linha.get("baseUnit"))
+    pares = [r for r in dados.get("sellerRanking", [])
+             if normalize_unit(r.get("baseUnit")) == unidade and float(r.get("revenueNet") or 0) > 0]
+
+    def media(campo: str) -> float:
+        valores = [float(r.get(campo) or 0) for r in pares]
+        return round(sum(valores) / len(valores), 2) if valores else 0.0
+
+    # Ligações registradas no mês (mínimo do MEC: 3/dia, 60/mês)
+    inicio = first_day_of_competence(competence).isoformat()
+    fim = last_day_of_competence(competence).isoformat()
+    ligacoes = conn.execute(
+        """
+        SELECT COUNT(*) n FROM crm_interactions
+        WHERE company_id = ? AND UPPER(seller_name) = ? AND contact_type_code = 'LIGACAO'
+          AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
+        """,
+        (company_id, alvo_key, inicio, fim),
+    ).fetchone()["n"]
+    contatos = conn.execute(
+        """
+        SELECT COUNT(*) n FROM crm_interactions
+        WHERE company_id = ? AND UPPER(seller_name) = ?
+          AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
+        """,
+        (company_id, alvo_key, inicio, fim),
+    ).fetchone()["n"]
+
+    # Situação da carteira
+    carteira = conn.execute(
+        """
+        SELECT status_code, COUNT(*) n FROM crm_client_summary
+        WHERE company_id = ? AND competence = ? AND UPPER(seller_name) = ?
+        GROUP BY status_code
+        """,
+        (company_id, competence, alvo_key),
+    ).fetchall()
+    por_status = {r["status_code"]: int(r["n"]) for r in carteira}
+    total_carteira = sum(por_status.values())
+
+    return {
+        "found": True,
+        "competence": competence,
+        "sellerName": linha["sellerName"],
+        "unitName": unidade,
+        "revenueNet": linha.get("revenueNet"),
+        "revenueGoal": linha.get("revenueGoal"),
+        "goalAttainmentPct": linha.get("goalAttainmentPct"),
+        "ticketAverage": linha.get("ticketAverage"),
+        "ticketAverageUnit": media("ticketAverage"),
+        "distinctClients": linha.get("distinctClients"),
+        "distinctClientsUnit": round(media("distinctClients")),
+        "mixSku": linha.get("mixSku"),
+        "returnsPct": round(safe_div(float(linha.get("returnsValue") or 0),
+                                     float(linha.get("revenueNet") or 0)) * 100, 2),
+        "discountPct": linha.get("discountPct"),
+        "discountPctUnit": media("discountPct"),
+        "calls": int(ligacoes),
+        "callsTarget": 60,
+        "contacts": int(contatos),
+        "portfolioTotal": total_carteira,
+        "portfolioActive": por_status.get("ATIVO", 0),
+        "portfolioPreInactive": por_status.get("PRE_INATIVO", 0),
+        "portfolioInactive": por_status.get("INATIVO", 0),
+    }
+
+
+def feedback_guidance(indicadores: dict[str, Any]) -> list[dict[str, Any]]:
+    """Orientações do guia que se aplicam a ESTE vendedor neste mês.
+
+    Só entra o que está fora do esperado. Guia completo em toda conversa vira
+    manual que ninguém lê; três pontos relevantes o gerente usa.
+    """
+    mec = _mec_content()
+    guia = mec.INDICATOR_GUIDE
+    if not indicadores.get("found"):
+        return []
+
+    alertas: list[str] = []
+    if float(indicadores.get("goalAttainmentPct") or 0) < 90:
+        alertas.append("goal_low")
+    if int(indicadores.get("calls") or 0) < int(indicadores.get("callsTarget") or 60):
+        alertas.append("calls_low")
+    if float(indicadores.get("returnsPct") or 0) > 3:
+        alertas.append("returns_high")
+    desconto = float(indicadores.get("discountPct") or 0)
+    desconto_unidade = float(indicadores.get("discountPctUnit") or 0)
+    if desconto_unidade and desconto > desconto_unidade * 1.15:
+        alertas.append("discount_high")
+    clientes = int(indicadores.get("distinctClients") or 0)
+    clientes_unidade = int(indicadores.get("distinctClientsUnit") or 0)
+    if clientes_unidade and clientes < clientes_unidade * 0.8:
+        alertas.append("clients_low")
+    if int(indicadores.get("portfolioTotal") or 0):
+        parados = int(indicadores.get("portfolioInactive") or 0) + int(indicadores.get("portfolioPreInactive") or 0)
+        if safe_div(parados, indicadores["portfolioTotal"]) > 0.35:
+            alertas.append("inactive_high")
+    ticket = float(indicadores.get("ticketAverage") or 0)
+    ticket_unidade = float(indicadores.get("ticketAverageUnit") or 0)
+    if ticket_unidade and ticket < ticket_unidade * 0.85:
+        alertas.append("ticket_low")
+
+    if not alertas:
+        alertas.append("good_overall")
+
+    return [{"id": chave, **guia[chave]} for chave in dict.fromkeys(alertas) if chave in guia][:4]
+
+
+def unit_indicators_for_feedback(
+    conn: sqlite3.Connection, company_id: int, unit_name: str, competence: str
+) -> dict[str, Any]:
+    """Números da unidade para o feedback do gerente, com o retrato dos ritos."""
+    filtros = build_filters_from_query({})
+    filtros["competence_start"] = competence
+    filtros["competence_end"] = competence
+    filtros["unit_name"] = normalize_unit(unit_name)
+    dados = get_dashboard_data_cached(conn, company_id, filtros)
+    resumo = dados.get("summary") or {}
+
+    inicio = first_day_of_competence(competence).isoformat()
+    fim = last_day_of_competence(competence).isoformat()
+    reunioes = conn.execute(
+        "SELECT COUNT(*) n FROM meetings WHERE company_id = ? AND status = 'PUBLICADA' "
+        "AND date(occurred_at) BETWEEN date(?) AND date(?) AND (unit_name = ? OR unit_name IS NULL)",
+        (company_id, inicio, fim, normalize_unit(unit_name)),
+    ).fetchone()["n"]
+    feedbacks_feitos = conn.execute(
+        "SELECT COUNT(*) n FROM feedbacks WHERE company_id = ? AND kind = 'VENDEDOR' "
+        "AND competence = ? AND unit_name = ? AND status = 'PUBLICADO'",
+        (company_id, competence, normalize_unit(unit_name)),
+    ).fetchone()["n"]
+    equipe = conn.execute(
+        "SELECT COUNT(DISTINCT person_name) n FROM people_records "
+        "WHERE company_id = ? AND base_unit = ? AND role_classification = 'Vendedor' "
+        "AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))",
+        (company_id, normalize_unit(unit_name), inicio),
+    ).fetchone()["n"]
+    pdis = conn.execute(
+        "SELECT COUNT(*) n FROM pdi_items WHERE company_id = ? AND unit_name = ? "
+        "AND status IN ('ABERTO','EVOLUINDO')",
+        (company_id, normalize_unit(unit_name)),
+    ).fetchone()["n"]
+    pdis_vencidos = conn.execute(
+        "SELECT COUNT(*) n FROM pdi_items WHERE company_id = ? AND unit_name = ? "
+        "AND status IN ('ABERTO','EVOLUINDO') AND due_date IS NOT NULL AND due_date <> '' "
+        "AND date(due_date) < date(?)",
+        (company_id, normalize_unit(unit_name), today_in_brazil().isoformat()),
+    ).fetchone()["n"]
+
+    return {
+        "found": bool(resumo),
+        "competence": competence,
+        "unitName": normalize_unit(unit_name),
+        "revenueNet": resumo.get("revenueNet"),
+        "revenueGoal": resumo.get("revenueGoal"),
+        "goalAttainmentPct": resumo.get("goalAttainmentPct"),
+        "returnsPct": resumo.get("returnsPct"),
+        "discountPct": resumo.get("discountPct"),
+        "ticketAverage": resumo.get("ticketAverage"),
+        "teamSize": int(equipe),
+        "meetingsPublished": int(reunioes),
+        "feedbacksDone": int(feedbacks_feitos),
+        "feedbacksExpected": int(equipe),
+        "pdiActive": int(pdis),
+        "pdiOverdue": int(pdis_vencidos),
+    }
+
+
+# ── Leitura e escrita do feedback ────────────────────────────────────────────
+
+def feedback_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "kind": row["kind"],
+        "kindLabel": next((k["label"] for k in FEEDBACK_KINDS if k["id"] == row["kind"]), row["kind"]),
+        "competence": row["competence"],
+        "personName": row["person_name"],
+        "personKey": row["person_key"],
+        "unitName": row["unit_name"] or "",
+        "authorName": row["author_name"],
+        "highlights": row["highlights"] or "",
+        "improvements": row["improvements"] or "",
+        "agreements": row["agreements"] or "",
+        "tacticalGoal": row["tactical_goal"] or "",
+        "tacticalReality": row["tactical_reality"] or "",
+        "tacticalOptions": row["tactical_options"] or "",
+        "tacticalWill": row["tactical_will"] or "",
+        "status": row["status"],
+        "publishedAt": row["published_at"] or "",
+        "acknowledgedAt": row["acknowledged_at"] or "",
+        "personNote": row["person_note"] or "",
+        "noteAt": row["note_at"] or "",
+        "createdAt": row["created_at"],
+        "indicators": json.loads(row["indicators_json"]) if row["indicators_json"] else {},
+    }
+
+
+def load_feedback(
+    conn: sqlite3.Connection, company_id: int, feedback_id: int, user: sqlite3.Row
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM feedbacks WHERE company_id = ? AND id = ?", (company_id, feedback_id)
+    ).fetchone()
+    if not row:
+        return None
+    fb = feedback_row_to_dict(row)
+
+    fb["ratings"] = {
+        r["item_id"]: {"level": r["level"], "comment": r["comment"] or ""}
+        for r in conn.execute(
+            "SELECT item_id, level, comment FROM feedback_ratings WHERE feedback_id = ?", (feedback_id,)
+        ).fetchall()
+    }
+    fb["items"] = feedback_items_for_kind(fb["kind"])
+    fb["groups"] = feedback_groups_for_kind(fb["kind"])
+    fb["guidance"] = feedback_guidance(fb["indicators"]) if fb["kind"] == "VENDEDOR" else []
+    fb["script"] = (_mec_content().FEEDBACK_SCRIPT_MANAGER if fb["kind"] == "GERENTE"
+                    else _mec_content().FEEDBACK_SCRIPT_SELLER)
+    fb["pdi"] = list_pdi_items(conn, company_id, fb["personKey"])
+
+    # A confidencial NÃO acompanha o objeto por padrão. Só quem tem direito recebe.
+    if user_can_read_confidential(conn, user):
+        fb["confidentialNote"] = row["confidential_note"] or ""
+        fb["canReadConfidential"] = True
+    else:
+        fb["canReadConfidential"] = False
+        fb["hasConfidentialNote"] = bool(normalize_whitespace(row["confidential_note"]))
+
+    minhas = set(user_person_keys(user))
+    fb["isMe"] = fb["personKey"] in minhas or (
+        row["person_user_id"] is not None and row["person_user_id"] == user["id"]
+    )
+    return fb
+
+
+def list_feedbacks(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    kind: str = "", competence: str = "", person: str = "",
+) -> list[dict[str, Any]]:
+    scope = data_scope_for_user(conn, user)
+    minhas = user_person_keys(user)
+    marcadores = ",".join("?" for _ in minhas) or "''"
+
+    sql = "SELECT * FROM feedbacks WHERE company_id = ?"
+    params: list[Any] = [company_id]
+
+    if scope == "proprio":
+        # O vendedor só enxerga o próprio feedback, e só depois de publicado.
+        sql += f" AND status = 'PUBLICADO' AND (person_user_id = ? OR person_key IN ({marcadores}))"
+        params.append(user["id"])
+        params.extend(minhas)
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas:
+            unidades = ",".join("?" for _ in permitidas)
+            # Vê a unidade dele e também o próprio feedback, que é da unidade dele mesmo.
+            sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
+            params.extend(permitidas)
+            params.extend(minhas)
+
+    if kind in FEEDBACK_KIND_IDS:
+        sql += " AND kind = ?"
+        params.append(kind)
+    if competence:
+        sql += " AND competence = ?"
+        params.append(competence)
+    if person:
+        sql += " AND UPPER(person_name) LIKE ?"
+        params.append(f"%{person.upper()}%")
+
+    sql += " ORDER BY competence DESC, person_name LIMIT 300"
+
+    resultado = []
+    for row in conn.execute(sql, params).fetchall():
+        fb = feedback_row_to_dict(row)
+        fb["isMe"] = fb["personKey"] in set(minhas) or (
+            row["person_user_id"] is not None and row["person_user_id"] == user["id"]
+        )
+        fb["ratingSummary"] = {
+            nivel["id"]: conn.execute(
+                "SELECT COUNT(*) n FROM feedback_ratings WHERE feedback_id = ? AND level = ?",
+                (fb["id"], nivel["id"]),
+            ).fetchone()["n"]
+            for nivel in _mec_content().FEEDBACK_LEVELS
+        }
+        fb["hasNote"] = bool(fb["personNote"])
+        fb["hasConfidentialNote"] = bool(normalize_whitespace(row["confidential_note"]))
+        resultado.append(fb)
+    return resultado
+
+
+def count_pending_feedback_ack(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row) -> int:
+    chaves = user_person_keys(user)
+    marcadores = ",".join("?" for _ in chaves) or "''"
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) n FROM feedbacks
+        WHERE company_id = ? AND status = 'PUBLICADO'
+          AND (person_user_id = ? OR person_key IN ({marcadores}))
+          AND (acknowledged_at IS NULL OR acknowledged_at = '')
+        """,
+        (company_id, user["id"], *chaves),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def save_feedback(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão registra feedback.")
+
+    kind = normalize_upper(payload.get("kind")) or "VENDEDOR"
+    if kind not in FEEDBACK_KIND_IDS:
+        raise ValueError("Tipo de feedback inválido.")
+    # Feedback de gerente é conversa de diretoria — gerente não avalia gerente.
+    if kind == "GERENTE" and not user_can_manage_users(conn, user):
+        raise PermissionError("Feedback de gerente é conduzido pela diretoria.")
+
+    person_name = normalize_whitespace(payload.get("personName"))
+    if not person_name:
+        raise ValueError("Selecione quem vai receber o feedback.")
+    competence = normalize_whitespace(payload.get("competence"))
+    if not competence or len(competence) != 7:
+        raise ValueError("Informe a competência no formato AAAA-MM.")
+
+    chave = person_key(person_name)
+    unidade = normalize_unit(payload.get("unitName")) or None
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is not None:
+        if not permitidas:
+            raise ValueError("Seu usuário não tem unidade vinculada. Peça ao administrador para vincular.")
+        if unidade not in permitidas:
+            unidade = permitidas[0]
+
+    # Foto dos indicadores no momento do feedback. Guardada junto porque o
+    # dashboard muda com novas importações — e a conversa precisa continuar
+    # fazendo sentido daqui a seis meses.
+    if kind == "VENDEDOR":
+        indicadores = seller_indicators_for_feedback(conn, company_id, person_name, competence)
+    else:
+        indicadores = unit_indicators_for_feedback(conn, company_id, unidade or "", competence)
+
+    existente = conn.execute(
+        "SELECT id, status FROM feedbacks WHERE company_id = ? AND kind = ? AND competence = ? AND person_key = ?",
+        (company_id, kind, competence, chave),
+    ).fetchone()
+
+    campos = (
+        normalize_whitespace(payload.get("highlights")),
+        normalize_whitespace(payload.get("improvements")),
+        normalize_whitespace(payload.get("agreements")),
+        normalize_whitespace(payload.get("tacticalGoal")),
+        normalize_whitespace(payload.get("tacticalReality")),
+        normalize_whitespace(payload.get("tacticalOptions")),
+        normalize_whitespace(payload.get("tacticalWill")),
+        json.dumps(indicadores, ensure_ascii=False),
+    )
+
+    if existente:
+        feedback_id = int(existente["id"])
+        conn.execute(
+            """
+            UPDATE feedbacks SET highlights=?, improvements=?, agreements=?,
+                   tactical_goal=?, tactical_reality=?, tactical_options=?, tactical_will=?,
+                   indicators_json=?, unit_name=?, updated_at=?
+            WHERE id = ?
+            """,
+            (*campos, unidade, now_iso(), feedback_id),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO feedbacks (company_id, kind, competence, person_name, person_key,
+                person_user_id, unit_name, author_name, author_user_id,
+                highlights, improvements, agreements,
+                tactical_goal, tactical_reality, tactical_options, tactical_will,
+                indicators_json, status, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'RASCUNHO', ?)
+            """,
+            (company_id, kind, competence, person_name, chave,
+             resolve_user_for_person(conn, company_id, person_name), unidade,
+             meeting_person_identity(user), user["id"], *campos, now_iso()),
+        )
+        feedback_id = int(cursor.lastrowid)
+
+    validos = {i["id"] for i in feedback_items_for_kind(kind)}
+    for item_id, dados in (payload.get("ratings") or {}).items():
+        if item_id not in validos:
+            continue
+        nivel = normalize_upper((dados or {}).get("level"))
+        if nivel not in _mec_content().FEEDBACK_LEVEL_IDS:
+            continue
+        conn.execute(
+            """
+            INSERT INTO feedback_ratings (feedback_id, item_id, level, comment)
+            VALUES (?,?,?,?)
+            ON CONFLICT(feedback_id, item_id) DO UPDATE SET
+                level = excluded.level, comment = excluded.comment
+            """,
+            (feedback_id, item_id, nivel, normalize_whitespace((dados or {}).get("comment"))),
+        )
+
+    audit_log(conn, company_id, user["id"], "salvar", "feedbacks", str(feedback_id),
+              {"pessoa": person_name, "competencia": competence, "tipo": kind})
+    conn.commit()
+    return {"feedbackId": feedback_id}
+
+
+def publish_feedback(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, feedback_id: int
+) -> dict[str, Any]:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão publica feedback.")
+    fb = conn.execute(
+        "SELECT * FROM feedbacks WHERE company_id = ? AND id = ?", (company_id, feedback_id)
+    ).fetchone()
+    if not fb:
+        raise ValueError("Feedback não encontrado.")
+
+    avaliados = conn.execute(
+        "SELECT COUNT(*) n FROM feedback_ratings WHERE feedback_id = ?", (feedback_id,)
+    ).fetchone()["n"]
+    total = len(feedback_items_for_kind(fb["kind"]))
+    if avaliados < total:
+        raise ValueError(f"Faltam {total - avaliados} item(ns) para avaliar antes de publicar.")
+    if not normalize_whitespace(fb["agreements"]):
+        raise ValueError("Preencha o que ficou combinado — é o que o vendedor leva da conversa.")
+
+    conn.execute(
+        "UPDATE feedbacks SET status='PUBLICADO', published_at=?, updated_at=? WHERE id=?",
+        (now_iso(), now_iso(), feedback_id),
+    )
+    audit_log(conn, company_id, user["id"], "publicar", "feedbacks", str(feedback_id), {})
+    conn.commit()
+    return {"published": True}
+
+
+def acknowledge_feedback(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    feedback_id: int, note: str = "", confidential: str = "",
+) -> dict[str, Any]:
+    """Ciência do avaliado, com dois canais de retorno separados.
+
+    `note` vai para o gestor. `confidential` NÃO — fica visível apenas para quem
+    gerencia usuários. Quem escreve precisa ter certeza de para onde vai, ou não
+    escreve nada de útil.
+    """
+    fb = conn.execute(
+        "SELECT * FROM feedbacks WHERE company_id = ? AND id = ?", (company_id, feedback_id)
+    ).fetchone()
+    if not fb:
+        raise ValueError("Feedback não encontrado.")
+    if fb["status"] != "PUBLICADO":
+        raise ValueError("Este feedback ainda não foi publicado.")
+
+    minhas = set(user_person_keys(user))
+    sou_eu = fb["person_key"] in minhas or (
+        fb["person_user_id"] is not None and fb["person_user_id"] == user["id"]
+    )
+    if not sou_eu:
+        raise ValueError("Este feedback não é seu.")
+
+    texto = normalize_whitespace(note)
+    sigilo = normalize_whitespace(confidential)
+    conn.execute(
+        """
+        UPDATE feedbacks
+        SET acknowledged_at   = COALESCE(NULLIF(acknowledged_at, ''), ?),
+            person_note       = CASE WHEN ? <> '' THEN ? ELSE person_note END,
+            confidential_note = CASE WHEN ? <> '' THEN ? ELSE confidential_note END,
+            note_at           = CASE WHEN ? <> '' OR ? <> '' THEN ? ELSE note_at END
+        WHERE id = ?
+        """,
+        (now_iso(), texto, texto, sigilo, sigilo, texto, sigilo, now_iso(), feedback_id),
+    )
+    # A auditoria registra que existe uma confidencial, nunca o conteúdo dela.
+    audit_log(conn, company_id, user["id"], "ciencia", "feedbacks", str(feedback_id),
+              {"comObservacao": bool(texto), "comConfidencial": bool(sigilo)})
+    conn.commit()
+    return {"acknowledged": True, "hasNote": bool(texto), "hasConfidential": bool(sigilo)}
+
+
+def delete_feedback(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, feedback_id: int) -> None:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão exclui feedback.")
+    conn.execute("DELETE FROM feedback_ratings WHERE feedback_id = ?", (feedback_id,))
+    conn.execute("DELETE FROM feedbacks WHERE company_id = ? AND id = ?", (company_id, feedback_id))
+    audit_log(conn, company_id, user["id"], "excluir", "feedbacks", str(feedback_id), {})
+    conn.commit()
+
+
+# ── PDI ──────────────────────────────────────────────────────────────────────
+
+def list_pdi_items(
+    conn: sqlite3.Connection, company_id: int, person_key_value: str, include_closed: bool = True
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM pdi_items WHERE company_id = ? AND person_key = ?"
+    params: list[Any] = [company_id, person_key_value]
+    if not include_closed:
+        sql += " AND status IN ('ABERTO','EVOLUINDO')"
+    sql += " ORDER BY CASE status WHEN 'EVOLUINDO' THEN 0 WHEN 'ABERTO' THEN 1 ELSE 2 END, date(due_date)"
+    hoje = today_in_brazil().isoformat()
+    return [
+        {
+            "id": int(r["id"]),
+            "personName": r["person_name"],
+            "title": r["title"],
+            "why": r["why"] or "",
+            "action": r["action"] or "",
+            "support": r["support"] or "",
+            "dueDate": r["due_date"] or "",
+            "status": r["status"],
+            "progressNote": r["progress_note"] or "",
+            "createdAt": r["created_at"],
+            "closedAt": r["closed_at"] or "",
+            "overdue": bool(r["due_date"] and r["status"] in ("ABERTO", "EVOLUINDO")
+                            and r["due_date"] < hoje),
+        }
+        for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def save_pdi_item(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão mantém o PDI.")
+    titulo = normalize_whitespace(payload.get("title"))
+    if not titulo:
+        raise ValueError("Informe o que precisa ser desenvolvido.")
+    person_name = normalize_whitespace(payload.get("personName"))
+    if not person_name:
+        raise ValueError("Informe a pessoa do PDI.")
+    chave = person_key(person_name)
+    status = normalize_upper(payload.get("status")) or "ABERTO"
+    if status not in PDI_STATUS_IDS:
+        status = "ABERTO"
+
+    item_id = payload.get("id")
+    if not item_id:
+        ativos = conn.execute(
+            "SELECT COUNT(*) n FROM pdi_items WHERE company_id = ? AND person_key = ? "
+            "AND status IN ('ABERTO','EVOLUINDO')",
+            (company_id, chave),
+        ).fetchone()["n"]
+        if ativos >= PDI_MAX_ACTIVE:
+            raise ValueError(
+                f"{person_name} já tem {ativos} pontos de desenvolvimento em aberto. "
+                f"Conclua um antes de abrir outro — plano com mais de {PDI_MAX_ACTIVE} frentes não sai do lugar."
+            )
+
+    campos = (
+        person_name, chave,
+        normalize_unit(payload.get("unitName")) or None,
+        titulo,
+        normalize_whitespace(payload.get("why")),
+        normalize_whitespace(payload.get("action")),
+        normalize_whitespace(payload.get("support")),
+        normalize_whitespace(payload.get("dueDate")) or None,
+        status,
+        normalize_whitespace(payload.get("progressNote")),
+    )
+    fechado = now_iso() if status in ("CONCLUIDO", "CANCELADO") else None
+
+    if item_id:
+        conn.execute(
+            """
+            UPDATE pdi_items SET person_name=?, person_key=?, unit_name=?, title=?, why=?,
+                   action=?, support=?, due_date=?, status=?, progress_note=?,
+                   updated_at=?, closed_at=?
+            WHERE company_id = ? AND id = ?
+            """,
+            (*campos, now_iso(), fechado, company_id, int(item_id)),
+        )
+        novo_id = int(item_id)
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO pdi_items (person_name, person_key, unit_name, title, why, action,
+                support, due_date, status, progress_note, company_id, origin_feedback_id,
+                created_by_user_id, created_at, closed_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (*campos, company_id, payload.get("originFeedbackId"), user["id"], now_iso(), fechado),
+        )
+        novo_id = int(cursor.lastrowid)
+
+    audit_log(conn, company_id, user["id"], "salvar", "pdi_items", str(novo_id),
+              {"pessoa": person_name, "status": status})
+    conn.commit()
+    return {"pdiId": novo_id}
+
+
+def delete_pdi_item(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, pdi_id: int) -> None:
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão mantém o PDI.")
+    conn.execute("DELETE FROM pdi_items WHERE company_id = ? AND id = ?", (company_id, pdi_id))
     conn.commit()
 
 
@@ -10439,6 +11209,51 @@ class AppHandler(BaseHTTPRequestHandler):
                     "canEdit": can_edit,
                 }))
                 return
+            if path == "/api/feedback":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    pode_dar = user_can_give_feedback(conn, user)
+                    competencias = query_competences(conn, user["company_id"])
+                    payload = {
+                        "feedbacks": list_feedbacks(
+                            conn, user["company_id"], user,
+                            kind=normalize_upper(query.get("kind", [""])[0]),
+                            competence=normalize_whitespace(query.get("competence", [""])[0]),
+                            person=normalize_whitespace(query.get("person", [""])[0]),
+                        ),
+                        "kinds": FEEDBACK_KINDS,
+                        "levels": _mec_content().FEEDBACK_LEVELS,
+                        "pdiStatuses": PDI_STATUSES,
+                        "pdiMaxActive": PDI_MAX_ACTIVE,
+                        "canGive": pode_dar,
+                        "canGiveManagerFeedback": user_can_manage_users(conn, user),
+                        "canReadConfidential": user_can_read_confidential(conn, user),
+                        "pendingCount": count_pending_feedback_ack(conn, user["company_id"], user),
+                        "myName": meeting_person_identity(user),
+                        "people": list_meeting_people(conn, user["company_id"], user) if pode_dar else [],
+                        "units": meeting_units_for_user(conn, user)["units"] if pode_dar else [],
+                        "competences": competencias,
+                        "latestCompetence": competencias[-1] if competencias else "",
+                    }
+                self._set_headers(200)
+                self.wfile.write(json_dumps(payload))
+                return
+            if path == "/api/feedback/pdi":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                nome = normalize_whitespace(query.get("person", [""])[0])
+                with closing(get_connection()) as conn:
+                    if not nome and data_scope_for_user(conn, user) == "proprio":
+                        nome = meeting_person_identity(user)
+                    itens = list_pdi_items(conn, user["company_id"], person_key(nome)) if nome else []
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"items": itens, "personName": nome}))
+                return
             if path == "/api/meetings":
                 user = self._require_auth()
                 if not user:
@@ -11483,6 +12298,83 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in ("/api/feedback/save", "/api/feedback/publish", "/api/feedback/detail",
+                        "/api/feedback/acknowledge", "/api/feedback/delete",
+                        "/api/feedback/pdi/save", "/api/feedback/pdi/delete",
+                        "/api/feedback/preview"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/feedback/save":
+                            resultado = save_feedback(conn, user["company_id"], user, payload)
+                        elif path == "/api/feedback/publish":
+                            resultado = publish_feedback(
+                                conn, user["company_id"], user, int(payload.get("feedbackId") or 0))
+                        elif path == "/api/feedback/detail":
+                            fb = load_feedback(
+                                conn, user["company_id"], int(payload.get("feedbackId") or 0), user)
+                            if fb and data_scope_for_user(conn, user) == "proprio":
+                                # Vendedor abre só o próprio, e só publicado.
+                                if not fb["isMe"] or fb["status"] != "PUBLICADO":
+                                    fb = None
+                            if not fb:
+                                self._set_headers(404)
+                                self.wfile.write(json_dumps({"error": "Feedback não encontrado."}))
+                                return
+                            resultado = {"feedback": fb}
+                        elif path == "/api/feedback/acknowledge":
+                            resultado = acknowledge_feedback(
+                                conn, user["company_id"], user,
+                                int(payload.get("feedbackId") or 0),
+                                payload.get("note") or "", payload.get("confidential") or "")
+                        elif path == "/api/feedback/delete":
+                            delete_feedback(conn, user["company_id"], user, int(payload.get("feedbackId") or 0))
+                            resultado = {}
+                        elif path == "/api/feedback/pdi/save":
+                            resultado = save_pdi_item(conn, user["company_id"], user, payload)
+                        elif path == "/api/feedback/pdi/delete":
+                            delete_pdi_item(conn, user["company_id"], user, int(payload.get("pdiId") or 0))
+                            resultado = {}
+                        else:
+                            # Prévia dos indicadores antes de abrir o feedback: o gerente
+                            # olha os números da pessoa sem precisar criar registro.
+                            if not user_can_give_feedback(conn, user):
+                                raise PermissionError("Apenas gestão consulta a prévia.")
+                            kind = normalize_upper(payload.get("kind")) or "VENDEDOR"
+                            competence = normalize_whitespace(payload.get("competence"))
+                            if kind == "GERENTE":
+                                indicadores = unit_indicators_for_feedback(
+                                    conn, user["company_id"],
+                                    normalize_whitespace(payload.get("unitName")), competence)
+                            else:
+                                indicadores = seller_indicators_for_feedback(
+                                    conn, user["company_id"],
+                                    normalize_whitespace(payload.get("personName")), competence)
+                            resultado = {
+                                "indicators": indicadores,
+                                "guidance": feedback_guidance(indicadores) if kind == "VENDEDOR" else [],
+                                "items": feedback_items_for_kind(kind),
+                                "groups": feedback_groups_for_kind(kind),
+                                "script": (_mec_content().FEEDBACK_SCRIPT_MANAGER if kind == "GERENTE"
+                                           else _mec_content().FEEDBACK_SCRIPT_SELLER),
+                                "pdi": list_pdi_items(
+                                    conn, user["company_id"],
+                                    person_key(payload.get("personName") or "")),
+                            }
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path == "/api/meetings/save":
                 user = self._require_auth()

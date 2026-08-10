@@ -10,6 +10,11 @@ const state = {
   meetingEditor: null,    // ata em edição (gestão)
   meetingDetail: null,    // ata aberta para leitura/ciência
   meetingFilters: { search: "", kind: "", from: "", to: "", mine: false },
+  feedback: null,         // feedbacks + PDI + catálogo do MEC
+  feedbackEditor: null,   // feedback em edição (gestão)
+  feedbackDetail: null,   // feedback aberto para leitura/ciência
+  pdiEditor: null,        // ponto de desenvolvimento em edição
+  feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
   teamScore: null,
   missionProgress: { contactsToday: 0 },
@@ -40,6 +45,7 @@ const state = {
       integrityAudit: false,
       filters: false,
       meetings: false,
+      feedback: false,
     },
     executiveSections: {
       details: false,
@@ -383,9 +389,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "reunioes", "calendario"]);
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "reunioes", "feedback", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "reunioes", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -496,6 +502,7 @@ async function bootstrap() {
     // Em background: alimenta o contador de ciência pendente no menu sem
     // atrasar a abertura do sistema.
     loadMeetings(true);
+    loadFeedback(true);
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
@@ -4727,6 +4734,830 @@ function ataDetalheModal() {
     </div>`;
 }
 
+// ─── Feedback e PDI ─────────────────────────────────────────────────────────
+//
+// Três telas na mesma view:
+//  - Gestão: lista quem já recebeu feedback no mês e quem falta; abre o
+//    formulário com os indicadores da pessoa já carregados e o guia da conversa.
+//  - Avaliado: lê o próprio feedback, dá ciência e escolhe para quem manda
+//    observação — gestor ou diretoria.
+//  - PDI: pontos de desenvolvimento vivos, que atravessam os meses.
+
+async function loadFeedback(silencioso) {
+  const f = state.feedbackFilters;
+  const q = new URLSearchParams();
+  if (f.kind) q.set("kind", f.kind);
+  if (f.competence) q.set("competence", f.competence);
+  if (f.person) q.set("person", f.person);
+  if (!silencioso) state.ui.loading.feedback = true;
+  try {
+    state.feedback = await api(`/api/feedback?${q.toString()}`);
+    if (!state.feedbackFilters.competence && state.feedback.latestCompetence) {
+      state.feedbackFilters.competence = state.feedback.latestCompetence;
+    }
+  } catch (e) {
+    state.feedback = { error: e.message, feedbacks: [], kinds: [], levels: [], people: [] };
+  } finally {
+    state.ui.loading.feedback = false;
+    requestRender();
+  }
+}
+
+function setFeedbackCompetence(valor) {
+  state.feedbackFilters.competence = valor;
+  loadFeedback();
+}
+
+function setFeedbackKind(kind) {
+  state.feedbackFilters.kind = state.feedbackFilters.kind === kind ? "" : kind;
+  loadFeedback();
+}
+
+function applyFeedbackPersonSearch() {
+  const campo = document.getElementById("feedback-person-search");
+  state.feedbackFilters.person = campo ? campo.value.trim() : "";
+  loadFeedback();
+}
+
+// ─── Formulário do gestor ───────────────────────────────────────────────────
+
+async function novoFeedback(kind, personName, unitName) {
+  const competence = state.feedbackFilters.competence || state.feedback?.latestCompetence || "";
+  state.feedbackEditor = {
+    id: null, kind, personName: personName || "", unitName: unitName || "",
+    competence, highlights: "", improvements: "", agreements: "",
+    tacticalGoal: "", tacticalReality: "", tacticalOptions: "", tacticalWill: "",
+    ratings: {}, indicators: {}, guidance: [], items: [], groups: [], script: [], pdi: [],
+    status: "RASCUNHO", saving: false, loading: true, tab: "conversa",
+  };
+  requestRender();
+  await carregarPreviaFeedback();
+}
+
+async function carregarPreviaFeedback() {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  try {
+    const r = await api("/api/feedback/preview", {
+      method: "POST",
+      body: JSON.stringify({
+        kind: e.kind, personName: e.personName, unitName: e.unitName, competence: e.competence,
+      }),
+    });
+    Object.assign(e, {
+      indicators: r.indicators || {}, guidance: r.guidance || [],
+      items: r.items || [], groups: r.groups || [], script: r.script || [], pdi: r.pdi || [],
+      loading: false,
+    });
+  } catch (err) {
+    e.loading = false;
+    addMessage("error", err.message);
+  }
+  requestRender();
+}
+
+async function editarFeedback(feedbackId) {
+  try {
+    const r = await api("/api/feedback/detail", {
+      method: "POST", body: JSON.stringify({ feedbackId }),
+    });
+    const fb = r.feedback;
+    state.feedbackEditor = {
+      id: fb.id, kind: fb.kind, personName: fb.personName, unitName: fb.unitName,
+      competence: fb.competence, highlights: fb.highlights, improvements: fb.improvements,
+      agreements: fb.agreements, tacticalGoal: fb.tacticalGoal, tacticalReality: fb.tacticalReality,
+      tacticalOptions: fb.tacticalOptions, tacticalWill: fb.tacticalWill,
+      ratings: fb.ratings || {}, indicators: fb.indicators || {}, guidance: fb.guidance || [],
+      items: fb.items || [], groups: fb.groups || [], script: fb.script || [], pdi: fb.pdi || [],
+      status: fb.status, saving: false, loading: false, tab: "conversa",
+    };
+    requestRender();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function fecharFeedbackEditor() { state.feedbackEditor = null; requestRender(); }
+function setFeedbackTab(aba) { if (state.feedbackEditor) { state.feedbackEditor.tab = aba; requestRender(); } }
+
+function marcarNivel(itemId, level) {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  const atual = e.ratings[itemId] || {};
+  e.ratings[itemId] = { ...atual, level: atual.level === level ? "" : level };
+  if (!e.ratings[itemId].level) delete e.ratings[itemId];
+  requestRender();
+}
+
+async function salvarFeedback(depoisPublicar) {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  if (!e.personName) { addMessage("error", "Selecione a pessoa."); return; }
+  e.saving = true; requestRender();
+  try {
+    const r = await api("/api/feedback/save", { method: "POST", body: JSON.stringify(e) });
+    e.id = r.feedbackId;
+    if (depoisPublicar) {
+      await api("/api/feedback/publish", { method: "POST", body: JSON.stringify({ feedbackId: r.feedbackId }) });
+      addMessage("success", `Feedback publicado. ${e.personName} recebeu a pendência de ciência.`);
+      state.feedbackEditor = null;
+    } else {
+      addMessage("success", "Rascunho salvo.");
+      e.status = "RASCUNHO";
+    }
+    await loadFeedback(true);
+  } catch (err) {
+    addMessage("error", err.message);
+  } finally {
+    if (state.feedbackEditor) state.feedbackEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirFeedback(feedbackId) {
+  if (!confirm("Excluir este feedback? A ação não pode ser desfeita.")) return;
+  try {
+    await api("/api/feedback/delete", { method: "POST", body: JSON.stringify({ feedbackId }) });
+    state.feedbackEditor = null; state.feedbackDetail = null;
+    addMessage("success", "Feedback excluído.");
+    await loadFeedback(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+// ─── Leitura e ciência ──────────────────────────────────────────────────────
+
+async function abrirFeedback(feedbackId) {
+  try {
+    const r = await api("/api/feedback/detail", { method: "POST", body: JSON.stringify({ feedbackId }) });
+    state.feedbackDetail = { ...r.feedback, saving: false };
+    requestRender();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function fecharFeedbackDetalhe() { state.feedbackDetail = null; requestRender(); }
+
+async function darCienciaFeedback() {
+  const d = state.feedbackDetail;
+  if (!d) return;
+  const note = document.getElementById("feedback-note")?.value.trim() || "";
+  const conf = document.getElementById("feedback-confidential")?.value.trim() || "";
+  d.saving = true; requestRender();
+  try {
+    const r = await api("/api/feedback/acknowledge", {
+      method: "POST", body: JSON.stringify({ feedbackId: d.id, note, confidential: conf }),
+    });
+    let msg = "Ciência registrada.";
+    if (r.hasNote && r.hasConfidential) msg = "Ciência registrada. Sua observação foi para o gestor e a confidencial para a diretoria.";
+    else if (r.hasNote) msg = "Ciência registrada e observação enviada ao gestor.";
+    else if (r.hasConfidential) msg = "Ciência registrada. Sua observação foi apenas para a diretoria.";
+    addMessage("success", msg);
+    state.feedbackDetail = null;
+    await loadFeedback(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.feedbackDetail) state.feedbackDetail.saving = false;
+    requestRender();
+  }
+}
+
+// ─── PDI ────────────────────────────────────────────────────────────────────
+
+function novoPdi(personName, unitName, feedbackId) {
+  state.pdiEditor = {
+    id: null, personName: personName || "", unitName: unitName || "",
+    title: "", why: "", action: "", support: state.feedback?.myName || "",
+    dueDate: dateInDays(30), status: "ABERTO", progressNote: "",
+    originFeedbackId: feedbackId || null, saving: false,
+  };
+  requestRender();
+}
+
+function editarPdi(item, personName, unitName) {
+  state.pdiEditor = { ...item, personName: item.personName || personName, unitName: unitName || "", saving: false };
+  requestRender();
+}
+
+function fecharPdiEditor() { state.pdiEditor = null; requestRender(); }
+
+async function salvarPdi() {
+  const p = state.pdiEditor;
+  if (!p) return;
+  if (!p.title.trim()) { addMessage("error", "Informe o que precisa ser desenvolvido."); return; }
+  p.saving = true; requestRender();
+  try {
+    await api("/api/feedback/pdi/save", { method: "POST", body: JSON.stringify(p) });
+    addMessage("success", "PDI salvo.");
+    state.pdiEditor = null;
+    if (state.feedbackEditor) await carregarPreviaFeedback();
+    await loadFeedback(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.pdiEditor) state.pdiEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirPdi(pdiId) {
+  if (!confirm("Excluir este ponto do PDI?")) return;
+  try {
+    await api("/api/feedback/pdi/delete", { method: "POST", body: JSON.stringify({ pdiId }) });
+    if (state.feedbackEditor) await carregarPreviaFeedback();
+    await loadFeedback(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+// ─── Componentes ────────────────────────────────────────────────────────────
+
+function nivelConfig(levelId) {
+  return (state.feedback?.levels || []).find((n) => n.id === levelId)
+    || { id: "", label: "—", icon: "○", color: "#5f6368", bg: "#f1f3f4" };
+}
+
+function nivelBadge(levelId) {
+  const n = nivelConfig(levelId);
+  return `<span class="status-tag" style="background:${n.bg};color:${n.color}">${n.icon} ${escapeHtml(n.label)}</span>`;
+}
+
+function pdiStatusBadge(status) {
+  const s = (state.feedback?.pdiStatuses || []).find((x) => x.id === status)
+    || { label: status, color: "#5f6368", bg: "#f1f3f4" };
+  return `<span class="status-tag" style="background:${s.bg};color:${s.color}">${escapeHtml(s.label)}</span>`;
+}
+
+/** Linha de indicador com o valor, a referência e a leitura em uma frase. */
+function indicadorLinha(rotulo, valor, referencia, ok) {
+  return `
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+                padding:6px 0;border-bottom:1px solid var(--line);font-size:13px">
+      <span style="color:var(--muted)">${escapeHtml(rotulo)}</span>
+      <span style="text-align:right">
+        <strong style="color:${ok === false ? "var(--bad)" : ok === true ? "var(--good)" : "inherit"}">${valor}</strong>
+        ${referencia ? `<span class="text-small" style="color:var(--muted);display:block">${referencia}</span>` : ""}
+      </span>
+    </div>`;
+}
+
+function painelIndicadores(ind, kind) {
+  if (!ind || !ind.found) {
+    return `<div class="message" style="font-size:12px">
+      Sem números para esta competência. O feedback pode ser feito assim mesmo, mas a conversa fica sem base.
+    </div>`;
+  }
+  if (kind === "GERENTE") {
+    const ritos = ind.feedbacksExpected
+      ? `${ind.feedbacksDone} de ${ind.feedbacksExpected} vendedores` : "—";
+    return `
+      <div>
+        ${indicadorLinha("Faturamento líquido", currency(ind.revenueNet), `meta ${currency(ind.revenueGoal)}`)}
+        ${indicadorLinha("Atingimento", pct(ind.goalAttainmentPct), "", Number(ind.goalAttainmentPct) >= 95)}
+        ${indicadorLinha("Devolução", pct(ind.returnsPct), "", Number(ind.returnsPct) <= 3)}
+        ${indicadorLinha("Desconto médio", pct(ind.discountPct), "")}
+        ${indicadorLinha("Ticket médio", currency(ind.ticketAverage), "")}
+        ${indicadorLinha("Feedbacks do mês", ritos, "", ind.feedbacksDone >= ind.feedbacksExpected)}
+        ${indicadorLinha("Reuniões registradas", number(ind.meetingsPublished), "", ind.meetingsPublished > 0)}
+        ${indicadorLinha("PDIs ativos", number(ind.pdiActive), ind.pdiOverdue ? `${ind.pdiOverdue} com prazo vencido` : "", ind.pdiOverdue === 0)}
+      </div>`;
+  }
+  const metaCalls = Number(ind.callsTarget || 60);
+  return `
+    <div>
+      ${indicadorLinha("Faturamento líquido", currency(ind.revenueNet), `meta ${currency(ind.revenueGoal)}`)}
+      ${indicadorLinha("Atingimento", pct(ind.goalAttainmentPct), "", Number(ind.goalAttainmentPct) >= 95)}
+      ${indicadorLinha("Ligações no mês", `${number(ind.calls)}`, `mínimo do MEC: ${metaCalls}`, Number(ind.calls) >= metaCalls)}
+      ${indicadorLinha("Contatos registrados", number(ind.contacts), "")}
+      ${indicadorLinha("Clientes atendidos", number(ind.distinctClients), `média da unidade: ${number(ind.distinctClientsUnit)}`, Number(ind.distinctClients) >= Number(ind.distinctClientsUnit))}
+      ${indicadorLinha("Ticket médio", currency(ind.ticketAverage), `unidade: ${currency(ind.ticketAverageUnit)}`, Number(ind.ticketAverage) >= Number(ind.ticketAverageUnit))}
+      ${indicadorLinha("Devolução", pct(ind.returnsPct), "", Number(ind.returnsPct) <= 3)}
+      ${indicadorLinha("Desconto", pct(ind.discountPct), `unidade: ${pct(ind.discountPctUnit)}`, Number(ind.discountPct) <= Number(ind.discountPctUnit))}
+      ${indicadorLinha("Carteira", `${number(ind.portfolioActive)} ativos`, `${number(ind.portfolioPreInactive)} pré-inativos · ${number(ind.portfolioInactive)} inativos`)}
+    </div>`;
+}
+
+function painelGuia(guidance) {
+  if (!guidance?.length) return "";
+  return `
+    <div class="stack" style="margin-top:8px">
+      ${guidance.map((g) => `
+        <div style="border-left:3px solid var(--accent);background:#f5f9ff;border-radius:0 6px 6px 0;padding:8px 12px">
+          <div style="font-weight:700;font-size:13px;color:var(--accent)">${escapeHtml(g.titulo)}</div>
+          <div style="font-size:12px;line-height:1.5;margin-top:4px">${escapeHtml(g.leitura)}</div>
+          <div style="font-size:12px;margin-top:6px"><strong>Perguntar:</strong>
+            <ul style="margin:4px 0 0 16px;padding:0">
+              ${g.perguntar.map((p) => `<li>${escapeHtml(p)}</li>`).join("")}
+            </ul>
+          </div>
+          <div style="font-size:12px;margin-top:6px"><strong>Combinar:</strong> ${escapeHtml(g.combinar)}</div>
+        </div>`).join("")}
+    </div>`;
+}
+
+function painelRoteiro(script) {
+  if (!script?.length) return "";
+  return `
+    <div class="stack" style="margin-top:8px">
+      ${script.map((s) => `
+        <div style="display:flex;gap:10px;font-size:12px;padding:6px 0;border-bottom:1px solid var(--line)">
+          <div style="min-width:150px;font-weight:700">${escapeHtml(s.etapa)}
+            <span style="color:var(--muted);font-weight:400;display:block">${escapeHtml(s.tempo)}</span></div>
+          <div style="line-height:1.5">${escapeHtml(s.texto)}</div>
+        </div>`).join("")}
+    </div>`;
+}
+
+function painelPdi(itens, personName, unitName, feedbackId, podeEditar) {
+  const ativos = (itens || []).filter((i) => ["ABERTO", "EVOLUINDO"].includes(i.status));
+  const fechados = (itens || []).filter((i) => !["ABERTO", "EVOLUINDO"].includes(i.status));
+  const max = state.feedback?.pdiMaxActive || 3;
+  return `
+    <div class="subtle-card padded-card" style="margin-top:10px">
+      <div class="section-title">
+        <div><h3>🎯 PDI — plano de desenvolvimento</h3>
+          <div class="text-small">${ativos.length} de ${max} pontos ativos. O plano continua vivo entre um feedback e outro.</div></div>
+        ${podeEditar && ativos.length < max ? `
+          <button class="btn btn-secondary btn-sm" onclick="novoPdi('${jsAttr(personName)}','${jsAttr(unitName || "")}',${feedbackId || "null"})">Novo ponto</button>` : ""}
+      </div>
+      <div class="stack" style="margin-top:8px">
+        ${ativos.map((i) => `
+          <div style="border-left:3px solid ${i.overdue ? "var(--bad)" : "var(--accent)"};
+                      background:#fafbfc;border-radius:0 6px 6px 0;padding:8px 12px">
+            <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:start">
+              <div style="flex:1;min-width:200px">
+                <div style="font-weight:700;font-size:13px">${escapeHtml(i.title)}</div>
+                ${i.why ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(i.why)}</div>` : ""}
+                ${i.action ? `<div style="font-size:12px;margin-top:4px"><strong>Como:</strong> ${escapeHtml(i.action)}</div>` : ""}
+                ${i.support ? `<div style="font-size:12px"><strong>Apoio:</strong> ${escapeHtml(i.support)}</div>` : ""}
+                ${i.progressNote ? `<div style="font-size:12px;margin-top:4px;color:var(--muted)">Evolução: ${escapeHtml(i.progressNote)}</div>` : ""}
+              </div>
+              <div style="text-align:right">
+                ${pdiStatusBadge(i.status)}
+                ${i.dueDate ? `<div class="text-small" style="color:${i.overdue ? "var(--bad)" : "var(--muted)"};margin-top:4px">
+                  ${i.overdue ? "vencido em " : "até "}${shortDate(i.dueDate)}</div>` : ""}
+              </div>
+            </div>
+            ${podeEditar ? `
+              <div class="actions" style="gap:6px;margin-top:6px">
+                <button class="btn btn-ghost btn-sm" onclick='editarPdi(${JSON.stringify(i).replace(/'/g, "&#39;")},"${jsAttr(personName)}","${jsAttr(unitName || "")}")'>Atualizar</button>
+                <button class="btn btn-ghost btn-sm" onclick="excluirPdi(${i.id})">Excluir</button>
+              </div>` : ""}
+          </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhum ponto de desenvolvimento em aberto.</div>'}
+        ${fechados.length ? `
+          <details style="margin-top:6px">
+            <summary class="text-small" style="cursor:pointer;color:var(--muted)">Histórico (${fechados.length})</summary>
+            ${fechados.map((i) => `
+              <div style="font-size:12px;padding:4px 0;color:var(--muted)">
+                ${pdiStatusBadge(i.status)} ${escapeHtml(i.title)}
+                ${i.closedAt ? ` · ${shortDate(i.closedAt)}` : ""}
+              </div>`).join("")}
+          </details>` : ""}
+      </div>
+    </div>`;
+}
+
+function feedbackView() {
+  if (!state.feedback) { loadFeedback(); return `<div class="loader panel">Carregando feedback…</div>`; }
+  if (state.feedback.error) return `<div class="message error">${escapeHtml(state.feedback.error)}</div>`;
+
+  const podeDar = Boolean(state.feedback.canGive);
+  const f = state.feedbackFilters;
+  const itens = state.feedback.feedbacks || [];
+  const pendentes = itens.filter((x) => x.isMe && x.status === "PUBLICADO" && !x.acknowledgedAt);
+  const meus = itens.filter((x) => x.isMe && !pendentes.includes(x));
+  const daEquipe = itens.filter((x) => !x.isMe);
+
+  // Quem da equipe ainda não recebeu feedback na competência escolhida
+  const jaFeito = new Set(daEquipe.filter((x) => x.competence === f.competence).map((x) => x.personKey));
+  const equipe = (state.feedback.people || []).filter((p) => p.role === "Vendedor");
+  const faltando = equipe.filter((p) => !jaFeito.has(p.personKey));
+
+  return `
+    <div class="stack">
+      ${state.feedbackEditor ? feedbackEditorModal() : ""}
+      ${state.feedbackDetail ? feedbackDetalheModal() : ""}
+      ${state.pdiEditor ? pdiEditorModal() : ""}
+
+      ${pendentes.length ? `
+        <div class="table-card" style="border-left:4px solid #f39c12">
+          <div class="section-title">
+            <div><h3>✋ Seu feedback está aguardando ciência</h3>
+              <div class="text-small">Leia com calma. Você pode responder ao gestor e, se preferir, escrever separadamente para a diretoria.</div></div>
+            <div class="soft-badge" style="background:#fef7e0;color:#b06000">${pendentes.length}</div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${pendentes.map((x) => feedbackCard(x, podeDar)).join("")}
+          </div>
+        </div>` : ""}
+
+      <div class="form-card" style="padding:14px 18px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <span style="font-size:12px;font-weight:700;color:var(--muted)">COMPETÊNCIA</span>
+          <select style="min-width:130px" onchange="setFeedbackCompetence(this.value)">
+            ${(state.feedback.competences || []).slice().reverse().map((c) => `
+              <option value="${escapeHtml(c)}" ${f.competence === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+          </select>
+          ${(state.feedback.kinds || []).map((k) => `
+            <button type="button" onclick="setFeedbackKind('${k.id}')"
+              style="border:1px solid ${f.kind === k.id ? "var(--accent)" : "var(--line)"};
+                     background:${f.kind === k.id ? "var(--accent)" : "#fff"};
+                     color:${f.kind === k.id ? "#fff" : "var(--text)"};
+                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer">
+              ${k.icon} ${escapeHtml(k.label)}
+            </button>`).join("")}
+          ${podeDar ? `
+            <input id="feedback-person-search" style="flex:1;min-width:180px" placeholder="🔍 Buscar por nome — Enter"
+              value="${escapeHtml(f.person)}"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();applyFeedbackPersonSearch();}" />
+            <button class="btn btn-secondary btn-sm" onclick="applyFeedbackPersonSearch()">Buscar</button>` : ""}
+          ${state.feedback.canGiveManagerFeedback ? `
+            <button class="btn btn-secondary btn-sm" onclick="novoFeedback('GERENTE','','')">🎯 Feedback de gerente</button>` : ""}
+        </div>
+      </div>
+
+      ${podeDar && faltando.length && (!f.kind || f.kind === "VENDEDOR") ? `
+        <div class="table-card">
+          <div class="section-title">
+            <div><h3>Ainda sem feedback em ${escapeHtml(f.competence || "—")}</h3>
+              <div class="text-small">O MEC prevê acompanhamento mensal. Clique no nome para começar.</div></div>
+            <div class="soft-badge">${faltando.length}</div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:8px">
+            ${faltando.map((p) => `
+              <button class="btn btn-ghost btn-sm" onclick="novoFeedback('VENDEDOR','${jsAttr(p.personName)}','${jsAttr(p.unitName || "")}')">
+                ＋ ${escapeHtml(p.personName)}
+              </button>`).join("")}
+          </div>
+        </div>` : ""}
+
+      ${meus.length ? `
+        <div class="table-card">
+          <div class="section-title"><div><h3>Meus feedbacks</h3></div></div>
+          <div class="stack" style="padding-top:8px">${meus.map((x) => feedbackCard(x, podeDar)).join("")}</div>
+        </div>` : ""}
+
+      ${podeDar ? `
+        <div class="table-card">
+          <div class="section-title">
+            <div><h3>Feedbacks registrados</h3>
+              <div class="text-small">${daEquipe.length} no filtro atual</div></div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${state.ui.loading.feedback ? '<div class="loader">Buscando…</div>' : ""}
+            ${daEquipe.map((x) => feedbackCard(x, podeDar)).join("")
+              || emptyStateCard("Nenhum feedback registrado nesta competência.")}
+          </div>
+        </div>` : (meus.length || pendentes.length ? "" :
+          emptyStateCard("Você ainda não recebeu nenhum feedback registrado."))}
+    </div>`;
+}
+
+function feedbackCard(x, podeDar) {
+  const pendente = x.isMe && x.status === "PUBLICADO" && !x.acknowledgedAt;
+  const evoluir = x.ratingSummary?.EVOLUIR || 0;
+  const supera = x.ratingSummary?.SUPERA || 0;
+  return `
+    <div class="crm-card clean" style="padding:14px;${pendente ? "border-left:4px solid #f39c12" : ""}">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:10px;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+            <span class="status-tag" style="background:#e8f0fe;color:#1a5276">
+              ${x.kind === "GERENTE" ? "🎯 Gerente" : "👤 Vendedor"}</span>
+            ${x.status === "RASCUNHO" ? '<span class="status-tag warn">Rascunho</span>' : ""}
+            ${pendente ? '<span class="status-tag bad">Sua ciência pendente</span>' : ""}
+            ${x.isMe && x.acknowledgedAt ? '<span class="status-tag good">✓ Você deu ciência</span>' : ""}
+            ${!x.isMe && x.status === "PUBLICADO" ? (x.acknowledgedAt
+              ? '<span class="status-tag good">✓ Ciente</span>'
+              : '<span class="status-tag warn">Aguardando ciência</span>') : ""}
+          </div>
+          <div style="font-weight:700;font-size:14px">${escapeHtml(x.personName)}</div>
+          <div class="text-small">
+            ${escapeHtml(x.competence)}${x.unitName ? ` · ${escapeHtml(x.unitName)}` : ""} · por ${escapeHtml(x.authorName)}
+          </div>
+        </div>
+        <div style="text-align:right;font-size:12px">
+          ${supera ? `<div style="color:var(--good);font-weight:700">▲ ${supera} supera</div>` : ""}
+          ${evoluir ? `<div style="color:var(--bad);font-weight:700">▼ ${evoluir} a evoluir</div>` : ""}
+          ${x.hasNote && podeDar ? '<div style="color:var(--accent);font-weight:600">💬 respondeu</div>' : ""}
+          ${x.hasConfidentialNote && state.feedback?.canReadConfidential
+            ? '<div style="color:#b06000;font-weight:600">🔒 confidencial</div>' : ""}
+        </div>
+      </div>
+      <div class="actions" style="gap:6px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line)">
+        <button class="btn ${pendente ? "btn-primary" : "btn-secondary"} btn-sm" onclick="abrirFeedback(${x.id})">
+          ${pendente ? "✋ Ler e dar ciência" : "Abrir"}
+        </button>
+        ${podeDar && !x.isMe ? `
+          <button class="btn btn-ghost btn-sm" onclick="editarFeedback(${x.id})">Editar</button>
+          <button class="btn btn-ghost btn-sm" onclick="excluirFeedback(${x.id})">Excluir</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function feedbackEditorModal() {
+  const e = state.feedbackEditor;
+  const pessoas = (state.feedback?.people || []);
+  const avaliados = Object.keys(e.ratings || {}).length;
+  const total = (e.items || []).length;
+  const abas = [
+    { id: "conversa", label: "Conversa" },
+    { id: "avaliacao", label: `Avaliação (${avaliados}/${total})` },
+    { id: "pdi", label: `PDI (${(e.pdi || []).filter((i) => ["ABERTO","EVOLUINDO"].includes(i.status)).length})` },
+    { id: "guia", label: "Guia do gestor" },
+  ];
+
+  return `
+    <div class="client-drawer-overlay open" onclick="fecharFeedbackEditor()">
+      <div class="panel" data-keep-scroll="feedback-editor"
+           style="max-width:1000px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>${e.id ? "Editar" : "Novo"} feedback ${e.kind === "GERENTE" ? "de gerente" : "de vendedor"}</h3>
+            <div class="text-small">${e.status === "PUBLICADO"
+              ? "Publicado — a pessoa já pode ler."
+              : "Rascunho. A pessoa só é notificada quando você publicar."}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharFeedbackEditor()">Fechar</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:12px;margin-top:12px">
+          <div class="field"><label>${e.kind === "GERENTE" ? "Gerente" : "Vendedor"} <span style="color:var(--bad)">*</span></label>
+            ${e.id ? `<input value="${escapeHtml(e.personName)}" disabled />`
+              : `<select onchange="state.feedbackEditor.personName=this.value;
+                    state.feedbackEditor.unitName=(this.selectedOptions[0]||{}).dataset?.unit||'';
+                    carregarPreviaFeedback()">
+                  <option value="">Selecione…</option>
+                  ${pessoas.map((p) => `<option value="${escapeHtml(p.personName)}" data-unit="${escapeHtml(p.unitName || "")}"
+                    ${e.personName === p.personName ? "selected" : ""}>${escapeHtml(p.personName)}${p.unitName ? ` · ${escapeHtml(p.unitName)}` : ""}</option>`).join("")}
+                </select>`}
+          </div>
+          <div class="field"><label>Competência</label>
+            <select onchange="state.feedbackEditor.competence=this.value;carregarPreviaFeedback()">
+              ${(state.feedback?.competences || []).slice().reverse().map((c) => `
+                <option value="${escapeHtml(c)}" ${e.competence === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field"><label>Unidade</label>
+            <select onchange="state.feedbackEditor.unitName=this.value;carregarPreviaFeedback()">
+              ${(state.feedback?.units || []).map((u) => `
+                <option value="${escapeHtml(u)}" ${e.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select>
+          </div>
+        </div>
+
+        <div class="subtle-card padded-card" style="margin-top:4px">
+          <div class="section-title"><div><h3>📊 Os números de ${escapeHtml(e.competence || "")}</h3>
+            <div class="text-small">Ficam gravados junto com o feedback — a conversa continua fazendo sentido daqui a seis meses.</div></div></div>
+          ${e.loading ? '<div class="loader">Buscando indicadores…</div>' : painelIndicadores(e.indicators, e.kind)}
+        </div>
+
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px;border-bottom:1px solid var(--line);padding-bottom:8px">
+          ${abas.map((a) => `
+            <button type="button" onclick="setFeedbackTab('${a.id}')"
+              style="border:none;background:${e.tab === a.id ? "var(--accent)" : "transparent"};
+                     color:${e.tab === a.id ? "#fff" : "var(--text)"};border-radius:8px;
+                     padding:6px 14px;font-size:13px;font-weight:600;cursor:pointer">
+              ${escapeHtml(a.label)}
+            </button>`).join("")}
+        </div>
+
+        ${e.tab === "conversa" ? `
+          ${e.kind === "GERENTE" ? `
+            <div class="text-small" style="color:var(--muted);margin-top:10px">
+              Estrutura GROW: objetivo, realidade, caminhos e compromisso. Deixe o gerente propor antes de você dar a solução.
+            </div>
+            <div class="field"><label>Objetivo — onde a unidade precisa chegar</label>
+              <textarea rows="2" style="font-family:inherit" oninput="state.feedbackEditor.tacticalGoal=this.value"
+                placeholder="O destino do próximo trimestre e por quê">${escapeHtml(e.tacticalGoal)}</textarea></div>
+            <div class="field"><label>Realidade — onde estamos hoje</label>
+              <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.tacticalReality=this.value"
+                placeholder="Leitura dos números sem filtro. Peça a versão dele primeiro.">${escapeHtml(e.tacticalReality)}</textarea></div>
+            <div class="field"><label>Caminhos — o que pode ser feito</label>
+              <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.tacticalOptions=this.value"
+                placeholder="Opções levantadas na conversa">${escapeHtml(e.tacticalOptions)}</textarea></div>
+            <div class="field"><label>Compromisso e apoio necessário</label>
+              <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.tacticalWill=this.value"
+                placeholder="O que ele vai fazer, até quando, e o que precisa da diretoria">${escapeHtml(e.tacticalWill)}</textarea></div>
+          ` : ""}
+          <div class="field"><label>O que foi bem</label>
+            <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.highlights=this.value"
+              placeholder="Cite fato e número. Elogio sem dado não é levado a sério.">${escapeHtml(e.highlights)}</textarea></div>
+          <div class="field"><label>O que precisa evoluir</label>
+            <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.improvements=this.value"
+              placeholder="Situação, comportamento e efeito. Descreva o que aconteceu, não como a pessoa é.">${escapeHtml(e.improvements)}</textarea></div>
+          <div class="field"><label>O que ficou combinado <span style="color:var(--bad)">*</span></label>
+            <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.agreements=this.value"
+              placeholder="É o que a pessoa leva da conversa. Sem isso, o feedback vira desabafo.">${escapeHtml(e.agreements)}</textarea></div>
+        ` : ""}
+
+        ${e.tab === "avaliacao" ? `
+          <div class="text-small" style="color:var(--muted);margin-top:10px">
+            ${(state.feedback?.levels || []).map((n) => `<strong style="color:${n.color}">${n.icon} ${escapeHtml(n.label)}</strong>: ${escapeHtml(n.hint)}`).join(" &nbsp;·&nbsp; ")}
+          </div>
+          ${(e.groups || []).map((grupo) => `
+            <div style="margin-top:14px">
+              <div class="eyebrow">${escapeHtml(grupo)}</div>
+              ${(e.items || []).filter((i) => i.group === grupo).map((item) => {
+                const atual = e.ratings[item.id]?.level || "";
+                return `
+                  <div style="padding:8px 0;border-bottom:1px solid var(--line)">
+                    <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+                      <div style="flex:1;min-width:240px">
+                        <div style="font-weight:700;font-size:13px">${escapeHtml(item.label)}</div>
+                        <div class="text-small" style="color:var(--muted)">${escapeHtml(item.hint)}</div>
+                        <div class="text-small" style="color:var(--accent);margin-top:2px">Onde conferir: ${escapeHtml(item.evidence)}</div>
+                      </div>
+                      <div style="display:flex;gap:4px">
+                        ${(state.feedback?.levels || []).map((n) => `
+                          <button type="button" onclick="marcarNivel('${item.id}','${n.id}')"
+                            title="${escapeHtml(n.hint)}"
+                            style="border:1px solid ${atual === n.id ? n.color : "var(--line)"};
+                                   background:${atual === n.id ? n.bg : "#fff"};
+                                   color:${atual === n.id ? n.color : "var(--muted)"};
+                                   border-radius:12px;padding:4px 10px;font-size:12px;
+                                   font-weight:${atual === n.id ? "700" : "500"};cursor:pointer;white-space:nowrap">
+                            ${n.icon} ${escapeHtml(n.label)}
+                          </button>`).join("")}
+                      </div>
+                    </div>
+                    ${atual ? `
+                      <input style="margin-top:6px;font-size:12px" placeholder="Exemplo concreto (opcional, mas é o que dá peso)"
+                        value="${escapeHtml(e.ratings[item.id]?.comment || "")}"
+                        oninput="state.feedbackEditor.ratings['${item.id}'].comment=this.value" />` : ""}
+                  </div>`;
+              }).join("")}
+            </div>`).join("")}
+        ` : ""}
+
+        ${e.tab === "pdi" ? painelPdi(e.pdi, e.personName, e.unitName, e.id, true) : ""}
+
+        ${e.tab === "guia" ? `
+          ${e.guidance?.length ? `
+            <div style="margin-top:12px"><div class="eyebrow">O QUE OS NÚMEROS ESTÃO DIZENDO</div>
+              ${painelGuia(e.guidance)}</div>` : ""}
+          <div style="margin-top:14px"><div class="eyebrow">ROTEIRO DA CONVERSA</div>
+            ${painelRoteiro(e.script)}</div>
+        ` : ""}
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-secondary" ${e.saving ? "disabled" : ""} onclick="salvarFeedback(false)">
+            ${e.saving ? "Salvando…" : "Salvar rascunho"}
+          </button>
+          <button class="btn btn-primary" ${e.saving ? "disabled" : ""} onclick="salvarFeedback(true)">
+            ${e.status === "PUBLICADO" ? "Salvar alterações" : "Publicar para a pessoa"}
+          </button>
+          <button class="btn btn-ghost" onclick="fecharFeedbackEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function feedbackDetalheModal() {
+  const d = state.feedbackDetail;
+  const podeDar = Boolean(state.feedback?.canGive);
+  const jaCiente = Boolean(d.acknowledgedAt);
+  const bloco = (titulo, texto) => texto ? `
+    <div style="margin-top:12px">
+      <div class="eyebrow">${titulo}</div>
+      <div style="white-space:pre-wrap;line-height:1.6;font-size:13px">${escapeHtml(texto)}</div>
+    </div>` : "";
+
+  return `
+    <div class="client-drawer-overlay open" onclick="fecharFeedbackDetalhe()">
+      <div class="panel" data-keep-scroll="feedback-detalhe"
+           style="max-width:900px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>${escapeHtml(d.personName)}</h3>
+            <div class="text-small">${escapeHtml(d.kindLabel)} · ${escapeHtml(d.competence)}
+              ${d.unitName ? ` · ${escapeHtml(d.unitName)}` : ""} · por ${escapeHtml(d.authorName)}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharFeedbackDetalhe()">Fechar</button>
+        </div>
+
+        <div class="subtle-card padded-card" style="margin-top:12px">
+          <div class="section-title"><div><h3>📊 Números de ${escapeHtml(d.competence)}</h3></div></div>
+          ${painelIndicadores(d.indicators, d.kind)}
+        </div>
+
+        ${bloco("OBJETIVO", d.tacticalGoal)}
+        ${bloco("REALIDADE", d.tacticalReality)}
+        ${bloco("CAMINHOS", d.tacticalOptions)}
+        ${bloco("COMPROMISSO E APOIO", d.tacticalWill)}
+        ${bloco("O QUE FOI BEM", d.highlights)}
+        ${bloco("O QUE PRECISA EVOLUIR", d.improvements)}
+        ${bloco("O QUE FICOU COMBINADO", d.agreements)}
+
+        <div class="subtle-card padded-card" style="margin-top:12px">
+          <div class="section-title"><div><h3>Avaliação</h3></div></div>
+          ${(d.groups || []).map((grupo) => `
+            <div style="margin-top:8px">
+              <div class="eyebrow">${escapeHtml(grupo)}</div>
+              ${(d.items || []).filter((i) => i.group === grupo).map((item) => {
+                const r = d.ratings?.[item.id];
+                if (!r) return "";
+                return `
+                  <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;
+                              padding:6px 0;border-bottom:1px solid var(--line);font-size:13px">
+                    <div style="flex:1;min-width:220px">
+                      ${escapeHtml(item.label)}
+                      ${r.comment ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(r.comment)}</div>` : ""}
+                    </div>
+                    ${nivelBadge(r.level)}
+                  </div>`;
+              }).join("")}
+            </div>`).join("")}
+        </div>
+
+        ${painelPdi(d.pdi, d.personName, d.unitName, d.id, podeDar && !d.isMe)}
+
+        ${d.personNote ? `
+          <div class="subtle-card padded-card" style="margin-top:10px">
+            <div class="section-title"><div><h3>💬 Resposta de ${escapeHtml(d.personName)}</h3></div></div>
+            <div style="white-space:pre-wrap;font-size:13px;line-height:1.5;margin-top:6px">${escapeHtml(d.personNote)}</div>
+          </div>` : ""}
+
+        ${d.canReadConfidential && d.confidentialNote ? `
+          <div class="subtle-card padded-card" style="margin-top:10px;border:1px solid #b06000">
+            <div class="section-title"><div><h3>🔒 Observação confidencial</h3>
+              <div class="text-small">Enviada apenas para a diretoria. O gestor que conduziu não tem acesso.</div></div></div>
+            <div style="white-space:pre-wrap;font-size:13px;line-height:1.5;margin-top:6px">${escapeHtml(d.confidentialNote)}</div>
+          </div>` : ""}
+        ${!d.canReadConfidential && d.hasConfidentialNote ? `
+          <div class="message" style="margin-top:10px;font-size:12px">
+            🔒 ${escapeHtml(d.personName)} deixou uma observação endereçada à diretoria.
+          </div>` : ""}
+
+        ${d.isMe && !jaCiente && d.status === "PUBLICADO" ? `
+          <div class="subtle-card padded-card" style="margin-top:14px;border:1px solid var(--accent)">
+            <div class="section-title"><div><h3>✋ Confirmar ciência</h3>
+              <div class="text-small">Você escolhe para quem vai cada observação. Nenhuma das duas é obrigatória.</div></div></div>
+            <div class="field" style="margin-top:8px">
+              <label>Observação para ${escapeHtml(d.authorName)}</label>
+              <textarea id="feedback-note" rows="3" style="font-family:inherit"
+                placeholder="O que você concorda, discorda ou precisa de apoio"></textarea>
+              <div class="text-small" style="color:var(--muted)">Vai para quem conduziu o feedback.</div>
+            </div>
+            <div class="field">
+              <label>🔒 Observação para a diretoria</label>
+              <textarea id="feedback-confidential" rows="3" style="font-family:inherit"
+                placeholder="Algo que você prefere tratar fora da linha direta"></textarea>
+              <div class="text-small" style="color:#b06000">
+                Não é lida por ${escapeHtml(d.authorName)}. Só a diretoria tem acesso.
+              </div>
+            </div>
+            <div class="actions">
+              <button class="btn btn-primary" ${d.saving ? "disabled" : ""} onclick="darCienciaFeedback()">
+                ${d.saving ? "Registrando…" : "Estou ciente"}
+              </button>
+            </div>
+          </div>` : ""}
+
+        ${d.isMe && jaCiente ? `
+          <div class="message success" style="margin-top:14px">✓ Você deu ciência neste feedback.</div>` : ""}
+      </div>
+    </div>`;
+}
+
+function pdiEditorModal() {
+  const p = state.pdiEditor;
+  return `
+    <div class="client-drawer-overlay open" onclick="fecharPdiEditor()" style="z-index:60">
+      <div class="panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${p.id ? "Atualizar" : "Novo"} ponto de desenvolvimento</h3>
+            <div class="text-small">${escapeHtml(p.personName)}</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharPdiEditor()">Fechar</button>
+        </div>
+        <div class="field" style="margin-top:10px"><label>O que desenvolver <span style="color:var(--bad)">*</span></label>
+          <input value="${escapeHtml(p.title)}" oninput="state.pdiEditor.title=this.value"
+            placeholder="Ex.: retorno de orçamento no mesmo dia" /></div>
+        <div class="field"><label>Por que importa</label>
+          <input value="${escapeHtml(p.why)}" oninput="state.pdiEditor.why=this.value"
+            placeholder="O efeito que isso tem no resultado dele" /></div>
+        <div class="field"><label>Como, na prática</label>
+          <textarea rows="2" style="font-family:inherit" oninput="state.pdiEditor.action=this.value"
+            placeholder="A ação concreta, não a intenção">${escapeHtml(p.action)}</textarea></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div class="field"><label>Quem apoia</label>
+            <input value="${escapeHtml(p.support)}" oninput="state.pdiEditor.support=this.value" /></div>
+          <div class="field"><label>Até quando</label>
+            <input type="date" value="${escapeHtml(p.dueDate || "")}" oninput="state.pdiEditor.dueDate=this.value" /></div>
+          <div class="field"><label>Situação</label>
+            <select onchange="state.pdiEditor.status=this.value">
+              ${(state.feedback?.pdiStatuses || []).map((s) => `
+                <option value="${s.id}" ${p.status === s.id ? "selected" : ""}>${escapeHtml(s.label)}</option>`).join("")}
+            </select></div>
+        </div>
+        <div class="field"><label>Evolução</label>
+          <textarea rows="2" style="font-family:inherit" oninput="state.pdiEditor.progressNote=this.value"
+            placeholder="O que mudou desde a última conversa">${escapeHtml(p.progressNote || "")}</textarea></div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" ${p.saving ? "disabled" : ""} onclick="salvarPdi()">
+            ${p.saving ? "Salvando…" : "Salvar"}</button>
+          <button class="btn btn-ghost" onclick="fecharPdiEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function crmFilterToolbar() {
   const filters = state.crm.crmClientFilters;
   const pagination = state.crm.pagination;
@@ -7283,6 +8114,7 @@ function topbarTitle() {
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
     "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
+    "feedback":       { title: "Feedback e PDI",         description: "Feedback mensal com base no MEC, plano de desenvolvimento e ciência." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
@@ -7526,9 +8358,14 @@ function dashboardView() {
     { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
-    { id: "reunioes",      title: "Reuniões",         desc: "Atas e treinamentos",      icon: "🗓️",
-      badge: state.meetings?.pendingCount || 0 },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
+  ].filter((t) => allowed.includes(t.id));
+
+  const devTabs = [
+    { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
+      badge: state.meetings?.pendingCount || 0 },
+    { id: "feedback", title: "Feedback",  desc: "Avaliação e PDI",      icon: "🎯",
+      badge: state.feedback?.pendingCount || 0 },
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
@@ -7617,6 +8454,7 @@ function dashboardView() {
               ${state.ui.sidebarCollapsed ? '▶' : '◀'}
             </button>
             ${sidebarTabGroup("CRM", crmTabs)}
+            ${sidebarTabGroup("Desenvolvimento", devTabs)}
             ${sidebarTabGroup("Resultados", resultTabs)}
             ${sidebarTabGroup("Operações", opsTabs)}
           </div>
@@ -7642,6 +8480,7 @@ function dashboardView() {
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
+          ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
