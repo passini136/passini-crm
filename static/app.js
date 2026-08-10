@@ -6,6 +6,10 @@ const state = {
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
+  meetings: null,         // atas de reunião/treinamento + pendências de ciência
+  meetingEditor: null,    // ata em edição (gestão)
+  meetingDetail: null,    // ata aberta para leitura/ciência
+  meetingFilters: { search: "", kind: "", from: "", to: "", mine: false },
   sellerScore: null,
   teamScore: null,
   missionProgress: { contactsToday: 0 },
@@ -35,6 +39,7 @@ const state = {
       admin: false,
       integrityAudit: false,
       filters: false,
+      meetings: false,
     },
     executiveSections: {
       details: false,
@@ -378,9 +383,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "calendario"]);
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "reunioes", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "reunioes", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -488,6 +493,9 @@ async function bootstrap() {
     // Cargas essenciais em paralelo (options não bloqueia mais o restante)
     const loads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
     if (session.user.role === "Vendedor" && placarEnabled()) loads.push(loadSellerScore());
+    // Em background: alimenta o contador de ciência pendente no menu sem
+    // atrasar a abertura do sistema.
+    loadMeetings(true);
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
@@ -4027,6 +4035,603 @@ async function confirmScheduleContact() {
   }
 }
 
+// ─── Reuniões e Treinamentos ────────────────────────────────────────────────
+//
+// Duas telas na mesma view, separadas pelo perfil:
+//  - Gestão: registra a ata, marca os presentes, anexa material e publica.
+//    Depois acompanha quem já deu ciência e lê os feedbacks.
+//  - Vendedor: vê as reuniões em que esteve, confirma ciência e pode deixar
+//    sugestão. Não vê rascunho nem o feedback dos colegas.
+
+async function loadMeetings(silencioso) {
+  const f = state.meetingFilters;
+  const q = new URLSearchParams();
+  if (f.search) q.set("q", f.search);
+  if (f.kind) q.set("kind", f.kind);
+  if (f.from) q.set("from", f.from);
+  if (f.to) q.set("to", f.to);
+  if (f.mine) q.set("mine", "1");
+  if (!silencioso) state.ui.loading.meetings = true;
+  try {
+    state.meetings = await api(`/api/meetings?${q.toString()}`);
+  } catch (e) {
+    state.meetings = { error: e.message, meetings: [], kinds: [], people: [] };
+  } finally {
+    state.ui.loading.meetings = false;
+    requestRender();
+  }
+}
+
+function applyMeetingSearch() {
+  const campo = document.getElementById("meeting-search");
+  state.meetingFilters.search = campo ? campo.value.trim() : "";
+  loadMeetings();
+}
+
+function setMeetingKindFilter(kind) {
+  state.meetingFilters.kind = state.meetingFilters.kind === kind ? "" : kind;
+  loadMeetings();
+}
+
+function clearMeetingFilters() {
+  state.meetingFilters = { search: "", kind: "", from: "", to: "", mine: false };
+  loadMeetings();
+}
+
+// ─── Editor da ata ──────────────────────────────────────────────────────────
+
+function novaAtaModal(kind) {
+  state.meetingEditor = {
+    id: null, kind: kind || "REUNIAO", title: "", topic: "",
+    unitName: (state.meetings?.units || [])[0] || "",
+    occurredAt: localDateTimeInput(), durationMin: 60, location: "",
+    agenda: "", summary: "", decisions: "",
+    organizerName: state.meetings?.myName || "",
+    participants: [], attachments: [], status: "RASCUNHO", saving: false,
+  };
+  requestRender();
+}
+
+async function editarAta(meetingId) {
+  try {
+    const r = await api("/api/meetings/detail", {
+      method: "POST", body: JSON.stringify({ meetingId }),
+    });
+    const m = r.meeting;
+    state.meetingEditor = {
+      id: m.id, kind: m.kind, title: m.title, topic: m.topic,
+      unitName: m.unitName, occurredAt: (m.occurredAt || "").replace(" ", "T").slice(0, 16),
+      durationMin: m.durationMin, location: m.location, agenda: m.agenda,
+      summary: m.summary, decisions: m.decisions, organizerName: m.organizerName,
+      participants: m.participants.map((p) => ({
+        personName: p.personName, personKey: p.personKey, unitName: p.unitName,
+        acknowledgedAt: p.acknowledgedAt,
+      })),
+      attachments: m.attachments, status: m.status, saving: false,
+    };
+    requestRender();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function fecharAtaEditor() { state.meetingEditor = null; requestRender(); }
+
+function togglePresente(personKey) {
+  const e = state.meetingEditor;
+  if (!e) return;
+  const pessoa = (state.meetings?.people || []).find((p) => p.personKey === personKey);
+  if (!pessoa) return;
+  const idx = e.participants.findIndex((p) => p.personKey === personKey);
+  if (idx >= 0) {
+    // Quem já deu ciência não sai por clique acidental — precisa confirmar.
+    if (e.participants[idx].acknowledgedAt
+        && !confirm(`${e.participants[idx].personName} já deu ciência. Remover mesmo assim?`)) return;
+    e.participants.splice(idx, 1);
+  } else {
+    e.participants.push({ personName: pessoa.personName, personKey: pessoa.personKey, unitName: pessoa.unitName });
+  }
+  requestRender();
+}
+
+function marcarTodosPresentes(unidade) {
+  const e = state.meetingEditor;
+  if (!e) return;
+  const alvo = (state.meetings?.people || []).filter((p) => !unidade || p.unitName === unidade);
+  const jaTem = new Set(e.participants.map((p) => p.personKey));
+  alvo.forEach((p) => {
+    if (!jaTem.has(p.personKey)) {
+      e.participants.push({ personName: p.personName, personKey: p.personKey, unitName: p.unitName });
+    }
+  });
+  requestRender();
+}
+
+function limparPresentes() {
+  const e = state.meetingEditor;
+  if (!e) return;
+  const comCiencia = e.participants.filter((p) => p.acknowledgedAt);
+  e.participants = comCiencia;   // preserva quem já confirmou
+  requestRender();
+}
+
+async function salvarAta(depoisPublicar) {
+  const e = state.meetingEditor;
+  if (!e) return;
+  if (!e.title.trim()) { addMessage("error", "Informe o assunto."); return; }
+  e.saving = true; requestRender();
+  try {
+    const r = await api("/api/meetings/save", {
+      method: "POST",
+      body: JSON.stringify({ ...e, occurredAt: (e.occurredAt || "").replace("T", " ") }),
+    });
+    e.id = r.meetingId;
+    if (depoisPublicar) {
+      await api("/api/meetings/publish", {
+        method: "POST", body: JSON.stringify({ meetingId: r.meetingId }),
+      });
+      addMessage("success", "Ata publicada. A equipe já recebeu a pendência de ciência.");
+      state.meetingEditor = null;
+    } else {
+      addMessage("success", "Rascunho salvo.");
+    }
+    await loadMeetings(true);
+  } catch (err) {
+    addMessage("error", err.message);
+  } finally {
+    if (state.meetingEditor) state.meetingEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirAta(meetingId) {
+  if (!confirm("Excluir esta ata e seus anexos? A ação não pode ser desfeita.")) return;
+  try {
+    await api("/api/meetings/delete", { method: "POST", body: JSON.stringify({ meetingId }) });
+    addMessage("success", "Ata excluída.");
+    state.meetingEditor = null;
+    state.meetingDetail = null;
+    await loadMeetings(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+// ─── Anexos ─────────────────────────────────────────────────────────────────
+
+async function enviarAnexos(input) {
+  const e = state.meetingEditor;
+  if (!e || !input.files?.length) return;
+  if (!e.id) {
+    addMessage("warn", "Salve o rascunho antes de anexar — o arquivo precisa de uma ata para ficar vinculado.");
+    input.value = "";
+    return;
+  }
+  const form = new FormData();
+  form.append("meetingId", String(e.id));
+  Array.from(input.files).forEach((f) => form.append("files", f));
+  try {
+    const resp = await fetch("/api/meetings/attachment/upload", {
+      method: "POST", body: form, credentials: "same-origin",
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || "Falha ao anexar.");
+    e.attachments = [...(e.attachments || []), ...(data.attachments || []).map((a) => ({
+      id: a.attachmentId, fileName: a.fileName, sizeBytes: a.sizeBytes,
+    }))];
+    addMessage("success", `${data.attachments.length} arquivo(s) anexado(s).`);
+  } catch (err) {
+    addMessage("error", err.message);
+  } finally {
+    input.value = "";
+    requestRender();
+  }
+}
+
+async function removerAnexo(attachmentId) {
+  try {
+    await api("/api/meetings/attachment/delete", {
+      method: "POST", body: JSON.stringify({ attachmentId }),
+    });
+    if (state.meetingEditor) {
+      state.meetingEditor.attachments = state.meetingEditor.attachments.filter((a) => a.id !== attachmentId);
+    }
+    requestRender();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function fileSizeLabel(bytes) {
+  const n = Number(bytes || 0);
+  if (n >= 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} B`;
+}
+
+// ─── Ciência do participante ────────────────────────────────────────────────
+
+async function abrirAta(meetingId) {
+  try {
+    const r = await api("/api/meetings/detail", {
+      method: "POST", body: JSON.stringify({ meetingId }),
+    });
+    state.meetingDetail = { ...r.meeting, feedbackDraft: "", saving: false };
+    requestRender();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function fecharAta() { state.meetingDetail = null; requestRender(); }
+
+async function darCiencia() {
+  const d = state.meetingDetail;
+  if (!d) return;
+  const campo = document.getElementById("meeting-feedback");
+  const texto = campo ? campo.value.trim() : "";
+  d.saving = true; requestRender();
+  try {
+    await api("/api/meetings/acknowledge", {
+      method: "POST", body: JSON.stringify({ meetingId: d.id, feedback: texto }),
+    });
+    addMessage("success", texto ? "Ciência registrada e feedback enviado ao gestor." : "Ciência registrada.");
+    state.meetingDetail = null;
+    await loadMeetings(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.meetingDetail) state.meetingDetail.saving = false;
+    requestRender();
+  }
+}
+
+// ─── Views ──────────────────────────────────────────────────────────────────
+
+function meetingKindChip(kind) {
+  const cfg = { REUNIAO: { icon: "🗓️", label: "Reunião", bg: "#e8f0fe", fg: "#1a5276" },
+                TREINAMENTO: { icon: "🎓", label: "Treinamento", bg: "#e6f4ea", fg: "#1e8e3e" } }[kind]
+             || { icon: "📄", label: kind, bg: "#f1f3f4", fg: "#5f6368" };
+  return `<span class="status-tag" style="background:${cfg.bg};color:${cfg.fg}">${cfg.icon} ${cfg.label}</span>`;
+}
+
+function meetingCard(m, podeGerir) {
+  const pendente = m.iAmParticipant && !m.myAcknowledgedAt && m.status === "PUBLICADA";
+  const progresso = m.participantCount
+    ? Math.round((m.acknowledgedCount / m.participantCount) * 100) : 0;
+  return `
+    <div class="crm-card clean" style="padding:14px;${pendente ? "border-left:4px solid #f39c12" : ""}">
+      <div style="display:flex;justify-content:space-between;align-items:start;gap:10px;flex-wrap:wrap">
+        <div style="flex:1;min-width:220px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
+            ${meetingKindChip(m.kind)}
+            ${m.status === "RASCUNHO" ? '<span class="status-tag warn">Rascunho</span>' : ""}
+            ${pendente ? '<span class="status-tag bad">Sua ciência pendente</span>' : ""}
+            ${m.iAmParticipant && m.myAcknowledgedAt ? '<span class="status-tag good">✓ Você deu ciência</span>' : ""}
+          </div>
+          <div style="font-weight:700;font-size:14px">${escapeHtml(m.title)}</div>
+          <div class="text-small">
+            ${shortDate(m.occurredAt)} ${escapeHtml((m.occurredAt || "").slice(11, 16))}
+            ${m.unitName ? ` · ${escapeHtml(m.unitName)}` : " · Corporativa"}
+            ${m.durationMin ? ` · ${m.durationMin} min` : ""}
+            · por ${escapeHtml(m.organizerName)}
+          </div>
+        </div>
+        <div style="text-align:right;font-size:12px;min-width:130px">
+          <div style="font-weight:700">${m.acknowledgedCount}/${m.participantCount} cientes</div>
+          <div class="score-bar-track" style="margin-top:4px">
+            <div class="score-bar-fill ${progresso >= 100 ? "good" : progresso >= 50 ? "warn" : ""}"
+                 style="width:${progresso}%;height:6px"></div>
+          </div>
+          ${m.feedbackCount ? `<div style="color:var(--accent);font-weight:600;margin-top:4px">💬 ${m.feedbackCount} feedback(s)</div>` : ""}
+          ${m.attachmentCount ? `<div class="text-small">📎 ${m.attachmentCount} anexo(s)</div>` : ""}
+        </div>
+      </div>
+      ${m.topic ? `<div class="text-small" style="color:var(--muted);margin-top:6px">${escapeHtml(m.topic)}</div>` : ""}
+      <div class="actions" style="gap:6px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line)">
+        <button class="btn ${pendente ? "btn-primary" : "btn-secondary"} btn-sm" onclick="abrirAta(${m.id})">
+          ${pendente ? "✋ Dar ciência" : "Abrir"}
+        </button>
+        ${podeGerir ? `
+          <button class="btn btn-ghost btn-sm" onclick="editarAta(${m.id})">Editar</button>
+          <button class="btn btn-ghost btn-sm" onclick="excluirAta(${m.id})">Excluir</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function reunioesView() {
+  if (!state.meetings) { loadMeetings(); return `<div class="loader panel">Carregando reuniões…</div>`; }
+  if (state.meetings.error) return `<div class="message error">${escapeHtml(state.meetings.error)}</div>`;
+
+  const podeGerir = Boolean(state.meetings.canManage);
+  const f = state.meetingFilters;
+  const itens = state.meetings.meetings || [];
+  const pendentes = itens.filter((m) => m.iAmParticipant && !m.myAcknowledgedAt && m.status === "PUBLICADA");
+  const demais = itens.filter((m) => !pendentes.includes(m));
+  const temFiltro = Boolean(f.search || f.kind || f.from || f.to || f.mine);
+
+  return `
+    <div class="stack">
+      ${state.meetingEditor ? ataEditorModal() : ""}
+      ${state.meetingDetail ? ataDetalheModal() : ""}
+
+      ${pendentes.length ? `
+        <div class="table-card" style="border-left:4px solid #f39c12">
+          <div class="section-title">
+            <div>
+              <h3>✋ Aguardando sua ciência</h3>
+              <div class="text-small">Confirme que participou. Se tiver sugestão, escreva — vai direto para quem conduziu.</div>
+            </div>
+            <div class="soft-badge" style="background:#fef7e0;color:#b06000">${pendentes.length}</div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${pendentes.map((m) => meetingCard(m, podeGerir)).join("")}
+          </div>
+        </div>` : ""}
+
+      <div class="form-card" style="padding:14px 18px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          <input id="meeting-search" style="flex:1;min-width:220px"
+            placeholder="🔍 Buscar por assunto, tema, decisão ou participante — Enter para buscar"
+            value="${escapeHtml(f.search)}"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();applyMeetingSearch();}" />
+          <button class="btn btn-secondary btn-sm" onclick="applyMeetingSearch()">Buscar</button>
+          ${temFiltro ? `<button class="btn btn-ghost btn-sm" onclick="clearMeetingFilters()">Limpar</button>` : ""}
+          ${podeGerir ? `
+            <button class="btn btn-primary btn-sm" onclick="novaAtaModal('REUNIAO')">🗓️ Nova reunião</button>
+            <button class="btn btn-primary btn-sm" onclick="novaAtaModal('TREINAMENTO')">🎓 Novo treinamento</button>` : ""}
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          ${(state.meetings.kinds || []).map((k) => `
+            <button type="button" onclick="setMeetingKindFilter('${k.id}')"
+              style="border:1px solid ${f.kind === k.id ? "var(--accent)" : "var(--line)"};
+                     background:${f.kind === k.id ? "var(--accent)" : "#fff"};
+                     color:${f.kind === k.id ? "#fff" : "var(--text)"};
+                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer">
+              ${k.icon} ${escapeHtml(k.label)}
+            </button>`).join("")}
+          <span class="text-small" style="color:var(--muted);margin-left:4px">Período</span>
+          <input type="date" style="width:150px" value="${escapeHtml(f.from)}"
+            onchange="state.meetingFilters.from=this.value;loadMeetings()" />
+          <span class="text-small">até</span>
+          <input type="date" style="width:150px" value="${escapeHtml(f.to)}"
+            onchange="state.meetingFilters.to=this.value;loadMeetings()" />
+          ${podeGerir ? `
+            <label class="text-small" style="display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input type="checkbox" ${f.mine ? "checked" : ""}
+                onchange="state.meetingFilters.mine=this.checked;loadMeetings()" />
+              Só as que eu conduzi
+            </label>` : ""}
+        </div>
+      </div>
+
+      <div class="stack">
+        ${state.ui.loading.meetings ? '<div class="loader panel">Buscando…</div>' : ""}
+        ${demais.length
+          ? demais.map((m) => meetingCard(m, podeGerir)).join("")
+          : (pendentes.length ? "" : emptyStateCard(temFiltro
+              ? "Nenhuma ata encontrada com esses filtros."
+              : (podeGerir
+                  ? "Nenhuma ata registrada ainda. Comece pela primeira reunião da equipe."
+                  : "Você ainda não participou de nenhuma reunião registrada.")))}
+      </div>
+    </div>`;
+}
+
+function ataEditorModal() {
+  const e = state.meetingEditor;
+  const pessoas = state.meetings?.people || [];
+  const unidades = [...new Set(pessoas.map((p) => p.unitName).filter(Boolean))];
+  const marcados = new Set(e.participants.map((p) => p.personKey));
+  const maxMb = state.meetings?.maxAttachmentMb || 15;
+
+  return `
+    <div class="client-drawer-overlay open" onclick="fecharAtaEditor()">
+      <div class="panel" style="max-width:900px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>${e.id ? "Editar" : "Nova"} ${e.kind === "TREINAMENTO" ? "ata de treinamento" : "ata de reunião"}</h3>
+            <div class="text-small">${e.status === "PUBLICADA"
+              ? "Publicada — editar não apaga as ciências já dadas."
+              : "Rascunho. A equipe só é notificada quando você publicar."}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharAtaEditor()">Fechar</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:12px;margin-top:12px">
+          <div class="field"><label>Assunto <span style="color:var(--bad)">*</span></label>
+            <input value="${escapeHtml(e.title)}" oninput="state.meetingEditor.title=this.value"
+              placeholder="Ex.: Alinhamento comercial de agosto" /></div>
+          <div class="field"><label>Tipo</label>
+            <select onchange="state.meetingEditor.kind=this.value;requestRender()">
+              ${(state.meetings?.kinds || []).map((k) => `
+                <option value="${k.id}" ${e.kind === k.id ? "selected" : ""}>${k.icon} ${escapeHtml(k.label)}</option>`).join("")}
+            </select></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px">
+          <div class="field"><label>Data e hora</label>
+            <input type="datetime-local" value="${escapeHtml(e.occurredAt)}"
+              oninput="state.meetingEditor.occurredAt=this.value" /></div>
+          <div class="field"><label>Duração (min)</label>
+            <input type="number" min="0" step="15" value="${Number(e.durationMin || 0)}"
+              oninput="state.meetingEditor.durationMin=Number(this.value)" /></div>
+          <div class="field"><label>Unidade</label>
+            <select onchange="state.meetingEditor.unitName=this.value">
+              <option value="">Corporativa (todas)</option>
+              ${(state.meetings?.units || []).map((u) => `
+                <option value="${escapeHtml(u)}" ${e.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Local</label>
+            <input value="${escapeHtml(e.location)}" oninput="state.meetingEditor.location=this.value"
+              placeholder="Sala, loja, online" /></div>
+        </div>
+
+        <div class="field"><label>Tema / palavras-chave <span style="color:var(--muted);font-weight:400">(ajuda a achar depois)</span></label>
+          <input value="${escapeHtml(e.topic)}" oninput="state.meetingEditor.topic=this.value"
+            placeholder="Ex.: correias, tensionador, política de desconto" /></div>
+
+        <div class="field"><label>Pauta</label>
+          <textarea rows="3" style="font-family:inherit;line-height:1.5"
+            oninput="state.meetingEditor.agenda=this.value"
+            placeholder="Os pontos previstos para o encontro">${escapeHtml(e.agenda)}</textarea></div>
+
+        <div class="field"><label>O que foi tratado <span style="color:var(--bad)">*</span></label>
+          <textarea rows="6" style="font-family:inherit;line-height:1.5"
+            oninput="state.meetingEditor.summary=this.value"
+            placeholder="O registro da reunião. É o que a equipe vai ler ao dar ciência.">${escapeHtml(e.summary)}</textarea></div>
+
+        <div class="field"><label>Decisões e encaminhamentos</label>
+          <textarea rows="3" style="font-family:inherit;line-height:1.5"
+            oninput="state.meetingEditor.decisions=this.value"
+            placeholder="Quem faz o quê e até quando">${escapeHtml(e.decisions)}</textarea></div>
+
+        <div class="subtle-card padded-card" style="margin-top:8px">
+          <div class="section-title">
+            <div><h3>Presentes</h3>
+              <div class="text-small">${e.participants.length} marcado(s) de ${pessoas.length} da sua equipe</div></div>
+            <div style="display:flex;gap:6px">
+              ${unidades.map((u) => `
+                <button class="btn btn-ghost btn-sm" onclick="marcarTodosPresentes('${jsAttr(u)}')">Toda ${escapeHtml(u)}</button>`).join("")}
+              <button class="btn btn-ghost btn-sm" onclick="limparPresentes()">Limpar</button>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-height:180px;overflow:auto">
+            ${pessoas.map((p) => {
+              const on = marcados.has(p.personKey);
+              const ciente = e.participants.find((x) => x.personKey === p.personKey)?.acknowledgedAt;
+              return `
+                <button type="button" onclick="togglePresente('${jsAttr(p.personKey)}')"
+                  title="${escapeHtml(p.role)}${p.unitName ? " · " + escapeHtml(p.unitName) : ""}"
+                  style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
+                         background:${on ? "var(--accent)" : "#fff"};color:${on ? "#fff" : "var(--text)"};
+                         border-radius:14px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer">
+                  ${ciente ? "✓ " : on ? "● " : "○ "}${escapeHtml(p.personName)}
+                </button>`;
+            }).join("") || '<div class="text-small">Nenhuma pessoa ativa nas suas unidades. Verifique o cadastro em Administração.</div>'}
+          </div>
+        </div>
+
+        <div class="subtle-card padded-card" style="margin-top:8px">
+          <div class="section-title">
+            <div><h3>Anexos</h3>
+              <div class="text-small">Até ${maxMb} MB por arquivo · PDF, Office, imagens e ZIP</div></div>
+          </div>
+          <input type="file" multiple onchange="enviarAnexos(this)" style="margin-top:8px" />
+          <div class="stack" style="margin-top:8px">
+            ${(e.attachments || []).map((a) => `
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;
+                          padding:6px 10px;background:#f8f9fa;border-radius:6px">
+                <span>📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted)">${fileSizeLabel(a.sizeBytes)}</span></span>
+                <button class="btn btn-ghost btn-sm" onclick="removerAnexo(${a.id})">Remover</button>
+              </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhum anexo.</div>'}
+          </div>
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-secondary" ${e.saving ? "disabled" : ""} onclick="salvarAta(false)">
+            ${e.saving ? "Salvando…" : "Salvar rascunho"}
+          </button>
+          <button class="btn btn-primary" ${e.saving ? "disabled" : ""} onclick="salvarAta(true)">
+            ${e.status === "PUBLICADA" ? "Salvar alterações" : "Publicar e notificar equipe"}
+          </button>
+          <button class="btn btn-ghost" onclick="fecharAtaEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function ataDetalheModal() {
+  const m = state.meetingDetail;
+  const jaCiente = Boolean((m.participants || []).find((p) => p.personName === state.meetings?.myName)?.acknowledgedAt);
+  const souParticipante = (m.participants || []).some((p) => p.personName === state.meetings?.myName);
+  const podeGerir = Boolean(state.meetings?.canManage);
+  const feedbacks = (m.participants || []).filter((p) => p.feedback);
+
+  const bloco = (titulo, texto) => texto ? `
+    <div style="margin-top:12px">
+      <div class="eyebrow">${titulo}</div>
+      <div style="white-space:pre-wrap;line-height:1.6;font-size:13px">${escapeHtml(texto)}</div>
+    </div>` : "";
+
+  return `
+    <div class="client-drawer-overlay open" onclick="fecharAta()">
+      <div class="panel" style="max-width:820px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <div style="margin-bottom:4px">${meetingKindChip(m.kind)}</div>
+            <h3>${escapeHtml(m.title)}</h3>
+            <div class="text-small">
+              ${shortDate(m.occurredAt)} ${escapeHtml((m.occurredAt || "").slice(11, 16))}
+              ${m.location ? ` · ${escapeHtml(m.location)}` : ""}
+              ${m.unitName ? ` · ${escapeHtml(m.unitName)}` : " · Corporativa"}
+              · conduzida por ${escapeHtml(m.organizerName)}
+            </div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharAta()">Fechar</button>
+        </div>
+
+        ${bloco("PAUTA", m.agenda)}
+        ${bloco("O QUE FOI TRATADO", m.summary)}
+        ${bloco("DECISÕES E ENCAMINHAMENTOS", m.decisions)}
+
+        ${(m.attachments || []).length ? `
+          <div style="margin-top:12px">
+            <div class="eyebrow">MATERIAL</div>
+            ${m.attachments.map((a) => `
+              <a href="/api/meetings/attachment/${a.id}" target="_blank"
+                 style="display:block;font-size:13px;padding:6px 0;color:var(--accent);font-weight:600">
+                📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted);font-weight:400">${fileSizeLabel(a.sizeBytes)}</span>
+              </a>`).join("")}
+          </div>` : ""}
+
+        <div class="subtle-card padded-card" style="margin-top:14px">
+          <div class="section-title">
+            <div><h3>Presentes</h3>
+              <div class="text-small">${m.acknowledgedCount} de ${m.participantCount} deram ciência</div></div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+            ${(m.participants || []).map((p) => `
+              <span class="status-tag ${p.acknowledgedAt ? "good" : ""}"
+                title="${p.acknowledgedAt ? "Ciente em " + escapeHtml(p.acknowledgedAt.slice(0, 16).replace("T", " ")) : "Pendente"}">
+                ${p.acknowledgedAt ? "✓" : "○"} ${escapeHtml(p.personName)}
+              </span>`).join("")}
+          </div>
+        </div>
+
+        ${podeGerir && feedbacks.length ? `
+          <div class="subtle-card padded-card" style="margin-top:10px">
+            <div class="section-title"><div><h3>💬 Retorno da equipe</h3></div></div>
+            <div class="stack" style="margin-top:8px">
+              ${feedbacks.map((p) => `
+                <div style="border-left:3px solid var(--accent);padding:6px 10px;background:#f5f9ff;border-radius:0 6px 6px 0">
+                  <div style="font-weight:700;font-size:12px">${escapeHtml(p.personName)}</div>
+                  <div style="font-size:13px;white-space:pre-wrap;line-height:1.5">${escapeHtml(p.feedback)}</div>
+                </div>`).join("")}
+            </div>
+          </div>` : ""}
+
+        ${souParticipante && !jaCiente && m.status === "PUBLICADA" ? `
+          <div class="subtle-card padded-card" style="margin-top:14px;border:1px solid var(--accent)">
+            <div class="section-title"><div><h3>✋ Confirmar ciência</h3>
+              <div class="text-small">Sugestão ou dúvida? Escreva abaixo — só ${escapeHtml(m.organizerName)} e a diretoria leem.</div></div></div>
+            <div class="field" style="margin-top:8px">
+              <textarea id="meeting-feedback" rows="3" style="font-family:inherit;line-height:1.5"
+                placeholder="Opcional: o que ficou claro, o que faltou, o que você sugere"></textarea>
+            </div>
+            <div class="actions">
+              <button class="btn btn-primary" ${m.saving ? "disabled" : ""} onclick="darCiencia()">
+                ${m.saving ? "Registrando…" : "Estou ciente"}
+              </button>
+            </div>
+          </div>` : ""}
+
+        ${jaCiente ? `
+          <div class="message success" style="margin-top:14px">
+            ✓ Você deu ciência nesta ${m.kind === "TREINAMENTO" ? "capacitação" : "reunião"}.
+          </div>` : ""}
+
+        ${podeGerir ? `
+          <div class="actions" style="margin-top:14px">
+            <button class="btn btn-secondary" onclick="fecharAta();editarAta(${m.id})">Editar ata</button>
+          </div>` : ""}
+      </div>
+    </div>`;
+}
+
 function crmFilterToolbar() {
   const filters = state.crm.crmClientFilters;
   const pagination = state.crm.pagination;
@@ -6579,6 +7184,7 @@ function topbarTitle() {
     "placar-equipe":  { title: "Placar da Equipe",        description: "Ranking de vendedores, zonas de premiação e alertas." },
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
+    "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
@@ -6600,6 +7206,8 @@ function sidebarTabGroup(title, tabs) {
             <span class="tab-title">${escapeHtml(tab.title)}</span>
             ${tab.desc ? `<span class="tab-desc">${escapeHtml(tab.desc)}</span>` : ""}
           </div>` : ""}
+          ${tab.badge ? `<span style="background:#e74c3c;color:#fff;border-radius:10px;padding:1px 7px;
+            font-size:11px;font-weight:800;margin-left:auto">${tab.badge}</span>` : ""}
         </button>
       `).join("")}
     </div>
@@ -6820,6 +7428,8 @@ function dashboardView() {
     { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
+    { id: "reunioes",      title: "Reuniões",         desc: "Atas e treinamentos",      icon: "🗓️",
+      badge: state.meetings?.pendingCount || 0 },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
   ].filter((t) => allowed.includes(t.id));
 
@@ -6933,6 +7543,7 @@ function dashboardView() {
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
+          ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}

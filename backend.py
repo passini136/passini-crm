@@ -7,6 +7,7 @@ import hmac
 import io
 import json
 import math
+import mimetypes
 import os
 import re
 import secrets
@@ -19,6 +20,7 @@ import threading
 import time
 import traceback
 import unicodedata
+import uuid
 from collections import Counter, defaultdict
 from contextlib import closing
 from dataclasses import dataclass
@@ -219,6 +221,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
+    {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "CRM"},
     # Resultados
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
@@ -270,6 +273,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
+            "reunioes",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -292,7 +296,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "executivo", "calendario",
+            "meu-placar", "biblioteca", "reunioes", "executivo", "calendario",
         ],
         "data_scope": "proprio",
         "can_manage_users": 0,
@@ -1590,6 +1594,65 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 UNIQUE(company_id, metric_id),
                 FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Atas de reunião e registros de treinamento
+            CREATE TABLE IF NOT EXISTS meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,              -- REUNIAO | TREINAMENTO
+                title TEXT NOT NULL,
+                topic TEXT,                      -- tema, usado na busca do acervo
+                unit_name TEXT,
+                occurred_at TEXT NOT NULL,       -- data e hora do encontro
+                duration_min INTEGER,
+                location TEXT,
+                agenda TEXT,                     -- pauta
+                summary TEXT,                    -- o que foi tratado
+                decisions TEXT,                  -- decisões e encaminhamentos
+                organizer_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'RASCUNHO',   -- RASCUNHO | PUBLICADA
+                published_at TEXT,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_meetings_company_date
+                ON meetings(company_id, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_meetings_company_unit
+                ON meetings(company_id, unit_name);
+
+            -- Presentes e a ciência de cada um
+            CREATE TABLE IF NOT EXISTS meeting_participants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id INTEGER NOT NULL,
+                person_name TEXT NOT NULL,
+                person_key TEXT NOT NULL,        -- nome normalizado, casa com o login
+                unit_name TEXT,
+                acknowledged_at TEXT,
+                feedback TEXT,
+                feedback_at TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(meeting_id, person_key),
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_meeting_participants_person
+                ON meeting_participants(person_key, acknowledged_at);
+
+            -- Anexos: o binário fica em disco, a tabela guarda só o ponteiro
+            CREATE TABLE IF NOT EXISTS meeting_attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                meeting_id INTEGER NOT NULL,
+                file_name TEXT NOT NULL,
+                stored_name TEXT NOT NULL,
+                content_type TEXT,
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                uploaded_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
 
             -- Biblioteca de conteúdo comercial: scripts, mensagens e orientações
@@ -3429,6 +3492,520 @@ def active_mapped_cities_for_units(conn: sqlite3.Connection, company_id: int, un
         [company_id, *normalized_units],
     ).fetchall()
     return [row["city_name"] for row in rows if row["city_name"]]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Atas de reunião e treinamento
+#
+# Fluxo: o gestor registra o encontro, marca quem participou e publica. A partir
+# da publicação cada participante recebe a pendência de ciência dentro do CRM,
+# com espaço para feedback que volta para o organizador.
+#
+# Duas decisões que moldam o resto:
+#
+# 1. RASCUNHO antes de PUBLICADA. A ata só vira pendência para a equipe quando o
+#    gestor confirma. Sem isso, quem digita a ata em duas sessões dispararia
+#    cobrança para todo mundo com o texto pela metade.
+#
+# 2. Participante identificado por NOME NORMALIZADO, não por user_id. Nem todo
+#    vendedor tem login (o piloto é 1 por unidade), e a lista de presença precisa
+#    valer como registro mesmo para quem não acessa o sistema. Quem tem login
+#    encontra a pendência pelo nome; quem não tem fica registrado como presente.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MEETING_KINDS = [
+    {"id": "REUNIAO", "label": "Reunião", "icon": "🗓️"},
+    {"id": "TREINAMENTO", "label": "Treinamento", "icon": "🎓"},
+]
+MEETING_KIND_IDS = {k["id"] for k in MEETING_KINDS}
+
+# Limite por arquivo. Ata carrega apresentação e planilha, não vídeo — acima
+# disso o servidor guarda peso que ninguém abre.
+MEETING_ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024
+MEETING_ATTACHMENT_ALLOWED_EXT = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".csv", ".txt", ".png", ".jpg", ".jpeg", ".webp", ".zip",
+}
+
+
+def meeting_files_dir() -> Path:
+    caminho = DATA_DIR / "meeting_files"
+    caminho.mkdir(parents=True, exist_ok=True)
+    return caminho
+
+
+def person_key(value: Any) -> str:
+    """Chave de comparação de pessoa: maiúsculas, sem acento e sem pontuação.
+
+    O mesmo vendedor aparece como 'Thielly Henrique', 'THIELLY HENRIQUE' e
+    'Thielly Henrique (VENDAS)' dependendo da origem. Sem normalizar, a ciência
+    de um nunca casaria com a pendência do outro.
+    """
+    texto = normalize_upper(strip_accents(str(value or "")))
+    texto = re.sub(r"\(.*?\)", " ", texto)
+    return re.sub(r"[^A-Z0-9]+", " ", texto).strip()
+
+
+def user_can_manage_meetings(conn: sqlite3.Connection, user: sqlite3.Row) -> bool:
+    """Registra ata quem tem visão de equipe. Vendedor só dá ciência."""
+    return data_scope_for_user(conn, user) != "proprio"
+
+
+def meeting_person_identity(user: sqlite3.Row) -> str:
+    """Nome com que o usuário aparece nas listas de presença."""
+    return normalize_whitespace(user["full_name"]) or normalize_whitespace(user["username"])
+
+
+def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row) -> list[dict[str, Any]]:
+    """Quem o gestor pode marcar como presente: pessoas ativas das unidades dele.
+
+    Inclui quem não é vendedor (balcão, telemarketing, administrativo) — reunião
+    e treinamento alcançam a equipe inteira, não só quem emite pedido.
+    """
+    competence = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    comp_day = first_day_of_competence(competence).isoformat()
+    allowed = crm_allowed_units_for_user(conn, user)
+    rows = conn.execute(
+        """
+        SELECT person_name, base_unit, role_classification
+        FROM people_records
+        WHERE company_id = ?
+          AND date(valid_from) <= date(?)
+          AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
+        ORDER BY person_name
+        """,
+        (company_id, comp_day, comp_day),
+    ).fetchall()
+    vistos: set[str] = set()
+    pessoas: list[dict[str, Any]] = []
+    for r in rows:
+        nome = normalize_whitespace(r["person_name"])
+        chave = person_key(nome)
+        if not nome or not chave or chave in vistos:
+            continue
+        unidade = normalize_unit(r["base_unit"])
+        if allowed and unidade and unidade not in allowed:
+            continue
+        vistos.add(chave)
+        pessoas.append({
+            "personName": nome,
+            "personKey": chave,
+            "unitName": unidade,
+            "role": normalize_whitespace(r["role_classification"]) or "Outros",
+        })
+    return pessoas
+
+
+def meeting_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": int(row["id"]),
+        "kind": row["kind"],
+        "kindLabel": next((k["label"] for k in MEETING_KINDS if k["id"] == row["kind"]), row["kind"]),
+        "title": row["title"],
+        "topic": row["topic"] or "",
+        "unitName": row["unit_name"] or "",
+        "occurredAt": row["occurred_at"] or "",
+        "durationMin": int(row["duration_min"] or 0),
+        "location": row["location"] or "",
+        "agenda": row["agenda"] or "",
+        "summary": row["summary"] or "",
+        "decisions": row["decisions"] or "",
+        "organizerName": row["organizer_name"] or "",
+        "status": row["status"],
+        "publishedAt": row["published_at"] or "",
+        "createdAt": row["created_at"],
+    }
+
+
+def load_meeting(conn: sqlite3.Connection, company_id: int, meeting_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id)
+    ).fetchone()
+    if not row:
+        return None
+    ata = meeting_row_to_dict(row)
+    ata["participants"] = [
+        {
+            "id": int(p["id"]),
+            "personName": p["person_name"],
+            "personKey": p["person_key"],
+            "unitName": p["unit_name"] or "",
+            "acknowledgedAt": p["acknowledged_at"] or "",
+            "feedback": p["feedback"] or "",
+            "feedbackAt": p["feedback_at"] or "",
+        }
+        for p in conn.execute(
+            "SELECT * FROM meeting_participants WHERE meeting_id = ? ORDER BY person_name",
+            (meeting_id,),
+        ).fetchall()
+    ]
+    ata["attachments"] = [
+        {
+            "id": int(a["id"]),
+            "fileName": a["file_name"],
+            "sizeBytes": int(a["size_bytes"] or 0),
+            "contentType": a["content_type"] or "",
+            "createdAt": a["created_at"],
+        }
+        for a in conn.execute(
+            "SELECT * FROM meeting_attachments WHERE meeting_id = ? ORDER BY id", (meeting_id,)
+        ).fetchall()
+    ]
+    total = len(ata["participants"])
+    cientes = sum(1 for p in ata["participants"] if p["acknowledgedAt"])
+    ata["participantCount"] = total
+    ata["acknowledgedCount"] = cientes
+    ata["pendingCount"] = total - cientes
+    ata["feedbackCount"] = sum(1 for p in ata["participants"] if p["feedback"])
+    return ata
+
+
+def list_meetings(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    search: str = "", kind: str = "", date_from: str = "", date_to: str = "",
+    only_mine: bool = False,
+) -> list[dict[str, Any]]:
+    """Acervo de atas com o recorte do usuário.
+
+    Gestor vê as atas das unidades dele; diretoria vê tudo. Vendedor só enxerga
+    as reuniões em que esteve presente — rascunho nunca aparece para ele.
+    """
+    scope = data_scope_for_user(conn, user)
+    sql = "SELECT m.* FROM meetings m WHERE m.company_id = ?"
+    params: list[Any] = [company_id]
+
+    if scope == "proprio":
+        sql += (
+            " AND m.status = 'PUBLICADA'"
+            " AND EXISTS (SELECT 1 FROM meeting_participants p"
+            "             WHERE p.meeting_id = m.id AND p.person_key = ?)"
+        )
+        params.append(person_key(meeting_person_identity(user)))
+    else:
+        allowed = crm_allowed_units_for_user(conn, user)
+        if allowed:
+            # Ata sem unidade é corporativa e aparece para todos os gestores.
+            marcadores = ",".join("?" for _ in allowed)
+            sql += f" AND (m.unit_name IS NULL OR m.unit_name = '' OR m.unit_name IN ({marcadores}))"
+            params.extend(allowed)
+        if only_mine:
+            sql += " AND UPPER(m.organizer_name) = ?"
+            params.append(normalize_upper(meeting_person_identity(user)))
+
+    if kind and kind in MEETING_KIND_IDS:
+        sql += " AND m.kind = ?"
+        params.append(kind)
+    if date_from:
+        sql += " AND date(m.occurred_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(m.occurred_at) <= date(?)"
+        params.append(date_to)
+    termo = normalize_whitespace(search)
+    if termo:
+        alvo = f"%{termo.upper()}%"
+        sql += (
+            " AND (UPPER(m.title) LIKE ? OR UPPER(COALESCE(m.topic,'')) LIKE ?"
+            "   OR UPPER(COALESCE(m.summary,'')) LIKE ? OR UPPER(COALESCE(m.agenda,'')) LIKE ?"
+            "   OR UPPER(COALESCE(m.decisions,'')) LIKE ?"
+            "   OR EXISTS (SELECT 1 FROM meeting_participants p2"
+            "              WHERE p2.meeting_id = m.id AND UPPER(p2.person_name) LIKE ?))"
+        )
+        params.extend([alvo] * 6)
+
+    sql += " ORDER BY datetime(m.occurred_at) DESC, m.id DESC LIMIT 300"
+    linhas = conn.execute(sql, params).fetchall()
+
+    resultado: list[dict[str, Any]] = []
+    minha_chave = person_key(meeting_person_identity(user))
+    for row in linhas:
+        ata = meeting_row_to_dict(row)
+        contagem = conn.execute(
+            "SELECT COUNT(*) total,"
+            "       SUM(CASE WHEN acknowledged_at IS NOT NULL AND acknowledged_at <> '' THEN 1 ELSE 0 END) cientes,"
+            "       SUM(CASE WHEN feedback IS NOT NULL AND feedback <> '' THEN 1 ELSE 0 END) feedbacks"
+            " FROM meeting_participants WHERE meeting_id = ?",
+            (ata["id"],),
+        ).fetchone()
+        ata["participantCount"] = int(contagem["total"] or 0)
+        ata["acknowledgedCount"] = int(contagem["cientes"] or 0)
+        ata["pendingCount"] = ata["participantCount"] - ata["acknowledgedCount"]
+        ata["feedbackCount"] = int(contagem["feedbacks"] or 0)
+        ata["attachmentCount"] = int(conn.execute(
+            "SELECT COUNT(*) n FROM meeting_attachments WHERE meeting_id = ?", (ata["id"],)
+        ).fetchone()["n"] or 0)
+        minha = conn.execute(
+            "SELECT acknowledged_at, feedback FROM meeting_participants "
+            "WHERE meeting_id = ? AND person_key = ?",
+            (ata["id"], minha_chave),
+        ).fetchone()
+        ata["iAmParticipant"] = bool(minha)
+        ata["myAcknowledgedAt"] = (minha["acknowledged_at"] or "") if minha else ""
+        ata["myFeedback"] = (minha["feedback"] or "") if minha else ""
+        resultado.append(ata)
+    return resultado
+
+
+def count_pending_acknowledgements(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row) -> int:
+    """Quantas atas publicadas ainda esperam a ciência deste usuário."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) n
+        FROM meeting_participants p
+        JOIN meetings m ON m.id = p.meeting_id
+        WHERE m.company_id = ? AND m.status = 'PUBLICADA'
+          AND p.person_key = ?
+          AND (p.acknowledged_at IS NULL OR p.acknowledged_at = '')
+        """,
+        (company_id, person_key(meeting_person_identity(user))),
+    ).fetchone()
+    return int(row["n"] or 0)
+
+
+def save_meeting(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Cria ou atualiza a ata. A lista de presença é substituída pela enviada.
+
+    Presença mantida por chave: quem já deu ciência e continua na lista NÃO perde
+    a confirmação quando o gestor edita a ata para corrigir um texto.
+    """
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão registra atas.")
+
+    meeting_id = payload.get("id")
+    kind = normalize_upper(payload.get("kind")) or "REUNIAO"
+    if kind not in MEETING_KIND_IDS:
+        raise ValueError("Tipo inválido: use Reunião ou Treinamento.")
+    title = normalize_whitespace(payload.get("title"))
+    if not title:
+        raise ValueError("Informe o assunto da reunião.")
+    occurred_at = normalize_whitespace(payload.get("occurredAt")).replace("T", " ")
+    if not occurred_at:
+        raise ValueError("Informe a data do encontro.")
+
+    campos = (
+        kind, title,
+        normalize_whitespace(payload.get("topic")),
+        normalize_unit(payload.get("unitName")) or None,
+        occurred_at,
+        int(payload.get("durationMin") or 0),
+        normalize_whitespace(payload.get("location")),
+        normalize_whitespace(payload.get("agenda")),
+        normalize_whitespace(payload.get("summary")),
+        normalize_whitespace(payload.get("decisions")),
+        normalize_whitespace(payload.get("organizerName")) or meeting_person_identity(user),
+    )
+
+    if meeting_id:
+        existente = conn.execute(
+            "SELECT id FROM meetings WHERE company_id = ? AND id = ?", (company_id, int(meeting_id))
+        ).fetchone()
+        if not existente:
+            raise ValueError("Ata não encontrada.")
+        conn.execute(
+            """
+            UPDATE meetings SET kind=?, title=?, topic=?, unit_name=?, occurred_at=?,
+                   duration_min=?, location=?, agenda=?, summary=?, decisions=?,
+                   organizer_name=?, updated_at=?
+            WHERE id = ?
+            """,
+            (*campos, now_iso(), int(meeting_id)),
+        )
+        meeting_id = int(meeting_id)
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO meetings (company_id, kind, title, topic, unit_name, occurred_at,
+                duration_min, location, agenda, summary, decisions, organizer_name,
+                status, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RASCUNHO',?,?)
+            """,
+            (company_id, *campos, user["id"], now_iso()),
+        )
+        meeting_id = int(cursor.lastrowid)
+
+    enviados = payload.get("participants") or []
+    chaves_enviadas: set[str] = set()
+    for item in enviados:
+        nome = normalize_whitespace(item.get("personName") if isinstance(item, dict) else item)
+        chave = person_key(nome)
+        if not nome or not chave or chave in chaves_enviadas:
+            continue
+        chaves_enviadas.add(chave)
+        unidade = normalize_unit(item.get("unitName")) if isinstance(item, dict) else ""
+        conn.execute(
+            """
+            INSERT INTO meeting_participants (meeting_id, person_name, person_key, unit_name, created_at)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(meeting_id, person_key) DO UPDATE SET
+                person_name = excluded.person_name,
+                unit_name   = excluded.unit_name
+            """,
+            (meeting_id, nome, chave, unidade or None, now_iso()),
+        )
+    if chaves_enviadas:
+        marcadores = ",".join("?" for _ in chaves_enviadas)
+        conn.execute(
+            f"DELETE FROM meeting_participants WHERE meeting_id = ? AND person_key NOT IN ({marcadores})",
+            (meeting_id, *chaves_enviadas),
+        )
+    else:
+        conn.execute("DELETE FROM meeting_participants WHERE meeting_id = ?", (meeting_id,))
+
+    audit_log(conn, company_id, user["id"], "salvar", "meetings", str(meeting_id),
+              {"titulo": title, "presentes": len(chaves_enviadas)})
+    conn.commit()
+    return {"meetingId": meeting_id}
+
+
+def publish_meeting(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, meeting_id: int
+) -> dict[str, Any]:
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão publica atas.")
+    ata = conn.execute(
+        "SELECT * FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id)
+    ).fetchone()
+    if not ata:
+        raise ValueError("Ata não encontrada.")
+    presentes = conn.execute(
+        "SELECT COUNT(*) n FROM meeting_participants WHERE meeting_id = ?", (meeting_id,)
+    ).fetchone()["n"]
+    if not presentes:
+        raise ValueError("Marque pelo menos um presente antes de publicar.")
+    if not normalize_whitespace(ata["summary"]):
+        raise ValueError("Preencha o que foi tratado antes de publicar.")
+    conn.execute(
+        "UPDATE meetings SET status='PUBLICADA', published_at=?, updated_at=? WHERE id=?",
+        (now_iso(), now_iso(), meeting_id),
+    )
+    audit_log(conn, company_id, user["id"], "publicar", "meetings", str(meeting_id),
+              {"presentes": int(presentes)})
+    conn.commit()
+    return {"published": True, "participants": int(presentes)}
+
+
+def acknowledge_meeting(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    meeting_id: int, feedback: str = "",
+) -> dict[str, Any]:
+    """Registra a ciência do participante e, se houver, o feedback dele.
+
+    A ciência é definitiva; o feedback pode ser complementado depois — o vendedor
+    costuma confirmar na hora e lembrar da sugestão mais tarde.
+    """
+    ata = conn.execute(
+        "SELECT status FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id)
+    ).fetchone()
+    if not ata:
+        raise ValueError("Ata não encontrada.")
+    if ata["status"] != "PUBLICADA":
+        raise ValueError("Esta ata ainda não foi publicada.")
+
+    chave = person_key(meeting_person_identity(user))
+    participante = conn.execute(
+        "SELECT id, acknowledged_at FROM meeting_participants WHERE meeting_id = ? AND person_key = ?",
+        (meeting_id, chave),
+    ).fetchone()
+    if not participante:
+        raise ValueError("Você não consta na lista de presença desta reunião.")
+
+    texto = normalize_whitespace(feedback)
+    conn.execute(
+        """
+        UPDATE meeting_participants
+        SET acknowledged_at = COALESCE(NULLIF(acknowledged_at, ''), ?),
+            feedback        = CASE WHEN ? <> '' THEN ? ELSE feedback END,
+            feedback_at     = CASE WHEN ? <> '' THEN ? ELSE feedback_at END
+        WHERE id = ?
+        """,
+        (now_iso(), texto, texto, texto, now_iso(), participante["id"]),
+    )
+    audit_log(conn, company_id, user["id"], "ciencia", "meetings", str(meeting_id),
+              {"pessoa": meeting_person_identity(user), "comFeedback": bool(texto)})
+    conn.commit()
+    return {"acknowledged": True, "hasFeedback": bool(texto)}
+
+
+def save_meeting_attachment(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    meeting_id: int, file_name: str, content: bytes,
+) -> dict[str, Any]:
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão anexa documentos.")
+    if not conn.execute(
+        "SELECT 1 FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id)
+    ).fetchone():
+        raise ValueError("Ata não encontrada.")
+
+    nome_limpo = Path(normalize_whitespace(file_name) or "arquivo").name
+    extensao = Path(nome_limpo).suffix.lower()
+    if extensao not in MEETING_ATTACHMENT_ALLOWED_EXT:
+        raise ValueError(f"Tipo de arquivo não aceito ({extensao or 'sem extensão'}).")
+    if len(content) > MEETING_ATTACHMENT_MAX_BYTES:
+        limite = MEETING_ATTACHMENT_MAX_BYTES // (1024 * 1024)
+        raise ValueError(f"Arquivo acima de {limite} MB.")
+    if not content:
+        raise ValueError("Arquivo vazio.")
+
+    # Nome em disco é gerado: o nome original vai para o banco. Evita colisão e
+    # impede que um nome com "../" escape da pasta de anexos.
+    stored = f"{meeting_id}_{uuid.uuid4().hex}{extensao}"
+    (meeting_files_dir() / stored).write_bytes(content)
+
+    cursor = conn.execute(
+        """
+        INSERT INTO meeting_attachments
+            (meeting_id, file_name, stored_name, content_type, size_bytes, uploaded_by_user_id, created_at)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (meeting_id, nome_limpo, stored,
+         mimetypes.guess_type(nome_limpo)[0] or "application/octet-stream",
+         len(content), user["id"], now_iso()),
+    )
+    conn.commit()
+    return {"attachmentId": int(cursor.lastrowid), "fileName": nome_limpo, "sizeBytes": len(content)}
+
+
+def delete_meeting_attachment(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, attachment_id: int
+) -> None:
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão remove anexos.")
+    row = conn.execute(
+        """
+        SELECT a.id, a.stored_name FROM meeting_attachments a
+        JOIN meetings m ON m.id = a.meeting_id
+        WHERE a.id = ? AND m.company_id = ?
+        """,
+        (attachment_id, company_id),
+    ).fetchone()
+    if not row:
+        raise ValueError("Anexo não encontrado.")
+    caminho = meeting_files_dir() / row["stored_name"]
+    if caminho.exists():
+        caminho.unlink()
+    conn.execute("DELETE FROM meeting_attachments WHERE id = ?", (attachment_id,))
+    conn.commit()
+
+
+def delete_meeting(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, meeting_id: int
+) -> None:
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão exclui atas.")
+    for row in conn.execute(
+        "SELECT stored_name FROM meeting_attachments WHERE meeting_id = ?", (meeting_id,)
+    ).fetchall():
+        caminho = meeting_files_dir() / row["stored_name"]
+        if caminho.exists():
+            caminho.unlink()
+    conn.execute("DELETE FROM meeting_attachments WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM meeting_participants WHERE meeting_id = ?", (meeting_id,))
+    conn.execute("DELETE FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id))
+    audit_log(conn, company_id, user["id"], "excluir", "meetings", str(meeting_id), {})
+    conn.commit()
 
 
 def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
@@ -9698,6 +10275,81 @@ class AppHandler(BaseHTTPRequestHandler):
                     "canEdit": can_edit,
                 }))
                 return
+            if path == "/api/meetings":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    itens = list_meetings(
+                        conn, user["company_id"], user,
+                        search=normalize_whitespace(query.get("q", [""])[0]),
+                        kind=normalize_upper(query.get("kind", [""])[0]),
+                        date_from=normalize_whitespace(query.get("from", [""])[0]),
+                        date_to=normalize_whitespace(query.get("to", [""])[0]),
+                        only_mine=query.get("mine", ["0"])[0] == "1",
+                    )
+                    pode_gerir = user_can_manage_meetings(conn, user)
+                    payload = {
+                        "meetings": itens,
+                        "kinds": MEETING_KINDS,
+                        "canManage": pode_gerir,
+                        "pendingCount": count_pending_acknowledgements(conn, user["company_id"], user),
+                        "myName": meeting_person_identity(user),
+                        "people": list_meeting_people(conn, user["company_id"], user) if pode_gerir else [],
+                        "units": crm_allowed_units_for_user(conn, user) or [],
+                        "maxAttachmentMb": MEETING_ATTACHMENT_MAX_BYTES // (1024 * 1024),
+                    }
+                self._set_headers(200)
+                self.wfile.write(json_dumps(payload))
+                return
+            if path.startswith("/api/meetings/attachment/"):
+                user = self._require_auth()
+                if not user:
+                    return
+                try:
+                    attachment_id = int(path.rsplit("/", 1)[-1])
+                except ValueError:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Anexo inválido."}))
+                    return
+                with closing(get_connection()) as conn:
+                    row = conn.execute(
+                        """
+                        SELECT a.file_name, a.stored_name, a.content_type, m.id AS meeting_id, m.status
+                        FROM meeting_attachments a
+                        JOIN meetings m ON m.id = a.meeting_id
+                        WHERE a.id = ? AND m.company_id = ?
+                        """,
+                        (attachment_id, user["company_id"]),
+                    ).fetchone()
+                    # Vendedor só baixa anexo de ata publicada em que ele consta.
+                    liberado = bool(row)
+                    if row and data_scope_for_user(conn, user) == "proprio":
+                        liberado = row["status"] == "PUBLICADA" and bool(conn.execute(
+                            "SELECT 1 FROM meeting_participants WHERE meeting_id = ? AND person_key = ?",
+                            (row["meeting_id"], person_key(meeting_person_identity(user))),
+                        ).fetchone())
+                if not row or not liberado:
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps({"error": "Anexo não encontrado."}))
+                    return
+                caminho = meeting_files_dir() / row["stored_name"]
+                if not caminho.exists():
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps({"error": "Arquivo removido do servidor."}))
+                    return
+                conteudo = caminho.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", row["content_type"] or "application/octet-stream")
+                self.send_header("Content-Length", str(len(conteudo)))
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{Path(row["file_name"]).name}"',
+                )
+                self.end_headers()
+                self.wfile.write(conteudo)
+                return
             if path == "/api/content":
                 # Biblioteca de conteúdo. Leitura liberada a todos os autenticados —
                 # é material de trabalho do vendedor.
@@ -10654,6 +11306,153 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/meetings/save":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        resultado = save_meeting(conn, user["company_id"], user, payload)
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
+                return
+            if path == "/api/meetings/publish":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        resultado = publish_meeting(
+                            conn, user["company_id"], user, int(payload.get("meetingId") or 0)
+                        )
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
+                return
+            if path == "/api/meetings/acknowledge":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        resultado = acknowledge_meeting(
+                            conn, user["company_id"], user,
+                            int(payload.get("meetingId") or 0),
+                            payload.get("feedback") or "",
+                        )
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
+                return
+            if path == "/api/meetings/detail":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                meeting_id = int(payload.get("meetingId") or 0)
+                with closing(get_connection()) as conn:
+                    ata = load_meeting(conn, user["company_id"], meeting_id)
+                    if ata and data_scope_for_user(conn, user) == "proprio":
+                        minha = person_key(meeting_person_identity(user))
+                        participo = any(p["personKey"] == minha for p in ata["participants"])
+                        if ata["status"] != "PUBLICADA" or not participo:
+                            ata = None
+                        else:
+                            # O vendedor não enxerga o feedback dos colegas — o canal
+                            # é dele com o gestor, não um mural público.
+                            ata["participants"] = [
+                                {**p, "feedback": p["feedback"] if p["personKey"] == minha else ""}
+                                for p in ata["participants"]
+                            ]
+                if not ata:
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps({"error": "Ata não encontrada."}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"meeting": ata}))
+                return
+            if path == "/api/meetings/delete":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        delete_meeting(conn, user["company_id"], user, int(payload.get("meetingId") or 0))
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True}))
+                return
+            if path == "/api/meetings/attachment/upload":
+                user = self._require_auth()
+                if not user:
+                    return
+                arquivos, campos = self._parse_multipart()
+                try:
+                    meeting_id = int(campos.get("meetingId") or 0)
+                    salvos = []
+                    with closing(get_connection()) as conn:
+                        for arquivo in arquivos:
+                            salvos.append(save_meeting_attachment(
+                                conn, user["company_id"], user, meeting_id,
+                                arquivo["fileName"], arquivo["content"],
+                            ))
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, "attachments": salvos}))
+                return
+            if path == "/api/meetings/attachment/delete":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        delete_meeting_attachment(
+                            conn, user["company_id"], user, int(payload.get("attachmentId") or 0)
+                        )
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True}))
                 return
             if path == "/api/content/save":
                 user = self._require_auth()
