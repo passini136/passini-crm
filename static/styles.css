@@ -1390,3 +1390,22 @@ tbody tr:hover {
   justify-content: space-between;
   color: var(--muted);
 }
+
+/* Painel de modal.
+   .panel é translúcido de propósito (rgba 0.92) para o fundo da aplicação
+   aparecer de leve. Dentro de um modal isso vira problema: o texto da tela
+   de trás atravessa e embaralha a leitura. Modal precisa ser opaco. */
+.modal-panel {
+  background: #ffffff;
+  border: 1px solid var(--line);
+  box-shadow: 0 24px 60px rgba(9, 23, 34, 0.30);
+}
+
+/* Escurece mais o fundo quando há um modal aberto, para separar os planos. */
+.client-drawer-overlay.modal-dim {
+  background: rgba(9, 23, 34, 0.52);
+}
+
+.client-drawer-overlay.modal-dim .modal-panel {
+  background: #ffffff;
+}

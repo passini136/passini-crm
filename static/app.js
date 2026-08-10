@@ -3665,8 +3665,8 @@ function copyFallbackModal() {
   const cf = state.crm.copyFallback;
   if (!cf) return "";
   return `
-    <div class="client-drawer-overlay open" onclick="closeCopyFallback()">
-      <div class="panel" style="max-width:640px;margin:8vh auto;padding:20px" onclick="event.stopPropagation()">
+    <div class="client-drawer-overlay open modal-dim" onclick="closeCopyFallback()">
+      <div class="panel modal-panel" style="max-width:640px;margin:8vh auto;padding:20px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${escapeHtml(cf.title)}</h3>
           <div class="text-small">Selecione o texto abaixo e copie com Ctrl+C.</div></div>
@@ -3812,8 +3812,8 @@ function assignTaskModal() {
   const demais = vendedores.filter((v) => !v.preferred);
 
   return `
-    <div class="client-drawer-overlay open" onclick="closeAssignTaskModal()">
-      <div class="panel" style="max-width:520px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
+    <div class="client-drawer-overlay open modal-dim" onclick="closeAssignTaskModal()">
+      <div class="panel modal-panel" style="max-width:520px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
             <h3>📣 Cobrar contato</h3>
@@ -3968,8 +3968,8 @@ function scheduleContactModal() {
   const hoje = dateInDays(0);
 
   return `
-    <div class="client-drawer-overlay open" onclick="closeScheduleContactModal()">
-      <div class="panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+    <div class="client-drawer-overlay open modal-dim" onclick="closeScheduleContactModal()">
+      <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
             <h3>📅 Agendar contato</h3>
@@ -4475,8 +4475,8 @@ function ataEditorModal() {
   const maxMb = state.meetings?.maxAttachmentMb || 15;
 
   return `
-    <div class="client-drawer-overlay open" onclick="fecharAtaEditor()">
-      <div class="panel" data-keep-scroll="ata-editor"
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharAtaEditor()">
+      <div class="panel modal-panel" data-keep-scroll="ata-editor"
            style="max-width:900px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
@@ -4633,8 +4633,8 @@ function ataDetalheModal() {
     </div>` : "";
 
   return `
-    <div class="client-drawer-overlay open" onclick="fecharAta()">
-      <div class="panel" data-keep-scroll="ata-detalhe"
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharAta()">
+      <div class="panel modal-panel" data-keep-scroll="ata-detalhe"
            style="max-width:820px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
@@ -5281,8 +5281,8 @@ function feedbackEditorModal() {
   ];
 
   return `
-    <div class="client-drawer-overlay open" onclick="fecharFeedbackEditor()">
-      <div class="panel" data-keep-scroll="feedback-editor"
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharFeedbackEditor()">
+      <div class="panel modal-panel" data-keep-scroll="feedback-editor"
            style="max-width:1000px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
@@ -5438,8 +5438,8 @@ function feedbackDetalheModal() {
     </div>` : "";
 
   return `
-    <div class="client-drawer-overlay open" onclick="fecharFeedbackDetalhe()">
-      <div class="panel" data-keep-scroll="feedback-detalhe"
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharFeedbackDetalhe()">
+      <div class="panel modal-panel" data-keep-scroll="feedback-detalhe"
            style="max-width:900px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
            onclick="event.stopPropagation()">
         <div class="section-title">
@@ -5538,8 +5538,8 @@ function feedbackDetalheModal() {
 function pdiEditorModal() {
   const p = state.pdiEditor;
   return `
-    <div class="client-drawer-overlay open" onclick="fecharPdiEditor()" style="z-index:60">
-      <div class="panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharPdiEditor()" style="z-index:60">
+      <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${p.id ? "Atualizar" : "Novo"} ponto de desenvolvimento</h3>
             <div class="text-small">${escapeHtml(p.personName)}</div></div>
