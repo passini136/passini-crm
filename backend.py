@@ -12409,6 +12409,16 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/styles.css":
                 self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
                 return
+            # Imagens da marca servidas direto de /static. Nome fixo por segurança:
+            # aceitar caminho do cliente aqui abriria leitura de arquivo arbitrário.
+            if path in ("/logo.png", "/logo.svg", "/logo.jpg", "/logo.webp"):
+                nome = path.lstrip("/")
+                tipo = {
+                    "logo.png": "image/png", "logo.svg": "image/svg+xml",
+                    "logo.jpg": "image/jpeg", "logo.webp": "image/webp",
+                }[nome]
+                self._serve_file(STATIC_DIR / nome, tipo)
+                return
             if path == "/api/health":
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, "timestamp": now_iso(), "build": "v20260602-agenda-fix"}))

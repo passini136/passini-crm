@@ -1144,51 +1144,6 @@ function messageHtml() {
 }
 
 /**
- * Escudo da marca em SVG.
- *
- * Desenhado em vetor no lugar de imagem: fica nítido em qualquer tela, não
- * precisa de arquivo no servidor e o brilho dourado do topo pode ser animado —
- * é o mesmo gesto do logotipo, agora vivo.
- */
-function passiniShield(tamanho) {
-  return `
-    <svg class="pl-shield" style="width:${tamanho || 86}px" viewBox="0 0 200 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Passini Distribuidora de Peças">
-      <defs>
-        <linearGradient id="plBody" x1="0" y1="0" x2="0.2" y2="1">
-          <stop offset="0%" stop-color="#6f5f9e" />
-          <stop offset="28%" stop-color="#3b2582" />
-          <stop offset="100%" stop-color="#241463" />
-        </linearGradient>
-        <radialGradient id="plGleam" cx="50%" cy="4%" r="42%">
-          <stop offset="0%" stop-color="#fff6c9" stop-opacity="0.95" />
-          <stop offset="45%" stop-color="#f4c25f" stop-opacity="0.55" />
-          <stop offset="100%" stop-color="#f4c25f" stop-opacity="0" />
-        </radialGradient>
-        <linearGradient id="plEdge" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stop-color="#f4c25f" stop-opacity="0.9" />
-          <stop offset="50%" stop-color="#f4c25f" stop-opacity="0.25" />
-          <stop offset="100%" stop-color="#f4c25f" stop-opacity="0.7" />
-        </linearGradient>
-      </defs>
-
-      <path id="plShieldPath"
-        d="M10 14 C60 30 140 30 190 14 C186 96 170 150 100 208 C30 150 14 96 10 14 Z"
-        fill="url(#plBody)" stroke="url(#plEdge)" stroke-width="2.5" />
-      <path d="M10 14 C60 30 140 30 190 14 C186 96 170 150 100 208 C30 150 14 96 10 14 Z"
-        fill="url(#plGleam)">
-        <animate attributeName="opacity" values="0.55;1;0.55" dur="4.5s" repeatCount="indefinite" />
-      </path>
-
-      <text x="100" y="86" text-anchor="middle" fill="#fff"
-        style="font:900 27px/1 Arial,Helvetica,sans-serif;letter-spacing:6px">PASSINI</text>
-      <text x="100" y="120" text-anchor="middle" fill="#fff"
-        style="font:800 17px/1 Arial,Helvetica,sans-serif;letter-spacing:0.5px">DISTRIBUIDORA</text>
-      <text x="100" y="146" text-anchor="middle" fill="#fff"
-        style="font:800 17px/1 Arial,Helvetica,sans-serif;letter-spacing:0.5px">DE PEÇAS</text>
-    </svg>`;
-}
-
-/**
  * Tela de entrada.
  *
  * Duas metades: a marca à esquerda, o acesso à direita. O lado da marca traz o
@@ -1201,8 +1156,14 @@ function loginView() {
     <div class="pl-shell">
       <aside class="pl-brand">
         <div class="pl-mark">
-          ${passiniShield(86)}
-          <div class="pl-mark-text">
+          <!-- Logo original, sem qualquer alteração. A placa branca existe porque
+               a arte tem fundo claro: sobre o índigo ela ficaria com um retângulo
+               esbranquiçado em volta. Assim o logo aparece exatamente como é. -->
+          <div class="pl-logo-plate">
+            <img src="/logo.png" alt="Passini Distribuidora de Peças"
+              onerror="this.closest('.pl-logo-plate').style.display='none';document.getElementById('pl-mark-fallback').style.display='block'" />
+          </div>
+          <div class="pl-mark-text" id="pl-mark-fallback" style="display:none">
             <div class="pl-name">PASSINI</div>
             <div class="pl-sub">DISTRIBUIDORA DE PEÇAS</div>
           </div>
