@@ -1735,3 +1735,135 @@ tbody tr:hover {
   .pl-brand::before, .pl-rotator p, .pl-step { animation: none; }
   .pl-rotator p:nth-child(1) { opacity: 1; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ASSISTENTE — avatar, painel e tutorial
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.as-fab {
+  position: fixed; right: 22px; bottom: 22px; z-index: 70;
+  width: 62px; height: 62px; border-radius: 50%; border: none; cursor: pointer;
+  background: linear-gradient(150deg, #2a1a6e, #4327a8);
+  box-shadow: 0 10px 26px rgba(42, 26, 110, 0.42);
+  display: flex; align-items: center; justify-content: center;
+  transition: transform 0.15s, box-shadow 0.2s;
+}
+.as-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 16px 34px rgba(42, 26, 110, 0.5); }
+.as-fab svg { width: 44px; height: 44px; }
+
+/* Selo com o número de novidades: dica situacional ou dúvida esperando resposta. */
+.as-fab-badge {
+  position: absolute; top: -2px; right: -2px;
+  min-width: 22px; height: 22px; padding: 0 6px; border-radius: 11px;
+  background: #e74c3c; color: #fff; font-size: 11px; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+  border: 2px solid #fff;
+}
+
+/* Balão que chama a atenção só na primeira visita do dia. */
+.as-bubble {
+  position: fixed; right: 96px; bottom: 34px; z-index: 70;
+  max-width: 260px; background: #fff; color: #16123a;
+  border: 1px solid var(--line); border-radius: 14px 14px 2px 14px;
+  padding: 10px 14px; font-size: 13px; line-height: 1.45;
+  box-shadow: 0 12px 30px rgba(9, 23, 34, 0.16);
+  animation: as-pop 0.35s ease-out;
+}
+@keyframes as-pop { from { opacity: 0; transform: translateY(8px) scale(0.96); } }
+
+.as-panel {
+  position: fixed; right: 22px; bottom: 96px; z-index: 71;
+  width: min(430px, calc(100vw - 44px)); max-height: min(76vh, 720px);
+  display: flex; flex-direction: column;
+  background: #fff; border-radius: 18px; border: 1px solid var(--line);
+  box-shadow: 0 24px 60px rgba(9, 23, 34, 0.26);
+  overflow: hidden; animation: as-pop 0.25s ease-out;
+}
+.as-head {
+  display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+  background: linear-gradient(140deg, #2a1a6e, #4327a8); color: #fff;
+}
+.as-head svg { width: 44px; height: 44px; flex: 0 0 auto; }
+.as-head .as-title { font-weight: 800; font-size: 15px; }
+.as-head .as-sub { font-size: 11px; color: rgba(255, 255, 255, 0.7); }
+.as-close {
+  margin-left: auto; background: rgba(255, 255, 255, 0.14); border: none; color: #fff;
+  width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 16px;
+}
+.as-close:hover { background: rgba(255, 255, 255, 0.26); }
+
+.as-tabs { display: flex; gap: 2px; padding: 8px 10px 0; border-bottom: 1px solid var(--line); }
+.as-tab {
+  border: none; background: transparent; cursor: pointer;
+  padding: 8px 12px; font-size: 12px; font-weight: 700; color: var(--muted);
+  border-bottom: 2px solid transparent;
+}
+.as-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+.as-body { padding: 14px 16px; overflow-y: auto; flex: 1; }
+.as-body::-webkit-scrollbar { width: 8px; }
+.as-body::-webkit-scrollbar-thumb { background: #d9dbe6; border-radius: 4px; }
+
+.as-card {
+  border-left: 3px solid #f4c25f; background: #fffaf0;
+  border-radius: 0 10px 10px 0; padding: 11px 14px; margin-bottom: 10px;
+}
+.as-card.acc { border-left-color: var(--accent); background: #f5f9ff; }
+.as-card.warn { border-left-color: #e74c3c; background: #fdecea; }
+.as-card h4 { margin: 0 0 4px; font-size: 13px; font-weight: 800; }
+.as-card p { margin: 0; font-size: 13px; line-height: 1.5; color: #45464f; }
+
+.as-q {
+  border: 1px solid var(--line); border-radius: 10px; margin-bottom: 8px; overflow: hidden;
+}
+.as-q summary {
+  cursor: pointer; padding: 10px 12px; font-size: 13px; font-weight: 700;
+  list-style: none; display: flex; justify-content: space-between; gap: 8px;
+}
+.as-q summary::-webkit-details-marker { display: none; }
+.as-q summary::after { content: "＋"; color: var(--muted); font-weight: 400; }
+.as-q[open] summary::after { content: "−"; }
+.as-q .as-a { padding: 0 12px 12px; font-size: 13px; line-height: 1.55; color: #45464f; }
+
+.as-ask { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--line); background: #fafbfc; }
+.as-ask input { flex: 1; padding: 10px 12px; border: 1px solid #d9dbe6; border-radius: 10px; font-size: 13px; }
+.as-ask button {
+  border: none; background: var(--accent); color: #fff; border-radius: 10px;
+  padding: 0 16px; font-weight: 700; font-size: 13px; cursor: pointer;
+}
+
+/* ── Tutorial ───────────────────────────────────────────────────────────── */
+.as-tour-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  background: rgba(9, 12, 34, 0.62);
+  display: flex; align-items: center; justify-content: center; padding: 20px;
+}
+.as-tour {
+  width: min(620px, 100%); background: #fff; border-radius: 20px; overflow: hidden;
+  box-shadow: 0 30px 70px rgba(0, 0, 0, 0.42); animation: as-pop 0.3s ease-out;
+}
+.as-tour-head {
+  background: linear-gradient(140deg, #2a1a6e, #4327a8); color: #fff;
+  padding: 22px 26px; display: flex; align-items: center; gap: 16px;
+}
+.as-tour-head svg { width: 62px; height: 62px; flex: 0 0 auto; }
+.as-tour-head .as-step-n { font-size: 11px; letter-spacing: 0.16em; color: #f4c25f; font-weight: 800; }
+.as-tour-head h3 { margin: 4px 0 0; font-size: 20px; font-weight: 800; color: #fff; }
+.as-tour-body { padding: 22px 26px; font-size: 15px; line-height: 1.62; color: #2f3140; }
+.as-tour-hint {
+  margin-top: 14px; border-left: 3px solid #f4c25f; background: #fffaf0;
+  border-radius: 0 8px 8px 0; padding: 10px 14px; font-size: 13px; color: #6b4a12;
+}
+.as-tour-foot {
+  display: flex; align-items: center; gap: 10px; padding: 16px 26px;
+  border-top: 1px solid var(--line); background: #fafbfc;
+}
+.as-dots { display: flex; gap: 6px; flex: 1; }
+.as-dot { width: 8px; height: 8px; border-radius: 50%; background: #d9dbe6; }
+.as-dot.on { background: var(--accent); width: 22px; border-radius: 4px; }
+
+@media (max-width: 640px) {
+  .as-panel { right: 12px; left: 12px; width: auto; bottom: 88px; }
+  .as-fab { right: 14px; bottom: 14px; }
+  .as-bubble { display: none; }
+}

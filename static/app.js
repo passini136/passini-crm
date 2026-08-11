@@ -22,6 +22,8 @@ const state = {
   tasks: null,            // tarefas + filtros + contadores
   taskEditor: null,       // nova tarefa de direcionamento
   taskFilters: { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" },
+  assistant: null,        // tutorial, FAQ e dicas
+  helpEditor: null,       // dica/FAQ em edição (diretoria)
   noteEditor: null,       // registro pontual em edição
   feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
@@ -59,6 +61,14 @@ const state = {
       visitRoute: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
+    assistantOpen: false,
+    assistantBubble: true,   // balão de chamada, some no primeiro clique
+    assistantTab: "dicas",
+    assistantAnswer: null,
+    assistantSearching: false,
+    tourOpen: false,
+    tourStep: 0,
+    tourManual: false,
     executiveSections: {
       details: false,
       ranking: false,
@@ -516,6 +526,14 @@ async function bootstrap() {
     loadMeetings(true);
     loadFeedback(true);
     loadVisits(true);
+    // Assistente e tutorial: carregam por último e abrem sozinhos só na
+    // primeira entrada daquele perfil.
+    loadAssistant(true).then(() => {
+      if (state.assistant && !state.assistant.tourSeen && (state.assistant.tour || []).length) {
+        abrirTour(false);
+      }
+      requestRender();
+    });
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
@@ -1151,6 +1169,497 @@ function messageHtml() {
  * Quem entra no sistema lê o método antes de digitar a senha; em três segundos
  * de espera, o hábito é reforçado sem custo nenhum.
  */
+// ─── Assistente ─────────────────────────────────────────────────────────────
+//
+// Personagem, painel e tutorial. A caixa de perguntas busca na base de
+// conhecimento — não é conversa com IA, e a tela diz isso. Prometer chat e
+// entregar busca destrói a confiança na primeira pergunta.
+
+/**
+ * Mecânico da Passini, em SVG.
+ *
+ * Vetor em vez de imagem: escala sem borrar, muda de tamanho no mesmo código e
+ * a animação (piscar, aceno, chave que balança) vem de graça. Boné e macacão no
+ * índigo da marca, para ele pertencer ao sistema e não parecer figurinha colada.
+ */
+function assistantAvatar(tamanho, animar) {
+  const id = `av${Math.random().toString(36).slice(2, 8)}`;
+  return `
+    <svg viewBox="0 0 120 120" width="${tamanho}" height="${tamanho}"
+         xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Assistente Passini">
+      <defs>
+        <linearGradient id="${id}cap" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#4a2fb5" /><stop offset="100%" stop-color="#2a1a6e" />
+        </linearGradient>
+        <linearGradient id="${id}suit" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="#3b2582" /><stop offset="100%" stop-color="#241463" />
+        </linearGradient>
+      </defs>
+
+      <circle cx="60" cy="60" r="56" fill="#fff" opacity="0.10" />
+
+      <path d="M34 96 C34 78 44 70 60 70 C76 70 86 78 86 96 L86 104 L34 104 Z" fill="url(#${id}suit)" />
+      <path d="M52 71 L60 82 L68 71 L64 69 L60 74 L56 69 Z" fill="#fff" opacity="0.9" />
+      <circle cx="60" cy="88" r="3" fill="#f4c25f" />
+
+      <g${animar ? '' : ''}>
+        <ellipse cx="60" cy="46" rx="23" ry="25" fill="#f2c9a0" />
+        <path d="M37 40 C37 24 47 16 60 16 C73 16 83 24 83 40 L83 43 C74 39 46 39 37 43 Z" fill="url(#${id}cap)" />
+        <rect x="33" y="41" width="54" height="7" rx="3.5" fill="#1d1250" />
+        <circle cx="60" cy="26" r="6" fill="#f4c25f" opacity="0.95" />
+
+        <g>
+          <ellipse cx="51" cy="49" rx="3.2" ry="3.6" fill="#2b2438">
+            ${animar ? '<animate attributeName="ry" values="3.6;0.4;3.6" dur="4.5s" begin="1.2s" repeatCount="indefinite" keyTimes="0;0.04;0.08" />' : ''}
+          </ellipse>
+          <ellipse cx="69" cy="49" rx="3.2" ry="3.6" fill="#2b2438">
+            ${animar ? '<animate attributeName="ry" values="3.6;0.4;3.6" dur="4.5s" begin="1.2s" repeatCount="indefinite" keyTimes="0;0.04;0.08" />' : ''}
+          </ellipse>
+        </g>
+        <path d="M53 58 Q60 64 67 58" stroke="#2b2438" stroke-width="2.4" fill="none" stroke-linecap="round" />
+        ${animar ? `<animateTransform attributeName="transform" type="translate"
+            values="0 0; 0 -1.6; 0 0" dur="3.6s" repeatCount="indefinite" />` : ''}
+      </g>
+
+      <g transform="translate(90 62)">
+        <path d="M0 0 l-4 -9 a7 7 0 1 1 9 9 l10 16 a4 4 0 0 1 -7 4 z"
+              fill="#c9ced8" stroke="#8b93a3" stroke-width="1.2" transform="rotate(-18)" />
+        ${animar ? `<animateTransform attributeName="transform" type="rotate"
+            values="0 0 0; -12 0 0; 0 0 0" dur="2.8s" repeatCount="indefinite" additive="sum" />` : ''}
+      </g>
+    </svg>`;
+}
+
+async function loadAssistant(silencioso) {
+  try {
+    state.assistant = await api("/api/help");
+  } catch (e) {
+    state.assistant = { error: e.message, faq: [], tips: [] };
+  }
+  if (!silencioso) requestRender();
+}
+
+function toggleAssistant() {
+  state.ui.assistantOpen = !state.ui.assistantOpen;
+  state.ui.assistantBubble = false;
+  if (state.ui.assistantOpen && !state.assistant) loadAssistant();
+  requestRender();
+}
+
+function setAssistantTab(aba) { state.ui.assistantTab = aba; requestRender(); }
+
+async function perguntarAssistente() {
+  const campo = document.getElementById("as-question");
+  const pergunta = campo ? campo.value.trim() : "";
+  if (pergunta.length < 3) { addMessage("warn", "Escreva a pergunta com pelo menos 3 letras."); return; }
+  state.ui.assistantSearching = true; requestRender();
+  try {
+    const r = await api("/api/help/ask", { method: "POST", body: JSON.stringify({ question: pergunta }) });
+    state.ui.assistantAnswer = r;
+    state.ui.assistantTab = "faq";
+  } catch (e) {
+    addMessage("error", e.message);
+  } finally {
+    state.ui.assistantSearching = false;
+    requestRender();
+  }
+}
+
+function limparRespostaAssistente() {
+  state.ui.assistantAnswer = null;
+  const campo = document.getElementById("as-question");
+  if (campo) campo.value = "";
+  requestRender();
+}
+
+function assistantFab() {
+  if (!state.user) return "";
+  const a = state.assistant;
+  const novidades = a ? (a.situationTips || []).length + (a.pendingQuestions || []).length : 0;
+  return `
+    ${state.ui.assistantBubble && !state.ui.assistantOpen && a?.messageOfDay ? `
+      <div class="as-bubble" onclick="toggleAssistant()">
+        <strong>${escapeHtml(a.messageOfDay.title)}</strong><br />
+        <span style="color:var(--muted)">Clique para ver a dica de hoje</span>
+      </div>` : ""}
+    <button class="as-fab" onclick="toggleAssistant()" title="Assistente Passini" aria-label="Abrir assistente">
+      ${assistantAvatar(44, true)}
+      ${novidades ? `<span class="as-fab-badge">${novidades}</span>` : ""}
+    </button>
+    ${state.ui.assistantOpen ? assistantPanel() : ""}`;
+}
+
+function assistantPanel() {
+  const a = state.assistant;
+  if (!a) return `<div class="as-panel"><div class="as-body"><div class="loader">Carregando…</div></div></div>`;
+  if (a.error) return `<div class="as-panel"><div class="as-body"><div class="message error">${escapeHtml(a.error)}</div></div></div>`;
+
+  const aba = state.ui.assistantTab || "dicas";
+  const abas = [
+    { id: "dicas", label: "Dicas" },
+    { id: "faq", label: "Dúvidas" },
+    ...(a.canManage ? [{ id: "admin", label: `Gerenciar${(a.pendingQuestions || []).length ? ` (${a.pendingQuestions.length})` : ""}` }] : []),
+  ];
+
+  return `
+    <div class="as-panel">
+      <div class="as-head">
+        ${assistantAvatar(44, true)}
+        <div>
+          <div class="as-title">Assistente Passini</div>
+          <div class="as-sub">Dicas do MEC, dúvidas e atalhos</div>
+        </div>
+        <button class="as-close" onclick="toggleAssistant()" aria-label="Fechar">×</button>
+      </div>
+
+      <div class="as-tabs">
+        ${abas.map((t) => `
+          <button class="as-tab ${aba === t.id ? "active" : ""}" onclick="setAssistantTab('${t.id}')">${escapeHtml(t.label)}</button>`).join("")}
+      </div>
+
+      <div class="as-body">
+        ${aba === "dicas" ? assistantTipsTab(a) : ""}
+        ${aba === "faq" ? assistantFaqTab(a) : ""}
+        ${aba === "admin" ? assistantAdminTab(a) : ""}
+      </div>
+
+      ${aba !== "admin" ? `
+        <div class="as-ask">
+          <input id="as-question" placeholder="Tem uma dúvida? Escreva aqui…"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();perguntarAssistente();}" />
+          <button onclick="perguntarAssistente()">${state.ui.assistantSearching ? "…" : "Buscar"}</button>
+        </div>` : ""}
+    </div>`;
+}
+
+function assistantTipsTab(a) {
+  const porTipo = (k) => (a.tips || []).filter((t) => t.kind === k && !t.trigger);
+  return `
+    ${a.messageOfDay ? `
+      <div class="as-card">
+        <h4>💬 ${escapeHtml(a.messageOfDay.title)}</h4>
+        <p>${escapeHtml(a.messageOfDay.body)}</p>
+      </div>` : ""}
+
+    ${(a.situationTips || []).length ? `
+      <div class="eyebrow" style="margin:14px 0 8px">PARA A SUA SITUAÇÃO DE HOJE</div>
+      ${a.situationTips.map((t) => `
+        <div class="as-card warn">
+          <h4>${escapeHtml(t.title)}</h4>
+          <p>${escapeHtml(t.body)}</p>
+        </div>`).join("")}` : ""}
+
+    ${["MEC", "DESEMPENHO", "LEMBRETE"].map((k) => {
+      const itens = porTipo(k);
+      if (!itens.length) return "";
+      const cfg = (a.tipKinds || []).find((x) => x.id === k) || { label: k, icon: "•" };
+      return `
+        <div class="eyebrow" style="margin:14px 0 8px">${cfg.icon} ${escapeHtml(cfg.label).toUpperCase()}</div>
+        ${itens.map((t) => `
+          <div class="as-card acc">
+            <h4>${escapeHtml(t.title)}</h4>
+            <p>${escapeHtml(t.body)}</p>
+          </div>`).join("")}`;
+    }).join("")}
+
+    <button class="btn btn-secondary btn-sm" style="width:100%;margin-top:10px" onclick="abrirTour(true)">
+      ▶ Rever o tutorial do meu perfil
+    </button>`;
+}
+
+function assistantFaqTab(a) {
+  const resposta = state.ui.assistantAnswer;
+  const categorias = a.faqCategories || [];
+  return `
+    ${resposta ? `
+      <div style="margin-bottom:12px">
+        <div class="text-small" style="color:var(--muted)">Você perguntou: “${escapeHtml(resposta.question)}”</div>
+        ${resposta.results?.length ? `
+          <div class="eyebrow" style="margin:8px 0">${resposta.results.length} resposta(s) encontrada(s)</div>
+          ${resposta.results.map((r) => `
+            <details class="as-q" open>
+              <summary>${escapeHtml(r.question)}</summary>
+              <div class="as-a">${escapeHtml(r.answer)}</div>
+            </details>`).join("")}` : `
+          <div class="as-card warn" style="margin-top:8px">
+            <h4>Não encontrei essa resposta</h4>
+            <p>Registrei sua pergunta para a diretoria responder. Quando ela for respondida,
+               passa a aparecer aqui para todo mundo. Se for urgente, fale com seu gerente.</p>
+          </div>`}
+        <button class="btn btn-ghost btn-sm" style="margin-top:8px" onclick="limparRespostaAssistente()">
+          Ver todas as dúvidas
+        </button>
+      </div>` : `
+      <div class="text-small" style="color:var(--muted);margin-bottom:10px">
+        Busca nas dúvidas cadastradas — não é um chat, é uma pesquisa por palavras.
+      </div>
+      ${categorias.map((cat) => {
+        const itens = (a.faq || []).filter((f) => f.category === cat.id);
+        if (!itens.length) return "";
+        return `
+          <div class="eyebrow" style="margin:14px 0 8px">${cat.icon} ${escapeHtml(cat.label).toUpperCase()}</div>
+          ${itens.map((f) => `
+            <details class="as-q">
+              <summary>${escapeHtml(f.question)}</summary>
+              <div class="as-a">${escapeHtml(f.answer)}</div>
+            </details>`).join("")}`;
+      }).join("")}`}`;
+}
+
+function assistantAdminTab(a) {
+  const pendentes = a.pendingQuestions || [];
+  return `
+    <div class="eyebrow" style="margin-bottom:8px">DÚVIDAS SEM RESPOSTA (${pendentes.length})</div>
+    ${pendentes.map((q) => `
+      <div class="as-card warn">
+        <h4>${escapeHtml(q.question)}</h4>
+        <p style="color:var(--muted);font-size:12px">${escapeHtml(q.userName)} · ${escapeHtml(q.userRole)} · ${shortDate(q.createdAt)}</p>
+        <textarea id="as-ans-${q.id}" rows="3" style="width:100%;margin-top:8px;font-family:inherit;font-size:13px;
+          border:1px solid var(--line);border-radius:8px;padding:8px" placeholder="Escreva a resposta…"></textarea>
+        <label class="check-row" style="margin-top:6px;font-size:12px">
+          <input type="checkbox" id="as-pub-${q.id}" checked />
+          <span>Publicar no FAQ para todos</span>
+        </label>
+        <div class="actions" style="gap:6px;margin-top:8px">
+          <button class="btn btn-primary btn-sm" onclick="responderDuvida(${q.id})">Responder</button>
+          <button class="btn btn-ghost btn-sm" onclick="descartarDuvida(${q.id})">Descartar</button>
+        </div>
+      </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhuma dúvida esperando resposta.</div>'}
+
+    <div class="eyebrow" style="margin:18px 0 8px">CONTEÚDO</div>
+    <div class="actions" style="gap:6px;flex-wrap:wrap">
+      <button class="btn btn-secondary btn-sm" onclick="novaDica()">＋ Nova dica</button>
+      <button class="btn btn-secondary btn-sm" onclick="novoFaq()">＋ Nova dúvida no FAQ</button>
+    </div>
+    <div class="text-small" style="color:var(--muted);margin-top:8px">
+      ${(a.allTips || []).length} dica(s) e ${(a.allFaq || []).length} pergunta(s) cadastradas.
+      As criadas por você ficam marcadas como MANUAL e não são sobrescritas por atualizações do sistema.
+    </div>
+    <div class="stack" style="margin-top:10px">
+      ${(a.allTips || []).filter((t) => t.source === "MANUAL").map((t) => `
+        <div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;
+                    padding:6px 10px;background:#f8f9fa;border-radius:6px">
+          <span>${escapeHtml(t.title)}</span>
+          <span style="display:flex;gap:4px">
+            <button class="btn btn-ghost btn-sm" onclick='editarDica(${JSON.stringify(t).replace(/'/g, "&#39;")})'>Editar</button>
+            <button class="btn btn-ghost btn-sm" onclick="excluirDica(${t.id})">Excluir</button>
+          </span>
+        </div>`).join("")}
+    </div>`;
+}
+
+async function responderDuvida(questionId) {
+  const texto = document.getElementById(`as-ans-${questionId}`)?.value.trim() || "";
+  const publicar = document.getElementById(`as-pub-${questionId}`)?.checked;
+  if (!texto) { addMessage("error", "Escreva a resposta."); return; }
+  try {
+    await api("/api/help/question/answer", {
+      method: "POST", body: JSON.stringify({ questionId, answer: texto, publish: publicar }),
+    });
+    addMessage("success", publicar ? "Respondida e publicada no FAQ." : "Respondida.");
+    await loadAssistant();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function descartarDuvida(questionId) {
+  try {
+    await api("/api/help/question/answer", {
+      method: "POST", body: JSON.stringify({ questionId, discard: true }),
+    });
+    await loadAssistant();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function novaDica() {
+  state.helpEditor = { type: "tip", id: null, kind: "MENSAGEM", title: "", body: "",
+                       roles: "", trigger: "", saving: false };
+  requestRender();
+}
+function editarDica(t) {
+  state.helpEditor = { type: "tip", ...t, saving: false };
+  requestRender();
+}
+function novoFaq() {
+  state.helpEditor = { type: "faq", id: null, category: "dia-a-dia", question: "", answer: "",
+                       keywords: "", roles: "", saving: false };
+  requestRender();
+}
+function fecharHelpEditor() { state.helpEditor = null; requestRender(); }
+
+async function salvarHelpEditor() {
+  const h = state.helpEditor;
+  if (!h) return;
+  h.saving = true; requestRender();
+  try {
+    const rota = h.type === "tip" ? "/api/help/tip/save" : "/api/help/article/save";
+    await api(rota, { method: "POST", body: JSON.stringify(h) });
+    addMessage("success", "Conteúdo salvo.");
+    state.helpEditor = null;
+    await loadAssistant();
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.helpEditor) state.helpEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirDica(tipId) {
+  if (!confirm("Excluir esta dica?")) return;
+  try {
+    await api("/api/help/tip/delete", { method: "POST", body: JSON.stringify({ tipId }) });
+    await loadAssistant();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function helpEditorModal() {
+  const h = state.helpEditor;
+  if (!h) return "";
+  const a = state.assistant || {};
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharHelpEditor()" style="z-index:95">
+      <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${h.type === "tip" ? (h.id ? "Editar dica" : "Nova dica") : (h.id ? "Editar dúvida" : "Nova dúvida no FAQ")}</h3></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharHelpEditor()">Fechar</button>
+        </div>
+        ${h.type === "tip" ? `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+            <div class="field"><label>Tipo</label>
+              <select onchange="state.helpEditor.kind=this.value">
+                ${(a.tipKinds || []).map((k) => `<option value="${k.id}" ${h.kind === k.id ? "selected" : ""}>${k.icon} ${escapeHtml(k.label)}</option>`).join("")}
+              </select></div>
+            <div class="field"><label>Para quais perfis</label>
+              <select onchange="state.helpEditor.roles=this.value">
+                <option value="" ${!h.roles ? "selected" : ""}>Todos</option>
+                <option value="VENDEDOR" ${h.roles === "VENDEDOR" ? "selected" : ""}>Só vendedores</option>
+                <option value="GERENTE DIRETOR" ${h.roles === "GERENTE DIRETOR" ? "selected" : ""}>Gestão</option>
+              </select></div>
+          </div>
+          <div class="field"><label>Título</label>
+            <input value="${escapeHtml(h.title)}" oninput="state.helpEditor.title=this.value" /></div>
+          <div class="field"><label>Texto</label>
+            <textarea rows="4" style="font-family:inherit" oninput="state.helpEditor.body=this.value">${escapeHtml(h.body)}</textarea></div>
+        ` : `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+            <div class="field"><label>Categoria</label>
+              <select onchange="state.helpEditor.category=this.value">
+                ${(a.faqCategories || []).map((c) => `<option value="${c.id}" ${h.category === c.id ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
+              </select></div>
+            <div class="field"><label>Para quais perfis</label>
+              <select onchange="state.helpEditor.roles=this.value">
+                <option value="" ${!h.roles ? "selected" : ""}>Todos</option>
+                <option value="VENDEDOR" ${h.roles === "VENDEDOR" ? "selected" : ""}>Só vendedores</option>
+                <option value="GERENTE DIRETOR" ${h.roles === "GERENTE DIRETOR" ? "selected" : ""}>Gestão</option>
+              </select></div>
+          </div>
+          <div class="field"><label>Pergunta</label>
+            <input value="${escapeHtml(h.question)}" oninput="state.helpEditor.question=this.value"
+              placeholder="Escreva como a pessoa perguntaria" /></div>
+          <div class="field"><label>Resposta</label>
+            <textarea rows="4" style="font-family:inherit" oninput="state.helpEditor.answer=this.value">${escapeHtml(h.answer)}</textarea></div>
+          <div class="field"><label>Palavras que levam a esta resposta</label>
+            <input value="${escapeHtml(h.keywords)}" oninput="state.helpEditor.keywords=this.value"
+              placeholder="senha login não entro acesso bloqueado" />
+            <div class="text-small" style="color:var(--muted)">
+              Escreva do jeito que a equipe fala. É por aqui que a busca encontra.
+            </div></div>
+        `}
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" ${h.saving ? "disabled" : ""} onclick="salvarHelpEditor()">
+            ${h.saving ? "Salvando…" : "Salvar"}</button>
+          <button class="btn btn-ghost" onclick="fecharHelpEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ─── Tutorial guiado ────────────────────────────────────────────────────────
+//
+// Passos em janela, não balões apontando para elementos da tela. Balão preso a
+// um elemento quebra quando o layout muda, e este sistema muda toda semana.
+// A janela sobrevive a qualquer mudança e ainda leva a pessoa para a tela real
+// quando ela clica em "Ir para esta tela".
+
+function abrirTour(manual) {
+  const a = state.assistant;
+  if (!a || !(a.tour || []).length) return;
+  state.ui.tourStep = 0;
+  state.ui.tourOpen = true;
+  state.ui.tourManual = Boolean(manual);
+  state.ui.assistantOpen = false;
+  requestRender();
+}
+
+function passoTour(delta) {
+  const total = (state.assistant?.tour || []).length;
+  const novo = (state.ui.tourStep || 0) + delta;
+  if (novo < 0) return;
+  if (novo >= total) { concluirTour(false); return; }
+  state.ui.tourStep = novo;
+  requestRender();
+}
+
+async function concluirTour(pulou) {
+  const a = state.assistant;
+  state.ui.tourOpen = false;
+  requestRender();
+  // Só registra quando o tour abriu sozinho. Rever pelo assistente não deve
+  // alterar o histórico de quem já tinha concluído.
+  if (!state.ui.tourManual && a?.tourKey) {
+    try {
+      await api("/api/help/tour", {
+        method: "POST", body: JSON.stringify({ tourKey: a.tourKey, skipped: Boolean(pulou) }),
+      });
+      state.assistant.tourSeen = true;
+    } catch (e) { /* não impede o uso do sistema */ }
+  }
+}
+
+function irParaTelaDoTour(tab) {
+  if (tab) { state.activeTab = tab; }
+  passoTour(1);
+}
+
+function tourOverlay() {
+  if (!state.ui.tourOpen) return "";
+  const a = state.assistant;
+  const passos = a?.tour || [];
+  const i = Math.min(state.ui.tourStep || 0, passos.length - 1);
+  const p = passos[i];
+  if (!p) return "";
+  const ultimo = i === passos.length - 1;
+
+  return `
+    <div class="as-tour-overlay">
+      <div class="as-tour">
+        <div class="as-tour-head">
+          ${assistantAvatar(62, true)}
+          <div>
+            <div class="as-step-n">PASSO ${i + 1} DE ${passos.length}</div>
+            <h3>${p.icon ? p.icon + " " : ""}${escapeHtml(p.title)}</h3>
+          </div>
+        </div>
+        <div class="as-tour-body">
+          ${escapeHtml(p.body)}
+          ${p.hint ? `<div class="as-tour-hint">💡 ${escapeHtml(p.hint)}</div>` : ""}
+        </div>
+        <div class="as-tour-foot">
+          <div class="as-dots">
+            ${passos.map((_, k) => `<span class="as-dot ${k === i ? "on" : ""}"></span>`).join("")}
+          </div>
+          ${i > 0 ? `<button class="btn btn-ghost btn-sm" onclick="passoTour(-1)">Voltar</button>` : ""}
+          ${!ultimo ? `<button class="btn btn-ghost btn-sm" onclick="concluirTour(true)">Pular</button>` : ""}
+          ${p.tab && !ultimo
+            ? `<button class="btn btn-secondary btn-sm" onclick="irParaTelaDoTour('${p.tab}')">Ir para esta tela</button>`
+            : ""}
+          <button class="btn btn-primary btn-sm" onclick="${ultimo ? "concluirTour(false)" : "passoTour(1)"}">
+            ${ultimo ? "Começar a usar" : "Próximo"}
+          </button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function loginView() {
   return `
     <div class="pl-shell">
@@ -10074,6 +10583,9 @@ function dashboardView() {
       ${assignTaskModal()}
       ${scheduleContactModal()}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
+      ${assistantFab()}
+      ${helpEditorModal()}
+      ${tourOverlay()}
       ${clientDrawerView()}
     </div>
   `;

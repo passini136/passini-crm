@@ -1796,6 +1796,73 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_visits_unit_status
                 ON visits(company_id, unit_name, status);
 
+            -- Base de conhecimento do assistente
+            CREATE TABLE IF NOT EXISTS help_articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                category TEXT NOT NULL,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                keywords TEXT,
+                roles TEXT,                       -- vazio = todos os perfis
+                source TEXT NOT NULL DEFAULT 'SEED',   -- SEED | MANUAL
+                is_active INTEGER NOT NULL DEFAULT 1,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, question),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Dicas do assistente
+            CREATE TABLE IF NOT EXISTS assistant_tips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,               -- MENSAGEM | MEC | DESEMPENHO | LEMBRETE
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                roles TEXT,
+                trigger_code TEXT,                -- vazio = sempre elegível
+                source TEXT NOT NULL DEFAULT 'SEED',
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, title),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Perguntas que a busca não respondeu. É daqui que o FAQ cresce:
+            -- a dúvida real da equipe vale mais que a que a gente imagina.
+            CREATE TABLE IF NOT EXISTS help_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                user_id INTEGER,
+                user_name TEXT,
+                user_role TEXT,
+                question TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDENTE',   -- PENDENTE | RESPONDIDA | DESCARTADA
+                answer TEXT,
+                answered_by_user_id INTEGER,
+                answered_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_help_questions_status
+                ON help_questions(company_id, status);
+
+            -- Quem já viu o tutorial
+            CREATE TABLE IF NOT EXISTS user_onboarding (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                tour_key TEXT NOT NULL,
+                completed_at TEXT,
+                skipped INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, tour_key)
+            );
+
             -- Registro pontual: a conversa que não espera o fechamento do mês.
             -- O MEC (item 7) prevê "orienta e combina a correção; se repetir,
             -- registra o fato e o combinado". É isso — leve, datado, e vira
@@ -2197,6 +2264,7 @@ def init_db() -> None:
         seed_content_library(conn, company_id)
         seed_kpi_thresholds(conn, company_id)
         backfill_meeting_participant_users(conn, company_id)
+        seed_help_content(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -6430,6 +6498,467 @@ def delete_crm_task(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
     audit_log(conn, company_id, user["id"], "excluir", "crm_tasks", str(task_id), {})
     conn.commit()
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assistente: tutorial, FAQ e dicas
+#
+# A caixa de perguntas NÃO é um chat inteligente — o servidor é local e não fala
+# com nenhum serviço de IA. Ela busca na base de conhecimento por palavra. Isso
+# fica dito na tela: prometer conversa e entregar busca destrói a confiança na
+# primeira pergunta.
+#
+# Quando a busca não acha, a pergunta é registrada para o admin responder. É
+# assim que o FAQ cresce com a dúvida real da equipe em vez da que imaginamos.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _help_content() -> Any:
+    import help_content
+    return help_content
+
+
+def help_role_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
+    """Perfil do usuário na linguagem do conteúdo de ajuda."""
+    scope = data_scope_for_user(conn, user)
+    if scope == "proprio":
+        return "VENDEDOR"
+    if scope == "todos":
+        return "DIRETOR"
+    return "GERENTE"
+
+
+def _matches_role(roles: str | None, papel: str) -> bool:
+    """Campo `roles` vazio vale para todos os perfis."""
+    texto = normalize_upper(roles)
+    return not texto or papel in texto.split()
+
+
+def seed_help_content(conn: sqlite3.Connection, company_id: int) -> None:
+    """Popula FAQ e dicas na primeira execução e a cada conteúdo novo.
+
+    INSERT OR IGNORE de propósito: o que o admin editou pela tela nunca é
+    sobrescrito por uma atualização do arquivo.
+    """
+    try:
+        conteudo = _help_content()
+    except Exception as exc:
+        print(f"[ajuda] help_content.py indisponível: {exc}", flush=True)
+        return
+
+    novos_faq = 0
+    for i, item in enumerate(conteudo.FAQ_SEED):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO help_articles
+                (company_id, category, question, answer, keywords, roles, source, sort_order, created_at)
+            VALUES (?,?,?,?,?,?,'SEED',?,?)
+            """,
+            (company_id, item["category"], item["question"], item["answer"],
+             item.get("keywords", ""), item.get("roles", ""), i, now_iso()),
+        )
+        novos_faq += cur.rowcount or 0
+
+    novas_dicas = 0
+    for item in conteudo.TIPS_SEED:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO assistant_tips
+                (company_id, kind, title, body, roles, trigger_code, source, created_at)
+            VALUES (?,?,?,?,?,?,'SEED',?)
+            """,
+            (company_id, item["kind"], item["title"], item["body"],
+             item.get("roles", ""), item.get("trigger", ""), now_iso()),
+        )
+        novas_dicas += cur.rowcount or 0
+
+    if novos_faq or novas_dicas:
+        conn.commit()
+        print(f"[ajuda] {novos_faq} pergunta(s) e {novas_dicas} dica(s) adicionadas", flush=True)
+
+
+def list_help_articles(
+    conn: sqlite3.Connection, company_id: int, papel: str, incluir_inativos: bool = False
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM help_articles WHERE company_id = ?"
+    if not incluir_inativos:
+        sql += " AND is_active = 1"
+    sql += " ORDER BY sort_order, id"
+    return [
+        {
+            "id": int(r["id"]), "category": r["category"], "question": r["question"],
+            "answer": r["answer"], "keywords": r["keywords"] or "", "roles": r["roles"] or "",
+            "source": r["source"], "isActive": bool(r["is_active"]),
+        }
+        for r in conn.execute(sql, (company_id,)).fetchall()
+        if _matches_role(r["roles"], papel)
+    ]
+
+
+def search_help(
+    conn: sqlite3.Connection, company_id: int, papel: str, pergunta: str, limite: int = 5
+) -> list[dict[str, Any]]:
+    """Busca por palavras, com pontuação simples.
+
+    Sem motor de busca e sem IA: cada palavra da pergunta com 3+ letras vale
+    pontos conforme onde aparece. Pergunta vale mais que palavra-chave, que vale
+    mais que o corpo da resposta — quem acerta o título costuma ser a resposta
+    certa. É simples, previsível e explicável, que é o que importa aqui.
+    """
+    termo = normalize_upper(strip_accents(normalize_whitespace(pergunta)))
+    # Palavras vazias de significado ficam de fora. Sem isso, "esqueci MINHA
+    # senha" casava com qualquer resposta que tivesse "minha" no meio do texto.
+    vazias = {
+        "COMO", "ONDE", "QUANDO", "QUAL", "QUAIS", "QUE", "POR", "PARA", "COM",
+        "SEM", "DOS", "DAS", "UMA", "UNS", "UMAS", "MEU", "MINHA", "MEUS",
+        "MINHAS", "SEU", "SUA", "NAO", "SIM", "ISSO", "ESSE", "ESSA", "ESTA",
+        "ESTE", "AQUI", "MAS", "TEM", "FAZ", "FOI", "SAO", "ERA", "DEU", "VOU",
+        "PODE", "POSSO", "DEVO", "AGORA", "DEPOIS", "ANTES", "MAIS", "MENOS",
+    }
+    palavras = [p for p in re.split(r"[^A-Z0-9]+", termo) if len(p) >= 3 and p not in vazias]
+    if not palavras:
+        return []
+
+    resultados = []
+    for artigo in list_help_articles(conn, company_id, papel):
+        alvo_q = normalize_upper(strip_accents(artigo["question"]))
+        alvo_k = normalize_upper(strip_accents(artigo["keywords"]))
+        alvo_a = normalize_upper(strip_accents(artigo["answer"]))
+        pontos = 0
+        acertos = 0
+        for palavra in palavras:
+            achou = False
+            if palavra in alvo_q:
+                pontos += 5; achou = True
+            if palavra in alvo_k:
+                pontos += 3; achou = True
+            if palavra in alvo_a:
+                pontos += 1; achou = True
+            if achou:
+                acertos += 1
+        # Exige boa parte das palavras da pergunta. Metade era frouxo demais e
+        # trazia resposta que só compartilhava uma palavra qualquer.
+        # Até 2 palavras, uma boa já basta ("como funciona o farol" vira
+        # FUNCIONA + FAROL, e só FAROL importa). De 3 em diante, exige 60%.
+        minimo = 1 if len(palavras) <= 2 else math.ceil(len(palavras) * 0.6)
+        if pontos and acertos >= minimo:
+            resultados.append({**artigo, "score": pontos})
+
+    resultados.sort(key=lambda x: x["score"], reverse=True)
+    return resultados[:limite]
+
+
+def register_help_question(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, pergunta: str
+) -> int:
+    texto = normalize_whitespace(pergunta)
+    if not texto:
+        return 0
+    ja = conn.execute(
+        "SELECT id FROM help_questions WHERE company_id = ? AND UPPER(question) = ? AND status = 'PENDENTE'",
+        (company_id, normalize_upper(texto)),
+    ).fetchone()
+    if ja:
+        return int(ja["id"])
+    cur = conn.execute(
+        """
+        INSERT INTO help_questions (company_id, user_id, user_name, user_role, question, created_at)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (company_id, user["id"], meeting_person_identity(user),
+         help_role_for_user(conn, user), texto, now_iso()),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def list_help_questions(
+    conn: sqlite3.Connection, company_id: int, status: str = "PENDENTE"
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM help_questions WHERE company_id = ?"
+    params: list[Any] = [company_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(normalize_upper(status))
+    sql += " ORDER BY datetime(created_at) DESC LIMIT 200"
+    return [
+        {
+            "id": int(r["id"]), "question": r["question"], "userName": r["user_name"] or "",
+            "userRole": r["user_role"] or "", "status": r["status"],
+            "answer": r["answer"] or "", "createdAt": r["created_at"],
+        }
+        for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def answer_help_question(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Responde a dúvida e, se pedido, publica no FAQ para os próximos."""
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria responde as dúvidas.")
+    question_id = int(payload.get("questionId") or 0)
+    linha = conn.execute(
+        "SELECT * FROM help_questions WHERE company_id = ? AND id = ?", (company_id, question_id)
+    ).fetchone()
+    if not linha:
+        raise ValueError("Pergunta não encontrada.")
+
+    if payload.get("discard"):
+        conn.execute("UPDATE help_questions SET status='DESCARTADA' WHERE id = ?", (question_id,))
+        conn.commit()
+        return {"discarded": True}
+
+    resposta = normalize_whitespace(payload.get("answer"))
+    if not resposta:
+        raise ValueError("Escreva a resposta.")
+
+    conn.execute(
+        "UPDATE help_questions SET status='RESPONDIDA', answer=?, answered_by_user_id=?, answered_at=? "
+        "WHERE id = ?",
+        (resposta, user["id"], now_iso(), question_id),
+    )
+
+    publicado = False
+    if payload.get("publish"):
+        titulo = normalize_whitespace(payload.get("question")) or linha["question"]
+        conn.execute(
+            """
+            INSERT INTO help_articles (company_id, category, question, answer, keywords, roles,
+                source, sort_order, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?, 'MANUAL', 100, ?, ?)
+            ON CONFLICT(company_id, question) DO UPDATE SET
+                answer = excluded.answer, keywords = excluded.keywords,
+                category = excluded.category, updated_at = excluded.created_at
+            """,
+            (company_id, normalize_whitespace(payload.get("category")) or "dia-a-dia",
+             titulo, resposta, normalize_whitespace(payload.get("keywords")) or titulo,
+             normalize_upper(payload.get("roles")), user["id"], now_iso()),
+        )
+        publicado = True
+
+    conn.commit()
+    return {"answered": True, "published": publicado}
+
+
+def save_help_article(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria edita o FAQ.")
+    pergunta = normalize_whitespace(payload.get("question"))
+    resposta = normalize_whitespace(payload.get("answer"))
+    if not pergunta or not resposta:
+        raise ValueError("Pergunta e resposta são obrigatórias.")
+    artigo_id = payload.get("id")
+    campos = (
+        normalize_whitespace(payload.get("category")) or "dia-a-dia",
+        pergunta, resposta,
+        normalize_whitespace(payload.get("keywords")) or pergunta,
+        normalize_upper(payload.get("roles")),
+        0 if payload.get("isActive") is False else 1,
+    )
+    if artigo_id:
+        conn.execute(
+            "UPDATE help_articles SET category=?, question=?, answer=?, keywords=?, roles=?, "
+            "is_active=?, updated_at=? WHERE company_id = ? AND id = ?",
+            (*campos, now_iso(), company_id, int(artigo_id)),
+        )
+        novo = int(artigo_id)
+    else:
+        cur = conn.execute(
+            "INSERT INTO help_articles (category, question, answer, keywords, roles, is_active, "
+            "company_id, source, sort_order, created_by_user_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?, 'MANUAL', 100, ?, ?)",
+            (*campos, company_id, user["id"], now_iso()),
+        )
+        novo = int(cur.lastrowid)
+    conn.commit()
+    return {"articleId": novo}
+
+
+def delete_help_article(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, article_id: int) -> None:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria edita o FAQ.")
+    conn.execute("DELETE FROM help_articles WHERE company_id = ? AND id = ?", (company_id, article_id))
+    conn.commit()
+
+
+def save_assistant_tip(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria edita as dicas.")
+    titulo = normalize_whitespace(payload.get("title"))
+    corpo = normalize_whitespace(payload.get("body"))
+    if not titulo or not corpo:
+        raise ValueError("Título e texto são obrigatórios.")
+    kind = normalize_upper(payload.get("kind")) or "MENSAGEM"
+    campos = (kind, titulo, corpo, normalize_upper(payload.get("roles")),
+              normalize_upper(payload.get("trigger")), 0 if payload.get("isActive") is False else 1)
+    tip_id = payload.get("id")
+    if tip_id:
+        conn.execute(
+            "UPDATE assistant_tips SET kind=?, title=?, body=?, roles=?, trigger_code=?, "
+            "is_active=?, updated_at=? WHERE company_id = ? AND id = ?",
+            (*campos, now_iso(), company_id, int(tip_id)),
+        )
+        novo = int(tip_id)
+    else:
+        cur = conn.execute(
+            "INSERT INTO assistant_tips (kind, title, body, roles, trigger_code, is_active, "
+            "company_id, source, created_by_user_id, created_at) VALUES (?,?,?,?,?,?,?, 'MANUAL', ?, ?)",
+            (*campos, company_id, user["id"], now_iso()),
+        )
+        novo = int(cur.lastrowid)
+    conn.commit()
+    return {"tipId": novo}
+
+
+def delete_assistant_tip(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, tip_id: int) -> None:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria edita as dicas.")
+    conn.execute("DELETE FROM assistant_tips WHERE company_id = ? AND id = ?", (company_id, tip_id))
+    conn.commit()
+
+
+def user_situation_triggers(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[str]:
+    """Situações em que este usuário está agora.
+
+    É o que faz a dica ser útil em vez de decorativa: só entra o que responde ao
+    número real da pessoa hoje.
+    """
+    gatilhos: list[str] = []
+    papel = help_role_for_user(conn, user)
+    hoje = today_in_brazil().isoformat()
+
+    if papel == "VENDEDOR":
+        nome = seller_identity_for_user(user)
+        atrasadas = conn.execute(
+            "SELECT COUNT(*) n FROM crm_tasks WHERE company_id = ? AND UPPER(seller_name) = ? "
+            "AND status NOT IN ('CONCLUIDA','CANCELADA') AND date(due_at) < date(?)",
+            (company_id, normalize_upper(nome), hoje),
+        ).fetchone()["n"]
+        if atrasadas:
+            gatilhos.append("TASKS_OVERDUE")
+        try:
+            competencia = crm_latest_competence(conn, company_id) or hoje[:7]
+            ind = safe_feedback_indicators(conn, company_id, "VENDEDOR", nome, "", competencia)
+            if ind.get("found"):
+                if int(ind.get("calls") or 0) < int(ind.get("callsTarget") or 60):
+                    gatilhos.append("CALLS_LOW")
+                if float(ind.get("goalAttainmentPct") or 0) < 90:
+                    gatilhos.append("GOAL_LOW")
+                if float(ind.get("returnsPct") or 0) > 3:
+                    gatilhos.append("RETURNS_HIGH")
+                ticket_unidade = float(ind.get("ticketAverageUnit") or 0)
+                if ticket_unidade and float(ind.get("ticketAverage") or 0) < ticket_unidade * 0.85:
+                    gatilhos.append("TICKET_LOW")
+                total = int(ind.get("portfolioTotal") or 0)
+                if total:
+                    parados = int(ind.get("portfolioInactive") or 0) + int(ind.get("portfolioPreInactive") or 0)
+                    if safe_div(parados, total) > 0.35:
+                        gatilhos.append("INACTIVE_HIGH")
+        except Exception as exc:
+            print(f"[ajuda] indicadores indisponíveis para dicas: {exc}", flush=True)
+    else:
+        pendentes = conn.execute(
+            "SELECT COUNT(*) n FROM visit_requests WHERE company_id = ? AND status = 'PENDENTE'",
+            (company_id,),
+        ).fetchone()["n"]
+        if pendentes:
+            gatilhos.append("VISITS_PENDING")
+        if papel == "GERENTE":
+            competencia = crm_latest_competence(conn, company_id) or hoje[:7]
+            feitos = conn.execute(
+                "SELECT COUNT(*) n FROM feedbacks WHERE company_id = ? AND kind='VENDEDOR' "
+                "AND competence = ? AND status='PUBLICADO'",
+                (company_id, competencia),
+            ).fetchone()["n"]
+            equipe = len([p for p in list_meeting_people(conn, company_id, user)
+                          if p["role"] == "Vendedor"])
+            if equipe and feitos < equipe:
+                gatilhos.append("FEEDBACK_PENDING")
+    return gatilhos
+
+
+def assistant_payload(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> dict[str, Any]:
+    conteudo = _help_content()
+    papel = help_role_for_user(conn, user)
+    gatilhos = user_situation_triggers(conn, company_id, user)
+
+    dicas = []
+    for r in conn.execute(
+        "SELECT * FROM assistant_tips WHERE company_id = ? AND is_active = 1 ORDER BY id",
+        (company_id,),
+    ).fetchall():
+        if not _matches_role(r["roles"], papel):
+            continue
+        gatilho = normalize_upper(r["trigger_code"])
+        if gatilho and gatilho not in gatilhos:
+            continue
+        dicas.append({
+            "id": int(r["id"]), "kind": r["kind"], "title": r["title"], "body": r["body"],
+            "roles": r["roles"] or "", "trigger": gatilho, "source": r["source"],
+            "isActive": bool(r["is_active"]),
+        })
+
+    # Mensagem do dia: gira pelo dia do ano, para toda a equipe ver a mesma e a
+    # frase virar assunto. Aleatório faria cada um ver uma coisa.
+    mensagens = [d for d in dicas if d["kind"] == "MENSAGEM"]
+    do_dia = mensagens[today_in_brazil().toordinal() % len(mensagens)] if mensagens else None
+
+    # Dica situacional tem prioridade sobre a mensagem: quem está com tarefa
+    # atrasada precisa mais de um empurrão concreto que de uma frase.
+    situacionais = [d for d in dicas if d["trigger"]]
+
+    tour_key = f"tour-{papel.lower()}"
+    visto = conn.execute(
+        "SELECT completed_at, skipped FROM user_onboarding WHERE user_id = ? AND tour_key = ?",
+        (user["id"], tour_key),
+    ).fetchone()
+
+    pode_gerir = user_can_manage_users(conn, user)
+    return {
+        "role": papel,
+        "myName": meeting_person_identity(user),
+        "tour": conteudo.TOURS.get(papel, []),
+        "tourKey": tour_key,
+        "tourSeen": bool(visto),
+        "messageOfDay": do_dia,
+        "situationTips": situacionais,
+        "tips": dicas,
+        "tipKinds": conteudo.TIP_KINDS,
+        "faq": list_help_articles(conn, company_id, papel),
+        "faqCategories": conteudo.FAQ_CATEGORIES,
+        "canManage": pode_gerir,
+        "pendingQuestions": (list_help_questions(conn, company_id, "PENDENTE") if pode_gerir else []),
+        "allTips": ([
+            {"id": int(r["id"]), "kind": r["kind"], "title": r["title"], "body": r["body"],
+             "roles": r["roles"] or "", "trigger": r["trigger_code"] or "",
+             "source": r["source"], "isActive": bool(r["is_active"])}
+            for r in conn.execute("SELECT * FROM assistant_tips WHERE company_id = ? ORDER BY kind, id",
+                                  (company_id,)).fetchall()
+        ] if pode_gerir else []),
+        "allFaq": (list_help_articles(conn, company_id, papel, incluir_inativos=True)
+                   if pode_gerir else []),
+    }
+
+
+def mark_tour_seen(conn: sqlite3.Connection, user: sqlite3.Row, tour_key: str, skipped: bool) -> None:
+    conn.execute(
+        """
+        INSERT INTO user_onboarding (user_id, tour_key, completed_at, skipped)
+        VALUES (?,?,?,?)
+        ON CONFLICT(user_id, tour_key) DO UPDATE SET
+            completed_at = excluded.completed_at, skipped = excluded.skipped
+        """,
+        (user["id"], normalize_whitespace(tour_key) or "tour", now_iso(), 1 if skipped else 0),
+    )
+    conn.commit()
 
 
 def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
@@ -12709,6 +13238,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     "canEdit": can_edit,
                 }))
                 return
+            if path == "/api/help":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    dados = assistant_payload(conn, user["company_id"], user)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
             if path == "/api/visits":
                 user = self._require_auth()
                 if not user:
@@ -13850,6 +14388,57 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in ("/api/help/ask", "/api/help/tour", "/api/help/question/answer",
+                        "/api/help/article/save", "/api/help/article/delete",
+                        "/api/help/tip/save", "/api/help/tip/delete"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/help/ask":
+                            papel = help_role_for_user(conn, user)
+                            pergunta = normalize_whitespace(payload.get("question"))
+                            achados = search_help(conn, user["company_id"], papel, pergunta)
+                            registrada = None
+                            if not achados:
+                                registrada = register_help_question(conn, user["company_id"], user, pergunta)
+                            resultado = {
+                                "results": achados,
+                                "registered": bool(registrada),
+                                "question": pergunta,
+                            }
+                        elif path == "/api/help/tour":
+                            mark_tour_seen(conn, user,
+                                           normalize_whitespace(payload.get("tourKey")),
+                                           bool(payload.get("skipped")))
+                            resultado = {}
+                        elif path == "/api/help/question/answer":
+                            resultado = answer_help_question(conn, user["company_id"], user, payload)
+                        elif path == "/api/help/article/save":
+                            resultado = save_help_article(conn, user["company_id"], user, payload)
+                        elif path == "/api/help/article/delete":
+                            delete_help_article(conn, user["company_id"], user,
+                                                int(payload.get("articleId") or 0))
+                            resultado = {}
+                        elif path == "/api/help/tip/save":
+                            resultado = save_assistant_tip(conn, user["company_id"], user, payload)
+                        else:
+                            delete_assistant_tip(conn, user["company_id"], user,
+                                                 int(payload.get("tipId") or 0))
+                            resultado = {}
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path in ("/api/crm/tasks/create", "/api/crm/tasks/delete"):
                 user = self._require_auth()
