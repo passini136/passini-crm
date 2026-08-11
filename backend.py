@@ -5685,6 +5685,38 @@ def suggest_visits(
 
 # ── Pedido de visita (vendedor → gerente) ────────────────────────────────────
 
+def visit_request_eligibility(
+    conn: sqlite3.Connection, company_id: int, client_key: str
+) -> dict[str, Any]:
+    """Se o cliente já teve ligação registrada dentro da janela.
+
+    É a condição para pedir visita. Sem ela o pedido vira atalho: o vendedor
+    empurra para o gerente o contato que era dele fazer.
+    """
+    limite = (today_in_brazil() - timedelta(days=VISIT_CALL_WINDOW_DAYS)).isoformat()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) n, MAX(occurred_at) ultima
+        FROM crm_interactions
+        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO'
+          AND date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?)
+        """,
+        (company_id, client_key, limite),
+    ).fetchone()
+    total = conn.execute(
+        "SELECT COUNT(*) n FROM crm_interactions WHERE company_id = ? AND client_key = ? "
+        "AND contact_type_code = 'LIGACAO'",
+        (company_id, client_key),
+    ).fetchone()["n"]
+    return {
+        "eligible": int(row["n"] or 0) > 0,
+        "callsInWindow": int(row["n"] or 0),
+        "callsTotal": int(total or 0),
+        "lastCallAt": row["ultima"] or "",
+        "windowDays": VISIT_CALL_WINDOW_DAYS,
+    }
+
+
 def create_visit_request(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -5694,6 +5726,16 @@ def create_visit_request(
         raise ValueError("Cliente inválido.")
     if not reason:
         raise ValueError("Diga por que a visita é necessária — é o que o gerente lê para decidir.")
+
+    # Condição do módulo: só pede visita quem já tentou por telefone. A checagem
+    # é no servidor porque a tela pode ser contornada, e essa regra é o que
+    # mantém a ordem entre o trabalho do vendedor e o do gestor.
+    elegivel = visit_request_eligibility(conn, company_id, client_key)
+    if not elegivel["eligible"]:
+        raise ValueError(
+            f"Registre uma ligação para este cliente antes de pedir a visita. "
+            f"Nenhuma ligação registrada nos últimos {elegivel['windowDays']} dias."
+        )
 
     ja_existe = conn.execute(
         "SELECT id FROM visit_requests WHERE company_id = ? AND client_key = ? AND status = 'PENDENTE'",
@@ -6033,6 +6075,7 @@ def client_contact_effect(
         } if pedido else None,
         "eligibleForVisit": int(ligacoes["recentes"] or 0) > 0,
         "callWindowDays": VISIT_CALL_WINDOW_DAYS,
+        "canRequestVisit": (int(ligacoes["recentes"] or 0) > 0 and pedido is None),
     }
 
 

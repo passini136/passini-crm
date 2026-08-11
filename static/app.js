@@ -18,6 +18,7 @@ const state = {
   visitRoute: null,        // roteiro sugerido por proximidade
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", relationship: true },
+  visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
   noteEditor: null,       // registro pontual em edição
   feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
@@ -4328,6 +4329,82 @@ async function loadClientVisitHistory(clientKey) {
   requestRender();
 }
 
+// ─── Pedido de visita a partir da ficha ─────────────────────────────────────
+
+function abrirPedidoVisita(clientKey, clientName) {
+  state.visitRequestEditor = {
+    clientKey, clientName: clientName || clientKey, reason: "", saving: false,
+  };
+  requestRender();
+}
+
+function fecharPedidoVisita() { state.visitRequestEditor = null; requestRender(); }
+
+async function enviarPedidoVisita() {
+  const p = state.visitRequestEditor;
+  if (!p) return;
+  if (!p.reason.trim()) { addMessage("error", "Diga por que a visita resolve o que a ligação não resolveu."); return; }
+  p.saving = true; requestRender();
+  try {
+    const r = await api("/api/visits/request", {
+      method: "POST",
+      body: JSON.stringify({ clientKey: p.clientKey, clientName: p.clientName, reason: p.reason }),
+    });
+    addMessage(r.duplicated ? "warn" : "success", r.message || "Pedido enviado.");
+    state.visitRequestEditor = null;
+    await loadClientVisitHistory(p.clientKey);
+    loadVisits(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.visitRequestEditor) state.visitRequestEditor.saving = false;
+    requestRender();
+  }
+}
+
+const MOTIVOS_VISITA = [
+  "Liguei várias vezes e não consigo falar com o responsável",
+  "Cliente parou de comprar e não diz o motivo por telefone",
+  "Concorrente entrou na conta — precisa de presença",
+  "Negociação de volume/tabela que não fecha por telefone",
+  "Problema antigo mal resolvido, o cliente está chateado",
+];
+
+function usarMotivoVisita(indice) {
+  if (!state.visitRequestEditor) return;
+  state.visitRequestEditor.reason = MOTIVOS_VISITA[indice] || state.visitRequestEditor.reason;
+  requestRender();
+}
+
+function pedidoVisitaModal() {
+  const p = state.visitRequestEditor;
+  if (!p) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharPedidoVisita()" style="z-index:60">
+      <div class="panel modal-panel" style="max-width:560px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>🙋 Pedir visita do gerente</h3>
+            <div class="text-small">${escapeHtml(p.clientName)}</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharPedidoVisita()">Fechar</button>
+        </div>
+        <div class="field" style="margin-top:12px">
+          <label>Por que a visita resolve o que a ligação não resolveu? <span style="color:var(--bad)">*</span></label>
+          <textarea rows="3" style="font-family:inherit" oninput="state.visitRequestEditor.reason=this.value"
+            placeholder="Seja específico — é o que o gerente lê para montar a rota da semana">${escapeHtml(p.reason)}</textarea>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:6px">
+            ${MOTIVOS_VISITA.map((m, i) => `
+              <button class="btn btn-ghost btn-sm" style="font-size:11px"
+                onclick="usarMotivoVisita(${i})">${escapeHtml(m)}</button>`).join("")}
+          </div>
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" ${p.saving ? "disabled" : ""} onclick="enviarPedidoVisita()">
+            ${p.saving ? "Enviando…" : "Enviar pedido"}</button>
+          <button class="btn btn-ghost" onclick="fecharPedidoVisita()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function clientVisitBlock(clientKey) {
   const d = state.crm.clientVisits;
   if (!d || d.error) return "";
@@ -4339,9 +4416,17 @@ function clientVisitBlock(clientKey) {
           <div class="text-small">
             ${number(d.callsTotal)} ligação(ões) no total · ${number(d.callsRecent)} nos últimos ${d.callWindowDays} dias
           </div></div>
-        ${podeGerir ? `
-          <button class="btn btn-secondary btn-sm"
-            onclick='novaVisita({clientKey:"${jsAttr(clientKey)}",clientName:"${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}"})'>Registrar visita</button>` : ""}
+        <div style="display:flex;gap:6px">
+          ${!podeGerir && d.canRequestVisit ? `
+            <button class="btn btn-primary btn-sm"
+              onclick="abrirPedidoVisita('${jsAttr(clientKey)}','${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}')">🙋 Pedir visita</button>` : ""}
+          ${!podeGerir && !d.canRequestVisit && !d.pendingRequest ? `
+            <button class="btn btn-ghost btn-sm" disabled
+              title="Registre uma ligação para este cliente antes de pedir a visita">🙋 Pedir visita</button>` : ""}
+          ${podeGerir ? `
+            <button class="btn btn-secondary btn-sm"
+              onclick='novaVisita({clientKey:"${jsAttr(clientKey)}",clientName:"${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}"})'>Registrar visita</button>` : ""}
+        </div>
       </div>
 
       ${d.pendingRequest ? `
@@ -4351,9 +4436,9 @@ function clientVisitBlock(clientKey) {
         </div>` : ""}
 
       ${!d.eligibleForVisit && !d.pendingRequest ? `
-        <div class="text-small" style="color:var(--muted);margin-top:8px">
-          Sem ligação registrada nos últimos ${d.callWindowDays} dias — por isso este cliente não aparece
-          no roteiro de visitas. O contato por telefone vem antes.
+        <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px;margin-top:8px">
+          Sem ligação registrada nos últimos ${d.callWindowDays} dias. Ligue e registre o contato —
+          só então dá para pedir visita ou o cliente entrar no roteiro do gerente. O telefone vem antes.
         </div>` : ""}
 
       <div class="stack" style="margin-top:8px">
@@ -5596,6 +5681,124 @@ function visitaCard(v, podeGerir) {
     </div>`;
 }
 
+// ─── Roteiro impresso e texto para WhatsApp ─────────────────────────────────
+//
+// Duas saídas para o mesmo roteiro, porque o gerente usa as duas: a folha (ou
+// PDF) que vai no carro e o texto que ele manda no grupo antes de sair.
+
+/** Só as cidades/bairros que interessam agora — respeita o filtro da tela. */
+function roteiroParaSaida() {
+  const rota = state.visitRoute || {};
+  const cidades = (rota.route || []).filter(
+    (c) => !state.visitFilters.city || c.cityName === state.visitFilters.city);
+  return cidades;
+}
+
+function dataPorExtenso() {
+  const d = new Date();
+  const dias = ["domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"];
+  const meses = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
+                 "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+  return `${dias[d.getDay()]}, ${d.getDate()} de ${meses[d.getMonth()]} de ${d.getFullYear()}`;
+}
+
+/**
+ * Monta a folha e chama a impressão.
+ *
+ * O conteúdo é escrito num container da própria página e o @media print troca
+ * o que fica visível. Abrir janela nova esbarraria no bloqueador de pop-up e
+ * perderia o estilo.
+ */
+function imprimirRoteiro() {
+  const cidades = roteiroParaSaida();
+  if (!cidades.length) { addMessage("warn", "Não há clientes no roteiro para imprimir."); return; }
+
+  const totalClientes = cidades.reduce((s, c) => s + c.count, 0);
+  const totalPotencial = cidades.reduce((s, c) => s + c.potential, 0);
+
+  const html = `
+    <div class="print-header">
+      <h1>Roteiro de visitas${state.visitFilters.city ? ` — ${escapeHtml(state.visitFilters.city)}` : ""}</h1>
+      <div class="sub">
+        ${escapeHtml(dataPorExtenso())} ·
+        ${escapeHtml(state.visits?.myName || "")} ·
+        ${totalClientes} cliente(s) · potencial ${currency(totalPotencial)}/mês
+      </div>
+    </div>
+    ${cidades.map((cidade) => `
+      ${cidades.length > 1 ? `<div class="print-bairro" style="background:#000;color:#fff">${escapeHtml(cidade.cityName)}</div>` : ""}
+      ${cidade.neighborhoods.map((b) => `
+        <div class="print-bairro">${escapeHtml(b.neighborhood)} — ${b.count} cliente(s) · ${currency(b.potential)}/mês</div>
+        ${b.clients.map((c) => `
+          <div class="print-client">
+            <div class="nome">☐ ${escapeHtml(c.clientName)}</div>
+            <div class="linha"><span class="rotulo">Endereço:</span> ${escapeHtml(c.addressLine || "não cadastrado")}${c.postalCode ? ` — CEP ${escapeHtml(c.postalCode)}` : ""}</div>
+            <div class="linha"><span class="rotulo">Telefone:</span> ${escapeHtml(c.phone || "—")} &nbsp;·&nbsp;
+              <span class="rotulo">Vendedor:</span> ${escapeHtml(c.assignedSeller || "sem vendedor")}</div>
+            <div class="linha"><span class="rotulo">Motivo:</span> ${escapeHtml(c.reason)}${c.requestedBy ? ` (pedido por ${escapeHtml(c.requestedBy)})` : ""}</div>
+            <div class="linha"><span class="rotulo">Média mensal:</span> ${currency(c.averageRevenue)} &nbsp;·&nbsp;
+              <span class="rotulo">Situação:</span> ${escapeHtml(c.statusCode || "—")}${c.daysWithoutPurchase ? ` (${c.daysWithoutPurchase} dias sem compra)` : ""}${c.classCode ? ` · ${escapeHtml(c.classCode)}` : ""}</div>
+            <div class="print-anotacao">
+              O que foi tratado / o que ficou combinado:
+              <div class="risco"></div><div class="risco"></div>
+            </div>
+          </div>`).join("")}
+      `).join("")}
+    `).join("")}
+    <div class="print-footer">
+      Passini Autopeças · CRM Comercial · Registre a visita no sistema no mesmo dia —
+      visita sem registro não conta e o efeito não é medido.
+    </div>`;
+
+  let area = document.getElementById("print-area");
+  if (!area) {
+    area = document.createElement("div");
+    area.id = "print-area";
+    area.className = "print-area";
+    document.body.appendChild(area);
+  }
+  area.innerHTML = html;
+  window.print();
+}
+
+/** Texto enxuto para colar no WhatsApp. Sem tabela — celular quebra tudo. */
+function textoRoteiroWhatsapp() {
+  const cidades = roteiroParaSaida();
+  const linhas = [];
+  const totalClientes = cidades.reduce((s, c) => s + c.count, 0);
+  linhas.push(`*ROTEIRO DE VISITAS*`);
+  linhas.push(`${dataPorExtenso()}`);
+  linhas.push(`${totalClientes} cliente(s)${state.visitFilters.city ? ` · ${state.visitFilters.city}` : ""}`);
+
+  cidades.forEach((cidade) => {
+    if (cidades.length > 1) linhas.push(`\n*${cidade.cityName}*`);
+    cidade.neighborhoods.forEach((b) => {
+      linhas.push(`\n*${b.neighborhood}*`);
+      b.clients.forEach((c, i) => {
+        linhas.push(`${i + 1}. *${c.clientName}*`);
+        linhas.push(`   ${c.addressLine || "endereço não cadastrado"}`);
+        if (c.phone) linhas.push(`   ${c.phone}`);
+        linhas.push(`   ${c.reason}`);
+        if (c.requestedBy) linhas.push(`   Pedido por ${c.requestedBy}`);
+      });
+    });
+  });
+  linhas.push(`\n_Registrar a visita no CRM no mesmo dia._`);
+  return linhas.join("\n");
+}
+
+async function copiarRoteiroWhatsapp() {
+  const cidades = roteiroParaSaida();
+  if (!cidades.length) { addMessage("warn", "Não há clientes no roteiro para copiar."); return; }
+  const texto = textoRoteiroWhatsapp();
+  if (await copyToClipboard(texto)) {
+    addMessage("success", "Roteiro copiado. É só colar no WhatsApp.");
+  } else {
+    // Servidor em HTTP não libera a área de transferência — abre para cópia manual.
+    showCopyFallback(texto, "Roteiro de visitas");
+  }
+}
+
 function visitasView() {
   if (!state.visits) { loadVisits(); return `<div class="loader panel">Carregando visitas…</div>`; }
   if (state.visits.error) return `<div class="message error">${escapeHtml(state.visits.error)}</div>`;
@@ -5609,6 +5812,7 @@ function visitasView() {
   return `
     <div class="stack">
       ${state.visitEditor ? visitaEditorModal() : ""}
+      ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
 
       ${pedidos.length ? `
         <div class="table-card" style="border-left:4px solid #e74c3c">
@@ -5663,6 +5867,9 @@ function visitasView() {
               Incluir visitas de relacionamento no caminho
             </label>
             <button class="btn btn-ghost btn-sm" onclick="loadVisitSuggestions()">Atualizar</button>
+            <span style="flex:1"></span>
+            <button class="btn btn-secondary btn-sm" onclick="imprimirRoteiro()">🖨️ Imprimir / PDF</button>
+            <button class="btn btn-secondary btn-sm" onclick="copiarRoteiroWhatsapp()">💬 Copiar p/ WhatsApp</button>
           </div>
           ${state.ui.loading.visitRoute ? '<div class="loader">Montando roteiro…</div>' : ""}
           ${rota.error ? `<div class="message error">${escapeHtml(rota.error)}</div>` : ""}
@@ -9295,6 +9502,7 @@ function dashboardView() {
       ${copyFallbackModal()}
       ${assignTaskModal()}
       ${scheduleContactModal()}
+      ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
       ${clientDrawerView()}
     </div>
   `;

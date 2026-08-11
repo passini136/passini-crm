@@ -1409,3 +1409,73 @@ tbody tr:hover {
 .client-drawer-overlay.modal-dim .modal-panel {
   background: #ffffff;
 }
+
+/* ── Impressão do roteiro de visitas ──────────────────────────────────────
+   A folha é montada dentro da própria página, num container escondido, e o
+   @media print troca o que aparece. Abrir janela nova esbarra em bloqueador
+   de pop-up e some com o estilo — este caminho funciona em qualquer navegador
+   e ainda permite "Salvar como PDF" na própria caixa de impressão. */
+.print-area { display: none; }
+
+@media print {
+  body * { visibility: hidden; }
+  .print-area, .print-area * { visibility: visible; }
+  .print-area {
+    display: block;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    padding: 0;
+    background: #fff;
+    color: #000;
+    font-family: Arial, Helvetica, sans-serif;
+  }
+  .print-header {
+    border-bottom: 2px solid #000;
+    padding-bottom: 6px;
+    margin-bottom: 12px;
+  }
+  .print-header h1 { font-size: 18pt; margin: 0 0 2px; }
+  .print-header .sub { font-size: 10pt; color: #333; }
+  .print-bairro {
+    background: #eee;
+    font-weight: bold;
+    font-size: 11pt;
+    padding: 4px 6px;
+    margin: 14px 0 6px;
+    border-left: 4px solid #000;
+    page-break-after: avoid;
+  }
+  .print-client {
+    border: 1px solid #999;
+    border-radius: 4px;
+    padding: 8px;
+    margin-bottom: 8px;
+    page-break-inside: avoid;
+    font-size: 10pt;
+  }
+  .print-client .nome { font-weight: bold; font-size: 11pt; }
+  .print-client .linha { margin-top: 2px; }
+  .print-client .rotulo { color: #444; }
+  .print-anotacao {
+    margin-top: 6px;
+    border-top: 1px dashed #999;
+    padding-top: 4px;
+    font-size: 9pt;
+    color: #666;
+  }
+  .print-anotacao .risco {
+    border-bottom: 1px solid #bbb;
+    height: 14px;
+    margin-top: 6px;
+  }
+  .print-footer {
+    margin-top: 16px;
+    font-size: 8pt;
+    color: #666;
+    border-top: 1px solid #ccc;
+    padding-top: 4px;
+  }
+  @page { margin: 12mm; }
+}
