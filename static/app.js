@@ -19,6 +19,9 @@ const state = {
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", relationship: true },
   visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
+  tasks: null,            // tarefas + filtros + contadores
+  taskEditor: null,       // nova tarefa de direcionamento
+  taskFilters: { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" },
   noteEditor: null,       // registro pontual em edição
   feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
@@ -640,6 +643,9 @@ async function loadCrmData() {
     state.crm.summary = summary;
     state.crm.agenda = agenda;
     state.crm.taskRows = tasks.rows || [];
+    // Guarda o payload inteiro: a tela de Tarefas depende dos contadores,
+    // da lista de pessoas e dos catálogos que vêm junto.
+    state.tasks = tasks;
     if (state.crm.selectedClientKey) {
       await openCrmClient(state.crm.selectedClientKey, false, false);
     }
@@ -7463,45 +7469,333 @@ function crmClientDetailView() {
   return "";
 }
 
-function crmTasksView() {
-  if (!state.crm.summary) return `<div class="loader panel">Carregando tarefas CRM...</div>`;
-  return `
-    <div class="table-card">
-      <div class="section-title">
-        <div>
-          <h3>Tarefas</h3>
-          <div class="text-small">Fila operacional de follow-ups e retornos do CRM.</div>
-        </div>
-      </div>
-      <div class="timeline-list">
-        ${(state.crm.taskRows || []).map((row) => {
-          const isOverdue = row.status === "ATRASADA";
-          const statusColor = isOverdue ? "var(--bad)" : "var(--accent)";
-          const dueLabel = (row.due_at || "").replace("T", " ").slice(0, 16);
-          return `<div class="timeline-item" style="border-left:3px solid ${statusColor};padding-left:12px">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
-              <div>
-                <strong>${escapeHtml(row.client_name || "—")}</strong>
-                <div class="text-small">${escapeHtml(row.title || "")}</div>
-                ${row.description ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(row.description)}</div>` : ""}
-              </div>
-              <div style="text-align:right;white-space:nowrap">
-                <span class="status-tag ${isOverdue ? "bad" : "warn"}">${escapeHtml(row.status)}</span>
-                <div class="text-small" style="margin-top:4px">${escapeHtml(dueLabel)}</div>
-              </div>
-            </div>
-            <div class="actions" style="margin-top:10px">
-              <button class="btn btn-primary btn-sm" onclick="prefillInteractionFromAgenda('${escapeHtml(row.client_key || "")}')">📞 Registrar contato</button>
-              <button class="btn btn-secondary btn-sm" onclick="completeCrmTask(${Number(row.id)})">✅ Concluir</button>
-              <button class="btn btn-ghost btn-sm" onclick="openTaskRescheduleModal(${Number(row.id)})">📅 Reagendar</button>
-            </div>
-          </div>`;
-        }).join("") || emptyStateCard("Sem tarefas abertas.")}
-      </div>
-    </div>
-  `;
+// ─── Tarefas ────────────────────────────────────────────────────────────────
+
+async function loadCrmTasks(silencioso) {
+  const f = state.taskFilters;
+  const q = new URLSearchParams();
+  q.set("status", f.status || "ABERTAS");
+  if (f.seller) q.set("seller", f.seller);
+  if (f.from) q.set("from", f.from);
+  if (f.to) q.set("to", f.to);
+  if (f.origin) q.set("origin", f.origin);
+  if (f.search) q.set("q", f.search);
+  if (!silencioso) state.ui.loading.crmTasks = true;
+  try {
+    const r = await api(`/api/crm/tasks?${q.toString()}`);
+    state.crm.taskRows = r.rows || [];
+    state.tasks = r;
+  } catch (e) {
+    state.tasks = { error: e.message, rows: [] };
+  } finally {
+    state.ui.loading.crmTasks = false;
+    requestRender();
+  }
 }
 
+function setTaskFilter(campo, valor) {
+  state.taskFilters[campo] = state.taskFilters[campo] === valor ? "" : valor;
+  loadCrmTasks();
+}
+
+function setTaskStatus(valor) {
+  state.taskFilters.status = valor;
+  loadCrmTasks();
+}
+
+function applyTaskSearch() {
+  const campo = document.getElementById("task-search");
+  state.taskFilters.search = campo ? campo.value.trim() : "";
+  loadCrmTasks();
+}
+
+function limparFiltrosTarefa() {
+  state.taskFilters = { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" };
+  loadCrmTasks();
+}
+
+function taskOriginCfg(origem) {
+  return (state.tasks?.origins || []).find((o) => o.id === origem)
+    || { label: origem, icon: "•", color: "#5f6368", bg: "#f1f3f4" };
+}
+
+// ─── Nova tarefa (direcionamento) ───────────────────────────────────────────
+
+function novaTarefa() {
+  state.taskEditor = {
+    title: "", description: "", dueAt: dateInDays(1), priority: "NORMAL",
+    clientKey: "", clientName: "", assignees: [], saving: false,
+  };
+  requestRender();
+}
+
+function fecharNovaTarefa() { state.taskEditor = null; requestRender(); }
+
+function toggleDestinatario(nome) {
+  const t = state.taskEditor;
+  if (!t) return;
+  const i = t.assignees.indexOf(nome);
+  if (i >= 0) t.assignees.splice(i, 1); else t.assignees.push(nome);
+  requestRender();
+}
+
+function selecionarTodosDestinatarios(apenasVendedores) {
+  const t = state.taskEditor;
+  if (!t) return;
+  const alvo = (state.tasks?.people || [])
+    .filter((p) => !apenasVendedores || p.role === "Vendedor")
+    .map((p) => p.personName);
+  t.assignees = t.assignees.length === alvo.length ? [] : alvo;
+  requestRender();
+}
+
+function atribuirParaMim() {
+  const t = state.taskEditor;
+  if (!t) return;
+  const eu = state.tasks?.myName;
+  if (!eu) return;
+  t.assignees = t.assignees.includes(eu) ? t.assignees.filter((n) => n !== eu) : [...t.assignees, eu];
+  requestRender();
+}
+
+async function salvarNovaTarefa() {
+  const t = state.taskEditor;
+  if (!t) return;
+  if (!t.title.trim()) { addMessage("error", "Escreva o que precisa ser feito."); return; }
+  if (!t.assignees.length) { addMessage("error", "Escolha quem vai receber a tarefa."); return; }
+  t.saving = true; requestRender();
+  try {
+    const r = await api("/api/crm/tasks/create", { method: "POST", body: JSON.stringify(t) });
+    addMessage("success", r.created === 1
+      ? "Tarefa criada."
+      : `Tarefa criada para ${r.created} pessoas — cada uma conclui a sua.`);
+    state.taskEditor = null;
+    await loadCrmTasks(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.taskEditor) state.taskEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirTarefa(taskId) {
+  if (!confirm("Excluir esta tarefa?")) return;
+  try {
+    await api("/api/crm/tasks/delete", { method: "POST", body: JSON.stringify({ taskId }) });
+    await loadCrmTasks(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+// ─── View ───────────────────────────────────────────────────────────────────
+
+function crmTasksView() {
+  if (!state.tasks) { loadCrmTasks(); return `<div class="loader panel">Carregando tarefas…</div>`; }
+  if (state.tasks.error) return `<div class="message error">${escapeHtml(state.tasks.error)}</div>`;
+
+  const f = state.taskFilters;
+  const rows = state.tasks.rows || [];
+  const c = state.tasks.counters || {};
+  const podeCriar = Boolean(state.tasks.canCreate);
+  const temFiltro = Boolean(f.seller || f.from || f.to || f.origin || f.search || f.status !== "ABERTAS");
+
+  const kpi = (rotulo, valor, cor) => `
+    <div style="flex:1;min-width:110px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+      <div class="text-small" style="color:var(--muted)">${rotulo}</div>
+      <div style="font-size:22px;font-weight:800;color:${cor || "inherit"}">${number(valor || 0)}</div>
+    </div>`;
+
+  return `
+    <div class="stack">
+      ${state.taskEditor ? novaTarefaModal() : ""}
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${kpi("Em aberto", c.open)}
+        ${kpi("Atrasadas", c.overdue, c.overdue ? "var(--bad)" : "")}
+        ${kpi("Vencem hoje", c.today, c.today ? "var(--warn, #b06000)" : "")}
+        ${kpi("Concluídas no mês", c.doneMonth, "var(--good)")}
+      </div>
+
+      <div class="form-card" style="padding:14px 18px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          ${(state.tasks.statusFilters || []).map((s) => `
+            <button type="button" onclick="setTaskStatus('${s.id}')"
+              style="border:1px solid ${f.status === s.id ? "var(--accent)" : "var(--line)"};
+                     background:${f.status === s.id ? "var(--accent)" : "#fff"};
+                     color:${f.status === s.id ? "#fff" : "var(--text)"};
+                     border-radius:14px;padding:5px 14px;font-size:12px;font-weight:600;cursor:pointer">
+              ${escapeHtml(s.label)}
+            </button>`).join("")}
+          <span style="flex:1"></span>
+          ${podeCriar ? `<button class="btn btn-primary btn-sm" onclick="novaTarefa()">＋ Nova tarefa</button>` : ""}
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+          <input id="task-search" style="flex:1;min-width:200px"
+            placeholder="🔍 Buscar por título, cliente ou descrição — Enter"
+            value="${escapeHtml(f.search)}"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();applyTaskSearch();}" />
+          <button class="btn btn-secondary btn-sm" onclick="applyTaskSearch()">Buscar</button>
+          ${(state.tasks.sellers || []).length > 1 ? `
+            <select style="min-width:190px" onchange="state.taskFilters.seller=this.value;loadCrmTasks()">
+              <option value="">Todos os vendedores</option>
+              ${(state.tasks.sellers || []).map((s) => `
+                <option value="${escapeHtml(s)}" ${f.seller === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
+            </select>` : ""}
+          <span class="text-small" style="color:var(--muted)">Vencimento</span>
+          <input type="date" style="width:150px" value="${escapeHtml(f.from)}"
+            onchange="state.taskFilters.from=this.value;loadCrmTasks()" />
+          <span class="text-small">até</span>
+          <input type="date" style="width:150px" value="${escapeHtml(f.to)}"
+            onchange="state.taskFilters.to=this.value;loadCrmTasks()" />
+          ${temFiltro ? `<button class="btn btn-ghost btn-sm" onclick="limparFiltrosTarefa()">Limpar</button>` : ""}
+        </div>
+
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
+          ${(state.tasks.origins || []).map((o) => `
+            <button type="button" onclick="setTaskFilter('origin','${o.id}')" title="${escapeHtml(o.hint)}"
+              style="border:1px solid ${f.origin === o.id ? o.color : "var(--line)"};
+                     background:${f.origin === o.id ? o.bg : "#fff"};
+                     color:${f.origin === o.id ? o.color : "var(--muted)"};
+                     border-radius:14px;padding:4px 12px;font-size:12px;
+                     font-weight:${f.origin === o.id ? "700" : "500"};cursor:pointer">
+              ${o.icon} ${escapeHtml(o.label)}
+            </button>`).join("")}
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Tarefas</h3>
+            <div class="text-small">${rows.length} no filtro atual</div></div>
+        </div>
+        <div class="timeline-list">
+          ${state.ui.loading.crmTasks ? '<div class="loader">Buscando…</div>' : ""}
+          ${rows.map((row) => taskRow(row, podeCriar)).join("")
+            || emptyStateCard(f.status === "CONCLUIDAS"
+                ? "Nenhuma tarefa concluída no filtro atual."
+                : "Nenhuma tarefa pendente. Fila limpa.")}
+        </div>
+      </div>
+    </div>`;
+}
+
+function taskRow(row, podeGerir) {
+  const concluida = row.status === "CONCLUIDA";
+  const cfg = taskOriginCfg(row.origin);
+  const cor = concluida ? "var(--good)" : row.overdue ? "var(--bad)" : "var(--accent)";
+  const prazo = (row.due_at || "").replace("T", " ").slice(0, 16);
+  return `
+    <div class="timeline-item" style="border-left:3px solid ${cor};padding-left:12px;${concluida ? "opacity:.75" : ""}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;flex-wrap:wrap">
+        <div style="flex:1;min-width:230px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+            <span class="status-tag" style="background:${cfg.bg};color:${cfg.color}">${cfg.icon} ${escapeHtml(cfg.label)}</span>
+            ${row.priority === "ALTA" ? '<span class="status-tag bad">Prioridade alta</span>' : ""}
+            ${row.overdue ? '<span class="status-tag bad">Atrasada</span>' : ""}
+            ${concluida ? '<span class="status-tag good">✓ Concluída</span>' : ""}
+          </div>
+          <strong>${escapeHtml(row.title || "—")}</strong>
+          ${row.client_name ? `<div class="text-small">Cliente: ${escapeHtml(row.client_name)}</div>` : ""}
+          ${row.description ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(row.description)}</div>` : ""}
+          <div class="text-small" style="color:var(--muted)">
+            ${escapeHtml(row.seller_name || "")}${row.created_by_name ? ` · por ${escapeHtml(row.created_by_name)}` : ""}
+          </div>
+        </div>
+        <div style="text-align:right;white-space:nowrap">
+          <div class="text-small" style="color:${row.overdue ? "var(--bad)" : "var(--muted)"}">
+            ${concluida ? "concluída " + shortDate(row.completed_at || "") : escapeHtml(prazo)}
+          </div>
+        </div>
+      </div>
+      ${!concluida ? `
+        <div class="actions" style="margin-top:10px;gap:6px">
+          ${row.client_key ? `
+            <button class="btn btn-primary btn-sm" onclick="prefillInteractionFromAgenda('${jsAttr(row.client_key)}','${jsAttr(row.client_name || "")}')">📞 Registrar contato</button>` : ""}
+          <button class="btn btn-secondary btn-sm" onclick="completeCrmTask(${Number(row.id)})">✅ Concluir</button>
+          <button class="btn btn-ghost btn-sm" onclick="openTaskRescheduleModal(${Number(row.id)})">📅 Reagendar</button>
+          ${row.client_key ? `<button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(row.client_key)}', false)">Ficha</button>` : ""}
+          ${podeGerir ? `<button class="btn btn-ghost btn-sm" onclick="excluirTarefa(${Number(row.id)})">Excluir</button>` : ""}
+        </div>` : ""}
+    </div>`;
+}
+
+function novaTarefaModal() {
+  const t = state.taskEditor;
+  const pessoas = state.tasks?.people || [];
+  const vendedores = pessoas.filter((p) => p.role === "Vendedor");
+  const eu = state.tasks?.myName || "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharNovaTarefa()">
+      <div class="panel modal-panel" data-keep-scroll="nova-tarefa"
+           style="max-width:660px;margin:6vh auto;padding:22px;max-height:88vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>🎯 Nova tarefa</h3>
+            <div class="text-small">Direcionamento para a equipe. Cliente é opcional.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharNovaTarefa()">Fechar</button>
+        </div>
+
+        <div class="field" style="margin-top:12px">
+          <label>O que precisa ser feito <span style="color:var(--bad)">*</span></label>
+          <input value="${escapeHtml(t.title)}" oninput="state.taskEditor.title=this.value"
+            placeholder="Ex.: Revisar os orçamentos do dia e levantar os motivos de desistência" />
+        </div>
+
+        <div class="field">
+          <label>Detalhe <span style="color:var(--muted);font-weight:400">(opcional)</span></label>
+          <textarea rows="3" style="font-family:inherit" oninput="state.taskEditor.description=this.value"
+            placeholder="O que esperar como resultado, onde buscar a informação">${escapeHtml(t.description)}</textarea>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:10px">
+          <div class="field"><label>Prazo</label>
+            <input type="date" value="${escapeHtml(t.dueAt)}" oninput="state.taskEditor.dueAt=this.value" /></div>
+          <div class="field"><label>Prioridade</label>
+            <select onchange="state.taskEditor.priority=this.value">
+              ${(state.tasks?.priorities || []).map((p) => `
+                <option value="${p.id}" ${t.priority === p.id ? "selected" : ""}>${escapeHtml(p.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Cliente <span style="color:var(--muted);font-weight:400">(opcional)</span></label>
+            <input value="${escapeHtml(t.clientKey)}" oninput="state.taskEditor.clientKey=this.value"
+              placeholder="Código, se a tarefa for de um cliente" /></div>
+        </div>
+
+        <div class="subtle-card padded-card" style="margin-top:8px">
+          <div class="section-title">
+            <div><h3>Para quem</h3>
+              <div class="text-small">${t.assignees.length} selecionado(s). Cada pessoa recebe a sua tarefa e conclui separadamente.</div></div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              ${eu ? `<button class="btn btn-ghost btn-sm" onclick="atribuirParaMim()">Para mim</button>` : ""}
+              ${vendedores.length ? `<button class="btn btn-ghost btn-sm" onclick="selecionarTodosDestinatarios(true)">Toda a equipe de vendas</button>` : ""}
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;max-height:200px;overflow:auto">
+            ${pessoas.map((p) => {
+              const on = t.assignees.includes(p.personName);
+              return `
+                <button type="button" onclick="toggleDestinatario('${jsAttr(p.personName)}')"
+                  title="${escapeHtml(p.role)}${p.unitName ? " · " + escapeHtml(p.unitName) : ""}"
+                  style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
+                         background:${on ? "var(--accent)" : "#fff"};color:${on ? "#fff" : "var(--text)"};
+                         border-radius:14px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer">
+                  ${on ? "● " : "○ "}${escapeHtml(p.personName)}${p.hasLogin ? "" : " ⚠"}
+                </button>`;
+            }).join("") || '<div class="text-small">Nenhuma pessoa disponível nas suas unidades.</div>'}
+          </div>
+          ${t.assignees.some((n) => !(pessoas.find((p) => p.personName === n)?.hasLogin)) ? `
+            <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px;margin-top:8px">
+              ⚠ Alguém selecionado não tem login no CRM e não vai ver a tarefa.
+            </div>` : ""}
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${t.saving ? "disabled" : ""} onclick="salvarNovaTarefa()">
+            ${t.saving ? "Criando…" : "Criar tarefa"}</button>
+          <button class="btn btn-ghost" onclick="fecharNovaTarefa()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
 function setInteractionResult(resultCode, contactTypeCode) {
   state.crm.interactionForm.resultCode = resultCode;
   if (contactTypeCode) state.crm.interactionForm.contactTypeCode = contactTypeCode;
@@ -9860,6 +10154,8 @@ async function completeCrmTask(taskId) {
   try {
     await api("/api/crm/tasks/complete", { method: "POST", body: JSON.stringify({ taskId }) });
     addMessage("success", "Tarefa concluída.");
+    // Recarrega respeitando o filtro escolhido, senão a tela volta para "em aberto".
+    await loadCrmTasks(true);
     await loadCrmData();
   } catch (error) {
     addMessage("error", error.message);

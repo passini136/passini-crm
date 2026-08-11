@@ -1016,6 +1016,19 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if meeting_columns and "visibility" not in meeting_columns:
         conn.execute("ALTER TABLE meetings ADD COLUMN visibility TEXT NOT NULL DEFAULT 'UNIDADE'")
 
+    # Tarefa deixou de ser só follow-up de cliente: agora também é direcionamento
+    # do gestor, com ou sem cliente vinculado. Precisa saber de onde veio e quem
+    # mandou — sem isso o vendedor recebe tarefa sem contexto.
+    task_columns = {row["name"] for row in conn.execute("PRAGMA table_info(crm_tasks)").fetchall()}
+    if "origin" not in task_columns:
+        conn.execute("ALTER TABLE crm_tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'FOLLOWUP'")
+    if "priority" not in task_columns:
+        conn.execute("ALTER TABLE crm_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'NORMAL'")
+    if "created_by_name" not in task_columns:
+        conn.execute("ALTER TABLE crm_tasks ADD COLUMN created_by_name TEXT")
+    if "created_by_user_id" not in task_columns:
+        conn.execute("ALTER TABLE crm_tasks ADD COLUMN created_by_user_id INTEGER")
+
 
 def seed_crm_catalogs(conn: sqlite3.Connection) -> None:
     for code, label in CRM_CONTACT_TYPES:
@@ -6090,13 +6103,13 @@ def save_visit(
             cur = conn.execute(
                 """
                 INSERT INTO crm_tasks (company_id, client_key, client_name, seller_name, title,
-                    description, due_at, status, created_at)
-                VALUES (?,?,?,?,?,?,?, 'ABERTA', ?)
+                    description, due_at, status, origin, created_by_name, created_by_user_id, created_at)
+                VALUES (?,?,?,?,?,?,?, 'ABERTA', 'VISITA', ?, ?, ?)
                 """,
                 (company_id, client_key, campos[1], vendedor,
                  f"Pós-visita: {campos[1]}", proxima,
                  normalize_whitespace(payload.get("nextActionDue")) or today_in_brazil().isoformat(),
-                 now_iso()),
+                 meeting_person_identity(user), user["id"], now_iso()),
             )
             tarefa_id = int(cur.lastrowid)
 
@@ -6172,6 +6185,251 @@ def client_contact_effect(
         "callWindowDays": VISIT_CALL_WINDOW_DAYS,
         "canRequestVisit": (int(ligacoes["recentes"] or 0) > 0 and pedido is None),
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tarefas
+#
+# A tabela nasceu só para follow-up de cliente. Agora carrega quatro origens
+# diferentes, e distinguir isso importa: o vendedor precisa saber se a tarefa
+# veio da própria ligação dele, de uma cobrança do gerente, de uma visita ou de
+# um direcionamento da gestão — a conversa que ele terá é outra em cada caso.
+#
+# Tarefa "para a equipe" vira UMA tarefa POR PESSOA. Uma tarefa coletiva que
+# qualquer um pode concluir não é de ninguém, e ninguém faz.
+# ─────────────────────────────────────────────────────────────────────────────
+
+TASK_ORIGINS = [
+    {"id": "FOLLOWUP", "label": "Follow-up", "icon": "🔁", "color": "#1a5276", "bg": "#e8f0fe",
+     "hint": "Nasceu do registro de contato do próprio vendedor."},
+    {"id": "COBRANCA", "label": "Cobrança da gestão", "icon": "📣", "color": "#b06000", "bg": "#fef7e0",
+     "hint": "O gestor pediu o contato com este cliente."},
+    {"id": "VISITA", "label": "Pós-visita", "icon": "🗺️", "color": "#1e8e3e", "bg": "#e6f4ea",
+     "hint": "Ação combinada durante uma visita gerencial."},
+    {"id": "LIVRE", "label": "Direcionamento", "icon": "🎯", "color": "#6a1b9a", "bg": "#f3e5f5",
+     "hint": "Tarefa de gestão, com ou sem cliente vinculado."},
+]
+TASK_ORIGIN_IDS = {o["id"] for o in TASK_ORIGINS}
+
+TASK_PRIORITIES = [
+    {"id": "ALTA", "label": "Alta", "color": "#c5221f", "bg": "#fce8e6"},
+    {"id": "NORMAL", "label": "Normal", "color": "#5f6368", "bg": "#f1f3f4"},
+]
+
+TASK_STATUS_FILTERS = [
+    {"id": "ABERTAS", "label": "Em aberto"},
+    {"id": "CONCLUIDAS", "label": "Concluídas"},
+    {"id": "ATRASADAS", "label": "Atrasadas"},
+    {"id": "TODAS", "label": "Todas"},
+]
+
+
+def task_assignable_people(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[dict[str, Any]]:
+    """Para quem este usuário pode criar tarefa.
+
+    Gestor de unidade: a equipe dele (inclusive ele mesmo). Diretoria: todo
+    mundo, o que inclui os gerentes — é assim que o direcionamento tático desce.
+    """
+    pessoas = list_meeting_people(conn, company_id, user)
+    eu = meeting_person_identity(user)
+    if eu and not any(person_key(p["personName"]) == person_key(eu) for p in pessoas):
+        # O gestor pode não estar no cadastro de pessoas da unidade dele, mas
+        # precisa poder criar tarefa para si mesmo.
+        pessoas.insert(0, {"personName": eu, "personKey": person_key(eu),
+                           "unitName": "", "role": "Gestão", "hasLogin": True})
+    return pessoas
+
+
+def task_visible_sellers(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[str] | None:
+    """Nomes cujas tarefas este usuário pode ver. None = sem restrição."""
+    scope = data_scope_for_user(conn, user)
+    if scope == "todos":
+        return None
+    if scope == "proprio":
+        return [seller_identity_for_user(user)]
+    nomes = {p["personName"] for p in task_assignable_people(conn, company_id, user)}
+    nomes.add(meeting_person_identity(user))
+    return sorted(n for n in nomes if n)
+
+
+def list_crm_tasks(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    status: str = "ABERTAS", seller: str = "", date_from: str = "", date_to: str = "",
+    origin: str = "", search: str = "", limit: int = 400,
+) -> list[dict[str, Any]]:
+    sql = """
+        SELECT id, client_key, client_name, seller_name, title, description, due_at, status,
+               source_interaction_id, created_at, completed_at,
+               COALESCE(origin, 'FOLLOWUP') AS origin,
+               COALESCE(priority, 'NORMAL') AS priority,
+               created_by_name
+        FROM crm_tasks
+        WHERE company_id = ?
+    """
+    params: list[Any] = [company_id]
+
+    visiveis = task_visible_sellers(conn, company_id, user)
+    if visiveis is not None:
+        if not visiveis:
+            return []
+        marcadores = ",".join("?" for _ in visiveis)
+        sql += f" AND UPPER(seller_name) IN ({marcadores})"
+        params.extend(normalize_upper(n) for n in visiveis)
+
+    if seller:
+        sql += " AND UPPER(seller_name) = ?"
+        params.append(normalize_upper(seller))
+
+    filtro = normalize_upper(status) or "ABERTAS"
+    if filtro == "ABERTAS":
+        sql += " AND status NOT IN ('CONCLUIDA', 'CANCELADA')"
+    elif filtro == "CONCLUIDAS":
+        sql += " AND status = 'CONCLUIDA'"
+    elif filtro == "ATRASADAS":
+        sql += " AND status NOT IN ('CONCLUIDA','CANCELADA') AND date(due_at) < date(?)"
+        params.append(today_in_brazil().isoformat())
+
+    if date_from:
+        sql += " AND date(due_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(due_at) <= date(?)"
+        params.append(date_to)
+    if origin in TASK_ORIGIN_IDS:
+        sql += " AND COALESCE(origin,'FOLLOWUP') = ?"
+        params.append(origin)
+    termo = normalize_whitespace(search)
+    if termo:
+        alvo = f"%{termo.upper()}%"
+        sql += (" AND (UPPER(title) LIKE ? OR UPPER(COALESCE(client_name,'')) LIKE ?"
+                " OR UPPER(COALESCE(description,'')) LIKE ?)")
+        params.extend([alvo, alvo, alvo])
+
+    sql += (" ORDER BY CASE status WHEN 'ATRASADA' THEN 0 WHEN 'ABERTA' THEN 1"
+            " WHEN 'REAGENDADA' THEN 2 ELSE 3 END, datetime(due_at) ASC LIMIT ?")
+    params.append(int(limit))
+
+    hoje = today_in_brazil().isoformat()
+    linhas = []
+    for r in conn.execute(sql, params).fetchall():
+        item = dict(r)
+        vencimento = (item.get("due_at") or "")[:10]
+        item["overdue"] = bool(
+            vencimento and vencimento < hoje and item["status"] not in ("CONCLUIDA", "CANCELADA")
+        )
+        linhas.append(item)
+    return linhas
+
+
+def crm_task_counters(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> dict[str, int]:
+    """Números do topo da tela. Contam sobre o mesmo recorte da lista."""
+    visiveis = task_visible_sellers(conn, company_id, user)
+    where = "company_id = ?"
+    params: list[Any] = [company_id]
+    if visiveis is not None:
+        if not visiveis:
+            return {"open": 0, "overdue": 0, "today": 0, "doneMonth": 0}
+        marcadores = ",".join("?" for _ in visiveis)
+        where += f" AND UPPER(seller_name) IN ({marcadores})"
+        params.extend(normalize_upper(n) for n in visiveis)
+    hoje = today_in_brazil().isoformat()
+    mes = hoje[:7]
+
+    def conta(extra: str, extras: list[Any]) -> int:
+        row = conn.execute(
+            f"SELECT COUNT(*) n FROM crm_tasks WHERE {where} AND {extra}", (*params, *extras)
+        ).fetchone()
+        return int(row["n"] or 0)
+
+    return {
+        "open": conta("status NOT IN ('CONCLUIDA','CANCELADA')", []),
+        "overdue": conta("status NOT IN ('CONCLUIDA','CANCELADA') AND date(due_at) < date(?)", [hoje]),
+        "today": conta("status NOT IN ('CONCLUIDA','CANCELADA') AND date(due_at) = date(?)", [hoje]),
+        "doneMonth": conta("status = 'CONCLUIDA' AND substr(COALESCE(completed_at, ''),1,7) = ?", [mes]),
+    }
+
+
+def create_crm_tasks(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Cria tarefa de direcionamento — uma por pessoa escolhida.
+
+    Cliente é OPCIONAL aqui: "revisar os orçamentos do dia e levantar os motivos
+    de desistência" é tarefa legítima e não pertence a nenhum cliente.
+    """
+    if data_scope_for_user(conn, user) == "proprio":
+        raise PermissionError("Apenas gestão cria direcionamento.")
+
+    titulo = normalize_whitespace(payload.get("title"))
+    if not titulo:
+        raise ValueError("Escreva o que precisa ser feito.")
+    vencimento = normalize_whitespace(payload.get("dueAt")) or today_in_brazil().isoformat()
+
+    permitidas = {person_key(p["personName"]): p["personName"]
+                  for p in task_assignable_people(conn, company_id, user)}
+    escolhidos = payload.get("assignees") or []
+    if isinstance(escolhidos, str):
+        escolhidos = [escolhidos]
+
+    destinos: list[str] = []
+    for nome in escolhidos:
+        chave = person_key(nome)
+        if chave in permitidas:
+            destinos.append(permitidas[chave])
+        elif normalize_whitespace(nome):
+            # Nome fora da equipe do gestor é recusado, não ignorado em silêncio.
+            raise PermissionError(f"{nome} não está entre as pessoas que você pode direcionar.")
+    destinos = list(dict.fromkeys(destinos))
+    if not destinos:
+        raise ValueError("Escolha ao menos uma pessoa para receber a tarefa.")
+
+    prioridade = normalize_upper(payload.get("priority")) or "NORMAL"
+    if prioridade not in {p["id"] for p in TASK_PRIORITIES}:
+        prioridade = "NORMAL"
+    client_key = normalize_whitespace(payload.get("clientKey"))
+    client_name = normalize_whitespace(payload.get("clientName"))
+    if client_key and not client_name:
+        perfil = conn.execute(
+            "SELECT client_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+            (company_id, client_key),
+        ).fetchone()
+        client_name = perfil["client_name"] if perfil else client_key
+
+    criados = []
+    for nome in destinos:
+        cursor = conn.execute(
+            """
+            INSERT INTO crm_tasks (company_id, client_key, client_name, seller_name, title,
+                description, due_at, status, origin, priority, created_by_name,
+                created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?, 'ABERTA', 'LIVRE', ?,?,?,?)
+            """,
+            (company_id, client_key or "", client_name or "", nome, titulo,
+             normalize_whitespace(payload.get("description")), vencimento,
+             prioridade, meeting_person_identity(user), user["id"], now_iso()),
+        )
+        criados.append({"taskId": int(cursor.lastrowid), "sellerName": nome})
+
+    audit_log(conn, company_id, user["id"], "criar", "crm_tasks", client_key or "-",
+              {"titulo": titulo, "destinos": len(criados), "origem": "direcionamento"})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"created": len(criados), "tasks": criados}
+
+
+def delete_crm_task(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, task_id: int) -> None:
+    if data_scope_for_user(conn, user) == "proprio":
+        raise PermissionError("Apenas gestão exclui tarefa.")
+    conn.execute("DELETE FROM crm_tasks WHERE company_id = ? AND id = ?", (company_id, task_id))
+    audit_log(conn, company_id, user["id"], "excluir", "crm_tasks", str(task_id), {})
+    conn.commit()
+
 
 
 def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
@@ -7953,8 +8211,8 @@ def create_crm_interaction(
             """
             INSERT INTO crm_tasks (
                 company_id, client_key, client_name, seller_name, title, description,
-                due_at, status, source_interaction_id, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?, ?)
+                due_at, status, origin, source_interaction_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ABERTA', 'FOLLOWUP', ?, ?)
             """,
             (
                 company_id,
@@ -12908,54 +13166,31 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not user:
                     return
                 query = parse_qs(parsed.query)
-                status_filter = normalize_upper(query.get("status", [None])[0])
-                seller_name = seller_identity_for_user(user) if user["role"] == "Vendedor" else normalize_whitespace(query.get("seller", [None])[0])
-                sql = """
-                    SELECT id, client_key, client_name, seller_name, title, description, due_at, status, source_interaction_id, created_at, completed_at
-                    FROM crm_tasks
-                    WHERE company_id = ?
-                """
-                params: list[Any] = [user["company_id"]]
                 with closing(get_connection()) as conn:
-                    if user["role"] in {"Gerente", "Analista"}:
-                        linked_units = linked_units_for_user(user)
-                        if linked_units:
-                            allowed_sellers: list[str] = []
-                            seller_competence = query_competences(conn, user["company_id"])
-                            seller_competence = seller_competence[0] if seller_competence else date.today().strftime("%Y-%m")
-                            for row in conn.execute(
-                                "SELECT DISTINCT seller_name FROM crm_tasks WHERE company_id = ?",
-                                (user["company_id"],),
-                            ).fetchall():
-                                current_seller = normalize_whitespace(row["seller_name"])
-                                _, seller_base_unit = current_role_and_unit(conn, user["company_id"], current_seller, seller_competence)
-                                if normalize_unit(seller_base_unit) in linked_units:
-                                    allowed_sellers.append(current_seller)
-                            if seller_name:
-                                if seller_name not in allowed_sellers:
-                                    allowed_sellers = []
-                                else:
-                                    allowed_sellers = [seller_name]
-                            if allowed_sellers:
-                                placeholders = ", ".join("?" for _ in allowed_sellers)
-                                sql += f" AND seller_name IN ({placeholders})"
-                                params.extend(allowed_sellers)
-                            else:
-                                sql += " AND 1 = 0"
-                        else:
-                            sql += " AND 1 = 0"
-                    elif seller_name:
-                        sql += " AND seller_name = ?"
-                        params.append(seller_name)
-                    if status_filter:
-                        sql += " AND status = ?"
-                        params.append(status_filter)
-                    else:
-                        sql += " AND status NOT IN ('CONCLUIDA', 'CANCELADA')"
-                    sql += " ORDER BY CASE status WHEN 'ATRASADA' THEN 0 WHEN 'ABERTA' THEN 1 WHEN 'REAGENDADA' THEN 2 ELSE 3 END, datetime(due_at) ASC"
-                    rows = [dict(row) for row in conn.execute(sql, params).fetchall()]
+                    pode_criar = data_scope_for_user(conn, user) != "proprio"
+                    rows = list_crm_tasks(
+                        conn, user["company_id"], user,
+                        status=normalize_upper(query.get("status", ["ABERTAS"])[0]),
+                        seller=normalize_whitespace(query.get("seller", [""])[0]),
+                        date_from=normalize_whitespace(query.get("from", [""])[0]),
+                        date_to=normalize_whitespace(query.get("to", [""])[0]),
+                        origin=normalize_upper(query.get("origin", [""])[0]),
+                        search=normalize_whitespace(query.get("q", [""])[0]),
+                    )
+                    payload = {
+                        "rows": rows,
+                        "total": len(rows),
+                        "counters": crm_task_counters(conn, user["company_id"], user),
+                        "origins": TASK_ORIGINS,
+                        "priorities": TASK_PRIORITIES,
+                        "statusFilters": TASK_STATUS_FILTERS,
+                        "canCreate": pode_criar,
+                        "people": task_assignable_people(conn, user["company_id"], user) if pode_criar else [],
+                        "sellers": task_visible_sellers(conn, user["company_id"], user) or [],
+                        "myName": meeting_person_identity(user),
+                    }
                 self._set_headers(200)
-                self.wfile.write(json_dumps({"rows": rows, "total": len(rows)}))
+                self.wfile.write(json_dumps(payload))
                 return
             if path == "/api/crm/agenda/actions":
                 user = self._require_auth()
@@ -13201,11 +13436,14 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn.execute(
                             """
                             INSERT INTO crm_tasks
-                                (company_id, client_key, client_name, seller_name, title, description, due_at, status, created_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?)
+                                (company_id, client_key, client_name, seller_name, title, description,
+                                 due_at, status, origin, created_by_name, created_by_user_id, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 'ABERTA', ?, ?, ?, ?)
                             """,
                             (user["company_id"], client_key, client_name, seller_name,
-                             title, description, due_at, now_iso()),
+                             title, description, due_at,
+                             "FOLLOWUP" if is_seller else "COBRANCA",
+                             meeting_person_identity(user), user["id"], now_iso()),
                         )
                         audit_log(conn, user["company_id"], user["id"], "criar", "crm_tasks", client_key,
                                   {"seller": seller_name,
@@ -13602,6 +13840,29 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in ("/api/crm/tasks/create", "/api/crm/tasks/delete"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/crm/tasks/create":
+                            resultado = create_crm_tasks(conn, user["company_id"], user, payload)
+                        else:
+                            delete_crm_task(conn, user["company_id"], user, int(payload.get("taskId") or 0))
+                            resultado = {}
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path in ("/api/visits/save", "/api/visits/delete", "/api/visits/request",
                         "/api/visits/request/resolve", "/api/visits/client"):
