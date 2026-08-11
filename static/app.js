@@ -4605,10 +4605,10 @@ function reunioesView() {
           <input type="date" style="width:150px" value="${escapeHtml(f.to)}"
             onchange="state.meetingFilters.to=this.value;loadMeetings()" />
           ${podeGerir ? `
-            <label class="text-small" style="display:flex;align-items:center;gap:4px;cursor:pointer">
+            <label class="check-row" style="font-weight:500">
               <input type="checkbox" ${f.mine ? "checked" : ""}
                 onchange="state.meetingFilters.mine=this.checked;loadMeetings()" />
-              Só as que eu conduzi
+              <span>Só as que eu conduzi</span>
             </label>` : ""}
         </div>
       </div>
@@ -5456,10 +5456,10 @@ function registroEditorModal() {
           <input value="${escapeHtml(n.agreement)}" oninput="state.noteEditor.agreement=this.value"
             placeholder="A ação e o prazo, se houve" /></div>
 
-        <label class="text-small" style="display:flex;align-items:center;gap:6px;cursor:pointer;margin-top:4px">
+        <label class="check-row" style="margin-top:8px">
           <input type="checkbox" ${n.requiresAck ? "checked" : ""}
             onchange="state.noteEditor.requiresAck=this.checked;requestRender()" />
-          Exigir ciência da pessoa
+          <span>Exigir ciência da pessoa</span>
         </label>
         <div class="text-small" style="color:var(--muted);margin-top:2px">
           ${n.requiresAck
@@ -5799,11 +5799,127 @@ async function copiarRoteiroWhatsapp() {
   }
 }
 
+/** Situação do pedido, na linguagem do vendedor. */
+function pedidoStatusBadge(status) {
+  const cfg = {
+    PENDENTE: { label: "Aguardando o gerente", color: "#b06000", bg: "#fef7e0" },
+    ACEITA:   { label: "✓ Aceito",             color: "#1e8e3e", bg: "#e6f4ea" },
+    RECUSADA: { label: "Recusado",             color: "#c5221f", bg: "#fce8e6" },
+  }[status] || { label: status, color: "#5f6368", bg: "#f1f3f4" };
+  return `<span class="status-tag" style="background:${cfg.bg};color:${cfg.color}">${escapeHtml(cfg.label)}</span>`;
+}
+
+/**
+ * Tela do vendedor. Duas perguntas que ele faz:
+ * "o que aconteceu com o que eu pedi?" e "o que o gerente combinou no meu cliente?".
+ * A segunda importa mais do que parece — cliente cobra do vendedor o que foi
+ * prometido na visita, e ele precisa saber antes de ser pego de surpresa.
+ */
+function visitasViewVendedor() {
+  const pedidos = state.visits.requests || [];
+  const visitas = state.visits.visits || [];
+  const pendentes = pedidos.filter((p) => p.status === "PENDENTE");
+  const respondidos = pedidos.filter((p) => p.status !== "PENDENTE");
+
+  return `
+    <div class="stack">
+      ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
+
+      <div class="panel" style="padding:14px 18px">
+        <div class="text-small" style="line-height:1.6">
+          Precisa da presença do gerente num cliente? Registre a ligação e marque
+          <strong>“Pedir visita do gerente”</strong>, ou peça direto pela ficha do cliente.
+          Só é possível pedir depois de uma ligação registrada — é o telefone antes da rua.
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>🙋 Meus pedidos de visita</h3>
+            <div class="text-small">${pendentes.length} aguardando resposta</div></div>
+          <div class="soft-badge">${pedidos.length}</div>
+        </div>
+        <div class="stack" style="padding-top:8px">
+          ${pedidos.map((p) => `
+            <div style="border-left:3px solid ${p.status === "PENDENTE" ? "#f39c12" : p.status === "ACEITA" ? "#1e8e3e" : "#c5221f"};
+                        background:#fff;border:1px solid var(--line);border-left-width:3px;
+                        border-radius:0 6px 6px 0;padding:10px 12px">
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+                <div style="flex:1;min-width:220px">
+                  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+                    ${pedidoStatusBadge(p.status)}
+                    <span class="text-small" style="color:var(--muted)">pedido em ${shortDate(p.createdAt)}</span>
+                  </div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(p.clientName)}</div>
+                  <div style="font-size:12px;margin-top:2px">${escapeHtml(p.reason)}</div>
+                  ${p.managerNote ? `
+                    <div style="font-size:12px;margin-top:4px;color:var(--accent)">
+                      <strong>Resposta do gerente:</strong> ${escapeHtml(p.managerNote)}</div>` : ""}
+                </div>
+                <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(p.clientKey)}', false)">Ficha</button>
+              </div>
+            </div>`).join("")
+            || emptyStateCard("Você ainda não pediu nenhuma visita.")}
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>🗺️ Visitas na minha carteira</h3>
+            <div class="text-small">
+              O que o gerente tratou e o que ficou combinado com o cliente.
+              O efeito compara o faturamento 60 dias antes e depois.
+            </div></div>
+          <div class="soft-badge">${visitas.length}</div>
+        </div>
+        <div class="stack" style="padding-top:8px">
+          ${visitas.map((v) => `
+            <div class="crm-card clean" style="padding:12px">
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+                <div style="flex:1;min-width:230px">
+                  <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+                    ${visitTypeBadge(v.visitType)}
+                    ${v.status === "PLANEJADA" ? '<span class="status-tag warn">Planejada</span>' : ""}
+                    ${v.sellerName ? '<span class="status-tag good">Você foi junto</span>' : ""}
+                  </div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(v.clientName)}</div>
+                  <div class="text-small" style="color:var(--muted)">
+                    ${v.occurredAt ? shortDate(v.occurredAt) : (v.scheduledFor ? `prevista ${shortDate(v.scheduledFor)}` : "")}
+                    · ${escapeHtml(v.managerName)}
+                  </div>
+                  ${v.outcome ? `<div style="font-size:12px;margin-top:4px;white-space:pre-wrap">${escapeHtml(v.outcome)}</div>` : ""}
+                  ${v.agreement ? `
+                    <div style="font-size:12px;margin-top:4px;background:#fff9e6;border-left:3px solid #f4c25f;
+                                padding:4px 8px;border-radius:0 4px 4px 0">
+                      <strong>Combinado com o cliente:</strong> ${escapeHtml(v.agreement)}
+                    </div>` : ""}
+                  ${v.nextAction ? `
+                    <div style="font-size:12px;margin-top:4px;color:var(--accent)">
+                      <strong>Sua tarefa:</strong> ${escapeHtml(v.nextAction)}${v.nextActionDue ? ` — até ${shortDate(v.nextActionDue)}` : ""}
+                    </div>` : ""}
+                </div>
+                <div style="text-align:right;min-width:140px">
+                  ${v.status === "REALIZADA" ? efeitoVisita(v) : ""}
+                  <div class="actions" style="gap:4px;margin-top:6px;justify-content:flex-end">
+                    <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(v.clientKey)}', false)">Ficha</button>
+                    ${v.nextAction ? `<button class="btn btn-secondary btn-sm" onclick="goToTab('crm-tarefas')">Ver tarefa</button>` : ""}
+                  </div>
+                </div>
+              </div>
+            </div>`).join("")
+            || emptyStateCard("Nenhuma visita registrada nos seus clientes ainda.")}
+        </div>
+      </div>
+    </div>`;
+}
+
 function visitasView() {
   if (!state.visits) { loadVisits(); return `<div class="loader panel">Carregando visitas…</div>`; }
   if (state.visits.error) return `<div class="message error">${escapeHtml(state.visits.error)}</div>`;
 
   const podeGerir = Boolean(state.visits.canManage);
+  if (!podeGerir) return visitasViewVendedor();
+
   const pedidos = state.visits.requests || [];
   const visitas = state.visits.visits || [];
   const rota = state.visitRoute || {};
@@ -5862,9 +5978,9 @@ function visitasView() {
               <option value="">Todas</option>
               ${(rota.cities || []).map((c) => `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
             </select>
-            <label class="text-small" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <label class="check-row" style="font-weight:500">
               <input type="checkbox" ${f.relationship ? "checked" : ""} onchange="toggleVisitRelationship()" />
-              Incluir visitas de relacionamento no caminho
+              <span>Incluir visitas de relacionamento no caminho</span>
             </label>
             <button class="btn btn-ghost btn-sm" onclick="loadVisitSuggestions()">Atualizar</button>
             <span style="flex:1"></span>
@@ -7373,23 +7489,23 @@ function crmInteractionView() {
               </div>
             ` : ""}
 
-            <div class="field" style="background:#f5f9ff;border:1px solid var(--accent);border-radius:12px;padding:12px">
-              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--accent)">
+            <div style="background:#f5f9ff;border:1px solid var(--accent);border-radius:12px;padding:14px">
+              <label class="check-row" style="color:var(--accent)">
                 <input type="checkbox" ${form.requestVisit ? "checked" : ""}
                   onchange="state.crm.interactionForm.requestVisit=this.checked;requestRender()" />
-                🙋 Pedir visita do gerente para este cliente
+                <span>🙋 Pedir visita do gerente para este cliente</span>
               </label>
               ${form.requestVisit ? `
-                <div style="margin-top:8px">
+                <div class="field" style="margin-top:10px">
                   <input value="${escapeHtml(form.visitReason || "")}"
                     oninput="state.crm.interactionForm.visitReason=this.value"
                     placeholder="Por que a visita resolve o que a ligação não resolveu?" />
-                  <div class="text-small" style="margin-top:4px;color:var(--muted)">
-                    O pedido entra na fila do gerente com o motivo que você escrever. Seja específico —
-                    é o que ele lê para decidir a rota da semana.
-                  </div>
+                </div>
+                <div class="text-small" style="color:var(--muted)">
+                  O pedido entra na fila do gerente com o motivo que você escrever. Seja específico —
+                  é o que ele lê para montar a rota da semana.
                 </div>` : `
-                <div class="text-small" style="margin-top:4px;color:var(--muted)">
+                <div class="text-small" style="margin-top:6px;color:var(--muted)">
                   Use quando o telefone não resolve: cliente parado, problema antigo ou negociação que
                   precisa de presença.
                 </div>`}
@@ -9359,7 +9475,10 @@ function dashboardView() {
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
     { id: "visitas",       title: "Visitas",          desc: "Roteiro e resultado",      icon: "🗺️",
-      badge: (state.visits?.requests || []).filter((r) => r.status === "PENDENTE").length },
+      // Só o gestor tem o que responder. Para o vendedor, pedido pendente é
+      // espera, não pendência — contador vermelho ali só geraria ansiedade.
+      badge: state.visits?.canManage
+        ? (state.visits?.requests || []).filter((r) => r.status === "PENDENTE").length : 0 },
   ].filter((t) => allowed.includes(t.id));
 
   const devTabs = [

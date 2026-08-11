@@ -12358,9 +12358,13 @@ class AppHandler(BaseHTTPRequestHandler):
                             conn, user["company_id"], user,
                             client_key=normalize_whitespace(query.get("client", [""])[0]),
                             status=normalize_upper(query.get("status", [""])[0])),
+                        # O gestor vê a fila do que precisa responder; o vendedor vê
+                        # TODOS os pedidos dele, inclusive os recusados — senão ele
+                        # nunca descobre por que a visita não aconteceu.
                         "requests": list_visit_requests(
                             conn, user["company_id"], user,
-                            status=normalize_upper(query.get("requestStatus", ["PENDENTE"])[0])),
+                            status=normalize_upper(query.get("requestStatus", [""])[0])
+                                   or ("" if not pode_gerir else "PENDENTE")),
                         "types": VISIT_TYPES,
                         "statuses": VISIT_STATUSES,
                         "canManage": pode_gerir,

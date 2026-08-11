@@ -156,6 +156,29 @@ button {
   color: var(--muted);
 }
 
+/* Caixa de seleção não é campo de texto: a regra width:100% abaixo a esticava
+   pela linha inteira, jogando o rótulo para a direita e desalinhando tudo. */
+.field input[type="checkbox"],
+.field input[type="radio"],
+.check-row input[type="checkbox"] {
+  width: auto;
+  min-width: 0;
+  flex: 0 0 auto;
+  padding: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+/* Linha de marcação: caixa à esquerda, rótulo colado nela. */
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
 .field input,
 .field select,
 .field textarea {
