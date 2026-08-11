@@ -1502,3 +1502,223 @@ tbody tr:hover {
   }
   @page { margin: 12mm; }
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TELA DE LOGIN — Passini | MEC
+   ───────────────────────────────────────────────────────────────────────────
+   A tela pertence à marca antes de pertencer ao sistema: mesmo escudo, mesmo
+   índigo, mesmo brilho dourado no topo. E carrega o método — quem entra lê o
+   ciclo do MEC antes de digitar a senha. É o primeiro lembrete do dia.
+   Prefixo pl- (passini login) para não colidir com o estilo antigo.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+.pl-shell {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  background: #0d0a2b;
+  overflow: auto;
+  font-family: inherit;
+}
+
+/* ── Lado da marca ──────────────────────────────────────────────────────── */
+.pl-brand {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 30px;
+  padding: 48px 56px;
+  background:
+    radial-gradient(120% 90% at 50% -20%, rgba(244, 194, 95, 0.30) 0%, rgba(244, 194, 95, 0) 55%),
+    linear-gradient(165deg, #2a1a6e 0%, #1d1250 45%, #120b34 100%);
+  color: #fff;
+}
+
+/* Feixe de luz que desce do topo, como o brilho do escudo da marca. */
+.pl-brand::before {
+  content: "";
+  position: absolute;
+  top: -30%;
+  left: 50%;
+  width: 60%;
+  height: 130%;
+  transform: translateX(-50%);
+  background: conic-gradient(from 180deg at 50% 0%,
+    rgba(244, 194, 95, 0) 0deg,
+    rgba(244, 194, 95, 0.16) 12deg,
+    rgba(244, 194, 95, 0) 26deg);
+  filter: blur(10px);
+  animation: pl-sweep 9s ease-in-out infinite;
+  pointer-events: none;
+}
+
+@keyframes pl-sweep {
+  0%, 100% { opacity: 0.35; transform: translateX(-50%) rotate(-6deg); }
+  50%      { opacity: 0.85; transform: translateX(-50%) rotate(6deg); }
+}
+
+/* Malha discreta ao fundo: dá profundidade sem competir com o conteúdo. */
+.pl-brand::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 46px 46px;
+  mask-image: radial-gradient(80% 70% at 50% 40%, #000 25%, transparent 78%);
+  -webkit-mask-image: radial-gradient(80% 70% at 50% 40%, #000 25%, transparent 78%);
+  pointer-events: none;
+}
+
+.pl-brand > * { position: relative; z-index: 2; }
+
+.pl-mark { display: flex; align-items: center; gap: 18px; }
+.pl-shield { width: 86px; flex: 0 0 auto; filter: drop-shadow(0 10px 26px rgba(0, 0, 0, 0.5)); }
+.pl-mark-text .pl-name {
+  font-size: 26px; font-weight: 900; letter-spacing: 0.20em; line-height: 1;
+}
+.pl-mark-text .pl-sub {
+  font-size: 11px; font-weight: 700; letter-spacing: 0.28em;
+  color: rgba(255, 255, 255, 0.62); margin-top: 6px;
+}
+
+.pl-eyebrow {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 11px; font-weight: 800; letter-spacing: 0.20em;
+  color: #f4c25f; text-transform: uppercase;
+}
+.pl-eyebrow::before {
+  content: ""; width: 26px; height: 2px; border-radius: 2px;
+  background: linear-gradient(90deg, #f4c25f, rgba(244, 194, 95, 0));
+}
+
+.pl-headline {
+  font-size: clamp(28px, 3.1vw, 44px);
+  font-weight: 800; line-height: 1.12; margin: 0; letter-spacing: -0.01em;
+}
+.pl-headline em {
+  font-style: normal;
+  background: linear-gradient(100deg, #f4c25f, #fff5d6 55%, #f4c25f);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+
+/* ── Frases do MEC que se alternam ──────────────────────────────────────── */
+.pl-rotator { position: relative; height: 74px; max-width: 560px; }
+.pl-rotator p {
+  position: absolute; inset: 0; margin: 0;
+  font-size: 15px; line-height: 1.55; color: rgba(255, 255, 255, 0.80);
+  opacity: 0; animation: pl-fade 24s infinite;
+}
+.pl-rotator p:nth-child(1) { animation-delay: 0s; }
+.pl-rotator p:nth-child(2) { animation-delay: 6s; }
+.pl-rotator p:nth-child(3) { animation-delay: 12s; }
+.pl-rotator p:nth-child(4) { animation-delay: 18s; }
+
+@keyframes pl-fade {
+  0%    { opacity: 0; transform: translateY(6px); }
+  3%,21%{ opacity: 1; transform: translateY(0); }
+  25%   { opacity: 0; transform: translateY(-6px); }
+  100%  { opacity: 0; }
+}
+
+/* ── Ciclo do MEC ───────────────────────────────────────────────────────── */
+.pl-cycle-label {
+  font-size: 10px; font-weight: 800; letter-spacing: 0.22em;
+  color: rgba(255, 255, 255, 0.42); text-transform: uppercase; margin-bottom: 12px;
+}
+.pl-cycle { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pl-step {
+  position: relative;
+  font-size: 11px; font-weight: 800; letter-spacing: 0.10em;
+  padding: 7px 13px; border-radius: 999px;
+  border: 1px solid rgba(244, 194, 95, 0.28);
+  color: rgba(255, 255, 255, 0.68);
+  background: rgba(255, 255, 255, 0.035);
+  animation: pl-pulse 7.2s infinite;
+}
+.pl-step:nth-child(1) { animation-delay: 0s; }
+.pl-step:nth-child(2) { animation-delay: 1.2s; }
+.pl-step:nth-child(3) { animation-delay: 2.4s; }
+.pl-step:nth-child(4) { animation-delay: 3.6s; }
+.pl-step:nth-child(5) { animation-delay: 4.8s; }
+.pl-step:nth-child(6) { animation-delay: 6.0s; }
+
+@keyframes pl-pulse {
+  0%, 12%, 100% {
+    color: rgba(255, 255, 255, 0.68);
+    border-color: rgba(244, 194, 95, 0.28);
+    background: rgba(255, 255, 255, 0.035);
+    box-shadow: none;
+  }
+  4% {
+    color: #12082e;
+    border-color: #f4c25f;
+    background: linear-gradient(180deg, #ffe9a8, #f4c25f);
+    box-shadow: 0 0 22px rgba(244, 194, 95, 0.45);
+  }
+}
+
+.pl-foot {
+  font-size: 11px; color: rgba(255, 255, 255, 0.40);
+  border-top: 1px solid rgba(255, 255, 255, 0.10); padding-top: 14px;
+}
+
+/* ── Lado do formulário ─────────────────────────────────────────────────── */
+.pl-panel {
+  display: flex; align-items: center; justify-content: center;
+  padding: 40px 32px; background: #f7f8fb;
+}
+.pl-form {
+  width: 100%; max-width: 372px;
+  display: flex; flex-direction: column; gap: 16px;
+}
+.pl-form h2 { margin: 0; font-size: 24px; font-weight: 800; color: #16123a; }
+.pl-form .pl-hint { margin: 0; font-size: 13px; color: #6b7280; }
+
+.pl-field label {
+  display: block; font-size: 11px; font-weight: 800; letter-spacing: 0.12em;
+  color: #6b7280; text-transform: uppercase; margin-bottom: 6px;
+}
+.pl-field input {
+  width: 100%; padding: 14px 16px; font-size: 15px;
+  border: 1px solid #d9dbe6; border-radius: 12px; background: #fff;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.pl-field input:focus {
+  outline: none; border-color: #2a1a6e;
+  box-shadow: 0 0 0 3px rgba(42, 26, 110, 0.12);
+}
+
+.pl-submit {
+  width: 100%; padding: 15px 18px; border: none; border-radius: 12px;
+  font-size: 15px; font-weight: 800; color: #fff; cursor: pointer;
+  background: linear-gradient(120deg, #2a1a6e, #4327a8);
+  box-shadow: 0 10px 26px rgba(42, 26, 110, 0.30);
+  transition: transform 0.12s, box-shadow 0.15s;
+}
+.pl-submit:hover { transform: translateY(-1px); box-shadow: 0 14px 32px rgba(42, 26, 110, 0.38); }
+.pl-submit:active { transform: translateY(0); }
+
+.pl-rule {
+  border-left: 3px solid #f4c25f; background: #fffaf0;
+  padding: 10px 14px; border-radius: 0 8px 8px 0;
+  font-size: 12px; line-height: 1.5; color: #6b4a12;
+}
+.pl-help { font-size: 12px; color: #9aa0ae; text-align: center; }
+
+/* ── Telas menores ──────────────────────────────────────────────────────── */
+@media (max-width: 980px) {
+  .pl-shell { grid-template-columns: 1fr; }
+  .pl-brand { padding: 34px 26px; gap: 22px; }
+  .pl-rotator { height: 92px; }
+  .pl-panel { padding: 28px 22px 48px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pl-brand::before, .pl-rotator p, .pl-step { animation: none; }
+  .pl-rotator p:nth-child(1) { opacity: 1; }
+}

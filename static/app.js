@@ -1143,48 +1143,136 @@ function messageHtml() {
   `;
 }
 
+/**
+ * Escudo da marca em SVG.
+ *
+ * Desenhado em vetor no lugar de imagem: fica nítido em qualquer tela, não
+ * precisa de arquivo no servidor e o brilho dourado do topo pode ser animado —
+ * é o mesmo gesto do logotipo, agora vivo.
+ */
+function passiniShield(tamanho) {
+  return `
+    <svg class="pl-shield" style="width:${tamanho || 86}px" viewBox="0 0 200 220" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Passini Distribuidora de Peças">
+      <defs>
+        <linearGradient id="plBody" x1="0" y1="0" x2="0.2" y2="1">
+          <stop offset="0%" stop-color="#6f5f9e" />
+          <stop offset="28%" stop-color="#3b2582" />
+          <stop offset="100%" stop-color="#241463" />
+        </linearGradient>
+        <radialGradient id="plGleam" cx="50%" cy="4%" r="42%">
+          <stop offset="0%" stop-color="#fff6c9" stop-opacity="0.95" />
+          <stop offset="45%" stop-color="#f4c25f" stop-opacity="0.55" />
+          <stop offset="100%" stop-color="#f4c25f" stop-opacity="0" />
+        </radialGradient>
+        <linearGradient id="plEdge" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%" stop-color="#f4c25f" stop-opacity="0.9" />
+          <stop offset="50%" stop-color="#f4c25f" stop-opacity="0.25" />
+          <stop offset="100%" stop-color="#f4c25f" stop-opacity="0.7" />
+        </linearGradient>
+      </defs>
+
+      <path id="plShieldPath"
+        d="M10 14 C60 30 140 30 190 14 C186 96 170 150 100 208 C30 150 14 96 10 14 Z"
+        fill="url(#plBody)" stroke="url(#plEdge)" stroke-width="2.5" />
+      <path d="M10 14 C60 30 140 30 190 14 C186 96 170 150 100 208 C30 150 14 96 10 14 Z"
+        fill="url(#plGleam)">
+        <animate attributeName="opacity" values="0.55;1;0.55" dur="4.5s" repeatCount="indefinite" />
+      </path>
+
+      <text x="100" y="86" text-anchor="middle" fill="#fff"
+        style="font:900 27px/1 Arial,Helvetica,sans-serif;letter-spacing:6px">PASSINI</text>
+      <text x="100" y="120" text-anchor="middle" fill="#fff"
+        style="font:800 17px/1 Arial,Helvetica,sans-serif;letter-spacing:0.5px">DISTRIBUIDORA</text>
+      <text x="100" y="146" text-anchor="middle" fill="#fff"
+        style="font:800 17px/1 Arial,Helvetica,sans-serif;letter-spacing:0.5px">DE PEÇAS</text>
+    </svg>`;
+}
+
+/**
+ * Tela de entrada.
+ *
+ * Duas metades: a marca à esquerda, o acesso à direita. O lado da marca traz o
+ * ciclo do MEC girando — abrir, preparar, fazer, registrar, marcar, concluir.
+ * Quem entra no sistema lê o método antes de digitar a senha; em três segundos
+ * de espera, o hábito é reforçado sem custo nenhum.
+ */
 function loginView() {
   return `
-    <div class="login-shell">
-      <div class="login-card">
-        <div class="login-hero">
-          <div class="login-badge">Dashboard Comercial Local</div>
-          <h1>Passini<br />Resultados Comerciais</h1>
-          <p>
-            Painel estratégico para gerentes com visão consolidada, metas, devoluções, projeções,
-            ticket médio, score de vendedores, quadrantes e governança de importação.
-          </p>
-          <div class="hero-grid">
-            <div class="mini-card"><span>Foco</span><strong>Unidades, vendedores, cidades e competência</strong></div>
-            <div class="mini-card"><span>Importação</span><strong>Custo e faturamento separados, com auditoria por competência</strong></div>
-            <div class="mini-card"><span>Operação</span><strong>Servidor local, login protegido e banco local</strong></div>
-            <div class="mini-card"><span>Expansão</span><strong>Estrutura pronta para servidor e multiempresa</strong></div>
+    <div class="pl-shell">
+      <aside class="pl-brand">
+        <div class="pl-mark">
+          ${passiniShield(86)}
+          <div class="pl-mark-text">
+            <div class="pl-name">PASSINI</div>
+            <div class="pl-sub">DISTRIBUIDORA DE PEÇAS</div>
           </div>
         </div>
-        <form class="login-form" onsubmit="handleLogin(event)">
+
+        <div>
+          <div class="pl-eyebrow">MEC · Método de Execução Comercial</div>
+          <h1 class="pl-headline">
+            A venda não acontece por acaso.<br />
+            Ela acontece <em>por método</em>.
+          </h1>
+        </div>
+
+        <div class="pl-rotator">
+          <p>Abra o CRM. Faça a primeira tarefa da fila. Registre o que aconteceu e marque o próximo passo.</p>
+          <p>São 5 contatos por dia — 2 Bronze/Prata, 2 Ouro/Diamante e 1 prospecção. Cinco, não oito.</p>
+          <p>Contato sem registro válido não conta. Atendimento sem próxima ação continua aberto.</p>
+          <p>Orçamento enviado não é orçamento terminado. Ligue e pergunte o que falta para fechar.</p>
+        </div>
+
+        <div>
+          <div class="pl-cycle-label">O ciclo de cada atendimento</div>
+          <div class="pl-cycle">
+            <span class="pl-step">ABRIR</span>
+            <span class="pl-step">PREPARAR</span>
+            <span class="pl-step">FAZER</span>
+            <span class="pl-step">REGISTRAR</span>
+            <span class="pl-step">MARCAR</span>
+            <span class="pl-step">CONCLUIR</span>
+          </div>
+        </div>
+
+        <div class="pl-foot">
+          Carteira, metas, visitas, reuniões e desenvolvimento — a operação comercial em um só lugar.
+        </div>
+      </aside>
+
+      <main class="pl-panel">
+        <form class="pl-form" onsubmit="handleLogin(event)">
           <div>
-            <h2>Entrar</h2>
-            <p class="hint">Informe suas credenciais de acesso.</p>
+            <h2>Bom trabalho hoje.</h2>
+            <p class="pl-hint">Entre para ver sua fila do dia.</p>
           </div>
+
           ${messageHtml()}
-          <div class="field">
+
+          <div class="pl-field">
             <label>Usuário</label>
-            <input autocomplete="username" value="${escapeHtml(state.login.username)}" oninput="state.login.username=this.value" required />
+            <input autocomplete="username" value="${escapeHtml(state.login.username)}"
+              oninput="state.login.username=this.value" required autofocus />
           </div>
-          <div class="field">
+          <div class="pl-field">
             <label>Senha</label>
-            <input type="password" autocomplete="current-password" value="${escapeHtml(state.login.password)}" oninput="state.login.password=this.value" required />
+            <input type="password" autocomplete="current-password" value="${escapeHtml(state.login.password)}"
+              oninput="state.login.password=this.value" required />
           </div>
-          <button class="btn btn-primary" type="submit">Entrar no dashboard</button>
-          <div class="text-small" style="text-align:center;color:var(--muted);margin-top:4px">
-            Esqueceu a senha? Fale com o administrador do sistema.
+
+          <button class="pl-submit" type="submit">Entrar</button>
+
+          <div class="pl-rule">
+            <strong>Regra de ouro:</strong> ligar sem proposta é desperdício.
+            Uma oferta e uma pergunta em cada contato.
           </div>
+
+          <div class="pl-help">Esqueceu a senha? Fale com o administrador do sistema.</div>
         </form>
-      </div>
+      </main>
     </div>
   `;
 }
-
 function tabButton(id, title, desc) {
   return `
     <button class="tab-button ${state.activeTab === id ? "active" : ""}" onclick="switchTab('${id}')">
