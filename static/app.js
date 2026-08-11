@@ -4107,6 +4107,7 @@ function novaAtaModal(kind) {
     occurredAt: localDateTimeInput(), durationMin: 60, location: "",
     agenda: "", summary: "", decisions: "",
     organizerName: state.meetings?.myName || "",
+    visibility: "UNIDADE",
     participants: [], attachments: [], status: "RASCUNHO", saving: false,
   };
   requestRender();
@@ -4123,6 +4124,7 @@ async function editarAta(meetingId) {
       unitName: m.unitName, occurredAt: (m.occurredAt || "").replace(" ", "T").slice(0, 16),
       durationMin: m.durationMin, location: m.location, agenda: m.agenda,
       summary: m.summary, decisions: m.decisions, organizerName: m.organizerName,
+      visibility: m.visibility || "UNIDADE",
       participants: m.participants.map((p) => ({
         personName: p.personName, personKey: p.personKey, unitName: p.unitName,
         acknowledgedAt: p.acknowledgedAt,
@@ -4513,7 +4515,8 @@ function meetingCard(m, podeGerir) {
         <div style="flex:1;min-width:220px">
           <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:4px">
             ${meetingKindChip(m.kind)}
-            ${m.status === "RASCUNHO" ? '<span class="status-tag warn">Rascunho</span>' : ""}
+            ${m.status === "RASCUNHO" ? '<span class="status-tag warn">✎ Rascunho — só você vê</span>' : ""}
+            ${m.visibility === "EMPRESA" ? '<span class="status-tag" style="background:#e8f0fe;color:#1a5276">🌐 Compartilhada</span>' : ""}
             ${pendente ? '<span class="status-tag bad">Sua ciência pendente</span>' : ""}
             ${m.iAmParticipant && m.myAcknowledgedAt ? '<span class="status-tag good">✓ Você deu ciência</span>' : ""}
           </div>
@@ -4702,6 +4705,19 @@ function ataEditorModal() {
             oninput="state.meetingEditor.decisions=this.value"
             placeholder="Quem faz o quê e até quando">${escapeHtml(e.decisions)}</textarea></div>
 
+        <div style="background:#f5f9ff;border:1px solid var(--accent);border-radius:12px;padding:14px;margin-top:8px">
+          <label class="check-row" style="color:var(--accent)">
+            <input type="checkbox" ${e.visibility === "EMPRESA" ? "checked" : ""}
+              onchange="state.meetingEditor.visibility=this.checked?'EMPRESA':'UNIDADE';requestRender()" />
+            <span>🌐 Liberar esta ata para as outras unidades</span>
+          </label>
+          <div class="text-small" style="margin-top:6px;color:var(--muted)">
+            ${e.visibility === "EMPRESA"
+              ? "Todos os gerentes vão poder ler. Use em treinamento e conteúdo que serve para a empresa toda."
+              : "Por padrão, só a sua unidade e a diretoria enxergam. Marque quando o conteúdo servir para as outras equipes."}
+          </div>
+        </div>
+
         <div class="subtle-card padded-card" style="margin-top:8px">
           <div class="section-title">
             <div><h3>Presentes</h3>
@@ -4798,7 +4814,8 @@ function ataDetalheModal() {
            onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
-            <div style="margin-bottom:4px">${meetingKindChip(m.kind)}</div>
+            <div style="margin-bottom:4px">${meetingKindChip(m.kind)}
+              ${m.visibility === "EMPRESA" ? '<span class="status-tag" style="background:#e8f0fe;color:#1a5276">🌐 Compartilhada</span>' : ""}</div>
             <h3>${escapeHtml(m.title)}</h3>
             <div class="text-small">
               ${shortDate(m.occurredAt)} ${escapeHtml((m.occurredAt || "").slice(11, 16))}

@@ -1012,6 +1012,10 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if participant_columns and "user_id" not in participant_columns:
         conn.execute("ALTER TABLE meeting_participants ADD COLUMN user_id INTEGER")
 
+    meeting_columns = {row["name"] for row in conn.execute("PRAGMA table_info(meetings)").fetchall()}
+    if meeting_columns and "visibility" not in meeting_columns:
+        conn.execute("ALTER TABLE meetings ADD COLUMN visibility TEXT NOT NULL DEFAULT 'UNIDADE'")
+
 
 def seed_crm_catalogs(conn: sqlite3.Connection) -> None:
     for code, label in CRM_CONTACT_TYPES:
@@ -1621,6 +1625,7 @@ def init_db() -> None:
                 summary TEXT,                    -- o que foi tratado
                 decisions TEXT,                  -- decisões e encaminhamentos
                 organizer_name TEXT NOT NULL,
+                visibility TEXT NOT NULL DEFAULT 'UNIDADE',  -- UNIDADE | EMPRESA
                 status TEXT NOT NULL DEFAULT 'RASCUNHO',   -- RASCUNHO | PUBLICADA
                 published_at TEXT,
                 created_by_user_id INTEGER,
@@ -3921,6 +3926,7 @@ def meeting_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "summary": row["summary"] or "",
         "decisions": row["decisions"] or "",
         "organizerName": row["organizer_name"] or "",
+        "visibility": row["visibility"] if "visibility" in row.keys() else "UNIDADE",
         "status": row["status"],
         "publishedAt": row["published_at"] or "",
         "createdAt": row["created_at"],
@@ -4000,11 +4006,29 @@ def list_meetings(
         params.extend(minhas_chaves)
     else:
         allowed = crm_allowed_units_for_user(conn, user)
-        if allowed:
-            # Ata sem unidade é corporativa e aparece para todos os gestores.
-            marcadores = ",".join("?" for _ in allowed)
-            sql += f" AND (m.unit_name IS NULL OR m.unit_name = '' OR m.unit_name IN ({marcadores}))"
-            params.extend(allowed)
+        # allowed None = diretoria, sem restrição. Lista VAZIA significa gestor
+        # sem unidade vinculada: nesse caso ele só enxerga o que é dele, nunca
+        # a empresa inteira. O `if allowed:` anterior deixava a lista vazia
+        # desligar o filtro e abria tudo — foi o que aconteceu com a Matriz.
+        if allowed is not None:
+            eu = normalize_upper(meeting_person_identity(user))
+            if allowed:
+                marcadores = ",".join("?" for _ in allowed)
+                sql += (
+                    " AND ("
+                    f"    m.unit_name IN ({marcadores})"          # a unidade dele
+                    "     OR m.visibility = 'EMPRESA'"            # liberada pelo autor
+                    "     OR UPPER(m.organizer_name) = ?"         # ata que ele mesmo conduziu
+                    ")"
+                )
+                params.extend(allowed)
+                params.append(eu)
+            else:
+                sql += " AND (m.visibility = 'EMPRESA' OR UPPER(m.organizer_name) = ?)"
+                params.append(eu)
+            # Rascunho é trabalho em andamento: só o autor vê.
+            sql += " AND (m.status <> 'RASCUNHO' OR UPPER(m.organizer_name) = ?)"
+            params.append(eu)
         if only_mine:
             sql += " AND UPPER(m.organizer_name) = ?"
             params.append(normalize_upper(meeting_person_identity(user)))
@@ -4125,6 +4149,7 @@ def save_meeting(
         normalize_whitespace(payload.get("summary")),
         normalize_whitespace(payload.get("decisions")),
         normalize_whitespace(payload.get("organizerName")) or meeting_person_identity(user),
+        "EMPRESA" if normalize_upper(payload.get("visibility")) == "EMPRESA" else "UNIDADE",
     )
 
     if meeting_id:
@@ -4137,7 +4162,7 @@ def save_meeting(
             """
             UPDATE meetings SET kind=?, title=?, topic=?, unit_name=?, occurred_at=?,
                    duration_min=?, location=?, agenda=?, summary=?, decisions=?,
-                   organizer_name=?, updated_at=?
+                   organizer_name=?, visibility=?, updated_at=?
             WHERE id = ?
             """,
             (*campos, now_iso(), int(meeting_id)),
@@ -4147,9 +4172,9 @@ def save_meeting(
         cursor = conn.execute(
             """
             INSERT INTO meetings (company_id, kind, title, topic, unit_name, occurred_at,
-                duration_min, location, agenda, summary, decisions, organizer_name,
+                duration_min, location, agenda, summary, decisions, organizer_name, visibility,
                 status, created_by_user_id, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'RASCUNHO',?,?)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'RASCUNHO',?,?)
             """,
             (company_id, *campos, user["id"], now_iso()),
         )
@@ -4775,11 +4800,15 @@ def list_feedbacks(
         params.extend(minhas)
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
-        if permitidas:
-            unidades = ",".join("?" for _ in permitidas)
-            # Vê a unidade dele e também o próprio feedback, que é da unidade dele mesmo.
-            sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
-            params.extend(permitidas)
+        # Lista vazia = gestor sem unidade vinculada. Vê só o próprio feedback,
+        # nunca a empresa inteira.
+        if permitidas is not None:
+            if permitidas:
+                unidades = ",".join("?" for _ in permitidas)
+                sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
+                params.extend(permitidas)
+            else:
+                sql += f" AND person_key IN ({marcadores})"
             params.extend(minhas)
 
     if kind in FEEDBACK_KIND_IDS:
@@ -5076,10 +5105,13 @@ def list_feedback_notes(
         params.extend(minhas)
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
-        if permitidas:
-            unidades = ",".join("?" for _ in permitidas)
-            sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
-            params.extend(permitidas)
+        if permitidas is not None:
+            if permitidas:
+                unidades = ",".join("?" for _ in permitidas)
+                sql += f" AND (unit_name IN ({unidades}) OR person_key IN ({marcadores}))"
+                params.extend(permitidas)
+            else:
+                sql += f" AND person_key IN ({marcadores})"
             params.extend(minhas)
 
     if person_key_value:
@@ -5529,12 +5561,15 @@ def search_clients_for_visit(
     # Restringe às cidades atendidas pelas unidades do gestor. Sem isso a busca
     # abriria a base inteira da empresa para um gerente de unidade.
     permitidas = crm_allowed_units_for_user(conn, user)
-    if permitidas:
-        cidades = active_mapped_cities_for_units(conn, company_id, permitidas)
-        if cidades:
-            marcadores = ",".join("?" for _ in cidades)
-            sql += f" AND UPPER(COALESCE(city_name,'')) IN ({marcadores})"
-            params.extend([normalize_upper(c) for c in cidades])
+    if permitidas is not None:
+        cidades = active_mapped_cities_for_units(conn, company_id, permitidas) if permitidas else []
+        if not cidades:
+            # Sem unidade vinculada (ou sem cidade mapeada) a busca não devolve
+            # nada, em vez de abrir a base inteira da empresa.
+            return []
+        marcadores = ",".join("?" for _ in cidades)
+        sql += f" AND UPPER(COALESCE(city_name,'')) IN ({marcadores})"
+        params.extend([normalize_upper(c) for c in cidades])
 
     sql += " ORDER BY client_name LIMIT ?"
     params.append(int(limite))
@@ -5836,10 +5871,13 @@ def list_visit_requests(
         params.append(normalize_upper(seller_identity_for_user(user)))
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
-        if permitidas:
-            marcadores = ",".join("?" for _ in permitidas)
-            sql += f" AND (unit_name IN ({marcadores}) OR unit_name IS NULL)"
-            params.extend(permitidas)
+        if permitidas is not None:
+            if permitidas:
+                marcadores = ",".join("?" for _ in permitidas)
+                sql += f" AND unit_name IN ({marcadores})"
+                params.extend(permitidas)
+            else:
+                sql += " AND 1 = 0"   # sem unidade vinculada, sem fila
     if status:
         sql += " AND status = ?"
         params.append(normalize_upper(status))
@@ -5930,10 +5968,13 @@ def list_visits(
         params.extend([eu, company_id, eu])
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
-        if permitidas:
-            marcadores = ",".join("?" for _ in permitidas)
-            sql += f" AND (unit_name IN ({marcadores}) OR unit_name IS NULL)"
-            params.extend(permitidas)
+        if permitidas is not None:
+            if permitidas:
+                marcadores = ",".join("?" for _ in permitidas)
+                sql += f" AND unit_name IN ({marcadores})"
+                params.extend(permitidas)
+            else:
+                sql += " AND 1 = 0"
     if client_key:
         sql += " AND client_key = ?"
         params.append(client_key)
