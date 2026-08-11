@@ -5544,6 +5544,9 @@ function novaVisita(cliente) {
     outcome: "", agreement: "", nextAction: "", nextActionDue: dateInDays(7),
     requestId: cliente?.requestId || null,
     addressLine: cliente?.addressLine || "",
+    neighborhood: cliente?.neighborhood || "",
+    phone: cliente?.phone || "",
+    results: null, searching: false,
     saving: false,
   };
   requestRender();
@@ -5555,6 +5558,58 @@ function editarVisita(v) {
 }
 
 function fecharVisitaEditor() { state.visitEditor = null; requestRender(); }
+
+/**
+ * Busca o cliente na base para vincular à visita.
+ *
+ * Digitar o código na mão é fonte de erro silencioso: um dígito trocado grava a
+ * visita no cliente errado e o efeito é medido em quem nunca foi visitado.
+ * Aqui o vínculo vem da própria base, junto com o endereço.
+ */
+async function buscarClienteVisita() {
+  const e = state.visitEditor;
+  if (!e) return;
+  const campo = document.getElementById("visit-client-search");
+  const termo = campo ? campo.value.trim() : "";
+  if (termo.length < 2) { addMessage("warn", "Digite ao menos 2 caracteres."); return; }
+  e.searching = true; e.results = null; requestRender();
+  try {
+    const r = await api(`/api/visits/client-search?q=${encodeURIComponent(termo)}`);
+    e.results = r.clients || [];
+    if (!e.results.length) addMessage("warn", "Nenhum cliente encontrado com esse código ou nome.");
+  } catch (err) {
+    addMessage("error", err.message);
+    e.results = [];
+  } finally {
+    e.searching = false;
+    requestRender();
+  }
+}
+
+function escolherClienteVisita(indice) {
+  const e = state.visitEditor;
+  if (!e || !e.results) return;
+  const c = e.results[indice];
+  if (!c) return;
+  Object.assign(e, {
+    clientKey: c.clientKey,
+    clientName: c.clientName,
+    cityName: c.cityName,
+    addressLine: c.addressLine,
+    neighborhood: c.neighborhood,
+    phone: c.phone,
+    sellerName: e.sellerName || c.assignedSeller || "",
+    results: null,
+  });
+  requestRender();
+}
+
+function trocarClienteVisita() {
+  const e = state.visitEditor;
+  if (!e) return;
+  Object.assign(e, { clientKey: "", clientName: "", addressLine: "", results: null });
+  requestRender();
+}
 
 async function salvarVisita() {
   const v = state.visitEditor;
@@ -6067,13 +6122,50 @@ function visitaEditorModal() {
 
         ${!v.clientKey ? `
           <div class="field" style="margin-top:12px">
-            <label>Código do cliente <span style="color:var(--bad)">*</span></label>
-            <input value="${escapeHtml(v.clientKey)}" oninput="state.visitEditor.clientKey=this.value"
-              placeholder="Digite o código do cliente" />
-            <div class="text-small" style="color:var(--muted)">
-              Dica: use o roteiro sugerido acima — ele já preenche o cliente e o endereço.
+            <label>Cliente <span style="color:var(--bad)">*</span></label>
+            <div style="display:flex;gap:8px">
+              <input id="visit-client-search" style="flex:1"
+                placeholder="Buscar por código, razão social ou nome fantasia — Enter para buscar"
+                onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClienteVisita();}" />
+              <button class="btn btn-secondary" onclick="buscarClienteVisita()">
+                ${v.searching ? "Buscando…" : "Buscar"}</button>
             </div>
-          </div>` : ""}
+            ${v.results ? `
+              <div style="border:1px solid var(--line);border-radius:8px;max-height:230px;overflow:auto;margin-top:8px">
+                ${v.results.map((c, i) => `
+                  <button type="button" onclick="escolherClienteVisita(${i})"
+                    style="width:100%;text-align:left;border:none;background:#fff;cursor:pointer;
+                           padding:8px 10px;border-bottom:1px solid var(--line)">
+                    <div style="font-weight:700;font-size:13px">${escapeHtml(c.clientName)}
+                      <span style="color:var(--muted);font-weight:400">· ${escapeHtml(c.clientKey)}</span></div>
+                    <div class="text-small" style="color:var(--muted)">
+                      ${escapeHtml(c.addressLine || "endereço não cadastrado")}
+                      ${c.neighborhood ? ` · ${escapeHtml(c.neighborhood)}` : ""}
+                      ${c.cityName ? ` · ${escapeHtml(c.cityName)}` : ""}
+                    </div>
+                    ${c.assignedSeller ? `<div class="text-small" style="color:var(--muted)">Vendedor: ${escapeHtml(c.assignedSeller)}</div>` : ""}
+                  </button>`).join("")
+                  || '<div class="text-small" style="padding:10px;color:var(--muted)">Nenhum cliente encontrado.</div>'}
+              </div>` : `
+              <div class="text-small" style="color:var(--muted)">
+                Ou use o roteiro sugerido — ele já preenche cliente e endereço.
+              </div>`}
+          </div>` : `
+          <div class="subtle-card padded-card" style="margin-top:12px">
+            <div style="display:flex;justify-content:space-between;gap:10px;align-items:start;flex-wrap:wrap">
+              <div>
+                <div style="font-weight:700;font-size:13px">${escapeHtml(v.clientName)}
+                  <span style="color:var(--muted);font-weight:400">· ${escapeHtml(v.clientKey)}</span></div>
+                <div class="text-small" style="color:var(--muted)">
+                  ${escapeHtml(v.addressLine || "endereço não cadastrado")}
+                  ${v.neighborhood ? ` · ${escapeHtml(v.neighborhood)}` : ""}
+                  ${v.cityName ? ` · ${escapeHtml(v.cityName)}` : ""}
+                  ${v.phone ? ` · ${escapeHtml(v.phone)}` : ""}
+                </div>
+              </div>
+              ${!v.id ? `<button class="btn btn-ghost btn-sm" onclick="trocarClienteVisita()">Trocar cliente</button>` : ""}
+            </div>
+          </div>`}
 
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px">
           <div class="field"><label>Situação</label>

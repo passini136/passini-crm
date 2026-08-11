@@ -5503,6 +5503,60 @@ def client_addresses(conn: sqlite3.Connection, company_id: int, codigos: list[st
     return resultado
 
 
+def search_clients_for_visit(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, termo: str, limite: int = 25
+) -> list[dict[str, Any]]:
+    """Busca cliente por código ou nome para vincular a uma visita.
+
+    Traz o endereço junto: o gerente escolhe o cliente e a visita já nasce com
+    rua, bairro e cidade preenchidos, sem digitação e sem risco de errar o vínculo.
+    """
+    texto = normalize_whitespace(termo)
+    if len(texto) < 2:
+        return []
+    alvo = f"%{texto.upper()}%"
+
+    sql = """
+        SELECT client_code, client_name, trade_name, city_name, neighborhood,
+               address_line, address_number, postal_code, phone, updated_phone,
+               COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name
+        FROM crm_client_profiles
+        WHERE company_id = ?
+          AND (UPPER(client_code) LIKE ? OR UPPER(client_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?)
+    """
+    params: list[Any] = [company_id, alvo, alvo, alvo]
+
+    # Restringe às cidades atendidas pelas unidades do gestor. Sem isso a busca
+    # abriria a base inteira da empresa para um gerente de unidade.
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas:
+        cidades = active_mapped_cities_for_units(conn, company_id, permitidas)
+        if cidades:
+            marcadores = ",".join("?" for _ in cidades)
+            sql += f" AND UPPER(COALESCE(city_name,'')) IN ({marcadores})"
+            params.extend([normalize_upper(c) for c in cidades])
+
+    sql += " ORDER BY client_name LIMIT ?"
+    params.append(int(limite))
+
+    resultado = []
+    for r in conn.execute(sql, params).fetchall():
+        rua = normalize_whitespace(r["address_line"])
+        numero = normalize_whitespace(r["address_number"])
+        resultado.append({
+            "clientKey": r["client_code"],
+            "clientName": normalize_whitespace(r["client_name"]),
+            "tradeName": normalize_whitespace(r["trade_name"]),
+            "cityName": normalize_upper(r["city_name"]),
+            "neighborhood": normalize_upper(r["neighborhood"]),
+            "addressLine": f"{rua}, {numero}" if rua and numero else rua,
+            "postalCode": normalize_whitespace(r["postal_code"]),
+            "phone": normalize_whitespace(r["updated_phone"]) or normalize_whitespace(r["phone"]),
+            "assignedSeller": normalize_whitespace(r["seller_name"]),
+        })
+    return resultado
+
+
 def suggest_visits(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     city: str = "", include_relationship: bool = True,
@@ -12375,6 +12429,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     }
                 self._set_headers(200)
                 self.wfile.write(json_dumps(payload))
+                return
+            if path == "/api/visits/client-search":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    if not user_can_manage_visits(conn, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Busca disponível para a gestão."}))
+                        return
+                    itens = search_clients_for_visit(
+                        conn, user["company_id"], user,
+                        normalize_whitespace(query.get("q", [""])[0]))
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"clients": itens}))
                 return
             if path == "/api/visits/suggestions":
                 user = self._require_auth()
