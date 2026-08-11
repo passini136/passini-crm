@@ -14,6 +14,10 @@ const state = {
   feedbackEditor: null,   // feedback em edição (gestão)
   feedbackDetail: null,   // feedback aberto para leitura/ciência
   pdiEditor: null,        // ponto de desenvolvimento em edição
+  visits: null,           // visitas + pedidos
+  visitRoute: null,        // roteiro sugerido por proximidade
+  visitEditor: null,       // visita em registro
+  visitFilters: { city: "", relationship: true },
   noteEditor: null,       // registro pontual em edição
   feedbackFilters: { kind: "", competence: "", person: "" },
   sellerScore: null,
@@ -47,7 +51,10 @@ const state = {
       filters: false,
       meetings: false,
       feedback: false,
+      visits: false,
+      visitRoute: false,
     },
+    visitOpenGroups: {},   // bairros abertos no roteiro
     executiveSections: {
       details: false,
       ranking: false,
@@ -390,9 +397,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "reunioes", "feedback", "calendario"]);
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "reunioes", "feedback", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -504,6 +511,7 @@ async function bootstrap() {
     // atrasar a abertura do sistema.
     loadMeetings(true);
     loadFeedback(true);
+    loadVisits(true);
     await Promise.all(loads);
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
@@ -4304,6 +4312,71 @@ function fileSizeLabel(bytes) {
 
 // ─── Ciência do participante ────────────────────────────────────────────────
 
+/**
+ * Ligações e visitas do cliente, com o efeito medido de cada visita.
+ * Responde a pergunta prática: "adiantou ter ido lá?".
+ */
+async function loadClientVisitHistory(clientKey) {
+  if (!clientKey) return;
+  try {
+    state.crm.clientVisits = await api("/api/visits/client", {
+      method: "POST", body: JSON.stringify({ clientKey }),
+    });
+  } catch (e) {
+    state.crm.clientVisits = { error: e.message, visits: [] };
+  }
+  requestRender();
+}
+
+function clientVisitBlock(clientKey) {
+  const d = state.crm.clientVisits;
+  if (!d || d.error) return "";
+  const podeGerir = Boolean(state.visits?.canManage);
+  return `
+    <div class="subtle-card padded-card">
+      <div class="section-title">
+        <div><h3>📞 Contatos e visitas</h3>
+          <div class="text-small">
+            ${number(d.callsTotal)} ligação(ões) no total · ${number(d.callsRecent)} nos últimos ${d.callWindowDays} dias
+          </div></div>
+        ${podeGerir ? `
+          <button class="btn btn-secondary btn-sm"
+            onclick='novaVisita({clientKey:"${jsAttr(clientKey)}",clientName:"${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}"})'>Registrar visita</button>` : ""}
+      </div>
+
+      ${d.pendingRequest ? `
+        <div class="message" style="background:#fdecea;color:#c0392b;font-size:12px;margin-top:8px">
+          🙋 ${escapeHtml(d.pendingRequest.sellerName)} pediu visita em ${shortDate(d.pendingRequest.createdAt)}:
+          ${escapeHtml(d.pendingRequest.reason)}
+        </div>` : ""}
+
+      ${!d.eligibleForVisit && !d.pendingRequest ? `
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Sem ligação registrada nos últimos ${d.callWindowDays} dias — por isso este cliente não aparece
+          no roteiro de visitas. O contato por telefone vem antes.
+        </div>` : ""}
+
+      <div class="stack" style="margin-top:8px">
+        ${(d.visits || []).map((v) => `
+          <div style="border-left:3px solid var(--accent);background:#fafbfc;border-radius:0 6px 6px 0;padding:8px 10px">
+            <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:start">
+              <div style="flex:1;min-width:200px">
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                  ${visitTypeBadge(v.visitType)}
+                  <span class="text-small">${v.occurredAt ? shortDate(v.occurredAt) : "planejada"}</span>
+                </div>
+                <div class="text-small" style="color:var(--muted)">
+                  ${escapeHtml(v.managerName)}${v.sellerName ? ` com ${escapeHtml(v.sellerName)}` : ""}</div>
+                ${v.outcome ? `<div style="font-size:12px;margin-top:3px;white-space:pre-wrap">${escapeHtml(v.outcome)}</div>` : ""}
+                ${v.agreement ? `<div style="font-size:12px"><strong>Combinado:</strong> ${escapeHtml(v.agreement)}</div>` : ""}
+              </div>
+              <div style="text-align:right">${v.status === "REALIZADA" ? efeitoVisita(v) : ""}</div>
+            </div>
+          </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhuma visita registrada para este cliente.</div>'}
+      </div>
+    </div>`;
+}
+
 async function abrirAta(meetingId) {
   try {
     const r = await api("/api/meetings/detail", {
@@ -5313,6 +5386,417 @@ function registroEditorModal() {
           <button class="btn btn-primary" ${n.saving ? "disabled" : ""} onclick="salvarRegistro()">
             ${n.saving ? "Salvando…" : "Salvar registro"}</button>
           <button class="btn btn-ghost" onclick="fecharRegistro()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+// ─── Visitas gerenciais ─────────────────────────────────────────────────────
+//
+// Três blocos: pedidos do vendedor esperando resposta, roteiro sugerido por
+// proximidade e o histórico do que já foi feito, com o efeito medido.
+
+async function loadVisits(silencioso) {
+  if (!silencioso) state.ui.loading.visits = true;
+  try {
+    state.visits = await api("/api/visits");
+    if (state.visits.canManage) await loadVisitSuggestions(true);
+  } catch (e) {
+    state.visits = { error: e.message, visits: [], requests: [], types: [] };
+  } finally {
+    state.ui.loading.visits = false;
+    requestRender();
+  }
+}
+
+async function loadVisitSuggestions(silencioso) {
+  const f = state.visitFilters;
+  const q = new URLSearchParams();
+  if (f.city) q.set("city", f.city);
+  q.set("relationship", f.relationship ? "1" : "0");
+  if (!silencioso) state.ui.loading.visitRoute = true;
+  try {
+    state.visitRoute = await api(`/api/visits/suggestions?${q.toString()}`);
+  } catch (e) {
+    state.visitRoute = { error: e.message, route: [] };
+  } finally {
+    state.ui.loading.visitRoute = false;
+    requestRender();
+  }
+}
+
+function setVisitCity(cidade) {
+  state.visitFilters.city = cidade;
+  loadVisitSuggestions();
+}
+
+function toggleVisitRelationship() {
+  state.visitFilters.relationship = !state.visitFilters.relationship;
+  loadVisitSuggestions();
+}
+
+function toggleBairro(chave) {
+  state.ui.visitOpenGroups[chave] = !state.ui.visitOpenGroups[chave];
+  requestRender();
+}
+
+// ─── Registro da visita ─────────────────────────────────────────────────────
+
+function novaVisita(cliente) {
+  state.visitEditor = {
+    id: null,
+    clientKey: cliente?.clientKey || "",
+    clientName: cliente?.clientName || "",
+    cityName: cliente?.cityName || "",
+    unitName: "",
+    visitType: cliente?.visitType || "RELACIONAMENTO",
+    status: "REALIZADA",
+    scheduledFor: "",
+    occurredAt: dateInDays(0),
+    managerName: state.visits?.myName || "",
+    sellerName: cliente?.assignedSeller || "",
+    objective: cliente?.reason || "",
+    outcome: "", agreement: "", nextAction: "", nextActionDue: dateInDays(7),
+    requestId: cliente?.requestId || null,
+    addressLine: cliente?.addressLine || "",
+    saving: false,
+  };
+  requestRender();
+}
+
+function editarVisita(v) {
+  state.visitEditor = { ...v, saving: false };
+  requestRender();
+}
+
+function fecharVisitaEditor() { state.visitEditor = null; requestRender(); }
+
+async function salvarVisita() {
+  const v = state.visitEditor;
+  if (!v) return;
+  if (!v.clientKey) { addMessage("error", "Selecione o cliente."); return; }
+  v.saving = true; requestRender();
+  try {
+    const r = await api("/api/visits/save", { method: "POST", body: JSON.stringify(v) });
+    addMessage("success", r.taskId
+      ? "Visita registrada. A ação combinada virou tarefa do vendedor."
+      : "Visita registrada.");
+    state.visitEditor = null;
+    await loadVisits(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.visitEditor) state.visitEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirVisita(visitId) {
+  if (!confirm("Excluir esta visita?")) return;
+  try {
+    await api("/api/visits/delete", { method: "POST", body: JSON.stringify({ visitId }) });
+    await loadVisits(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function responderPedido(requestId, aceitar) {
+  try {
+    await api("/api/visits/request/resolve", {
+      method: "POST", body: JSON.stringify({ requestId, accept: aceitar }),
+    });
+    addMessage("success", aceitar ? "Pedido aceito." : "Pedido recusado.");
+    await loadVisits(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+// ─── Componentes ────────────────────────────────────────────────────────────
+
+function visitTypeCfg(tipo) {
+  return (state.visits?.types || []).find((t) => t.id === tipo)
+    || { label: tipo, icon: "📍", color: "#5f6368", bg: "#f1f3f4" };
+}
+
+function visitTypeBadge(tipo) {
+  const t = visitTypeCfg(tipo);
+  return `<span class="status-tag" style="background:${t.bg};color:${t.color}">${t.icon} ${escapeHtml(t.label)}</span>`;
+}
+
+/** Efeito da visita: verde quando cresceu, vermelho quando caiu. */
+function efeitoVisita(v) {
+  if (v.revenueBefore === null || v.revenueBefore === undefined) {
+    return `<span class="text-small" style="color:var(--muted)">efeito em apuração</span>`;
+  }
+  const pct = v.effectPct;
+  const cor = pct === null ? "var(--muted)" : pct >= 0 ? "var(--good)" : "var(--bad)";
+  const seta = pct === null ? "" : pct >= 0 ? "▲" : "▼";
+  return `
+    <span class="text-small">
+      <strong style="color:${cor}">${seta} ${pct === null ? "—" : pct + "%"}</strong>
+      <span style="color:var(--muted)"> · ${currency(v.revenueBefore)} → ${currency(v.revenueAfter)}</span>
+    </span>`;
+}
+
+function clienteRoteiroLinha(c, podeGerir) {
+  return `
+    <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start;
+                padding:8px 10px;border-bottom:1px solid var(--line)">
+      <div style="flex:1;min-width:230px">
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          ${visitTypeBadge(c.visitType)}
+          <strong style="font-size:13px">${escapeHtml(c.clientName)}</strong>
+        </div>
+        <div class="text-small" style="color:var(--muted)">
+          ${c.addressLine ? escapeHtml(c.addressLine) : "Endereço não cadastrado"}
+          ${c.postalCode ? ` · ${escapeHtml(c.postalCode)}` : ""}
+        </div>
+        <div class="text-small">${escapeHtml(c.reason)}</div>
+        ${c.requestedBy ? `<div class="text-small" style="color:var(--bad);font-weight:600">Pedido por ${escapeHtml(c.requestedBy)}</div>` : ""}
+      </div>
+      <div style="text-align:right;min-width:130px">
+        <div class="text-small">média ${currency(c.averageRevenue)}/mês</div>
+        ${c.phone ? `<div class="text-small" style="color:var(--muted)">📞 ${escapeHtml(c.phone)}</div>` : ""}
+        ${c.assignedSeller ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(c.assignedSeller)}</div>` : ""}
+        <div class="actions" style="gap:4px;margin-top:4px;justify-content:flex-end">
+          <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(c.clientKey)}', false)">Ficha</button>
+          ${podeGerir ? `<button class="btn btn-primary btn-sm" onclick='novaVisita(${JSON.stringify(c).replace(/'/g, "&#39;")})'>Registrar visita</button>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+function visitaCard(v, podeGerir) {
+  return `
+    <div class="crm-card clean" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+        <div style="flex:1;min-width:230px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+            ${visitTypeBadge(v.visitType)}
+            ${v.status === "PLANEJADA" ? '<span class="status-tag warn">Planejada</span>' : ""}
+            ${v.status === "CANCELADA" ? '<span class="status-tag">Cancelada</span>' : ""}
+          </div>
+          <div style="font-weight:700;font-size:13px">${escapeHtml(v.clientName)}</div>
+          <div class="text-small" style="color:var(--muted)">
+            ${v.occurredAt ? shortDate(v.occurredAt) : (v.scheduledFor ? `agendada ${shortDate(v.scheduledFor)}` : "")}
+            ${v.cityName ? ` · ${escapeHtml(v.cityName)}` : ""}
+            ${v.neighborhood ? ` · ${escapeHtml(v.neighborhood)}` : ""}
+            · ${escapeHtml(v.managerName)}${v.sellerName ? ` com ${escapeHtml(v.sellerName)}` : ""}
+          </div>
+          ${v.outcome ? `<div style="font-size:12px;margin-top:4px;white-space:pre-wrap">${escapeHtml(v.outcome)}</div>` : ""}
+          ${v.agreement ? `<div style="font-size:12px;margin-top:2px"><strong>Combinado:</strong> ${escapeHtml(v.agreement)}</div>` : ""}
+          ${v.nextAction ? `<div style="font-size:12px"><strong>Próximo passo:</strong> ${escapeHtml(v.nextAction)}${v.nextActionDue ? ` (${shortDate(v.nextActionDue)})` : ""}</div>` : ""}
+        </div>
+        <div style="text-align:right;min-width:150px">
+          ${v.status === "REALIZADA" ? efeitoVisita(v) : ""}
+          ${podeGerir ? `
+            <div class="actions" style="gap:4px;margin-top:6px;justify-content:flex-end">
+              <button class="btn btn-ghost btn-sm" onclick='editarVisita(${JSON.stringify(v).replace(/'/g, "&#39;")})'>Editar</button>
+              <button class="btn btn-ghost btn-sm" onclick="excluirVisita(${v.id})">Excluir</button>
+            </div>` : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+function visitasView() {
+  if (!state.visits) { loadVisits(); return `<div class="loader panel">Carregando visitas…</div>`; }
+  if (state.visits.error) return `<div class="message error">${escapeHtml(state.visits.error)}</div>`;
+
+  const podeGerir = Boolean(state.visits.canManage);
+  const pedidos = state.visits.requests || [];
+  const visitas = state.visits.visits || [];
+  const rota = state.visitRoute || {};
+  const f = state.visitFilters;
+
+  return `
+    <div class="stack">
+      ${state.visitEditor ? visitaEditorModal() : ""}
+
+      ${pedidos.length ? `
+        <div class="table-card" style="border-left:4px solid #e74c3c">
+          <div class="section-title">
+            <div><h3>🙋 Pedidos de visita da equipe</h3>
+              <div class="text-small">${podeGerir
+                ? "O vendedor já ligou e pediu sua presença. Aceite e registre, ou recuse com o motivo."
+                : "Pedidos que você enviou ao gerente."}</div></div>
+            <div class="soft-badge" style="background:#fde8e8;color:#e74c3c">${pedidos.length}</div>
+          </div>
+          <div class="stack" style="padding-top:8px">
+            ${pedidos.map((p) => `
+              <div style="border-left:3px solid #e74c3c;background:#fff;border:1px solid var(--line);
+                          border-left-width:3px;border-radius:0 6px 6px 0;padding:10px 12px">
+                <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+                  <div style="flex:1;min-width:220px">
+                    <div style="font-weight:700;font-size:13px">${escapeHtml(p.clientName)}</div>
+                    <div class="text-small" style="color:var(--muted)">
+                      ${escapeHtml(p.sellerName)}${p.cityName ? ` · ${escapeHtml(p.cityName)}` : ""} · ${shortDate(p.createdAt)}</div>
+                    <div style="font-size:13px;margin-top:4px">${escapeHtml(p.reason)}</div>
+                  </div>
+                  <div class="actions" style="gap:6px">
+                    <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(p.clientKey)}', false)">Ficha</button>
+                    ${podeGerir ? `
+                      <button class="btn btn-primary btn-sm"
+                        onclick='novaVisita({clientKey:"${jsAttr(p.clientKey)}",clientName:"${jsAttr(p.clientName)}",cityName:"${jsAttr(p.cityName)}",visitType:"SOLICITADA",reason:"${jsAttr(p.reason)}",requestId:${p.id}})'>Registrar visita</button>
+                      <button class="btn btn-ghost btn-sm" onclick="responderPedido(${p.id}, false)">Recusar</button>` : ""}
+                  </div>
+                </div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+
+      ${podeGerir ? `
+        <div class="table-card">
+          <div class="section-title">
+            <div><h3>🗺️ Roteiro sugerido</h3>
+              <div class="text-small">
+                Agrupado por bairro e rua para você não cruzar a cidade duas vezes.
+                Só entra quem teve ligação registrada nos últimos ${rota.params?.callWindowDays || 30} dias.
+              </div></div>
+            <div class="soft-badge">${rota.total || 0}</div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 0">
+            <span class="text-small" style="font-weight:700;color:var(--muted)">CIDADE</span>
+            <select style="min-width:160px" onchange="setVisitCity(this.value)">
+              <option value="">Todas</option>
+              ${(rota.cities || []).map((c) => `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select>
+            <label class="text-small" style="display:flex;align-items:center;gap:6px;cursor:pointer">
+              <input type="checkbox" ${f.relationship ? "checked" : ""} onchange="toggleVisitRelationship()" />
+              Incluir visitas de relacionamento no caminho
+            </label>
+            <button class="btn btn-ghost btn-sm" onclick="loadVisitSuggestions()">Atualizar</button>
+          </div>
+          ${state.ui.loading.visitRoute ? '<div class="loader">Montando roteiro…</div>' : ""}
+          ${rota.error ? `<div class="message error">${escapeHtml(rota.error)}</div>` : ""}
+          <div class="stack">
+            ${(rota.route || []).map((cidade) => `
+              <div>
+                <div style="display:flex;justify-content:space-between;align-items:baseline;
+                            padding:6px 0;border-bottom:2px solid var(--accent)">
+                  <strong style="font-size:14px">📍 ${escapeHtml(cidade.cityName)}</strong>
+                  <span class="text-small">${cidade.count} cliente(s) · potencial ${currency(cidade.potential)}/mês</span>
+                </div>
+                ${cidade.neighborhoods.map((b) => {
+                  const chave = `${cidade.cityName}|${b.neighborhood}`;
+                  const aberto = state.ui.visitOpenGroups[chave] !== false;
+                  return `
+                    <div style="margin-top:6px">
+                      <button type="button" onclick="toggleBairro('${jsAttr(chave)}')"
+                        style="width:100%;text-align:left;border:none;background:#f5f9ff;border-radius:6px;
+                               padding:6px 10px;cursor:pointer;display:flex;justify-content:space-between;
+                               align-items:center;font-size:13px;font-weight:700;color:var(--accent)">
+                        <span>${aberto ? "▾" : "▸"} ${escapeHtml(b.neighborhood)}</span>
+                        <span style="font-weight:500;color:var(--muted)">${b.count} · ${currency(b.potential)}/mês</span>
+                      </button>
+                      ${aberto ? b.clients.map((c) => clienteRoteiroLinha(c, podeGerir)).join("") : ""}
+                    </div>`;
+                }).join("")}
+              </div>`).join("") || (state.ui.loading.visitRoute ? "" : emptyStateCard(
+                "Nenhuma sugestão. Lembre que o cliente só entra depois de uma ligação registrada pelo vendedor."))}
+          </div>
+        </div>` : ""}
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Visitas registradas</h3>
+            <div class="text-small">O efeito compara o faturamento 60 dias antes e 60 dias depois.</div></div>
+          <div style="display:flex;gap:8px;align-items:center">
+            ${podeGerir ? `<button class="btn btn-secondary btn-sm" onclick="novaVisita(null)">＋ Nova visita</button>` : ""}
+            <div class="soft-badge">${visitas.length}</div>
+          </div>
+        </div>
+        <div class="stack" style="padding-top:8px">
+          ${visitas.map((v) => visitaCard(v, podeGerir)).join("")
+            || emptyStateCard("Nenhuma visita registrada ainda.")}
+        </div>
+      </div>
+    </div>`;
+}
+
+function visitaEditorModal() {
+  const v = state.visitEditor;
+  const realizada = v.status === "REALIZADA";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharVisitaEditor()">
+      <div class="panel modal-panel" data-keep-scroll="visita-editor"
+           style="max-width:720px;margin:5vh auto;padding:22px;max-height:90vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${v.id ? "Editar" : "Registrar"} visita</h3>
+            <div class="text-small">${escapeHtml(v.clientName || "Selecione o cliente")}
+              ${v.addressLine ? ` · ${escapeHtml(v.addressLine)}` : ""}</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharVisitaEditor()">Fechar</button>
+        </div>
+
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:12px">
+          ${(state.visits?.types || []).map((t) => `
+            <button type="button" onclick="state.visitEditor.visitType='${t.id}';requestRender()"
+              title="${escapeHtml(t.hint)}"
+              style="border:1px solid ${v.visitType === t.id ? t.color : "var(--line)"};
+                     background:${v.visitType === t.id ? t.bg : "#fff"};
+                     color:${v.visitType === t.id ? t.color : "var(--muted)"};
+                     border-radius:14px;padding:5px 12px;font-size:12px;
+                     font-weight:${v.visitType === t.id ? "700" : "500"};cursor:pointer">
+              ${t.icon} ${escapeHtml(t.label)}
+            </button>`).join("")}
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:6px">
+          ${escapeHtml(visitTypeCfg(v.visitType).hint || "")}
+        </div>
+
+        ${!v.clientKey ? `
+          <div class="field" style="margin-top:12px">
+            <label>Código do cliente <span style="color:var(--bad)">*</span></label>
+            <input value="${escapeHtml(v.clientKey)}" oninput="state.visitEditor.clientKey=this.value"
+              placeholder="Digite o código do cliente" />
+            <div class="text-small" style="color:var(--muted)">
+              Dica: use o roteiro sugerido acima — ele já preenche o cliente e o endereço.
+            </div>
+          </div>` : ""}
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px">
+          <div class="field"><label>Situação</label>
+            <select onchange="state.visitEditor.status=this.value;requestRender()">
+              ${(state.visits?.statuses || []).map((s) => `
+                <option value="${s.id}" ${v.status === s.id ? "selected" : ""}>${escapeHtml(s.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>${realizada ? "Data da visita" : "Data prevista"}</label>
+            <input type="date" value="${escapeHtml(realizada ? (v.occurredAt || "") : (v.scheduledFor || ""))}"
+              oninput="${realizada ? "state.visitEditor.occurredAt=this.value" : "state.visitEditor.scheduledFor=this.value"}" /></div>
+          <div class="field"><label>Vendedor foi junto?</label>
+            <select onchange="state.visitEditor.sellerName=this.value">
+              <option value="">Fui sozinho</option>
+              ${(state.visits?.sellers || []).map((s) => `
+                <option value="${escapeHtml(s)}" ${v.sellerName === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
+            </select></div>
+        </div>
+
+        <div class="field"><label>Objetivo da visita</label>
+          <input value="${escapeHtml(v.objective)}" oninput="state.visitEditor.objective=this.value"
+            placeholder="O que você foi resolver" /></div>
+
+        ${realizada ? `
+          <div class="field"><label>O que aconteceu <span style="color:var(--bad)">*</span></label>
+            <textarea rows="3" style="font-family:inherit" oninput="state.visitEditor.outcome=this.value"
+              placeholder="O que o cliente disse, o motivo real do problema, o que você observou na oficina">${escapeHtml(v.outcome)}</textarea></div>
+          <div class="field"><label>O que ficou combinado com o cliente</label>
+            <input value="${escapeHtml(v.agreement)}" oninput="state.visitEditor.agreement=this.value"
+              placeholder="Condição, prazo, teste de uma linha, volume" /></div>
+          <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
+            <div class="field"><label>Ação para o vendedor</label>
+              <input value="${escapeHtml(v.nextAction)}" oninput="state.visitEditor.nextAction=this.value"
+                placeholder="Vira tarefa dele automaticamente" /></div>
+            <div class="field"><label>Prazo</label>
+              <input type="date" value="${escapeHtml(v.nextActionDue || "")}"
+                oninput="state.visitEditor.nextActionDue=this.value" /></div>
+          </div>
+          <div class="text-small" style="color:var(--muted)">
+            A ação vira tarefa do vendedor selecionado acima — é o que faz a visita continuar
+            depois que você sai de lá.
+          </div>` : ""}
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-primary" ${v.saving ? "disabled" : ""} onclick="salvarVisita()">
+            ${v.saving ? "Salvando…" : "Salvar visita"}</button>
+          <button class="btn btn-ghost" onclick="fecharVisitaEditor()">Cancelar</button>
         </div>
       </div>
     </div>`;
@@ -6472,6 +6956,7 @@ function clientDrawerView() {
                 </div>` : ""}
               ${averageBreakdown(client)}
             </div>
+            ${clientVisitBlock(client.clientKey || state.crm.selectedClientKey || "")}
             ${clientActionPanel(client)}
             <div class="table-card">
               <div class="section-title">
@@ -6680,6 +7165,28 @@ function crmInteractionView() {
                 <div class="text-small" style="margin-top:6px;color:#c0832a">O sistema cria uma tarefa de retorno automaticamente.</div>
               </div>
             ` : ""}
+
+            <div class="field" style="background:#f5f9ff;border:1px solid var(--accent);border-radius:12px;padding:12px">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--accent)">
+                <input type="checkbox" ${form.requestVisit ? "checked" : ""}
+                  onchange="state.crm.interactionForm.requestVisit=this.checked;requestRender()" />
+                🙋 Pedir visita do gerente para este cliente
+              </label>
+              ${form.requestVisit ? `
+                <div style="margin-top:8px">
+                  <input value="${escapeHtml(form.visitReason || "")}"
+                    oninput="state.crm.interactionForm.visitReason=this.value"
+                    placeholder="Por que a visita resolve o que a ligação não resolveu?" />
+                  <div class="text-small" style="margin-top:4px;color:var(--muted)">
+                    O pedido entra na fila do gerente com o motivo que você escrever. Seja específico —
+                    é o que ele lê para decidir a rota da semana.
+                  </div>
+                </div>` : `
+                <div class="text-small" style="margin-top:4px;color:var(--muted)">
+                  Use quando o telefone não resolve: cliente parado, problema antigo ou negociação que
+                  precisa de presença.
+                </div>`}
+            </div>
 
             ${resultSold ? `
               <div class="field" style="background:#eafaf1;border:1px solid #27ae60;border-radius:12px;padding:12px">
@@ -6900,6 +7407,8 @@ async function openCrmClient(clientKey, switchToClientsTab = true, renderAfterLo
   state.crm.selectedClientKey = clientKey;
   state.ui.crmClientDetailTab = "historico";
   state.ui.clientDrawerOpen = true;
+  state.crm.clientVisits = null;          // some o histórico do cliente anterior
+  loadClientVisitHistory(clientKey);      // em paralelo, não atrasa a abertura
   setLoading("clientDrawer", true);
   state.ui.clientDrawerError = "";
   resetSelectedClientTabs();
@@ -6968,6 +7477,8 @@ function prefillInteractionFromAgenda(clientKey, fallbackName) {
     offerTitle: source.offerPrimary?.title || "",
     nextAction: crmRecommendedAction(source),
     followupDueAt: "",
+    requestVisit: false,
+    visitReason: "",
   };
   state.activeTab = "crm-interacao";
   requestRender();
@@ -6980,6 +7491,7 @@ function resetInteractionForm() {
     contactTypeCode: "LIGACAO", resultCode: "FALOU_CLIENTE",
     occurredAt: "", notes: "", questionUsed: "", hadProgress: false,
     offerTitle: "", nextAction: "", followupDueAt: "",
+    requestVisit: false, visitReason: "",
   };
   requestRender();
 }
@@ -7010,6 +7522,23 @@ async function submitCrmInteraction() {
         hadProgress: form.resultCode === "GEROU_PEDIDO" || form.resultCode === "GEROU_ORCAMENTO",
       }),
     });
+    // Pedido de visita: sai depois da interação porque nasce dela. Se falhar,
+    // o contato já está registrado — o vendedor não perde o trabalho.
+    if (form.requestVisit) {
+      try {
+        const rv = await api("/api/visits/request", {
+          method: "POST",
+          body: JSON.stringify({
+            clientKey: form.clientCode || form.clientKey,
+            clientName: form.clientName,
+            reason: form.visitReason || form.notes || "Solicitado durante ligação",
+          }),
+        });
+        addMessage(rv.duplicated ? "warn" : "success", rv.message || "Pedido de visita enviado.");
+      } catch (err) {
+        addMessage("warn", `Contato registrado, mas o pedido de visita falhou: ${err.message}`);
+      }
+    }
     // Atualizar placar de ligações em background
     if (roleIsSeller() && placarEnabled()) loadSellerScore();
     const resultLabel = {
@@ -8377,6 +8906,7 @@ function topbarTitle() {
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
     "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
     "feedback":       { title: "Feedback e PDI",         description: "Feedback mensal com base no MEC, plano de desenvolvimento e ciência." },
+    "visitas":        { title: "Visitas",                description: "Roteiro sugerido, registro da visita e efeito no faturamento." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
@@ -8621,6 +9151,8 @@ function dashboardView() {
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
+    { id: "visitas",       title: "Visitas",          desc: "Roteiro e resultado",      icon: "🗺️",
+      badge: (state.visits?.requests || []).filter((r) => r.status === "PENDENTE").length },
   ].filter((t) => allowed.includes(t.id));
 
   const devTabs = [
@@ -8743,6 +9275,7 @@ function dashboardView() {
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
+          ${state.activeTab === "visitas"       ? visitasView()        : ""}
           ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}

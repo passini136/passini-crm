@@ -221,6 +221,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
+    {"id": "visitas",        "label": "Visitas",            "group": "CRM"},
     # Desenvolvimento
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Desenvolvimento"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Desenvolvimento"},
@@ -275,7 +276,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
-            "reunioes", "feedback",
+            "visitas", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -298,7 +299,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "reunioes", "feedback", "executivo", "calendario",
+            "meu-placar", "biblioteca", "visitas", "reunioes", "feedback", "executivo", "calendario",
         ],
         "data_scope": "proprio",
         "can_manage_users": 0,
@@ -1712,6 +1713,70 @@ def init_db() -> None:
                 UNIQUE(feedback_id, item_id),
                 FOREIGN KEY (feedback_id) REFERENCES feedbacks(id) ON DELETE CASCADE
             );
+
+            -- Pedido de visita feito pelo vendedor ao registrar uma ligação.
+            -- É o que garante a ordem certa: o vendedor tenta por telefone e,
+            -- quando o problema passa do alcance dele, pede a presença do gestor.
+            CREATE TABLE IF NOT EXISTS visit_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                client_key TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                unit_name TEXT,
+                city_name TEXT,
+                seller_name TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDENTE',   -- PENDENTE | ACEITA | RECUSADA
+                manager_note TEXT,
+                interaction_id INTEGER,
+                requested_by_user_id INTEGER,
+                resolved_by_user_id INTEGER,
+                resolved_at TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_visit_requests_status
+                ON visit_requests(company_id, status, unit_name);
+
+            -- Visita gerencial. O endereço é copiado no momento do registro:
+            -- o cadastro do cliente muda, e o roteiro de ontem precisa continuar
+            -- mostrando onde a visita realmente aconteceu.
+            CREATE TABLE IF NOT EXISTS visits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                client_key TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                unit_name TEXT,
+                city_name TEXT,
+                neighborhood TEXT,
+                address_line TEXT,
+                visit_type TEXT NOT NULL,        -- REATIVACAO | RELACIONAMENTO | SOLICITADA | NEGOCIACAO
+                status TEXT NOT NULL DEFAULT 'PLANEJADA',  -- PLANEJADA | REALIZADA | CANCELADA
+                scheduled_for TEXT,
+                occurred_at TEXT,
+                manager_name TEXT NOT NULL,
+                seller_name TEXT,                -- vendedor que foi junto, quando foi
+                objective TEXT,
+                outcome TEXT,                    -- o que aconteceu
+                agreement TEXT,                  -- ação combinada com o cliente
+                next_action TEXT,
+                next_action_due TEXT,
+                request_id INTEGER,
+                -- Efeito medido: faturamento nos 60 dias antes e depois da visita
+                revenue_before REAL,
+                revenue_after REAL,
+                effect_measured_at TEXT,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_visits_client
+                ON visits(company_id, client_key, occurred_at);
+            CREATE INDEX IF NOT EXISTS idx_visits_unit_status
+                ON visits(company_id, unit_name, status);
 
             -- Registro pontual: a conversa que não espera o fechamento do mês.
             -- O MEC (item 7) prevê "orienta e combina a correção; se repetir,
@@ -5257,6 +5322,718 @@ def delete_pdi_item(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
         raise PermissionError("Apenas gestão mantém o PDI.")
     conn.execute("DELETE FROM pdi_items WHERE company_id = ? AND id = ?", (company_id, pdi_id))
     conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Visitas gerenciais
+#
+# Regras que definem o módulo:
+#
+# 1. LIGAÇÃO ANTES DE VISITA. Só entra na sugestão quem já teve tentativa de
+#    contato registrada. Visita é o recurso mais caro que a operação tem —
+#    gastar em cliente que nem foi procurado por telefone é desperdício, e
+#    inverte a ordem: o vendedor precisa fazer a parte dele primeiro.
+#
+# 2. ROTEIRO POR PROXIMIDADE. A lista é agrupada por cidade, bairro e rua. Um
+#    gerente que atravessa a cidade três vezes faz metade das visitas do dia.
+#    Por isso entram também os clientes de relacionamento que estão no caminho,
+#    mesmo sem indicador ruim — o custo marginal de parar ali é quase zero.
+#
+# 3. EFEITO MEDIDO SOZINHO. O faturamento 60 dias antes e 60 dias depois já
+#    está no banco. Pedir para alguém avaliar "se funcionou" produz opinião;
+#    comparar o faturamento produz resposta.
+# ─────────────────────────────────────────────────────────────────────────────
+
+VISIT_TYPES = [
+    {"id": "SOLICITADA", "label": "Pedida pelo vendedor", "icon": "🙋", "color": "#c5221f", "bg": "#fce8e6",
+     "hint": "O vendedor tentou por telefone e pediu a presença do gestor."},
+    {"id": "REATIVACAO", "label": "Reativação", "icon": "🔄", "color": "#b06000", "bg": "#fef7e0",
+     "hint": "Cliente parou de comprar ou caiu forte. A visita busca entender o motivo."},
+    {"id": "RELACIONAMENTO", "label": "Relacionamento", "icon": "🤝", "color": "#1e8e3e", "bg": "#e6f4ea",
+     "hint": "Cliente bom, sem problema aparente. Presença para sustentar a conta."},
+    {"id": "NEGOCIACAO", "label": "Negociação", "icon": "💼", "color": "#1a5276", "bg": "#e8f0fe",
+     "hint": "Fechar acordo, tabela ou volume que não se resolve por telefone."},
+]
+VISIT_TYPE_IDS = {t["id"] for t in VISIT_TYPES}
+
+VISIT_STATUSES = [
+    {"id": "PLANEJADA", "label": "Planejada", "color": "#5f6368", "bg": "#f1f3f4"},
+    {"id": "REALIZADA", "label": "Realizada", "color": "#1e8e3e", "bg": "#e6f4ea"},
+    {"id": "CANCELADA", "label": "Cancelada", "color": "#5f6368", "bg": "#f1f3f4"},
+]
+
+# Parâmetros do motor de sugestão — juntos e nomeados, são regra comercial.
+VISIT_CALL_WINDOW_DAYS = 30      # janela em que a ligação do vendedor vale como pré-requisito
+VISIT_COOLDOWN_DAYS = 60         # não sugere de novo quem foi visitado há menos que isso
+VISIT_RELATIONSHIP_DAYS = 180    # cliente bom sem visita há mais que isso entra por relacionamento
+VISIT_EFFECT_WINDOW_DAYS = 60    # janela de comparação antes/depois
+VISIT_SUGGESTION_LIMIT = 60
+
+
+def user_can_manage_visits(conn: sqlite3.Connection, user: sqlite3.Row) -> bool:
+    """Registra visita quem tem visão de equipe. O vendedor solicita e acompanha."""
+    return data_scope_for_user(conn, user) != "proprio"
+
+
+def client_sales_names(conn: sqlite3.Connection, company_id: int, client_key: str) -> list[str]:
+    """Nomes com que este cliente aparece no faturamento.
+
+    `client_key` é o CÓDIGO do cliente; o faturamento grava o NOME. Sem essa
+    tradução a comparação nunca casa — e o efeito da visita saía sempre zero.
+    """
+    nomes: set[str] = set()
+    perfil = conn.execute(
+        "SELECT client_name, trade_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, client_key),
+    ).fetchone()
+    if perfil:
+        for campo in ("client_name", "trade_name"):
+            valor = normalize_whitespace(perfil[campo])
+            if valor:
+                nomes.add(valor)
+    for r in conn.execute(
+        "SELECT DISTINCT client_name FROM crm_client_summary WHERE company_id = ? AND client_code = ?",
+        (company_id, client_key),
+    ).fetchall():
+        valor = normalize_whitespace(r["client_name"])
+        if valor:
+            nomes.add(valor)
+    return sorted(nomes)
+
+
+def client_revenue_between(
+    conn: sqlite3.Connection, company_id: int, client_key: str, inicio: str, fim: str
+) -> float:
+    """Faturamento líquido do cliente no intervalo, pela data da nota.
+
+    Linha sem data de emissão usa o primeiro dia da competência — melhor do que
+    descartar, porque o mês inteiro cairia fora da janela.
+    """
+    nomes = client_sales_names(conn, company_id, client_key)
+    if not nomes:
+        return 0.0
+    # Filtra por nome no SQL: a tabela de faturamento tem milhões de linhas e
+    # trazer a competência inteira para a memória só para descartar não escala.
+    marcadores = ",".join("?" for _ in nomes)
+    linhas = conn.execute(
+        f"""
+        SELECT client_name, competence, issue_date, net_value
+        FROM fact_sales_detail
+        WHERE company_id = ? AND net_value > 0
+          AND competence >= ? AND competence <= ?
+          AND UPPER(client_name) IN ({marcadores})
+        """,
+        (company_id, inicio[:7], fim[:7], *[normalize_upper(n) for n in nomes]),
+    ).fetchall()
+    total = 0.0
+    for r in linhas:
+        data = normalize_whitespace(r["issue_date"])[:10] or f"{r['competence']}-01"
+        if inicio <= data <= fim:
+            total += float(r["net_value"] or 0.0)
+    return round(total, 2)
+
+
+def measure_visit_effect(
+    conn: sqlite3.Connection, company_id: int, visit_id: int, force: bool = False
+) -> dict[str, Any] | None:
+    """Calcula o antes e depois da visita, quando a janela já fechou.
+
+    Só mede depois que os 60 dias posteriores passaram — antes disso o número
+    seria parcial e daria a impressão errada de que a visita não funcionou.
+    """
+    visita = conn.execute(
+        "SELECT * FROM visits WHERE company_id = ? AND id = ?", (company_id, visit_id)
+    ).fetchone()
+    if not visita or visita["status"] != "REALIZADA" or not visita["occurred_at"]:
+        return None
+    if visita["effect_measured_at"] and not force:
+        return {"revenueBefore": visita["revenue_before"], "revenueAfter": visita["revenue_after"]}
+
+    dt = parse_datetime_flexible(visita["occurred_at"][:10])
+    if not dt:
+        return None
+    dia = dt.date()
+    fim_depois = dia + timedelta(days=VISIT_EFFECT_WINDOW_DAYS)
+    if fim_depois > today_in_brazil() and not force:
+        return None   # janela ainda aberta
+
+    antes = client_revenue_between(
+        conn, company_id, visita["client_key"],
+        (dia - timedelta(days=VISIT_EFFECT_WINDOW_DAYS)).isoformat(),
+        (dia - timedelta(days=1)).isoformat(),
+    )
+    depois = client_revenue_between(
+        conn, company_id, visita["client_key"],
+        dia.isoformat(), fim_depois.isoformat(),
+    )
+    conn.execute(
+        "UPDATE visits SET revenue_before = ?, revenue_after = ?, effect_measured_at = ? WHERE id = ?",
+        (antes, depois, now_iso(), visit_id),
+    )
+    conn.commit()
+    return {"revenueBefore": antes, "revenueAfter": depois}
+
+
+def client_addresses(conn: sqlite3.Connection, company_id: int, codigos: list[str]) -> dict[str, dict[str, str]]:
+    """Endereço por código de cliente, para montar o roteiro."""
+    if not codigos:
+        return {}
+    resultado: dict[str, dict[str, str]] = {}
+    for bloco in range(0, len(codigos), 400):
+        parte = codigos[bloco:bloco + 400]
+        marcadores = ",".join("?" for _ in parte)
+        for r in conn.execute(
+            f"""
+            SELECT client_code, address_line, address_number, neighborhood, city_name, postal_code, phone
+            FROM crm_client_profiles
+            WHERE company_id = ? AND client_code IN ({marcadores})
+            """,
+            (company_id, *parte),
+        ).fetchall():
+            rua = normalize_whitespace(r["address_line"])
+            numero = normalize_whitespace(r["address_number"])
+            resultado[r["client_code"]] = {
+                "street": rua,
+                "addressLine": f"{rua}, {numero}" if rua and numero else rua,
+                "neighborhood": normalize_upper(r["neighborhood"]) or "SEM BAIRRO",
+                "cityName": normalize_upper(r["city_name"]),
+                "postalCode": normalize_whitespace(r["postal_code"]),
+                "phone": normalize_whitespace(r["phone"]),
+            }
+    return resultado
+
+
+def suggest_visits(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    city: str = "", include_relationship: bool = True,
+) -> dict[str, Any]:
+    """Roteiro sugerido, agrupado por cidade → bairro → rua."""
+    competence = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    permitidas = crm_allowed_units_for_user(conn, user)
+    hoje = today_in_brazil()
+
+    # Usa exatamente o mesmo recorte da tela de Carteira. Se o gerente vê o
+    # cliente lá, ele pode aparecer no roteiro — e vice-versa. Regra própria aqui
+    # criaria duas verdades sobre "quais clientes são meus".
+    filtros = build_filters_from_query({})
+    filtros["competence_start"] = competence
+    filtros["competence_end"] = competence
+    filtros = crm_scoped_filters_for_user(conn, company_id, user, filtros)
+    clientes = list_crm_clients(conn, company_id, filtros, attach_context=False)
+
+    # Pré-requisito: ligação registrada na janela
+    limite_ligacao = (hoje - timedelta(days=VISIT_CALL_WINDOW_DAYS)).isoformat()
+    com_ligacao = {
+        normalize_client_key(r["client_key"])
+        for r in conn.execute(
+            """
+            SELECT DISTINCT client_key FROM crm_interactions
+            WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+              AND date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?)
+            """,
+            (company_id, limite_ligacao),
+        ).fetchall()
+    }
+
+    # Visitas recentes: evita repetir o mesmo cliente
+    limite_visita = (hoje - timedelta(days=VISIT_COOLDOWN_DAYS)).isoformat()
+    visitados = {
+        normalize_client_key(r["client_key"]): r["ultima"]
+        for r in conn.execute(
+            """
+            SELECT client_key, MAX(date(occurred_at)) ultima FROM visits
+            WHERE company_id = ? AND status = 'REALIZADA'
+            GROUP BY client_key
+            """,
+            (company_id,),
+        ).fetchall()
+    }
+
+    # Pedidos pendentes do vendedor entram sempre, e na frente
+    pedidos = {
+        normalize_client_key(r["client_key"]): dict(r)
+        for r in conn.execute(
+            "SELECT * FROM visit_requests WHERE company_id = ? AND status = 'PENDENTE'",
+            (company_id,),
+        ).fetchall()
+    }
+
+    codigos = [c["clientKey"] for c in clientes]
+    enderecos = client_addresses(conn, company_id, codigos)
+    cidade_filtro = normalize_upper(city)
+
+    candidatos: list[dict[str, Any]] = []
+    for c in clientes:
+        chave = normalize_client_key(c["clientKey"])
+        endereco = enderecos.get(c["clientKey"], {})
+        cidade = endereco.get("cityName") or normalize_upper(c.get("cityName"))
+        if cidade_filtro and cidade != cidade_filtro:
+            continue
+
+        pedido = pedidos.get(chave)
+        ultima_visita = visitados.get(chave)
+        dias_visita = None
+        if ultima_visita:
+            d = parse_datetime_flexible(ultima_visita)
+            dias_visita = (hoje - d.date()).days if d else None
+            # Cooldown: quem foi visitado há pouco sai, exceto se o vendedor pediu.
+            if dias_visita is not None and dias_visita < VISIT_COOLDOWN_DAYS and not pedido:
+                continue
+
+        status = normalize_upper(c.get("statusCode"))
+        queda = float(c.get("dropPct") or 0.0)
+        media = float(c.get("averageRevenue") or 0.0)
+        atual = float(c.get("currentRevenue") or 0.0)
+
+        if pedido:
+            # Pedido do vendedor vem SEMPRE na frente, qualquer que seja o porte do
+            # cliente. Quem está na rua todo dia viu algo que o indicador não mostra;
+            # ignorar isso ensina a equipe a parar de pedir.
+            tipo = "SOLICITADA"
+            motivo = normalize_whitespace(pedido["reason"])
+            base = 1_000_000.0 + media
+        elif not com_ligacao and not pedido:
+            continue
+        elif chave not in com_ligacao:
+            # Sem ligação registrada não vira sugestão. É a regra que mantém a ordem.
+            continue
+        elif status in ("INATIVO", "PRE_INATIVO"):
+            tipo = "REATIVACAO"
+            motivo = f"{'Inativo' if status == 'INATIVO' else 'Pré-inativo'} há {c.get('daysWithoutPurchase') or '?'} dias"
+            base = media * 2
+        elif queda <= -0.30:
+            tipo = "REATIVACAO"
+            motivo = f"Queda de {abs(round(queda * 100))}% contra a média do trimestre"
+            base = media * 1.5
+        elif atual <= 0 and media > 0:
+            tipo = "REATIVACAO"
+            motivo = "Sem compra no mês"
+            base = media
+        elif include_relationship and media > 0 and (dias_visita is None or dias_visita >= VISIT_RELATIONSHIP_DAYS):
+            tipo = "RELACIONAMENTO"
+            motivo = ("Nunca visitado" if dias_visita is None
+                      else f"Sem visita há {dias_visita} dias")
+            base = media * 0.4
+        else:
+            continue
+
+        candidatos.append({
+            "clientKey": c["clientKey"],
+            "clientName": c.get("clientName"),
+            "cityName": cidade,
+            "neighborhood": endereco.get("neighborhood") or "SEM BAIRRO",
+            "street": endereco.get("street") or "",
+            "addressLine": endereco.get("addressLine") or "",
+            "postalCode": endereco.get("postalCode") or "",
+            "phone": c.get("updatedPhone") or c.get("phone") or endereco.get("phone") or "",
+            "assignedSeller": c.get("assignedSeller") or "",
+            "statusCode": status,
+            "classCode": c.get("classCode") or "",
+            "daysWithoutPurchase": c.get("daysWithoutPurchase"),
+            "currentRevenue": atual,
+            "averageRevenue": media,
+            "dropPct": queda,
+            "lastVisitDays": dias_visita,
+            "visitType": tipo,
+            "reason": motivo,
+            "requestId": pedido["id"] if pedido else None,
+            "requestedBy": pedido["seller_name"] if pedido else "",
+            "score": round(base, 2),
+        })
+
+    candidatos.sort(key=lambda x: x["score"], reverse=True)
+    candidatos = candidatos[:VISIT_SUGGESTION_LIMIT]
+
+    # Agrupa por cidade → bairro → rua. A ordem dentro do bairro segue a rua,
+    # para o gerente andar por quarteirão em vez de pular de ponta a ponta.
+    rotas: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for item in candidatos:
+        rotas.setdefault(item["cityName"] or "SEM CIDADE", {}).setdefault(
+            item["neighborhood"], []).append(item)
+
+    roteiro = []
+    for cidade_nome, bairros in rotas.items():
+        blocos = []
+        for bairro, itens in bairros.items():
+            itens.sort(key=lambda x: (x["street"], -x["score"]))
+            blocos.append({
+                "neighborhood": bairro,
+                "clients": itens,
+                "count": len(itens),
+                "potential": round(sum(i["averageRevenue"] for i in itens), 2),
+            })
+        blocos.sort(key=lambda b: b["potential"], reverse=True)
+        roteiro.append({
+            "cityName": cidade_nome,
+            "neighborhoods": blocos,
+            "count": sum(b["count"] for b in blocos),
+            "potential": round(sum(b["potential"] for b in blocos), 2),
+        })
+    roteiro.sort(key=lambda r: r["potential"], reverse=True)
+
+    return {
+        "route": roteiro,
+        "total": len(candidatos),
+        "cities": sorted({r["cityName"] for r in roteiro if r["cityName"]}),
+        "params": {
+            "callWindowDays": VISIT_CALL_WINDOW_DAYS,
+            "cooldownDays": VISIT_COOLDOWN_DAYS,
+            "relationshipDays": VISIT_RELATIONSHIP_DAYS,
+        },
+    }
+
+
+# ── Pedido de visita (vendedor → gerente) ────────────────────────────────────
+
+def create_visit_request(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    client_key = normalize_whitespace(payload.get("clientKey"))
+    reason = normalize_whitespace(payload.get("reason"))
+    if not client_key:
+        raise ValueError("Cliente inválido.")
+    if not reason:
+        raise ValueError("Diga por que a visita é necessária — é o que o gerente lê para decidir.")
+
+    ja_existe = conn.execute(
+        "SELECT id FROM visit_requests WHERE company_id = ? AND client_key = ? AND status = 'PENDENTE'",
+        (company_id, client_key),
+    ).fetchone()
+    if ja_existe:
+        return {"requestId": int(ja_existe["id"]), "duplicated": True,
+                "message": "Já existe um pedido de visita aberto para este cliente."}
+
+    perfil = conn.execute(
+        "SELECT client_name, city_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, client_key),
+    ).fetchone()
+    seller = seller_identity_for_user(user)
+    _, unidade = current_role_and_unit(
+        conn, company_id, seller,
+        crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m"),
+    )
+
+    cursor = conn.execute(
+        """
+        INSERT INTO visit_requests (company_id, client_key, client_name, unit_name, city_name,
+            seller_name, reason, interaction_id, requested_by_user_id, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (company_id, client_key,
+         normalize_whitespace(payload.get("clientName")) or (perfil["client_name"] if perfil else client_key),
+         normalize_unit(unidade), normalize_upper(perfil["city_name"]) if perfil else None,
+         seller, reason, payload.get("interactionId"), user["id"], now_iso()),
+    )
+    audit_log(conn, company_id, user["id"], "criar", "visit_requests", client_key, {"vendedor": seller})
+    conn.commit()
+    return {"requestId": int(cursor.lastrowid), "duplicated": False,
+            "message": "Pedido de visita enviado ao gerente."}
+
+
+def list_visit_requests(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, status: str = "PENDENTE"
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM visit_requests WHERE company_id = ?"
+    params: list[Any] = [company_id]
+    if data_scope_for_user(conn, user) == "proprio":
+        sql += " AND UPPER(seller_name) = ?"
+        params.append(normalize_upper(seller_identity_for_user(user)))
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas:
+            marcadores = ",".join("?" for _ in permitidas)
+            sql += f" AND (unit_name IN ({marcadores}) OR unit_name IS NULL)"
+            params.extend(permitidas)
+    if status:
+        sql += " AND status = ?"
+        params.append(normalize_upper(status))
+    sql += " ORDER BY datetime(created_at) DESC LIMIT 200"
+    return [
+        {
+            "id": int(r["id"]),
+            "clientKey": r["client_key"],
+            "clientName": r["client_name"],
+            "cityName": r["city_name"] or "",
+            "unitName": r["unit_name"] or "",
+            "sellerName": r["seller_name"],
+            "reason": r["reason"],
+            "status": r["status"],
+            "managerNote": r["manager_note"] or "",
+            "createdAt": r["created_at"],
+            "resolvedAt": r["resolved_at"] or "",
+        }
+        for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def resolve_visit_request(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    request_id: int, accept: bool, note: str = "",
+) -> dict[str, Any]:
+    if not user_can_manage_visits(conn, user):
+        raise PermissionError("Apenas gestão responde pedidos de visita.")
+    conn.execute(
+        "UPDATE visit_requests SET status = ?, manager_note = ?, resolved_by_user_id = ?, resolved_at = ? "
+        "WHERE company_id = ? AND id = ?",
+        ("ACEITA" if accept else "RECUSADA", normalize_whitespace(note), user["id"], now_iso(),
+         company_id, request_id),
+    )
+    conn.commit()
+    return {"resolved": True}
+
+
+# ── Visita ───────────────────────────────────────────────────────────────────
+
+def visit_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    cfg = next((t for t in VISIT_TYPES if t["id"] == row["visit_type"]), None)
+    antes = row["revenue_before"]
+    depois = row["revenue_after"]
+    variacao = None
+    if antes is not None and depois is not None:
+        variacao = round(safe_div(float(depois) - float(antes), float(antes)) * 100, 1) if antes else None
+    return {
+        "id": int(row["id"]),
+        "clientKey": row["client_key"],
+        "clientName": row["client_name"],
+        "unitName": row["unit_name"] or "",
+        "cityName": row["city_name"] or "",
+        "neighborhood": row["neighborhood"] or "",
+        "addressLine": row["address_line"] or "",
+        "visitType": row["visit_type"],
+        "visitTypeLabel": cfg["label"] if cfg else row["visit_type"],
+        "visitTypeIcon": cfg["icon"] if cfg else "📍",
+        "status": row["status"],
+        "scheduledFor": row["scheduled_for"] or "",
+        "occurredAt": row["occurred_at"] or "",
+        "managerName": row["manager_name"],
+        "sellerName": row["seller_name"] or "",
+        "objective": row["objective"] or "",
+        "outcome": row["outcome"] or "",
+        "agreement": row["agreement"] or "",
+        "nextAction": row["next_action"] or "",
+        "nextActionDue": row["next_action_due"] or "",
+        "revenueBefore": antes,
+        "revenueAfter": depois,
+        "effectPct": variacao,
+        "effectMeasuredAt": row["effect_measured_at"] or "",
+        "createdAt": row["created_at"],
+    }
+
+
+def list_visits(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    client_key: str = "", status: str = "", limit: int = 200,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM visits WHERE company_id = ?"
+    params: list[Any] = [company_id]
+    if data_scope_for_user(conn, user) == "proprio":
+        # O vendedor vê as visitas dos clientes dele e aquelas em que participou.
+        sql += " AND (UPPER(seller_name) = ? OR client_key IN (SELECT client_code FROM crm_client_profiles "
+        sql += "     WHERE company_id = ? AND UPPER(COALESCE(NULLIF(internal_seller_name,''), external_seller_name)) = ?))"
+        eu = normalize_upper(seller_identity_for_user(user))
+        params.extend([eu, company_id, eu])
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas:
+            marcadores = ",".join("?" for _ in permitidas)
+            sql += f" AND (unit_name IN ({marcadores}) OR unit_name IS NULL)"
+            params.extend(permitidas)
+    if client_key:
+        sql += " AND client_key = ?"
+        params.append(client_key)
+    if status:
+        sql += " AND status = ?"
+        params.append(normalize_upper(status))
+    sql += " ORDER BY date(COALESCE(NULLIF(occurred_at,''), scheduled_for, created_at)) DESC, id DESC LIMIT ?"
+    params.append(int(limit))
+    return [visit_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def save_visit(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_manage_visits(conn, user):
+        raise PermissionError("Apenas gestão registra visitas.")
+
+    client_key = normalize_whitespace(payload.get("clientKey"))
+    if not client_key:
+        raise ValueError("Selecione o cliente.")
+    tipo = normalize_upper(payload.get("visitType")) or "RELACIONAMENTO"
+    if tipo not in VISIT_TYPE_IDS:
+        raise ValueError("Tipo de visita inválido.")
+    status = normalize_upper(payload.get("status")) or "PLANEJADA"
+    ocorrida = normalize_whitespace(payload.get("occurredAt"))
+    if status == "REALIZADA":
+        if not ocorrida:
+            ocorrida = today_in_brazil().isoformat()
+        if not normalize_whitespace(payload.get("outcome")):
+            raise ValueError("Descreva o que aconteceu na visita antes de marcar como realizada.")
+
+    perfil = conn.execute(
+        "SELECT client_name, city_name, neighborhood, address_line, address_number "
+        "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, client_key),
+    ).fetchone()
+    rua = normalize_whitespace(perfil["address_line"]) if perfil else ""
+    numero = normalize_whitespace(perfil["address_number"]) if perfil else ""
+
+    unidade = normalize_unit(payload.get("unitName")) or None
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is not None:
+        if not permitidas:
+            raise ValueError("Seu usuário não tem unidade vinculada. Peça ao administrador para vincular.")
+        if unidade not in permitidas:
+            unidade = permitidas[0]
+
+    campos = (
+        client_key,
+        normalize_whitespace(payload.get("clientName")) or (perfil["client_name"] if perfil else client_key),
+        unidade,
+        normalize_upper(perfil["city_name"]) if perfil else normalize_upper(payload.get("cityName")),
+        normalize_upper(perfil["neighborhood"]) if perfil else None,
+        f"{rua}, {numero}" if rua and numero else rua,
+        tipo, status,
+        normalize_whitespace(payload.get("scheduledFor")) or None,
+        ocorrida or None,
+        normalize_whitespace(payload.get("managerName")) or meeting_person_identity(user),
+        normalize_whitespace(payload.get("sellerName")) or None,
+        normalize_whitespace(payload.get("objective")),
+        normalize_whitespace(payload.get("outcome")),
+        normalize_whitespace(payload.get("agreement")),
+        normalize_whitespace(payload.get("nextAction")),
+        normalize_whitespace(payload.get("nextActionDue")) or None,
+    )
+
+    visit_id = payload.get("id")
+    if visit_id:
+        conn.execute(
+            """
+            UPDATE visits SET client_key=?, client_name=?, unit_name=?, city_name=?, neighborhood=?,
+                   address_line=?, visit_type=?, status=?, scheduled_for=?, occurred_at=?,
+                   manager_name=?, seller_name=?, objective=?, outcome=?, agreement=?,
+                   next_action=?, next_action_due=?, updated_at=?
+            WHERE company_id = ? AND id = ?
+            """,
+            (*campos, now_iso(), company_id, int(visit_id)),
+        )
+        novo_id = int(visit_id)
+    else:
+        cursor = conn.execute(
+            """
+            INSERT INTO visits (client_key, client_name, unit_name, city_name, neighborhood,
+                address_line, visit_type, status, scheduled_for, occurred_at, manager_name,
+                seller_name, objective, outcome, agreement, next_action, next_action_due,
+                company_id, request_id, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (*campos, company_id, payload.get("requestId"), user["id"], now_iso()),
+        )
+        novo_id = int(cursor.lastrowid)
+
+    # O pedido do vendedor é encerrado quando a visita nasce dele.
+    if payload.get("requestId"):
+        conn.execute(
+            "UPDATE visit_requests SET status='ACEITA', resolved_by_user_id=?, resolved_at=? "
+            "WHERE company_id = ? AND id = ? AND status = 'PENDENTE'",
+            (user["id"], now_iso(), company_id, int(payload["requestId"])),
+        )
+
+    # Ação direcionada vira tarefa do vendedor. É o elo que faz a visita
+    # continuar depois que o gerente vai embora.
+    tarefa_id = None
+    proxima = normalize_whitespace(payload.get("nextAction"))
+    vendedor = normalize_whitespace(payload.get("sellerName"))
+    if status == "REALIZADA" and proxima and vendedor:
+        aberta = conn.execute(
+            "SELECT id FROM crm_tasks WHERE company_id = ? AND client_key = ? AND seller_name = ? "
+            "AND status IN ('ABERTA','ATRASADA')",
+            (company_id, client_key, vendedor),
+        ).fetchone()
+        if not aberta:
+            cur = conn.execute(
+                """
+                INSERT INTO crm_tasks (company_id, client_key, client_name, seller_name, title,
+                    description, due_at, status, created_at)
+                VALUES (?,?,?,?,?,?,?, 'ABERTA', ?)
+                """,
+                (company_id, client_key, campos[1], vendedor,
+                 f"Pós-visita: {campos[1]}", proxima,
+                 normalize_whitespace(payload.get("nextActionDue")) or today_in_brazil().isoformat(),
+                 now_iso()),
+            )
+            tarefa_id = int(cur.lastrowid)
+
+    audit_log(conn, company_id, user["id"], "salvar", "visits", str(novo_id),
+              {"cliente": client_key, "tipo": tipo, "status": status})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    if status == "REALIZADA":
+        measure_visit_effect(conn, company_id, novo_id)
+    return {"visitId": novo_id, "taskId": tarefa_id}
+
+
+def delete_visit(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, visit_id: int) -> None:
+    if not user_can_manage_visits(conn, user):
+        raise PermissionError("Apenas gestão exclui visitas.")
+    conn.execute("DELETE FROM visits WHERE company_id = ? AND id = ?", (company_id, visit_id))
+    audit_log(conn, company_id, user["id"], "excluir", "visits", str(visit_id), {})
+    conn.commit()
+
+
+def client_contact_effect(
+    conn: sqlite3.Connection, company_id: int, client_key: str
+) -> dict[str, Any]:
+    """Histórico de contatos e visitas do cliente, com o efeito de cada visita.
+
+    É o que responde a pergunta que o gerente faz: "adiantou ter ido lá?".
+    """
+    visitas = [
+        visit_row_to_dict(r)
+        for r in conn.execute(
+            "SELECT * FROM visits WHERE company_id = ? AND client_key = ? "
+            "ORDER BY date(COALESCE(NULLIF(occurred_at,''), scheduled_for)) DESC LIMIT 20",
+            (company_id, client_key),
+        ).fetchall()
+    ]
+    # Mede o que ainda não foi medido e já fechou a janela
+    for v in visitas:
+        if v["status"] == "REALIZADA" and v["revenueBefore"] is None:
+            medido = measure_visit_effect(conn, company_id, v["id"])
+            if medido:
+                v["revenueBefore"] = medido["revenueBefore"]
+                v["revenueAfter"] = medido["revenueAfter"]
+                v["effectPct"] = (round(safe_div(medido["revenueAfter"] - medido["revenueBefore"],
+                                                 medido["revenueBefore"]) * 100, 1)
+                                  if medido["revenueBefore"] else None)
+
+    ligacoes = conn.execute(
+        """
+        SELECT COUNT(*) total,
+               SUM(CASE WHEN date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?) THEN 1 ELSE 0 END) recentes,
+               MAX(occurred_at) ultima
+        FROM crm_interactions
+        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO'
+        """,
+        ((today_in_brazil() - timedelta(days=VISIT_CALL_WINDOW_DAYS)).isoformat(), company_id, client_key),
+    ).fetchone()
+
+    pedido = conn.execute(
+        "SELECT * FROM visit_requests WHERE company_id = ? AND client_key = ? AND status = 'PENDENTE'",
+        (company_id, client_key),
+    ).fetchone()
+
+    return {
+        "visits": visitas,
+        "callsTotal": int(ligacoes["total"] or 0),
+        "callsRecent": int(ligacoes["recentes"] or 0),
+        "lastCallAt": ligacoes["ultima"] or "",
+        "pendingRequest": {
+            "id": int(pedido["id"]), "reason": pedido["reason"], "sellerName": pedido["seller_name"],
+            "createdAt": pedido["created_at"],
+        } if pedido else None,
+        "eligibleForVisit": int(ligacoes["recentes"] or 0) > 0,
+        "callWindowDays": VISIT_CALL_WINDOW_DAYS,
+    }
 
 
 def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
@@ -11526,6 +12303,50 @@ class AppHandler(BaseHTTPRequestHandler):
                     "canEdit": can_edit,
                 }))
                 return
+            if path == "/api/visits":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    pode_gerir = user_can_manage_visits(conn, user)
+                    payload = {
+                        "visits": list_visits(
+                            conn, user["company_id"], user,
+                            client_key=normalize_whitespace(query.get("client", [""])[0]),
+                            status=normalize_upper(query.get("status", [""])[0])),
+                        "requests": list_visit_requests(
+                            conn, user["company_id"], user,
+                            status=normalize_upper(query.get("requestStatus", ["PENDENTE"])[0])),
+                        "types": VISIT_TYPES,
+                        "statuses": VISIT_STATUSES,
+                        "canManage": pode_gerir,
+                        "myName": meeting_person_identity(user),
+                        "sellers": ([s["sellerName"] for s in
+                                     sellers_available_for_assignment(conn, user["company_id"], user)]
+                                    if pode_gerir else []),
+                    }
+                self._set_headers(200)
+                self.wfile.write(json_dumps(payload))
+                return
+            if path == "/api/visits/suggestions":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    if not user_can_manage_visits(conn, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Roteiro é da gestão."}))
+                        return
+                    dados = suggest_visits(
+                        conn, user["company_id"], user,
+                        city=normalize_whitespace(query.get("city", [""])[0]),
+                        include_relationship=query.get("relationship", ["1"])[0] == "1",
+                    )
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
             if path == "/api/feedback":
                 user = self._require_auth()
                 if not user:
@@ -12623,6 +13444,40 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in ("/api/visits/save", "/api/visits/delete", "/api/visits/request",
+                        "/api/visits/request/resolve", "/api/visits/client"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/visits/save":
+                            resultado = save_visit(conn, user["company_id"], user, payload)
+                        elif path == "/api/visits/delete":
+                            delete_visit(conn, user["company_id"], user, int(payload.get("visitId") or 0))
+                            resultado = {}
+                        elif path == "/api/visits/request":
+                            resultado = create_visit_request(conn, user["company_id"], user, payload)
+                        elif path == "/api/visits/request/resolve":
+                            resultado = resolve_visit_request(
+                                conn, user["company_id"], user,
+                                int(payload.get("requestId") or 0),
+                                bool(payload.get("accept")), payload.get("note") or "")
+                        else:
+                            resultado = client_contact_effect(
+                                conn, user["company_id"], normalize_whitespace(payload.get("clientKey")))
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path in ("/api/feedback/save", "/api/feedback/publish", "/api/feedback/detail",
                         "/api/feedback/acknowledge", "/api/feedback/delete",
