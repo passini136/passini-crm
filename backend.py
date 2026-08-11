@@ -4664,6 +4664,14 @@ def seller_indicators_for_feedback(
         print(f"[feedback] carteira indisponível para {nome_vendas}: {exc}", flush=True)
     total_carteira = sum(por_status.values())
 
+    # Meta de ligações proporcional ao mês decorrido. O piso do MEC é 60 NO MÊS;
+    # cobrar 60 no dia 6 marcaria todo vendedor como irregular.
+    dias_decorridos = int(linha.get("sellerElapsedWorkingDays") or 0)
+    dias_totais = int(linha.get("sellerWorkingDays") or 0)
+    meta_ligacoes_mes = 60
+    meta_ligacoes_ate_hoje = (round(meta_ligacoes_mes * dias_decorridos / dias_totais)
+                              if dias_decorridos and dias_totais else meta_ligacoes_mes)
+
     return {
         "found": True,
         "competence": competence,
@@ -4673,6 +4681,12 @@ def seller_indicators_for_feedback(
         "revenueNet": linha.get("revenueNet"),
         "revenueGoal": linha.get("revenueGoal"),
         "goalAttainmentPct": linha.get("goalAttainmentPct"),
+        # Atingimento projetado para o fim do mês. É o número que diz se a
+        # pessoa está NO RITMO — comparar o acumulado do dia 6 com 100% da meta
+        # acusaria todo mundo no começo do mês.
+        "projectedGoalAttainmentPct": linha.get("projectedGoalAttainmentPct"),
+        "elapsedWorkingDays": linha.get("sellerElapsedWorkingDays"),
+        "totalWorkingDays": linha.get("sellerWorkingDays"),
         "ticketAverage": linha.get("ticketAverage"),
         "ticketAverageUnit": media("ticketAverage"),
         "distinctClients": linha.get("distinctClients"),
@@ -4683,7 +4697,8 @@ def seller_indicators_for_feedback(
         "discountPct": linha.get("discountPct"),
         "discountPctUnit": media("discountPct"),
         "calls": int(ligacoes),
-        "callsTarget": 60,
+        "callsTarget": meta_ligacoes_mes,
+        "callsTargetToDate": meta_ligacoes_ate_hoje,
         "contacts": int(contatos),
         "portfolioTotal": total_carteira,
         "portfolioActive": por_status.get("ATIVO", 0),
@@ -4704,9 +4719,17 @@ def feedback_guidance(indicadores: dict[str, Any]) -> list[dict[str, Any]]:
         return []
 
     alertas: list[str] = []
-    if float(indicadores.get("goalAttainmentPct") or 0) < 90:
+    # Mede RITMO, não acumulado. No dia 6 de 21 ninguém tem 100% da meta nem 60
+    # ligações — comparar com o mês fechado acusaria a equipe inteira e o alerta
+    # perderia o sentido, que é o mesmo raciocínio dos faróis.
+    ritmo_meta = indicadores.get("projectedGoalAttainmentPct")
+    if ritmo_meta is None:
+        ritmo_meta = indicadores.get("goalAttainmentPct")
+    if float(ritmo_meta or 0) < 90:
         alertas.append("goal_low")
-    if int(indicadores.get("calls") or 0) < int(indicadores.get("callsTarget") or 60):
+    meta_ligacoes = int(indicadores.get("callsTargetToDate")
+                        or indicadores.get("callsTarget") or 60)
+    if int(indicadores.get("calls") or 0) < meta_ligacoes:
         alertas.append("calls_low")
     if float(indicadores.get("returnsPct") or 0) > 3:
         alertas.append("returns_high")
@@ -6846,9 +6869,14 @@ def user_situation_triggers(
             competencia = crm_latest_competence(conn, company_id) or hoje[:7]
             ind = safe_feedback_indicators(conn, company_id, "VENDEDOR", nome, "", competencia)
             if ind.get("found"):
-                if int(ind.get("calls") or 0) < int(ind.get("callsTarget") or 60):
+                # Mesmo critério dos faróis: ritmo, não acumulado.
+                meta_ligacoes = int(ind.get("callsTargetToDate") or ind.get("callsTarget") or 60)
+                if int(ind.get("calls") or 0) < meta_ligacoes:
                     gatilhos.append("CALLS_LOW")
-                if float(ind.get("goalAttainmentPct") or 0) < 90:
+                ritmo = ind.get("projectedGoalAttainmentPct")
+                if ritmo is None:
+                    ritmo = ind.get("goalAttainmentPct")
+                if float(ritmo or 0) < 90:
                     gatilhos.append("GOAL_LOW")
                 if float(ind.get("returnsPct") or 0) > 3:
                     gatilhos.append("RETURNS_HIGH")
@@ -9759,7 +9787,12 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     summary_ticket_average = round(safe_div(summary_revenue, summary_distinct_clients), 2)
     summary_ticket_per_piece = round(safe_div(summary_revenue, summary_qty_sold), 2)
     summary_discount_value = round(detail_totals["discountValue"], 2)
-    summary_discount_pct = round(safe_div(detail_totals["discountValue"], summary_gross) * 100, 2)
+    # Mesma base do ranking de vendedores: desconto sobre a venda bruta POSITIVA
+    # do faturamento detalhado. Antes o denominador vinha do arquivo de
+    # custo/venda (`summary_gross`), que é outra fonte e outra magnitude — o
+    # Executivo mostrava 59% onde o ranking mostrava 26% para a mesma pessoa.
+    # Numerador e denominador precisam sair do mesmo lugar.
+    summary_discount_pct = round(detail_totals["discountPct"], 2)
 
     comparison_previous = {}
     comparison_yoy = {}

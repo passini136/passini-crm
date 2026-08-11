@@ -5854,13 +5854,19 @@ function painelIndicadores(ind, kind) {
         ${indicadorLinha("PDIs ativos", number(ind.pdiActive), ind.pdiOverdue ? `${ind.pdiOverdue} com prazo vencido` : "", ind.pdiOverdue === 0)}
       </div>`;
   }
-  const metaCalls = Number(ind.callsTarget || 60);
+  const metaCallsMes = Number(ind.callsTarget || 60);
+  const metaCallsHoje = Number(ind.callsTargetToDate || metaCallsMes);
+  const ritmo = ind.projectedGoalAttainmentPct ?? ind.goalAttainmentPct;
+  const dias = ind.elapsedWorkingDays && ind.totalWorkingDays
+    ? `${ind.elapsedWorkingDays} de ${ind.totalWorkingDays} dias úteis` : "";
   return `
     <div>
       ${aviso}
       ${indicadorLinha("Faturamento líquido", currency(ind.revenueNet), `meta ${currency(ind.revenueGoal)}`)}
-      ${indicadorLinha("Atingimento", pct(ind.goalAttainmentPct), "", Number(ind.goalAttainmentPct) >= 95)}
-      ${indicadorLinha("Ligações no mês", `${number(ind.calls)}`, `mínimo do MEC: ${metaCalls}`, Number(ind.calls) >= metaCalls)}
+      ${indicadorLinha("Atingimento", pct(ind.goalAttainmentPct), dias)}
+      ${indicadorLinha("Projeção para o mês", pct(ritmo), "é o que diz se está no ritmo", Number(ritmo) >= 95)}
+      ${indicadorLinha("Ligações", `${number(ind.calls)}`,
+          `esperado até hoje: ${metaCallsHoje} · mês: ${metaCallsMes}`, Number(ind.calls) >= metaCallsHoje)}
       ${indicadorLinha("Contatos registrados", number(ind.contacts), "")}
       ${indicadorLinha("Clientes atendidos", number(ind.distinctClients), `média da unidade: ${number(ind.distinctClientsUnit)}`, Number(ind.distinctClients) >= Number(ind.distinctClientsUnit))}
       ${indicadorLinha("Ticket médio", currency(ind.ticketAverage), `unidade: ${currency(ind.ticketAverageUnit)}`, Number(ind.ticketAverage) >= Number(ind.ticketAverageUnit))}
