@@ -1176,60 +1176,138 @@ function messageHtml() {
 // entregar busca destrói a confiança na primeira pergunta.
 
 /**
- * Mecânico da Passini, em SVG.
+ * Mecânico da Passini, em SVG com volume.
  *
- * Vetor em vez de imagem: escala sem borrar, muda de tamanho no mesmo código e
- * a animação (piscar, aceno, chave que balança) vem de graça. Boné e macacão no
- * índigo da marca, para ele pertencer ao sistema e não parecer figurinha colada.
+ * A primeira versão parecia policial: boné de aba reta somado a macacão escuro
+ * fechado dá farda. Aqui os sinais são de oficina — boné virado para trás,
+ * macacão grafite com gola aberta, zíper, crachá no peito e mancha de graxa no
+ * rosto. O índigo da marca ficou nos detalhes (boné, gola, crachá) em vez de
+ * cobrir o corpo inteiro.
+ *
+ * A sensação de 3D vem de degradês radiais com luz vindo de cima à esquerda,
+ * sombra própria embaixo do queixo e do boné, e brilho especular nos olhos e no
+ * metal. Vetor continua sendo a escolha certa: nítido de 32 a 200 px, sem peso
+ * de arquivo e com a animação embutida.
  */
 function assistantAvatar(tamanho, animar) {
   const id = `av${Math.random().toString(36).slice(2, 8)}`;
+  const anima = (attr, valores, dur, extra) => animar
+    ? `<animate attributeName="${attr}" values="${valores}" dur="${dur}" repeatCount="indefinite" ${extra || ""} />`
+    : "";
+
   return `
     <svg viewBox="0 0 120 120" width="${tamanho}" height="${tamanho}"
          xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Assistente Passini">
       <defs>
-        <linearGradient id="${id}cap" x1="0" y1="0" x2="0" y2="1">
+        <radialGradient id="${id}pele" cx="38%" cy="30%" r="78%">
+          <stop offset="0%"   stop-color="#ffd9b3" />
+          <stop offset="55%"  stop-color="#f0b98a" />
+          <stop offset="100%" stop-color="#c98b5e" />
+        </radialGradient>
+        <linearGradient id="${id}macacao" x1="0.2" y1="0" x2="0.85" y2="1">
+          <stop offset="0%"   stop-color="#5b6474" />
+          <stop offset="45%"  stop-color="#3f4756" />
+          <stop offset="100%" stop-color="#262c38" />
+        </linearGradient>
+        <linearGradient id="${id}gola" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stop-color="#4a2fb5" /><stop offset="100%" stop-color="#2a1a6e" />
         </linearGradient>
-        <linearGradient id="${id}suit" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="#3b2582" /><stop offset="100%" stop-color="#241463" />
+        <radialGradient id="${id}bone" cx="34%" cy="22%" r="80%">
+          <stop offset="0%"   stop-color="#5f3ed6" />
+          <stop offset="60%"  stop-color="#3b2582" />
+          <stop offset="100%" stop-color="#221551" />
+        </radialGradient>
+        <linearGradient id="${id}metal" x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0%"   stop-color="#f2f4f8" />
+          <stop offset="45%"  stop-color="#b9c0cc" />
+          <stop offset="100%" stop-color="#79818f" />
         </linearGradient>
+        <radialGradient id="${id}piso" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stop-color="#000" stop-opacity="0.28" />
+          <stop offset="100%" stop-color="#000" stop-opacity="0" />
+        </radialGradient>
       </defs>
 
-      <circle cx="60" cy="60" r="56" fill="#fff" opacity="0.10" />
+      <ellipse cx="60" cy="110" rx="34" ry="6" fill="url(#${id}piso)" />
 
-      <path d="M34 96 C34 78 44 70 60 70 C76 70 86 78 86 96 L86 104 L34 104 Z" fill="url(#${id}suit)" />
-      <path d="M52 71 L60 82 L68 71 L64 69 L60 74 L56 69 Z" fill="#fff" opacity="0.9" />
-      <circle cx="60" cy="88" r="3" fill="#f4c25f" />
+      <g>
+        ${anima("transform", "translate(0 0); translate(0 -1.8); translate(0 0)", "3.8s", 'type="translate" attributeType="XML"')}
 
-      <g${animar ? '' : ''}>
-        <ellipse cx="60" cy="46" rx="23" ry="25" fill="#f2c9a0" />
-        <path d="M37 40 C37 24 47 16 60 16 C73 16 83 24 83 40 L83 43 C74 39 46 39 37 43 Z" fill="url(#${id}cap)" />
-        <rect x="33" y="41" width="54" height="7" rx="3.5" fill="#1d1250" />
-        <circle cx="60" cy="26" r="6" fill="#f4c25f" opacity="0.95" />
+        <path d="M28 108 C28 84 40 74 60 74 C80 74 92 84 92 108 Z" fill="url(#${id}macacao)" />
+        <path d="M28 108 C28 92 34 82 44 77 L44 108 Z" fill="#fff" opacity="0.07" />
+
+        <path d="M49 74 L60 90 L71 74 L64 71 L60 78 L56 71 Z" fill="url(#${id}gola)" />
+        <rect x="58.4" y="86" width="3.2" height="22" rx="1.6" fill="#1b2029" />
+        <g stroke="#8a93a3" stroke-width="0.9" opacity="0.75">
+          <line x1="58.4" y1="90" x2="61.6" y2="90" /><line x1="58.4" y1="94" x2="61.6" y2="94" />
+          <line x1="58.4" y1="98" x2="61.6" y2="98" /><line x1="58.4" y1="102" x2="61.6" y2="102" />
+        </g>
+
+        <g transform="translate(72 89)">
+          <rect x="0" y="0" width="18" height="12" rx="3" fill="#2e3542" stroke="#79818f" stroke-width="0.8" />
+          <rect x="2.5" y="3" width="13" height="2" rx="1" fill="#f4c25f" />
+          <rect x="2.5" y="7" width="9" height="1.6" rx="0.8" fill="#aeb6c4" />
+        </g>
+        <rect x="34" y="90" width="12" height="9" rx="2.5" fill="#333b49" stroke="#5b6474" stroke-width="0.8" />
+
+        <path d="M52 64 h16 v10 h-16 z" fill="#d9a071" />
+        <ellipse cx="60" cy="70" rx="9" ry="4" fill="#000" opacity="0.16" />
+
+        <ellipse cx="60" cy="46" rx="24" ry="25.5" fill="url(#${id}pele)" />
+        <ellipse cx="36.5" cy="49" rx="4" ry="5.5" fill="#e8ab7c" />
+        <ellipse cx="83.5" cy="49" rx="4" ry="5.5" fill="#e8ab7c" />
+        <path d="M37.5 41 q-1.6 5 -0.6 9.5 q3 -4.6 3 -9.2 z" fill="#4a3728" />
+        <path d="M82.5 41 q1.6 5 0.6 9.5 q-3 -4.6 -3 -9.2 z" fill="#4a3728" />
+
+        <path d="M35 36 C35 21 46 14 60 14 C74 14 85 21 85 36 C74 31 46 31 35 36 Z" fill="url(#${id}bone)" />
+        <path d="M40 32 C43 23 50 18 59 17.4 C50 20 44 25 40 32 Z" fill="#fff" opacity="0.13" />
+        <path d="M84 32.5 C93 31.5 100 34.5 101 38.5 C101.6 41 98.5 42.6 93.5 42 C90.5 38.5 87 34.8 84 32.5 Z"
+              fill="#2a1a6e" stroke="#1a1040" stroke-width="0.8" />
+        <path d="M86 34 C92 34 97 36 98.6 38.4 C95 36.4 90.5 35 86 34 Z" fill="#fff" opacity="0.12" />
+        <circle cx="60" cy="16.5" r="2.6" fill="#f4c25f" />
+        <path d="M35 35 h50 v4.5 a2.2 2.2 0 0 1 -2.2 2.2 h-45.6 a2.2 2.2 0 0 1 -2.2 -2.2 z" fill="#1d1250" />
+        <path d="M31 40 C31 30 37 22 45 19 C40 25 37 32 37 40 Z" fill="#000" opacity="0.10" />
 
         <g>
-          <ellipse cx="51" cy="49" rx="3.2" ry="3.6" fill="#2b2438">
-            ${animar ? '<animate attributeName="ry" values="3.6;0.4;3.6" dur="4.5s" begin="1.2s" repeatCount="indefinite" keyTimes="0;0.04;0.08" />' : ''}
-          </ellipse>
-          <ellipse cx="69" cy="49" rx="3.2" ry="3.6" fill="#2b2438">
-            ${animar ? '<animate attributeName="ry" values="3.6;0.4;3.6" dur="4.5s" begin="1.2s" repeatCount="indefinite" keyTimes="0;0.04;0.08" />' : ''}
-          </ellipse>
+          <ellipse cx="50" cy="48" rx="4.6" ry="5" fill="#fff" />
+          <ellipse cx="70" cy="48" rx="4.6" ry="5" fill="#fff" />
+          <circle cx="50.8" cy="48.6" r="2.5" fill="#3b2a20" />
+          <circle cx="70.8" cy="48.6" r="2.5" fill="#3b2a20" />
+          <circle cx="49.7" cy="47.4" r="1" fill="#fff" />
+          <circle cx="69.7" cy="47.4" r="1" fill="#fff" />
+          ${animar ? `<animateTransform attributeName="transform" type="scale" additive="sum"
+             values="1 1; 1 0.08; 1 1" dur="5.2s" begin="1.6s" repeatCount="indefinite"
+             keyTimes="0;0.03;0.06" />` : ""}
         </g>
-        <path d="M53 58 Q60 64 67 58" stroke="#2b2438" stroke-width="2.4" fill="none" stroke-linecap="round" />
-        ${animar ? `<animateTransform attributeName="transform" type="translate"
-            values="0 0; 0 -1.6; 0 0" dur="3.6s" repeatCount="indefinite" />` : ''}
+        <path d="M44.5 40.5 q5.5 -2.6 11 -0.4" stroke="#4a3728" stroke-width="2.2" fill="none" stroke-linecap="round" />
+        <path d="M64.5 40.1 q5.5 -2.2 11 0.4" stroke="#4a3728" stroke-width="2.2" fill="none" stroke-linecap="round" />
+
+        <path d="M58.6 52 q1.4 3.4 -1 4.6" stroke="#c98b5e" stroke-width="1.8" fill="none" stroke-linecap="round" />
+        <path d="M51 61.5 q9 6.6 18 0" stroke="#8c5a37" stroke-width="2.6" fill="none" stroke-linecap="round" />
+        <path d="M53.5 62.6 q6.5 4 13 0 q-6.5 1.6 -13 0 z" fill="#fff" opacity="0.85" />
+
+        <g fill="#3f4048" opacity="0.72">
+          <ellipse cx="75.5" cy="57.5" rx="6.2" ry="3.2" transform="rotate(-18 75.5 57.5)" />
+          <ellipse cx="80.5" cy="52.8" rx="3.1" ry="1.8" transform="rotate(-18 80.5 52.8)" />
+          <circle cx="71" cy="61.5" r="1.3" />
+          <circle cx="83.5" cy="49.5" r="0.9" />
+        </g>
+        <ellipse cx="43.5" cy="55" rx="4.4" ry="2.8" fill="#e8825f" opacity="0.30" />
+        <ellipse cx="76.5" cy="55" rx="4.4" ry="2.8" fill="#e8825f" opacity="0.22" />
       </g>
 
-      <g transform="translate(90 62)">
-        <path d="M0 0 l-4 -9 a7 7 0 1 1 9 9 l10 16 a4 4 0 0 1 -7 4 z"
-              fill="#c9ced8" stroke="#8b93a3" stroke-width="1.2" transform="rotate(-18)" />
-        ${animar ? `<animateTransform attributeName="transform" type="rotate"
-            values="0 0 0; -12 0 0; 0 0 0" dur="2.8s" repeatCount="indefinite" additive="sum" />` : ''}
+      <g transform="rotate(-28 92 94)">
+        ${anima("transform", "rotate(0 92 94); rotate(-12 92 94); rotate(0 92 94)", "3.2s", 'type="rotate" attributeType="XML" additive="sum"')}
+        <rect x="88.6" y="66" width="6.8" height="28" rx="3.2"
+              fill="url(#${id}metal)" stroke="#5e6572" stroke-width="1.1" />
+        <rect x="90" y="68" width="1.8" height="23" rx="0.9" fill="#fff" opacity="0.5" />
+        <path d="M84.4 62 a7.6 7.6 0 0 1 4.2 -6.9 l0 6.2 l6.8 0 l0 -6.2 a7.6 7.6 0 1 1 -11 6.9 z"
+              fill="url(#${id}metal)" stroke="#5e6572" stroke-width="1.1" />
+        <ellipse cx="92" cy="94" rx="6" ry="4.4" fill="#e8ab7c" stroke="#c98b5e" stroke-width="0.8" />
+        <path d="M86.4 93 q5.6 -3 11.2 0 q-5.6 2.6 -11.2 0 z" fill="#c98b5e" />
       </g>
     </svg>`;
 }
-
 async function loadAssistant(silencioso) {
   try {
     state.assistant = await api("/api/help");
