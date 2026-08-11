@@ -61,6 +61,11 @@ FEEDBACK_ITEMS_SELLER = [
      "label": "Faz a prospecção diária",
      "hint": "O quinto contato do TOP 5 é cliente novo.",
      "evidence": "Clientes novos no mês."},
+    {"id": "mec_prospeccao_qualidade", "group": "Execução do MEC",
+     "label": "Prospecção com as 4 perguntas e fechamento",
+     "hint": "Tipo de serviço, carros por semana, linha que mais gira e forma de pagamento — "
+             "e termina com um dos 3 gatilhos. Sem gatilho, a prospecção não conta no funil.",
+     "evidence": "Abra 2 registros de prospecção: as 4 respostas estão anotadas? Há gatilho aceito?"},
     {"id": "mec_carteira", "group": "Execução do MEC",
      "label": "Trabalha a carteira inteira",
      "hint": "Clientes sem compra, recuperação, recompra e aumento de mix — não só quem liga.",

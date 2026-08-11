@@ -1367,6 +1367,7 @@ CONTENT_CATEGORIES = [
     {"id": "whatsapp", "label": "Mensagem de WhatsApp",   "icon": "💬"},
     {"id": "objecao",  "label": "Tratamento de objeção",  "icon": "🛡"},
     {"id": "garantia", "label": "Devolução e garantia",   "icon": "📋"},
+    {"id": "prospeccao", "label": "Prospecção",           "icon": "🎯"},
 ]
 CONTENT_CATEGORY_IDS = {c["id"] for c in CONTENT_CATEGORIES}
 
@@ -1383,18 +1384,29 @@ CONTENT_SITUATION_IDS = {s["id"] for s in CONTENT_SITUATIONS}
 
 
 def seed_content_library(conn: sqlite3.Connection, company_id: int) -> None:
-    """Popula a biblioteca uma única vez. Edições do usuário não são sobrescritas."""
-    existing = conn.execute(
-        "SELECT COUNT(*) AS n FROM content_library WHERE company_id = ?", (company_id,)
-    ).fetchone()["n"]
-    if existing:
-        return
+    """Adiciona os conteúdos do arquivo que ainda não existem na biblioteca.
+
+    Antes só populava com a tabela vazia — conteúdo novo nunca chegava a quem já
+    tinha a biblioteca em uso, que é justamente o caso de todo mundo depois da
+    primeira semana. A comparação é pelo título: o que o usuário editou pela
+    tela permanece intocado, e material novo entra no restart.
+    """
     try:
         from content_seed import CONTENT_SEED
     except ImportError:
         print("[content] content_seed.py não encontrado — biblioteca iniciada vazia")
         return
+
+    existentes = {
+        normalize_upper(r["title"])
+        for r in conn.execute(
+            "SELECT title FROM content_library WHERE company_id = ?", (company_id,)
+        ).fetchall()
+    }
+    novos = 0
     for item in CONTENT_SEED:
+        if normalize_upper(item["title"]) in existentes:
+            continue
         conn.execute(
             """
             INSERT INTO content_library
@@ -1404,8 +1416,10 @@ def seed_content_library(conn: sqlite3.Connection, company_id: int) -> None:
             (company_id, item["category"], item["situation"], item["title"],
              item["body"], item.get("hint"), item.get("sort_order", 0), now_iso()),
         )
-    conn.commit()
-    print(f"[content] biblioteca iniciada com {len(CONTENT_SEED)} conteúdos")
+        novos += 1
+    if novos:
+        conn.commit()
+        print(f"[content] {novos} conteúdo(s) adicionado(s) à biblioteca")
 
 
 def content_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:

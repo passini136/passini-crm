@@ -65,6 +65,15 @@ TOUR_VENDEDOR = [
     },
     {
         "tab": "biblioteca",
+        "icon": "🎯",
+        "title": "Prospecção — o quinto contato do dia",
+        "body": "Um cliente novo por dia. A Passini tem um modelo próprio: quatro perguntas que "
+                "revelam o potencial da oficina e três gatilhos de fechamento. Está tudo na "
+                "Biblioteca, na aba Prospecção, com o roteiro completo da primeira ligação.",
+        "hint": "Sem um dos 3 gatilhos no fim, a prospecção não conta como válida no funil.",
+    },
+    {
+        "tab": "biblioteca",
         "icon": "📚",
         "title": "Biblioteca e Meu Placar",
         "body": "Na Biblioteca você encontra mensagens prontas de WhatsApp, abordagens de ligação e "
@@ -287,6 +296,38 @@ FAQ_SEED = [
         "roles": "VENDEDOR",
     },
 
+    {
+        "category": "dia-a-dia",
+        "question": "Como faço uma prospecção do jeito da Passini?",
+        "answer": "São quatro perguntas: se ele compra mais manutenção rápida ou corretiva pesada; "
+                  "quantos carros atende por semana; se gira mais suspensão, freio ou motor; e se "
+                  "compra à vista, cartão ou faturado. Com isso você estima o potencial e escolhe "
+                  "o mix certo. No fim, feche com um dos três gatilhos. O roteiro completo está na "
+                  "Biblioteca, aba Prospecção.",
+        "keywords": "prospecção prospectar cliente novo primeira ligação abordagem 4 perguntas",
+        "roles": "",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "Quais são os 3 gatilhos de fechamento da prospecção?",
+        "answer": "1) 'Posso te atender no próximo orçamento e te mostrar nosso atendimento?' "
+                  "2) 'Posso te incluir nas próximas cotações dessa linha?' "
+                  "3) 'Qual dia da semana você costuma comprar para eu te chamar?' "
+                  "Sem um deles, a prospecção não entra como válida no funil — vira só uma conversa.",
+        "keywords": "gatilho fechamento prospecção como fechar encerrar ligação cliente novo funil",
+        "roles": "",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "Que dados preciso para cadastrar um cliente novo?",
+        "answer": "Para pagamento à vista, PIX ou cartão, só três: CNPJ, telefone e e-mail — envie "
+                  "para crédito e cobrança pelo Skype. Para compra faturada no boleto, preencha a "
+                  "ficha para o cliente, mande só para ele assinar e ele envia direto ao setor, "
+                  "que analisa e pede mais dados se precisar.",
+        "keywords": "cadastro cliente novo dados cnpj ficha crédito boleto faturado abrir cliente",
+        "roles": "",
+    },
+
     # ── Clientes e carteira ─────────────────────────────────────────────
     {
         "category": "clientes",
@@ -493,6 +534,21 @@ TIPS_SEED = [
      "title": "O quinto contato é cliente novo",
      "body": "Prospecção não é o que sobra do dia. É um dos cinco. Uma empresa nova por dia são "
              "vinte por mês na sua carteira."},
+    {"kind": "MEC", "roles": "VENDEDOR", "trigger": "",
+     "title": "Quatro perguntas antes de oferecer",
+     "body": "Manutenção rápida ou corretiva pesada? Quantos carros por semana? Suspensão, freio "
+             "ou motor? À vista, cartão ou faturado? Com essas respostas você para de fazer "
+             "abordagem rasa e passa a oferecer o que a oficina realmente gira."},
+    {"kind": "MEC", "roles": "VENDEDOR", "trigger": "",
+     "title": "Prospecção sem gatilho não conta",
+     "body": "Termine sempre com um dos três: participar do próximo orçamento, entrar nas cotações "
+             "da linha, ou saber o dia da semana em que ele compra. Conversa boa que acaba sem "
+             "compromisso não é prospecção — é ligação perdida."},
+    {"kind": "MEC", "roles": "VENDEDOR", "trigger": "",
+     "title": "Não deixe a venda travar no cadastro",
+     "body": "À vista, PIX ou cartão: CNPJ, telefone e e-mail resolvem e você fatura hoje. "
+             "Faturado: preencha a ficha para o cliente e mande só para assinar — ficha em branco "
+             "quase nunca volta."},
     {"kind": "MEC", "roles": "GERENTE DIRETOR", "trigger": "",
      "title": "Cobrança precisa de motivo",
      "body": "'Liga nesse cliente' não muda comportamento. 'Este cliente caiu 60% e você não fala "

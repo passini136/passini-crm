@@ -363,4 +363,184 @@ CONTENT_SEED = [
             "oficina. Abra o processo, mostre o caminho e dê retorno."
         ),
     },
+
+    # ─────────────────────────────────────────────────────────────────────
+    # PROSPECÇÃO
+    #
+    # Baseado em "Primeiros Passos para Abrir Novos Clientes", versão 01/2026.
+    # A lógica do documento é que a prospecção não é conversa solta: quatro
+    # perguntas qualificam a oficina e um dos três gatilhos fecha o contato.
+    # Sem gatilho, não entra como prospecção válida no funil.
+    # ─────────────────────────────────────────────────────────────────────
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 1,
+        "title": "As 4 perguntas que dizem tudo sobre a oficina",
+        "hint": "É o coração da prospecção Passini. Com as 4 respostas você estima o potencial, "
+                "escolhe o mix certo e evita abordagem rasa. Faça na ordem e ANOTE.",
+        "body": (
+            "Abertura:\n"
+            "\"Bom dia, aqui é {vendedor} da Passini. Quero conhecer melhor o perfil da sua "
+            "oficina para não te oferecer coisa errada. Posso te fazer quatro perguntas rápidas?\"\n\n"
+            "1. TIPO DE SERVIÇO\n"
+            "\"Hoje você compra mais peças de manutenção rápida ou corretiva pesada?\"\n"
+            "→ Rápida: gira freio, filtro, correia, amortecedor. Volume e recompra.\n"
+            "→ Pesada: motor, câmbio, suspensão completa. Ticket maior, giro menor.\n\n"
+            "2. VOLUME\n"
+            "\"Em média, quantos carros você atende por semana?\"\n"
+            "→ É o que estima o potencial de compra. Anote o número.\n\n"
+            "3. LINHA QUE MAIS GIRA\n"
+            "\"Suspensão, freio ou motor — onde você mais gira peças?\"\n"
+            "→ Define por qual linha você começa a oferecer.\n\n"
+            "4. FORMA DE PAGAMENTO\n"
+            "\"Você costuma comprar mais à vista, cartão de crédito ou faturado?\"\n"
+            "→ À vista, PIX ou cartão: cadastro rápido, vende hoje.\n"
+            "→ Faturado: já encaminhe a ficha de crédito, senão a venda trava depois.\n\n"
+            "REGISTRE as 4 respostas no CRM. Sem isso a próxima ligação recomeça do zero."
+        ),
+    },
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 2,
+        "title": "Fechamento obrigatório — os 3 gatilhos",
+        "hint": "Toda prospecção termina com UM destes três. Sem gatilho, não entra como "
+                "prospecção válida no funil — é só uma conversa.",
+        "body": (
+            "Escolha o gatilho conforme o que o cliente sinalizou:\n\n"
+            "1. SE ELE COMPRA DE OUTRO E ESTÁ SATISFEITO\n"
+            "\"Posso te atender no próximo orçamento e te mostrar nosso atendimento?\"\n"
+            "→ Não pede exclusividade nem briga com o concorrente. Pede uma chance de mostrar.\n\n"
+            "2. SE ELE FALOU DE UMA LINHA ESPECÍFICA\n"
+            "\"Posso te incluir nas próximas cotações dessa linha?\"\n"
+            "→ Usa a linha que ELE disse que mais gira. Compromisso pequeno, fácil de aceitar.\n\n"
+            "3. SE ELE TEM ROTINA DE COMPRA\n"
+            "\"Qual dia da semana você costuma comprar para eu te chamar?\"\n"
+            "→ O melhor dos três: sai com dia marcado e a próxima ligação já tem motivo.\n\n"
+            "Depois do sim, feche assim:\n"
+            "\"Perfeito. Vou te mandar meu contato no WhatsApp agora e te chamo na {dia_retorno}.\"\n\n"
+            "No CRM: registre a resposta e marque a próxima ação com data e hora. "
+            "Prospecção sem próximo passo marcado continua aberta e some da sua fila."
+        ),
+    },
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 3,
+        "title": "Pontos fortes da Passini — o que dizer quando perguntarem",
+        "hint": "Não recite tudo. Escolha o argumento que responde ao que o cliente acabou de dizer.",
+        "body": (
+            "CONHECIMENTO\n"
+            "\"Somos treinados para atender como consultor técnico, não como tirador de pedido. "
+            "Se você tiver dúvida de aplicação, a gente confirma antes de faturar.\"\n"
+            "→ Use quando ele reclamar de erro de peça ou de vendedor que não entende do assunto.\n\n"
+            "AGILIDADE\n"
+            "\"Nosso foco é atender rápido e entregar rápido. Entrega por moto e por transportadora.\"\n"
+            "→ Use quando ele reclamar de demora ou disser que precisa da peça no mesmo dia.\n\n"
+            "CONVENIÊNCIA — autopeças com peso de distribuidora\n"
+            "• Entregas por moto e transportadora\n"
+            "• Marcas reconhecidas no mercado de reposição\n"
+            "• PIX, cartão de crédito e débito, dinheiro — levamos a maquininha até você\n"
+            "• Boleto disponível, sujeito a análise de crédito\n"
+            "• Portfólio forte em SUSPENSÃO, FREIO, TRANSMISSÃO e DIREÇÃO\n\n"
+            "SEMPRE que fizer sentido: envie a apresentação da empresa com o portfólio completo "
+            "logo depois da ligação, enquanto a conversa está fresca."
+        ),
+    },
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 4,
+        "title": "Cadastro ágil — não deixe a venda travar no cadastro",
+        "hint": "A maior parte das prospecções morre aqui. Saiba de cor o que pedir em cada caso.",
+        "body": (
+            "PAGAMENTO À VISTA, PIX OU CARTÃO — cadastro rápido\n"
+            "Peça só três dados e envie para crédito e cobrança pelo Skype:\n"
+            "• CNPJ\n"
+            "• Telefone\n"
+            "• E-mail\n\n"
+            "Fala pronta:\n"
+            "\"Para eu já te atender hoje, me passa só o CNPJ, um telefone e um e-mail. "
+            "Em poucos minutos você está cadastrado e eu consigo faturar.\"\n\n"
+            "PAGAMENTO FATURADO (BOLETO) — análise de crédito\n"
+            "1. PREENCHA a ficha para o cliente. Não mande em branco: ficha em branco não volta.\n"
+            "2. Envie só para ele assinar.\n"
+            "3. Ele envia direto ao setor de crédito e cobrança (passe o e-mail, WhatsApp ou Skype do setor).\n"
+            "4. A partir daí o setor analisa e pede mais dados se precisar.\n\n"
+            "Fala pronta:\n"
+            "\"Eu preencho a ficha para você, você só assina e manda para o setor. "
+            "Assim você não perde tempo e já sai com limite aprovado.\"\n\n"
+            "Enquanto o crédito não sai, NÃO pare a relação: venda à vista ou no cartão e "
+            "mantenha o contato ativo."
+        ),
+    },
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 5,
+        "title": "Roteiro completo da primeira ligação",
+        "hint": "Do bom dia ao próximo passo, em cerca de 5 minutos. Use até decorar.",
+        "body": (
+            "1. ABRIR (20 segundos)\n"
+            "\"Bom dia, aqui é {vendedor} da Passini, distribuidora de autopeças. "
+            "Falo com o responsável pelas compras?\"\n\n"
+            "2. PEDIR LICENÇA\n"
+            "\"Quero conhecer o perfil da sua oficina para não te oferecer coisa errada. "
+            "Posso te fazer quatro perguntas rápidas?\"\n\n"
+            "3. QUALIFICAR — as 4 perguntas\n"
+            "Tipo de serviço · carros por semana · linha que mais gira · forma de pagamento.\n"
+            "Anote tudo enquanto ele fala.\n\n"
+            "4. DEVOLVER VALOR (escolha UM ponto forte, ligado ao que ele disse)\n"
+            "Reclamou de demora → agilidade e entrega por moto.\n"
+            "Reclamou de peça errada → consultor técnico, confirmação de aplicação.\n"
+            "Falou de dinheiro → todas as formas de pagamento, maquininha no local.\n\n"
+            "5. FECHAR com um dos 3 gatilhos\n"
+            "Próximo orçamento · incluir nas cotações da linha · dia da semana de compra.\n\n"
+            "6. CADASTRAR\n"
+            "À vista: CNPJ, telefone, e-mail. Faturado: ficha preenchida para assinar.\n\n"
+            "7. REGISTRAR NO CRM\n"
+            "As 4 respostas, o gatilho aceito e a próxima ação com data e hora."
+        ),
+    },
+    {
+        "category": "prospeccao", "situation": "NOVO", "sort_order": 6,
+        "title": "Objeções que aparecem na prospecção",
+        "hint": "Nenhuma delas é um não. São formas de encerrar a ligação rápido.",
+        "body": (
+            "\"JÁ TENHO FORNECEDOR\"\n"
+            "\"Imaginei que sim, e nem quero que troque. Só quero participar da próxima cotação "
+            "para você comparar. Se eu não for melhor, você continua com quem está.\"\n\n"
+            "\"MANDA POR E-MAIL QUE EU VEJO\"\n"
+            "\"Mando sim. Só me diz uma coisa antes: qual linha você mais gira? "
+            "Assim eu mando o que interessa e não uma tabela de 400 itens.\"\n\n"
+            "\"AGORA NÃO POSSO FALAR\"\n"
+            "\"Sem problema. Qual o melhor horário para eu te chamar — começo da manhã ou "
+            "depois do almoço?\" (nunca desligue sem dia e hora)\n\n"
+            "\"VOCÊS SÃO CAROS\"\n"
+            "\"Pode ser em alguns itens. Me dá uma peça que você compra sempre e o valor. "
+            "Se eu não cobrir, eu te falo na hora e não te faço perder tempo.\"\n\n"
+            "\"NÃO CONHEÇO A PASSINI\"\n"
+            "\"Justo. Somos distribuidora com entrega por moto e transportadora, forte em "
+            "suspensão, freio, transmissão e direção. Te mando a apresentação e no próximo "
+            "orçamento você me testa.\"\n\n"
+            "\"SÓ COMPRO FATURADO\"\n"
+            "\"Trabalhamos com boleto sim, sujeito a análise. Eu já preencho sua ficha e você "
+            "só assina. Enquanto o crédito sai, se precisar de algo urgente eu te atendo no PIX.\""
+        ),
+    },
+    {
+        "category": "whatsapp", "situation": "NOVO", "sort_order": 3,
+        "title": "WhatsApp — logo após a primeira ligação",
+        "hint": "Mande em até 10 minutos, enquanto a conversa está fresca. Curto.",
+        "body": (
+            "{cliente}, foi bom falar com você agora!\n\n"
+            "Sou {vendedor}, da Passini Distribuidora de Peças. Salva meu contato.\n\n"
+            "Como combinamos, vou te chamar {dia_retorno} para participar da sua cotação "
+            "de {item}.\n\n"
+            "Qualquer peça que precisar antes disso, é só me chamar aqui — respondo rápido."
+        ),
+    },
+    {
+        "category": "whatsapp", "situation": "NOVO", "sort_order": 4,
+        "title": "WhatsApp — retomar prospecção que não respondeu",
+        "hint": "Segunda tentativa, alguns dias depois. Traga algo novo, não repita a mesma mensagem.",
+        "body": (
+            "{cliente}, tudo bem? Aqui é {vendedor}, da Passini.\n\n"
+            "Separei o que temos de pronta entrega na linha de {item}, que foi a que você "
+            "comentou que mais gira aí.\n\n"
+            "Me manda a próxima cotação que eu te respondo com preço e prazo. "
+            "Se não servir, não tem problema nenhum — fico à disposição para a próxima."
+        ),
+    },
 ]
