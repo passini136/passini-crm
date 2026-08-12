@@ -7899,17 +7899,43 @@ function crmClientsView() {
       `;
     }
 
+    // Os cartões somam a MESMA lista que a tabela mostra.
+    // Antes vinham prontos do servidor, que só conhece competência e PJ/PF —
+    // filtrar por unidade, status ou vendedor mudava a tabela e deixava os
+    // números de cima parados, dizendo outra coisa.
+    const linhasFiltradas = applyLocalFilters(psSellers);
+    const somar = (campo) => linhasFiltradas.reduce((acc, r) => acc + Number(r[campo] || 0), 0);
+    const totalFiltrado = somar("total");
+    const totF = {
+      total: totalFiltrado,
+      ativos: somar("ativos"),
+      preInativos: somar("preInativos"),
+      inativos: somar("inativos"),
+      comVendaMes: somar("comVendaMes"),
+      comVendaMesAnterior: somar("comVendaMesAnterior"),
+    };
+    totF.semVendaMes = Math.max(0, totF.total - totF.comVendaMes);
+    totF.pctAtivos = totalFiltrado ? Math.round(totF.ativos / totalFiltrado * 1000) / 10 : 0;
+    totF.pctInativos = totalFiltrado ? Math.round(totF.inativos / totalFiltrado * 1000) / 10 : 0;
+    const filtroLigado = Boolean(pfState.search || pfState.unit || pfState.status);
+
     return `
       <div class="stack">
         <!-- Filtros -->
         ${portfolioFilterBar()}
 
+        ${filtroLigado ? `
+          <div class="message" style="font-size:12px;background:rgba(15,48,68,0.06)">
+            Filtro ativo — os números abaixo somam ${number(linhasFiltradas.length)} de
+            ${number(psSellers.length)} vendedor(es).
+          </div>` : ""}
+
         <!-- Totais -->
         <div class="kpi-grid">
-          <div class="kpi-card"><div class="kpi-value">${number(tot.total)}</div><div class="kpi-label">Total de clientes</div><div class="kpi-sub">${number(tot.comVendaMes)} com compra no mês</div></div>
-          <div class="kpi-card"><div class="kpi-value" style="color:var(--good)">${number(tot.ativos)}</div><div class="kpi-label">Ativos <span style="font-size:12px;font-weight:400">(${tot.pctAtivos}%)</span></div><div class="kpi-sub">${number(tot.preInativos)} pré-inativos</div></div>
-          <div class="kpi-card"><div class="kpi-value" style="color:var(--bad)">${number(tot.inativos)}</div><div class="kpi-label">Inativos <span style="font-size:12px;font-weight:400">(${tot.pctInativos}%)</span></div><div class="kpi-sub">Prioridade de reativação</div></div>
-          <div class="kpi-card"><div class="kpi-value">${number(tot.comVendaMesAnterior)}</div><div class="kpi-label">Compraram mês anterior</div><div class="kpi-sub">${number(tot.semVendaMes)} sem compra este mês</div></div>
+          <div class="kpi-card"><div class="kpi-value">${number(totF.total)}</div><div class="kpi-label">Total de clientes</div><div class="kpi-sub">${number(totF.comVendaMes)} com compra no mês</div></div>
+          <div class="kpi-card"><div class="kpi-value" style="color:var(--good)">${number(totF.ativos)}</div><div class="kpi-label">Ativos <span style="font-size:12px;font-weight:400">(${totF.pctAtivos}%)</span></div><div class="kpi-sub">${number(totF.preInativos)} pré-inativos</div></div>
+          <div class="kpi-card"><div class="kpi-value" style="color:var(--bad)">${number(totF.inativos)}</div><div class="kpi-label">Inativos <span style="font-size:12px;font-weight:400">(${totF.pctInativos}%)</span></div><div class="kpi-sub">Prioridade de reativação</div></div>
+          <div class="kpi-card"><div class="kpi-value">${number(totF.comVendaMesAnterior)}</div><div class="kpi-label">Compraram mês anterior</div><div class="kpi-sub">${number(totF.semVendaMes)} sem compra este mês</div></div>
         </div>
 
         <!-- Tabela por vendedor -->
@@ -7934,7 +7960,7 @@ function crmClientsView() {
                 </tr>
               </thead>
               <tbody>
-                ${applyLocalFilters(psSellers).map((r) => `
+                ${linhasFiltradas.map((r) => `
                   <tr>
                     <td><strong>${escapeHtml(r.sellerName)}</strong></td>
                     <td><strong>${number(r.total)}</strong></td>
