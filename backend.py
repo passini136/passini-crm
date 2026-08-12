@@ -12448,14 +12448,18 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
     linked_units = [normalize_unit(u) for u in linked_units_raw if u]
 
     # Escopo "próprio" exige vínculo com a pessoa; escopos por unidade exigem unidades.
+    #
+    # O vínculo com a pessoa é GRAVADO EM TODOS OS PERFIS. Antes ele era apagado
+    # fora do escopo "próprio", partindo da ideia de que só serviria para filtrar
+    # a carteira. Não serve: é por ele que o gerente recebe a ciência de uma ata,
+    # aparece como participante de reunião e recebe feedback do diretor. Apagar
+    # aqui fazia o campo "não salvar" sem nenhum aviso na tela.
     if data_scope == "proprio":
         linked_units = []
         if not linked_person:
             raise ValueError("Perfis com escopo 'própria carteira' exigem a pessoa vinculada.")
-    else:
-        linked_person = None
-        if data_scope in {"unidade", "unidade_consolidado"} and not linked_units:
-            raise ValueError("Este perfil exige ao menos uma unidade vinculada.")
+    elif data_scope in {"unidade", "unidade_consolidado"} and not linked_units:
+        raise ValueError("Este perfil exige ao menos uma unidade vinculada.")
 
     linked_units_json = json.dumps(linked_units, ensure_ascii=False) if linked_units else None
     password = (payload.get("password") or "").strip()

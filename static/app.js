@@ -10607,9 +10607,16 @@ function acessosView() {
             <tbody>
               ${users.length ? users.map((row) => {
                 const profile = accessProfileById(row.profile_id) || profiles.find((p) => p.name === row.role);
-                const vinculo = row.linked_person_name
-                  ? escapeHtml(row.linked_person_name)
-                  : (row.linked_units_display ? escapeHtml(row.linked_units_display) : '<span style="color:var(--muted)">Toda a empresa</span>');
+                // Pessoa e unidades são vínculos DIFERENTES e um gerente tem os dois.
+                // Mostrar só um escondia o outro e dava a impressão de que não salvou.
+                const vinculo = [
+                  row.linked_person_name
+                    ? `<div>${escapeHtml(row.linked_person_name)}</div>`
+                    : '<div style="color:var(--bad)">sem pessoa vinculada</div>',
+                  row.linked_units_display
+                    ? `<div style="color:var(--muted)">${escapeHtml(row.linked_units_display)}</div>`
+                    : '<div style="color:var(--muted)">Toda a empresa</div>',
+                ].join("");
                 return `
                 <tr>
                   <td><strong>${escapeHtml(row.username)}</strong></td>
