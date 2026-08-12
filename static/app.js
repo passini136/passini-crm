@@ -1126,7 +1126,9 @@ function unclassifiedSellers() {
  * partir do que já está gravado nos usuários e no cadastro de pessoas.
  */
 function unitOptionsForEditor() {
-  const nomes = new Set(state.options.units || []);
+  // `state.admin.units` vem da própria tela de Acessos e é a fonte principal;
+  // as demais são reforço para o caso de a tela abrir antes do carregamento.
+  const nomes = new Set([...(state.admin?.units || []), ...(state.options.units || [])]);
   (state.admin?.users || []).forEach((u) => (u.linked_units || []).forEach((x) => x && nomes.add(x)));
   (state.admin?.people || []).forEach((p) => p.base_unit && nomes.add(p.base_unit));
   (state.userEditor?.linkedUnits || []).forEach((x) => x && nomes.add(x));

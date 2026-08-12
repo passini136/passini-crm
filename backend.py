@@ -12007,11 +12007,32 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
     profile_name_by_id = {p["id"]: p["name"] for p in profiles}
     for item in users:
         item["profile_name"] = profile_name_by_id.get(item.get("profile_id")) or item.get("role") or ""
+    # A tela de Acessos precisa da lista de unidades para marcar o vínculo do
+    # gerente. Antes ela dependia dos filtros do Dashboard: quem entrava direto
+    # em Acessos via a seção "Unidades vinculadas" sem nenhuma caixa para
+    # marcar. Aqui a lista é montada de todas as fontes que conhecem unidade,
+    # inclusive a que ainda não faturou (unit_phases) — é o caso da Zona Norte.
+    unidades: set[str] = set(CANONICAL_UNITS)
+    for sql in (
+        "SELECT DISTINCT unit_name AS u FROM fact_unit_summary WHERE company_id = ?",
+        "SELECT DISTINCT base_unit AS u FROM people_records WHERE company_id = ?",
+        "SELECT DISTINCT unit_name AS u FROM goals_unit WHERE company_id = ?",
+        "SELECT DISTINCT unit_name AS u FROM unit_phases WHERE company_id = ?",
+    ):
+        try:
+            for row in conn.execute(sql, (company_id,)).fetchall():
+                nome = normalize_unit(row["u"])
+                if nome:
+                    unidades.add(nome)
+        except sqlite3.OperationalError:
+            continue
+
     return {
         "users": users,
         "profiles": profiles,
         "accessModules": ACCESS_MODULES,
         "dataScopes": DATA_SCOPES,
+        "units": sorted(unidades),
         "clients": [dict(row) for row in conn.execute("SELECT * FROM client_registry WHERE company_id = ? ORDER BY updated_at DESC, client_name LIMIT 300", (company_id,)).fetchall()],
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
         "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
