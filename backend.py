@@ -222,6 +222,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
     {"id": "visitas",        "label": "Visitas",            "group": "CRM"},
+    {"id": "prospeccao",     "label": "Prospecção",         "group": "CRM"},
     # Desenvolvimento
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Desenvolvimento"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Desenvolvimento"},
@@ -276,7 +277,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
-            "visitas", "reunioes", "feedback",
+            "visitas", "prospeccao", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -299,7 +300,8 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "visitas", "reunioes", "feedback", "executivo", "calendario",
+            "meu-placar", "biblioteca", "visitas", "prospeccao", "reunioes", "feedback",
+            "executivo", "calendario",
         ],
         "data_scope": "proprio",
         "can_manage_users": 0,
@@ -1745,6 +1747,82 @@ def init_db() -> None:
                 UNIQUE(feedback_id, item_id),
                 FOREIGN KEY (feedback_id) REFERENCES feedbacks(id) ON DELETE CASCADE
             );
+
+            -- Fase da unidade. Unidade nova opera meses sem meta e sem carteira:
+            -- sem essa marcação, todo indicador de faturamento fica vermelho e a
+            -- equipe aprende que o painel não diz nada sobre o trabalho dela.
+            CREATE TABLE IF NOT EXISTS unit_phases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                unit_name TEXT NOT NULL,
+                phase TEXT NOT NULL DEFAULT 'OPERACAO',   -- IMPLANTACAO | OPERACAO
+                opening_date TEXT,                        -- inauguração prevista/realizada
+                goal_exempt_until TEXT,                   -- última competência sem meta (AAAA-MM)
+                notes TEXT,
+                updated_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, unit_name),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Metas de esforço para quem ainda não tem meta de faturamento.
+            -- seller_name vazio = meta da unidade.
+            CREATE TABLE IF NOT EXISTS activity_goals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                competence TEXT NOT NULL,
+                unit_name TEXT NOT NULL,
+                seller_name TEXT,
+                metric TEXT NOT NULL,      -- CALLS | PROSPECTS_NEW | PROSPECTS_REGISTERED | FIRST_PURCHASES
+                target REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, competence, unit_name, seller_name, metric),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Prospect: oficina que ainda não existe no cadastro do Alfa.
+            -- Vira cliente quando o CNPJ aparece na importação; até lá, o contato
+            -- é registrado igual ao de um cliente, na mesma tabela de interações.
+            CREATE TABLE IF NOT EXISTS prospects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                unit_name TEXT NOT NULL,
+                seller_name TEXT NOT NULL,
+                company_name TEXT NOT NULL,
+                trade_name TEXT,
+                document_number TEXT,      -- CNPJ: é o que permite o casamento automático
+                document_digits TEXT,      -- só dígitos, para comparar sem formatação
+                phone TEXT,
+                contact_name TEXT,
+                email TEXT,
+                city_name TEXT,
+                neighborhood TEXT,
+                address_line TEXT,
+                origin TEXT,               -- indicação, rua, lista, internet
+                status TEXT NOT NULL DEFAULT 'NOVO',  -- NOVO | EM_CONTATO | QUALIFICADO | CADASTRADO | PERDIDO
+                -- Qualificação do modelo Passini (4 perguntas)
+                q_service_type TEXT,       -- rápida | pesada | ambas
+                q_cars_week INTEGER,
+                q_main_line TEXT,          -- suspensão | freio | motor | outra
+                q_payment TEXT,            -- à vista | cartão | faturado
+                closing_trigger TEXT,      -- ORCAMENTO | COTACAO | DIA_COMPRA
+                notes TEXT,
+                client_code TEXT,          -- preenchido quando vira cliente
+                converted_at TEXT,
+                first_purchase_at TEXT,
+                lost_reason TEXT,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_prospects_unit_status
+                ON prospects(company_id, unit_name, status);
+            CREATE INDEX IF NOT EXISTS idx_prospects_document
+                ON prospects(company_id, document_digits);
 
             -- Pedido de visita feito pelo vendedor ao registrar uma ligação.
             -- É o que garante a ordem certa: o vendedor tenta por telefone e,
@@ -3408,6 +3486,13 @@ def import_package(
     )
     ensure_client_registry_for_sales(conn, company_id)
     conn.commit()
+    # O cadastro do Alfa acabou de mudar: é o momento em que um prospect pode
+    # ter virado cliente. Casa pelo CNPJ e migra o histórico de prospecção.
+    try:
+        reconcile_prospects(conn, company_id)
+        refresh_prospect_first_purchases(conn, company_id)
+    except Exception as exc:
+        print(f"[prospeccao] reconciliação após importação falhou: {exc}", flush=True)
     # Dados mudaram: derruba caches derivados (dashboard e CRM)
     invalidate_crm_cache(company_id)
     result: dict[str, Any] = {
@@ -4614,6 +4699,33 @@ def seller_indicators_for_feedback(
         linha = candidatos[0] if len(candidatos) == 1 else None
 
     if not linha:
+        # Vendedor de unidade nova ainda não fatura, então não existe no ranking.
+        # Em vez de devolver "sem dados", devolve a fase e os números de esforço:
+        # é o que permite dar feedback antes da primeira venda.
+        unidade_pessoa = seller_unit_name(conn, company_id, seller_name, competence)
+        em_implantacao = unit_is_in_deployment(conn, company_id, unidade_pessoa, competence)
+        if em_implantacao:
+            inicio_i = first_day_of_competence(competence).isoformat()
+            fim_i = last_day_of_competence(competence).isoformat()
+            variantes_i = seller_name_variants(conn, company_id, seller_name)
+            marcadores_i = ",".join("?" for _ in variantes_i) or "''"
+            ligacoes_i = conn.execute(
+                f"""SELECT COUNT(*) n FROM crm_interactions
+                    WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+                      AND UPPER(seller_name) IN ({marcadores_i})
+                      AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)""",
+                (company_id, *[normalize_upper(v) for v in variantes_i], inicio_i, fim_i),
+            ).fetchone()["n"]
+            return {
+                "found": False,
+                "inDeployment": True,
+                "competence": competence,
+                "sellerName": seller_name,
+                "unitName": unidade_pessoa,
+                "calls": int(ligacoes_i or 0),
+                "activity": activity_progress(conn, company_id, competence, unidade_pessoa, seller_name),
+                "reason": "Unidade em implantação — ainda sem faturamento e sem meta.",
+            }
         return {
             "found": False,
             "competence": competence,
@@ -4689,6 +4801,7 @@ def seller_indicators_for_feedback(
     return {
         "found": True,
         "competence": competence,
+        "inDeployment": bool(linha.get("inDeployment")),
         "sellerName": nome_vendas,
         "matchedName": nome_vendas if person_key(nome_vendas) != person_key(seller_name) else "",
         "unitName": unidade,
@@ -4730,16 +4843,23 @@ def feedback_guidance(indicadores: dict[str, Any]) -> list[dict[str, Any]]:
     mec = _mec_content()
     guia = mec.INDICATOR_GUIDE
     if not indicadores.get("found"):
+        # Sem faturamento o guia normal não se aplica, mas unidade em implantação
+        # tem conversa própria — e é justamente ela que precisa acontecer agora.
+        if indicadores.get("inDeployment") and "deployment" in guia:
+            return [{"id": "deployment", **guia["deployment"]}]
         return []
 
     alertas: list[str] = []
     # Mede RITMO, não acumulado. No dia 6 de 21 ninguém tem 100% da meta nem 60
     # ligações — comparar com o mês fechado acusaria a equipe inteira e o alerta
     # perderia o sentido, que é o mesmo raciocínio dos faróis.
+    # Unidade em implantação não tem meta de faturamento. Cobrar meta de quem
+    # ainda está montando carteira é injusto e destrói a credibilidade do guia.
+    em_implantacao = bool(indicadores.get("inDeployment"))
     ritmo_meta = indicadores.get("projectedGoalAttainmentPct")
     if ritmo_meta is None:
         ritmo_meta = indicadores.get("goalAttainmentPct")
-    if float(ritmo_meta or 0) < 90:
+    if not em_implantacao and float(ritmo_meta or 0) < 90:
         alertas.append("goal_low")
     meta_ligacoes = int(indicadores.get("callsTargetToDate")
                         or indicadores.get("callsTarget") or 60)
@@ -4764,6 +4884,8 @@ def feedback_guidance(indicadores: dict[str, Any]) -> list[dict[str, Any]]:
     if ticket_unidade and ticket < ticket_unidade * 0.85:
         alertas.append("ticket_low")
 
+    if em_implantacao:
+        alertas.append("deployment")
     if not alertas:
         alertas.append("good_overall")
 
@@ -6882,16 +7004,20 @@ def user_situation_triggers(
         try:
             competencia = crm_latest_competence(conn, company_id) or hoje[:7]
             ind = safe_feedback_indicators(conn, company_id, "VENDEDOR", nome, "", competencia)
+            if ind.get("inDeployment"):
+                gatilhos.append("DEPLOYMENT")
             if ind.get("found"):
                 # Mesmo critério dos faróis: ritmo, não acumulado.
                 meta_ligacoes = int(ind.get("callsTargetToDate") or ind.get("callsTarget") or 60)
                 if int(ind.get("calls") or 0) < meta_ligacoes:
                     gatilhos.append("CALLS_LOW")
-                ritmo = ind.get("projectedGoalAttainmentPct")
-                if ritmo is None:
-                    ritmo = ind.get("goalAttainmentPct")
-                if float(ritmo or 0) < 90:
-                    gatilhos.append("GOAL_LOW")
+                if not ind.get("inDeployment"):
+                    ritmo = ind.get("projectedGoalAttainmentPct")
+                    if ritmo is None:
+                        ritmo = ind.get("goalAttainmentPct")
+                    if float(ritmo or 0) < 90:
+                        gatilhos.append("GOAL_LOW")
+                # Ligações continuam valendo em implantação — é o esforço que sobra.
                 if float(ind.get("returnsPct") or 0) > 3:
                     gatilhos.append("RETURNS_HIGH")
                 ticket_unidade = float(ind.get("ticketAverageUnit") or 0)
@@ -7001,6 +7127,641 @@ def mark_tour_seen(conn: sqlite3.Connection, user: sqlite3.Row, tour_key: str, s
         (user["id"], normalize_whitespace(tour_key) or "tour", now_iso(), 1 if skipped else 0),
     )
     conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unidade em implantação e prospecção
+#
+# Uma unidade nova passa meses sem meta e sem carteira. A estrutura do sistema
+# pressupõe as duas coisas, então em vez de criar um sistema paralelo — que
+# duplicaria carteira, tarefas e placar — a fase da unidade muda a LEITURA do
+# que já existe:
+#
+#   • sem meta de faturamento, o farol vira neutro em vez de crítico;
+#   • no lugar da meta entram metas de ESFORÇO (ligações, prospects, cadastros);
+#   • o contato com prospect usa a MESMA tabela de interações, com a chave
+#     "P-<id>". Assim ele conta no placar, gera tarefa de retorno e aparece no
+#     histórico. Quando o CNPJ é cadastrado no Alfa, as interações são
+#     reapontadas para o código real e o histórico vai junto para a ficha.
+#
+# A ideia é que, quando a Zona Norte inaugurar, nada precise ser migrado: a
+# unidade só muda de fase.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROSPECT_KEY_PREFIX = "P-"
+
+PROSPECT_STATUSES = [
+    {"id": "NOVO",       "label": "A contatar",  "icon": "○", "color": "#5f6368", "bg": "#f1f3f4",
+     "hint": "Cadastrado no CRM, ainda sem contato."},
+    {"id": "EM_CONTATO", "label": "Em contato",  "icon": "◐", "color": "#1a5276", "bg": "#e8f0fe",
+     "hint": "Já houve ligação, ainda sem qualificação completa."},
+    {"id": "QUALIFICADO","label": "Qualificado", "icon": "◆", "color": "#b06000", "bg": "#fef7e0",
+     "hint": "Respondeu as 4 perguntas e aceitou um gatilho de fechamento."},
+    {"id": "CADASTRADO", "label": "Cadastrado",  "icon": "●", "color": "#1e8e3e", "bg": "#e6f4ea",
+     "hint": "Virou cliente no Alfa. Já está na carteira."},
+    {"id": "PERDIDO",    "label": "Perdido",     "icon": "✕", "color": "#c5221f", "bg": "#fce8e6",
+     "hint": "Recusou ou não é público-alvo."},
+]
+PROSPECT_STATUS_IDS = {s["id"] for s in PROSPECT_STATUSES}
+
+PROSPECT_TRIGGERS = [
+    {"id": "ORCAMENTO",  "label": "Participar do próximo orçamento"},
+    {"id": "COTACAO",    "label": "Entrar nas cotações da linha"},
+    {"id": "DIA_COMPRA", "label": "Dia da semana de compra combinado"},
+]
+
+ACTIVITY_METRICS = [
+    {"id": "CALLS", "label": "Ligações", "icon": "📞",
+     "hint": "Ligações registradas no mês, para clientes e prospects."},
+    {"id": "PROSPECTS_NEW", "label": "Prospects novos", "icon": "🆕",
+     "hint": "Oficinas novas cadastradas no CRM no mês."},
+    {"id": "PROSPECTS_REGISTERED", "label": "Cadastros concluídos", "icon": "✅",
+     "hint": "Prospects que viraram cliente no Alfa no mês."},
+    {"id": "FIRST_PURCHASES", "label": "Primeiras compras", "icon": "💰",
+     "hint": "Prospects convertidos que compraram pela primeira vez."},
+]
+ACTIVITY_METRIC_IDS = {m["id"] for m in ACTIVITY_METRICS}
+
+
+def only_digits(value: Any) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def prospect_client_key(prospect_id: int) -> str:
+    """Chave usada nas interações e tarefas de um prospect.
+
+    O prefixo garante que nenhuma consulta de carteira encontre esse registro
+    por engano — código de cliente do Alfa é numérico.
+    """
+    return f"{PROSPECT_KEY_PREFIX}{int(prospect_id)}"
+
+
+# ── Fase da unidade ──────────────────────────────────────────────────────────
+
+def get_unit_phase(conn: sqlite3.Connection, company_id: int, unit_name: str) -> dict[str, Any]:
+    unidade = normalize_unit(unit_name)
+    row = conn.execute(
+        "SELECT * FROM unit_phases WHERE company_id = ? AND unit_name = ?", (company_id, unidade)
+    ).fetchone()
+    if not row:
+        return {"unitName": unidade, "phase": "OPERACAO", "openingDate": "",
+                "goalExemptUntil": "", "notes": "", "isDeployment": False}
+    return {
+        "unitName": unidade,
+        "phase": row["phase"],
+        "openingDate": row["opening_date"] or "",
+        "goalExemptUntil": row["goal_exempt_until"] or "",
+        "notes": row["notes"] or "",
+        "isDeployment": row["phase"] == "IMPLANTACAO",
+    }
+
+
+def list_unit_phases(conn: sqlite3.Connection, company_id: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "unitName": r["unit_name"], "phase": r["phase"],
+            "openingDate": r["opening_date"] or "", "goalExemptUntil": r["goal_exempt_until"] or "",
+            "notes": r["notes"] or "", "isDeployment": r["phase"] == "IMPLANTACAO",
+        }
+        for r in conn.execute(
+            "SELECT * FROM unit_phases WHERE company_id = ? ORDER BY unit_name", (company_id,)
+        ).fetchall()
+    ]
+
+
+def save_unit_phase(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria define a fase da unidade.")
+    unidade = normalize_unit(payload.get("unitName"))
+    if not unidade:
+        raise ValueError("Informe a unidade.")
+    fase = normalize_upper(payload.get("phase")) or "OPERACAO"
+    if fase not in {"IMPLANTACAO", "OPERACAO"}:
+        raise ValueError("Fase inválida.")
+    conn.execute(
+        """
+        INSERT INTO unit_phases (company_id, unit_name, phase, opening_date, goal_exempt_until,
+            notes, updated_by_user_id, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(company_id, unit_name) DO UPDATE SET
+            phase = excluded.phase, opening_date = excluded.opening_date,
+            goal_exempt_until = excluded.goal_exempt_until, notes = excluded.notes,
+            updated_by_user_id = excluded.updated_by_user_id, updated_at = excluded.updated_at
+        """,
+        (company_id, unidade, fase, normalize_whitespace(payload.get("openingDate")) or None,
+         normalize_whitespace(payload.get("goalExemptUntil")) or None,
+         normalize_whitespace(payload.get("notes")), user["id"], now_iso(), now_iso()),
+    )
+    audit_log(conn, company_id, user["id"], "salvar", "unit_phases", unidade, {"fase": fase})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"saved": True}
+
+
+def unit_is_in_deployment(conn: sqlite3.Connection, company_id: int, unit_name: str,
+                          competence: str = "") -> bool:
+    """Se a unidade está em implantação nesta competência.
+
+    `goal_exempt_until` permite manter a isenção até uma competência específica
+    mesmo depois de inaugurar — a loja abre, mas a meta só entra no ano seguinte.
+    """
+    fase = get_unit_phase(conn, company_id, unit_name)
+    if fase["phase"] == "IMPLANTACAO":
+        return True
+    limite = fase.get("goalExemptUntil")
+    return bool(limite and competence and competence <= limite)
+
+
+def seller_unit_name(conn: sqlite3.Connection, company_id: int, seller_name: str,
+                     competence: str = "") -> str:
+    competence = competence or crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
+    _, unidade = current_role_and_unit(conn, company_id, seller_name, competence)
+    return normalize_unit(unidade)
+
+
+# ── Metas de atividade ───────────────────────────────────────────────────────
+
+def list_activity_goals(
+    conn: sqlite3.Connection, company_id: int, competence: str, unit_name: str = ""
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM activity_goals WHERE company_id = ? AND competence = ?"
+    params: list[Any] = [company_id, competence]
+    if unit_name:
+        sql += " AND unit_name = ?"
+        params.append(normalize_unit(unit_name))
+    sql += " ORDER BY unit_name, seller_name, metric"
+    return [
+        {"id": int(r["id"]), "competence": r["competence"], "unitName": r["unit_name"],
+         "sellerName": r["seller_name"] or "", "metric": r["metric"], "target": float(r["target"] or 0)}
+        for r in conn.execute(sql, params).fetchall()
+    ]
+
+
+def save_activity_goal(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    if data_scope_for_user(conn, user) == "proprio":
+        raise PermissionError("Apenas gestão define metas de atividade.")
+    metric = normalize_upper(payload.get("metric"))
+    if metric not in ACTIVITY_METRIC_IDS:
+        raise ValueError("Indicador inválido.")
+    competence = normalize_whitespace(payload.get("competence"))
+    if not competence or len(competence) != 7:
+        raise ValueError("Informe a competência no formato AAAA-MM.")
+    unidade = normalize_unit(payload.get("unitName"))
+    if not unidade:
+        raise ValueError("Informe a unidade.")
+    conn.execute(
+        """
+        INSERT INTO activity_goals (company_id, competence, unit_name, seller_name, metric, target, created_at, updated_at)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(company_id, competence, unit_name, seller_name, metric) DO UPDATE SET
+            target = excluded.target, updated_at = excluded.updated_at
+        """,
+        (company_id, competence, unidade, normalize_whitespace(payload.get("sellerName")) or None,
+         metric, float(payload.get("target") or 0), now_iso(), now_iso()),
+    )
+    conn.commit()
+    return {"saved": True}
+
+
+def activity_progress(
+    conn: sqlite3.Connection, company_id: int, competence: str,
+    unit_name: str = "", seller_name: str = "",
+) -> list[dict[str, Any]]:
+    """Realizado × meta de esforço, com o mesmo raciocínio de ritmo dos faróis."""
+    inicio = first_day_of_competence(competence).isoformat()
+    fim = last_day_of_competence(competence).isoformat()
+    unidade = normalize_unit(unit_name)
+    filtro_vendedor = normalize_upper(seller_name)
+
+    def conta(sql: str, params: tuple) -> int:
+        return int(conn.execute(sql, params).fetchone()["n"] or 0)
+
+    cond_v = " AND UPPER(seller_name) = ?" if filtro_vendedor else ""
+    p_v = (filtro_vendedor,) if filtro_vendedor else ()
+
+    ligacoes = conta(
+        f"""SELECT COUNT(*) n FROM crm_interactions
+            WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+              AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?){cond_v}""",
+        (company_id, inicio, fim, *p_v),
+    )
+    cond_u = " AND unit_name = ?" if unidade else ""
+    p_u = (unidade,) if unidade else ()
+    novos = conta(
+        f"""SELECT COUNT(*) n FROM prospects
+            WHERE company_id = ? AND date(created_at) BETWEEN date(?) AND date(?){cond_u}{cond_v}""",
+        (company_id, inicio, fim, *p_u, *p_v),
+    )
+    cadastrados = conta(
+        f"""SELECT COUNT(*) n FROM prospects
+            WHERE company_id = ? AND converted_at IS NOT NULL
+              AND date(converted_at) BETWEEN date(?) AND date(?){cond_u}{cond_v}""",
+        (company_id, inicio, fim, *p_u, *p_v),
+    )
+    primeiras = conta(
+        f"""SELECT COUNT(*) n FROM prospects
+            WHERE company_id = ? AND first_purchase_at IS NOT NULL
+              AND date(first_purchase_at) BETWEEN date(?) AND date(?){cond_u}{cond_v}""",
+        (company_id, inicio, fim, *p_u, *p_v),
+    )
+    realizado = {"CALLS": ligacoes, "PROSPECTS_NEW": novos,
+                 "PROSPECTS_REGISTERED": cadastrados, "FIRST_PURCHASES": primeiras}
+
+    metas = {
+        g["metric"]: g["target"]
+        for g in list_activity_goals(conn, company_id, competence, unidade)
+        if not g["sellerName"] or normalize_upper(g["sellerName"]) == filtro_vendedor
+    }
+
+    # Ritmo do mês, para não cobrar 100% no dia 6 — mesma regra dos faróis.
+    calendario = get_business_calendar(conn, company_id, competence)
+    decorridos = int(calendario.get("elapsedWorkingDays") or 0)
+    totais = int(calendario.get("totalWorkingDays") or 0)
+    ritmo = safe_div(decorridos, totais) if totais else 1.0
+
+    resultado = []
+    for m in ACTIVITY_METRICS:
+        alvo = float(metas.get(m["id"], 0))
+        feito = realizado.get(m["id"], 0)
+        esperado = round(alvo * ritmo) if alvo else 0
+        pct_ritmo = safe_div(feito, esperado) * 100 if esperado else None
+        resultado.append({
+            **m,
+            "target": alvo,
+            "expectedToDate": esperado,
+            "actual": feito,
+            "pacePct": round(pct_ritmo, 1) if pct_ritmo is not None else None,
+            "onTrack": None if pct_ritmo is None else pct_ritmo >= 90,
+        })
+    return resultado
+
+
+# ── Prospects ────────────────────────────────────────────────────────────────
+
+def prospect_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    cfg = next((s for s in PROSPECT_STATUSES if s["id"] == row["status"]), None)
+    return {
+        "id": int(row["id"]),
+        "clientKey": prospect_client_key(row["id"]),
+        "unitName": row["unit_name"],
+        "sellerName": row["seller_name"],
+        "companyName": row["company_name"],
+        "tradeName": row["trade_name"] or "",
+        "documentNumber": row["document_number"] or "",
+        "phone": row["phone"] or "",
+        "contactName": row["contact_name"] or "",
+        "email": row["email"] or "",
+        "cityName": row["city_name"] or "",
+        "neighborhood": row["neighborhood"] or "",
+        "addressLine": row["address_line"] or "",
+        "origin": row["origin"] or "",
+        "status": row["status"],
+        "statusLabel": cfg["label"] if cfg else row["status"],
+        "statusIcon": cfg["icon"] if cfg else "•",
+        "serviceType": row["q_service_type"] or "",
+        "carsWeek": row["q_cars_week"],
+        "mainLine": row["q_main_line"] or "",
+        "payment": row["q_payment"] or "",
+        "closingTrigger": row["closing_trigger"] or "",
+        "notes": row["notes"] or "",
+        "clientCode": row["client_code"] or "",
+        "convertedAt": row["converted_at"] or "",
+        "firstPurchaseAt": row["first_purchase_at"] or "",
+        "lostReason": row["lost_reason"] or "",
+        "createdAt": row["created_at"],
+        # Qualificado = as 4 respostas + um gatilho, como manda o modelo Passini.
+        "isQualified": bool(row["q_service_type"] and row["q_cars_week"]
+                            and row["q_main_line"] and row["q_payment"] and row["closing_trigger"]),
+    }
+
+
+def list_prospects(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    status: str = "", search: str = "", seller: str = "", limit: int = 500,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM prospects WHERE company_id = ?"
+    params: list[Any] = [company_id]
+
+    if data_scope_for_user(conn, user) == "proprio":
+        sql += " AND UPPER(seller_name) = ?"
+        params.append(normalize_upper(seller_identity_for_user(user)))
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas is not None:
+            if permitidas:
+                marcadores = ",".join("?" for _ in permitidas)
+                sql += f" AND unit_name IN ({marcadores})"
+                params.extend(permitidas)
+            else:
+                sql += " AND 1 = 0"
+        if seller:
+            sql += " AND UPPER(seller_name) = ?"
+            params.append(normalize_upper(seller))
+
+    if status in PROSPECT_STATUS_IDS:
+        sql += " AND status = ?"
+        params.append(status)
+    termo = normalize_whitespace(search)
+    if termo:
+        alvo = f"%{termo.upper()}%"
+        sql += (" AND (UPPER(company_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?"
+                " OR UPPER(COALESCE(contact_name,'')) LIKE ? OR COALESCE(document_digits,'') LIKE ?"
+                " OR UPPER(COALESCE(city_name,'')) LIKE ?)")
+        params.extend([alvo, alvo, alvo, f"%{only_digits(termo)}%" if only_digits(termo) else "%%", alvo])
+
+    sql += """ ORDER BY CASE status WHEN 'QUALIFICADO' THEN 0 WHEN 'EM_CONTATO' THEN 1
+               WHEN 'NOVO' THEN 2 WHEN 'CADASTRADO' THEN 3 ELSE 4 END, company_name LIMIT ?"""
+    params.append(int(limit))
+
+    linhas = [prospect_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    # Último contato e retorno marcado vêm das mesmas tabelas usadas para cliente.
+    for p in linhas:
+        chave = p["clientKey"]
+        ultimo = conn.execute(
+            "SELECT MAX(occurred_at) u, COUNT(*) n FROM crm_interactions "
+            "WHERE company_id = ? AND client_key = ?", (company_id, chave),
+        ).fetchone()
+        p["lastContactAt"] = ultimo["u"] or ""
+        p["contactCount"] = int(ultimo["n"] or 0)
+        tarefa = conn.execute(
+            "SELECT MIN(due_at) d FROM crm_tasks WHERE company_id = ? AND client_key = ? "
+            "AND status NOT IN ('CONCLUIDA','CANCELADA')", (company_id, chave),
+        ).fetchone()
+        p["nextTaskAt"] = tarefa["d"] or ""
+        dias = None
+        if p["lastContactAt"]:
+            dt = parse_datetime_flexible(p["lastContactAt"][:10])
+            if dt:
+                dias = (today_in_brazil() - dt.date()).days
+        p["daysSinceContact"] = dias
+    return linhas
+
+
+def save_prospect(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    nome = normalize_whitespace(payload.get("companyName"))
+    if not nome:
+        raise ValueError("Informe o nome da oficina.")
+
+    escopo = data_scope_for_user(conn, user)
+    if escopo == "proprio":
+        vendedor = seller_identity_for_user(user)
+    else:
+        vendedor = normalize_whitespace(payload.get("sellerName")) or meeting_person_identity(user)
+
+    unidade = normalize_unit(payload.get("unitName")) or seller_unit_name(conn, company_id, vendedor)
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is not None and permitidas and unidade not in permitidas:
+        unidade = permitidas[0]
+
+    documento = normalize_whitespace(payload.get("documentNumber"))
+    digitos = only_digits(documento)
+
+    prospect_id = payload.get("id")
+    campos = (
+        unidade, vendedor, nome,
+        normalize_whitespace(payload.get("tradeName")),
+        documento or None, digitos or None,
+        normalize_whitespace(payload.get("phone")),
+        normalize_whitespace(payload.get("contactName")),
+        normalize_whitespace(payload.get("email")),
+        normalize_upper(payload.get("cityName")),
+        normalize_upper(payload.get("neighborhood")),
+        normalize_whitespace(payload.get("addressLine")),
+        normalize_whitespace(payload.get("origin")),
+        normalize_whitespace(payload.get("serviceType")),
+        int(payload["carsWeek"]) if str(payload.get("carsWeek") or "").strip().isdigit() else None,
+        normalize_whitespace(payload.get("mainLine")),
+        normalize_whitespace(payload.get("payment")),
+        normalize_upper(payload.get("closingTrigger")) or None,
+        normalize_whitespace(payload.get("notes")),
+    )
+
+    if prospect_id:
+        conn.execute(
+            """
+            UPDATE prospects SET unit_name=?, seller_name=?, company_name=?, trade_name=?,
+                   document_number=?, document_digits=?, phone=?, contact_name=?, email=?,
+                   city_name=?, neighborhood=?, address_line=?, origin=?,
+                   q_service_type=?, q_cars_week=?, q_main_line=?, q_payment=?,
+                   closing_trigger=?, notes=?, updated_at=?
+            WHERE company_id = ? AND id = ?
+            """,
+            (*campos, now_iso(), company_id, int(prospect_id)),
+        )
+        novo_id = int(prospect_id)
+    else:
+        duplicado = None
+        if digitos:
+            duplicado = conn.execute(
+                "SELECT id, company_name, seller_name FROM prospects "
+                "WHERE company_id = ? AND document_digits = ?", (company_id, digitos),
+            ).fetchone()
+        if duplicado:
+            return {"prospectId": int(duplicado["id"]), "duplicated": True,
+                    "message": f"Este CNPJ já está com {duplicado['seller_name']} "
+                               f"como {duplicado['company_name']}."}
+        cursor = conn.execute(
+            """
+            INSERT INTO prospects (unit_name, seller_name, company_name, trade_name,
+                document_number, document_digits, phone, contact_name, email, city_name,
+                neighborhood, address_line, origin, q_service_type, q_cars_week, q_main_line,
+                q_payment, closing_trigger, notes, company_id, status, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'NOVO',?,?)
+            """,
+            (*campos, company_id, user["id"], now_iso()),
+        )
+        novo_id = int(cursor.lastrowid)
+
+    _refresh_prospect_status(conn, company_id, novo_id)
+    audit_log(conn, company_id, user["id"], "salvar", "prospects", str(novo_id), {"nome": nome})
+    conn.commit()
+
+    # Já testa se este CNPJ existe no cadastro — pode ser cliente antigo da casa.
+    achado = try_convert_prospect(conn, company_id, novo_id)
+    return {"prospectId": novo_id, "duplicated": False, "converted": bool(achado), **(achado or {})}
+
+
+def _refresh_prospect_status(conn: sqlite3.Connection, company_id: int, prospect_id: int) -> None:
+    """Status derivado do que já aconteceu, para ninguém precisar mantê-lo na mão."""
+    row = conn.execute(
+        "SELECT * FROM prospects WHERE company_id = ? AND id = ?", (company_id, prospect_id)
+    ).fetchone()
+    if not row or row["status"] in ("CADASTRADO", "PERDIDO"):
+        return
+    contatos = conn.execute(
+        "SELECT COUNT(*) n FROM crm_interactions WHERE company_id = ? AND client_key = ?",
+        (company_id, prospect_client_key(prospect_id)),
+    ).fetchone()["n"]
+    qualificado = all([row["q_service_type"], row["q_cars_week"], row["q_main_line"],
+                       row["q_payment"], row["closing_trigger"]])
+    novo = "QUALIFICADO" if qualificado else ("EM_CONTATO" if contatos else "NOVO")
+    if novo != row["status"]:
+        conn.execute("UPDATE prospects SET status = ?, updated_at = ? WHERE id = ?",
+                     (novo, now_iso(), prospect_id))
+
+
+def try_convert_prospect(
+    conn: sqlite3.Connection, company_id: int, prospect_id: int
+) -> dict[str, Any] | None:
+    """Procura o CNPJ do prospect no cadastro de clientes e vincula.
+
+    Achando, o histórico de contatos e as tarefas passam a apontar para o código
+    real. É o que faz o esforço de prospecção aparecer na ficha do cliente em vez
+    de desaparecer no dia em que ele é cadastrado.
+    """
+    row = conn.execute(
+        "SELECT * FROM prospects WHERE company_id = ? AND id = ?", (company_id, prospect_id)
+    ).fetchone()
+    if not row or row["client_code"] or not row["document_digits"]:
+        return None
+
+    cliente = conn.execute(
+        """
+        SELECT client_code, client_name FROM crm_client_profiles
+        WHERE company_id = ? AND REPLACE(REPLACE(REPLACE(COALESCE(document_number,''),'.',''),'/',''),'-','') = ?
+        LIMIT 1
+        """,
+        (company_id, row["document_digits"]),
+    ).fetchone()
+    if not cliente:
+        return None
+
+    return link_prospect_to_client(conn, company_id, prospect_id, cliente["client_code"],
+                                   automatic=True)
+
+
+def link_prospect_to_client(
+    conn: sqlite3.Connection, company_id: int, prospect_id: int, client_code: str,
+    automatic: bool = False,
+) -> dict[str, Any]:
+    codigo = normalize_whitespace(client_code)
+    if not codigo:
+        raise ValueError("Informe o código do cliente.")
+    chave_prospect = prospect_client_key(prospect_id)
+    perfil = conn.execute(
+        "SELECT client_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, codigo),
+    ).fetchone()
+
+    movidas = conn.execute(
+        "UPDATE crm_interactions SET client_key = ?, client_name = COALESCE(?, client_name) "
+        "WHERE company_id = ? AND client_key = ?",
+        (codigo, perfil["client_name"] if perfil else None, company_id, chave_prospect),
+    ).rowcount
+    conn.execute(
+        "UPDATE crm_tasks SET client_key = ?, client_name = COALESCE(?, client_name) "
+        "WHERE company_id = ? AND client_key = ?",
+        (codigo, perfil["client_name"] if perfil else None, company_id, chave_prospect),
+    )
+    conn.execute(
+        "UPDATE prospects SET status = 'CADASTRADO', client_code = ?, converted_at = ?, updated_at = ? "
+        "WHERE company_id = ? AND id = ?",
+        (codigo, now_iso(), now_iso(), company_id, prospect_id),
+    )
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    print(f"[prospeccao] prospect {prospect_id} vinculado ao cliente {codigo} "
+          f"({'automático' if automatic else 'manual'}) · {movidas} contato(s) migrado(s)", flush=True)
+    return {"clientCode": codigo, "clientName": perfil["client_name"] if perfil else codigo,
+            "movedInteractions": int(movidas or 0), "automatic": automatic}
+
+
+def reconcile_prospects(conn: sqlite3.Connection, company_id: int) -> int:
+    """Passa por todos os prospects pendentes e tenta casar com o cadastro.
+
+    Roda depois de cada importação de clientes: é o momento em que o cadastro do
+    Alfa acabou de mudar e o vínculo passa a ser possível.
+    """
+    pendentes = conn.execute(
+        "SELECT id FROM prospects WHERE company_id = ? AND client_code IS NULL "
+        "AND document_digits IS NOT NULL AND document_digits <> '' AND status <> 'PERDIDO'",
+        (company_id,),
+    ).fetchall()
+    vinculados = 0
+    for r in pendentes:
+        if try_convert_prospect(conn, company_id, int(r["id"])):
+            vinculados += 1
+    if vinculados:
+        print(f"[prospeccao] {vinculados} prospect(s) viraram cliente nesta importação", flush=True)
+    return vinculados
+
+
+def refresh_prospect_first_purchases(conn: sqlite3.Connection, company_id: int) -> int:
+    """Marca a primeira compra de quem já foi convertido.
+
+    É o indicador que fecha o funil: prospectado → cadastrado → comprou.
+    """
+    convertidos = conn.execute(
+        "SELECT id, client_code FROM prospects WHERE company_id = ? AND client_code IS NOT NULL "
+        "AND first_purchase_at IS NULL", (company_id,),
+    ).fetchall()
+    marcados = 0
+    for r in convertidos:
+        nomes = client_sales_names(conn, company_id, r["client_code"])
+        if not nomes:
+            continue
+        marcadores = ",".join("?" for _ in nomes)
+        linha = conn.execute(
+            f"""SELECT MIN(COALESCE(NULLIF(issue_date,''), competence || '-01')) d
+                FROM fact_sales_detail
+                WHERE company_id = ? AND net_value > 0 AND UPPER(client_name) IN ({marcadores})""",
+            (company_id, *[normalize_upper(n) for n in nomes]),
+        ).fetchone()
+        if linha and linha["d"]:
+            conn.execute("UPDATE prospects SET first_purchase_at = ? WHERE id = ?",
+                         (linha["d"][:10], r["id"]))
+            marcados += 1
+    if marcados:
+        conn.commit()
+    return marcados
+
+
+def mark_prospect_lost(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, prospect_id: int, reason: str
+) -> None:
+    conn.execute(
+        "UPDATE prospects SET status='PERDIDO', lost_reason=?, updated_at=? WHERE company_id=? AND id=?",
+        (normalize_whitespace(reason), now_iso(), company_id, prospect_id),
+    )
+    conn.commit()
+
+
+def delete_prospect(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, prospect_id: int) -> None:
+    if data_scope_for_user(conn, user) == "proprio":
+        dono = conn.execute(
+            "SELECT seller_name FROM prospects WHERE company_id = ? AND id = ?", (company_id, prospect_id)
+        ).fetchone()
+        if not dono or normalize_upper(dono["seller_name"]) != normalize_upper(seller_identity_for_user(user)):
+            raise PermissionError("Você só pode excluir os seus prospects.")
+    conn.execute("DELETE FROM prospects WHERE company_id = ? AND id = ?", (company_id, prospect_id))
+    conn.commit()
+
+
+def prospect_funnel(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> dict[str, Any]:
+    linhas = list_prospects(conn, company_id, user, limit=5000)
+    por_status = {s["id"]: 0 for s in PROSPECT_STATUSES}
+    for p in linhas:
+        por_status[p["status"]] = por_status.get(p["status"], 0) + 1
+    total = len(linhas)
+    convertidos = por_status.get("CADASTRADO", 0)
+    return {
+        "total": total,
+        "byStatus": por_status,
+        "conversionPct": round(safe_div(convertidos, total) * 100, 1) if total else 0.0,
+        "withoutContact": sum(1 for p in linhas if not p["contactCount"]),
+        "stale": sum(1 for p in linhas
+                     if p["status"] in ("NOVO", "EM_CONTATO", "QUALIFICADO")
+                     and (p["daysSinceContact"] is None or p["daysSinceContact"] >= 7)),
+    }
 
 
 def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
@@ -9442,6 +10203,20 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     # ── Faróis ────────────────────────────────────────────────────────────────
     # Percentual do mês já decorrido: base para avaliar ritmo em vez de valor cheio.
     farol_thresholds = load_kpi_thresholds(conn, company_id)
+    # Unidades em implantação: carregadas de uma vez para não consultar por linha.
+    # Sem meta, o farol precisa ficar neutro — pintar de vermelho quem ainda nem
+    # inaugurou ensina a equipe a ignorar o painel.
+    competencia_atual = filters.get("competence_end") or filters.get("competence_start") or ""
+    unidades_implantacao = set()
+    for _linha_fase in conn.execute(
+        "SELECT unit_name, phase, goal_exempt_until FROM unit_phases WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        _isento = _linha_fase["goal_exempt_until"]
+        if _linha_fase["phase"] == "IMPLANTACAO" or (
+            _isento and competencia_atual and competencia_atual <= _isento
+        ):
+            unidades_implantacao.add(normalize_unit(_linha_fase["unit_name"]))
     pace_pct = (
         safe_div(summary_calendar["elapsedWorkingDays"], summary_calendar["totalWorkingDays"]) * 100
         if summary_calendar["totalWorkingDays"] else 0.0
@@ -9580,6 +10355,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "score": round(score, 2),
                 "pendingMapping": role is None,
                 "missingGoal": revenue_goal <= 0,
+                "inDeployment": normalize_unit(base_unit) in unidades_implantacao,
                 "metaDiaria": round(daily_goal_value, 2),
                 "sellerWorkingDays": seller_total_days,
                 "sellerElapsedWorkingDays": seller_elapsed_days,
@@ -9809,6 +10585,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     # Executivo mostrava 59% onde o ranking mostrava 26% para a mesma pessoa.
     # Numerador e denominador precisam sair do mesmo lugar.
     summary_discount_pct = round(detail_totals["discountPct"], 2)
+    unidade_filtrada = normalize_unit(filters.get("unit_name"))
+    resumo_em_implantacao = bool(unidade_filtrada and unidade_filtrada in unidades_implantacao)
 
     comparison_previous = {}
     comparison_yoy = {}
@@ -9967,6 +10745,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "marginAverage": round(summary_margin, 2) if summary_margin is not None else None,
             "discountValue": summary_discount_value,
             "discountPct": summary_discount_pct,
+            "inDeployment": resumo_em_implantacao,
             "scoreAverage": score_average,
             "workingDaysTotal": total_days_current,
             "workingDaysElapsed": elapsed_days_current,
@@ -13287,6 +14066,50 @@ class AppHandler(BaseHTTPRequestHandler):
                     "canEdit": can_edit,
                 }))
                 return
+            if path == "/api/prospects":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    competencia = (normalize_whitespace(query.get("competence", [""])[0])
+                                   or crm_latest_competence(conn, user["company_id"])
+                                   or date.today().strftime("%Y-%m"))
+                    escopo = data_scope_for_user(conn, user)
+                    permitidas = crm_allowed_units_for_user(conn, user)
+                    if escopo == "proprio":
+                        minha_unidade = seller_unit_name(
+                            conn, user["company_id"], seller_identity_for_user(user), competencia)
+                    else:
+                        minha_unidade = (permitidas or [""])[0] if permitidas else ""
+                    payload = {
+                        "prospects": list_prospects(
+                            conn, user["company_id"], user,
+                            status=normalize_upper(query.get("status", [""])[0]),
+                            search=normalize_whitespace(query.get("q", [""])[0]),
+                            seller=normalize_whitespace(query.get("seller", [""])[0])),
+                        "funnel": prospect_funnel(conn, user["company_id"], user),
+                        "statuses": PROSPECT_STATUSES,
+                        "triggers": PROSPECT_TRIGGERS,
+                        "metrics": ACTIVITY_METRICS,
+                        "competence": competencia,
+                        "unitName": minha_unidade,
+                        "unitPhase": get_unit_phase(conn, user["company_id"], minha_unidade),
+                        "activity": activity_progress(
+                            conn, user["company_id"], competencia, minha_unidade,
+                            seller_identity_for_user(user) if escopo == "proprio" else ""),
+                        "canManage": escopo != "proprio",
+                        "canSetPhase": user_can_manage_users(conn, user),
+                        "units": permitidas if permitidas is not None else [],
+                        "phases": list_unit_phases(conn, user["company_id"]) if user_can_manage_users(conn, user) else [],
+                        "sellers": ([s["sellerName"] for s in
+                                     sellers_available_for_assignment(conn, user["company_id"], user)]
+                                    if escopo != "proprio" else []),
+                        "myName": seller_identity_for_user(user) if escopo == "proprio" else meeting_person_identity(user),
+                    }
+                self._set_headers(200)
+                self.wfile.write(json_dumps(payload))
+                return
             if path == "/api/help":
                 user = self._require_auth()
                 if not user:
@@ -14478,6 +15301,50 @@ class AppHandler(BaseHTTPRequestHandler):
                             delete_assistant_tip(conn, user["company_id"], user,
                                                  int(payload.get("tipId") or 0))
                             resultado = {}
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
+                return
+            if path in ("/api/prospects/save", "/api/prospects/delete", "/api/prospects/lost",
+                        "/api/prospects/link", "/api/prospects/reconcile",
+                        "/api/prospects/phase", "/api/prospects/activity-goal"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/prospects/save":
+                            resultado = save_prospect(conn, user["company_id"], user, payload)
+                        elif path == "/api/prospects/delete":
+                            delete_prospect(conn, user["company_id"], user, int(payload.get("prospectId") or 0))
+                            resultado = {}
+                        elif path == "/api/prospects/lost":
+                            mark_prospect_lost(conn, user["company_id"], user,
+                                               int(payload.get("prospectId") or 0),
+                                               payload.get("reason") or "")
+                            resultado = {}
+                        elif path == "/api/prospects/link":
+                            resultado = link_prospect_to_client(
+                                conn, user["company_id"], int(payload.get("prospectId") or 0),
+                                normalize_whitespace(payload.get("clientCode")))
+                        elif path == "/api/prospects/reconcile":
+                            if data_scope_for_user(conn, user) == "proprio":
+                                raise PermissionError("Apenas gestão roda a reconciliação.")
+                            vinculados = reconcile_prospects(conn, user["company_id"])
+                            primeiras = refresh_prospect_first_purchases(conn, user["company_id"])
+                            resultado = {"linked": vinculados, "firstPurchases": primeiras}
+                        elif path == "/api/prospects/phase":
+                            resultado = save_unit_phase(conn, user["company_id"], user, payload)
+                        else:
+                            resultado = save_activity_goal(conn, user["company_id"], user, payload)
                 except PermissionError as exc:
                     self._set_headers(403)
                     self.wfile.write(json_dumps({"error": str(exc)}))

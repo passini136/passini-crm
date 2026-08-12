@@ -235,6 +235,20 @@ INDICATOR_GUIDE = {
         ],
         "combinar": "Uma oferta complementar por atendimento, usando a sugestão que o CRM já mostra.",
     },
+    "deployment": {
+        "titulo": "Unidade em implantação — o que cobrar agora",
+        "leitura": "Sem meta de faturamento, o que mede o trabalho é o esforço: ligações feitas, "
+                   "oficinas novas cadastradas e primeiras compras. Faturamento nesta fase é "
+                   "consequência, não indicador de desempenho.",
+        "perguntar": [
+            "Quantas oficinas novas você cadastrou este mês?",
+            "Dos prospects que você qualificou, quantos já compraram a primeira vez?",
+            "Onde está travando: achar a oficina, falar com o dono, ou fechar o cadastro?",
+        ],
+        "combinar": "Um número de esforço por semana — quantas oficinas novas contatadas e quantos "
+                    "cadastros concluídos. Volume agora vira carteira depois; sem volume, a "
+                    "unidade inaugura sem ninguém para vender.",
+    },
     "good_overall": {
         "titulo": "Resultado dentro ou acima do esperado",
         "leitura": "Feedback bom mal dado vira 'está tudo certo' e não ensina nada. "

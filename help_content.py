@@ -330,6 +330,26 @@ FAQ_SEED = [
 
     # ── Clientes e carteira ─────────────────────────────────────────────
     {
+        "category": "dia-a-dia",
+        "question": "Minha unidade é nova e não tem meta. Como sou avaliado?",
+        "answer": "Enquanto a unidade está em implantação, o painel não cobra meta de faturamento — "
+                  "os indicadores aparecem como 'em implantação'. O que vale são as metas de "
+                  "atividade: ligações, oficinas novas cadastradas, cadastros concluídos e "
+                  "primeiras compras. Elas ficam na tela de Prospecção.",
+        "keywords": "unidade nova sem meta implantação como sou avaliado zona norte inauguração",
+        "roles": "",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "Como registro uma oficina que ainda não é cliente?",
+        "answer": "Na tela de Prospecção, use Nova oficina. Anote pelo menos o nome, o telefone e "
+                  "o CNPJ — o CNPJ é o que permite o sistema reconhecer sozinho quando ela for "
+                  "cadastrada no Alfa e levar seu histórico de ligações para a ficha do cliente. "
+                  "Depois é só registrar o contato como você faria com qualquer cliente.",
+        "keywords": "prospect oficina nova sem cadastro cliente novo registrar contato prospecção cnpj",
+        "roles": "",
+    },
+    {
         "category": "clientes",
         "question": "O que significa cliente ativo, pré-inativo e inativo?",
         "answer": "É calculado pelos dias sem compra. Ativo compra dentro do prazo esperado; "
@@ -585,6 +605,17 @@ TIPS_SEED = [
              "custou dinheiro."},
 
     # ── Lembretes ───────────────────────────────────────────────────────
+    {"kind": "DESEMPENHO", "roles": "VENDEDOR", "trigger": "DEPLOYMENT",
+     "title": "Unidade em implantação — seu placar é o esforço",
+     "body": "Aqui ainda não existe meta de faturamento, e isso não quer dizer que não exista alvo. "
+             "O que conta agora é oficina nova contatada, cadastro concluído e primeira compra. "
+             "A carteira que você montar nestes meses é a que vai te sustentar o ano inteiro."},
+    {"kind": "MEC", "roles": "VENDEDOR", "trigger": "DEPLOYMENT",
+     "title": "Anote o CNPJ na primeira ligação",
+     "body": "É o CNPJ que faz o sistema reconhecer sozinho quando a oficina virar cliente — e leva "
+             "todo o seu histórico de prospecção para a ficha dela. Sem CNPJ, o vínculo vira "
+             "trabalho manual e costuma se perder."},
+
     {"kind": "LEMBRETE", "roles": "VENDEDOR", "trigger": "TASKS_OVERDUE",
      "title": "Você tem tarefas atrasadas",
      "body": "Comece por elas. Cliente esperando retorno vencido é o jeito mais rápido de perder "

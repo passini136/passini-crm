@@ -22,6 +22,9 @@ const state = {
   tasks: null,            // tarefas + filtros + contadores
   taskEditor: null,       // nova tarefa de direcionamento
   taskFilters: { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" },
+  prospects: null,        // prospecção e fase da unidade
+  prospectEditor: null,
+  prospectFilters: { status: "", search: "", seller: "" },
   assistant: null,        // tutorial, FAQ e dicas
   helpEditor: null,       // dica/FAQ em edição (diretoria)
   noteEditor: null,       // registro pontual em edição
@@ -59,6 +62,7 @@ const state = {
       feedback: false,
       visits: false,
       visitRoute: false,
+      prospects: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     assistantOpen: false,
@@ -411,9 +415,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "reunioes", "feedback", "calendario"]);
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "reunioes", "feedback", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -526,6 +530,7 @@ async function bootstrap() {
     loadMeetings(true);
     loadFeedback(true);
     loadVisits(true);
+    loadProspects(true);
     // Assistente e tutorial: carregam por último e abrem sozinhos só na
     // primeira entrada daquele perfil.
     loadAssistant(true).then(() => {
@@ -1428,6 +1433,418 @@ function limparRespostaAssistente() {
   const campo = document.getElementById("as-question");
   if (campo) campo.value = "";
   requestRender();
+}
+
+// ─── Prospecção e unidade em implantação ────────────────────────────────────
+//
+// Prospect é oficina que ainda não existe no cadastro do Alfa. O contato dele
+// usa a MESMA tabela de interações dos clientes, com a chave "P-<id>": conta no
+// placar, gera tarefa de retorno e, quando o CNPJ for cadastrado, todo o
+// histórico migra para a ficha do cliente em vez de se perder.
+
+async function loadProspects(silencioso) {
+  const f = state.prospectFilters;
+  const q = new URLSearchParams();
+  if (f.status) q.set("status", f.status);
+  if (f.search) q.set("q", f.search);
+  if (f.seller) q.set("seller", f.seller);
+  if (!silencioso) state.ui.loading.prospects = true;
+  try {
+    state.prospects = await api(`/api/prospects?${q.toString()}`);
+  } catch (e) {
+    state.prospects = { error: e.message, prospects: [], funnel: {}, statuses: [] };
+  } finally {
+    state.ui.loading.prospects = false;
+    requestRender();
+  }
+}
+
+function setProspectStatus(status) {
+  state.prospectFilters.status = state.prospectFilters.status === status ? "" : status;
+  loadProspects();
+}
+
+function applyProspectSearch() {
+  const campo = document.getElementById("prospect-search");
+  state.prospectFilters.search = campo ? campo.value.trim() : "";
+  loadProspects();
+}
+
+function novoProspect() {
+  const p = state.prospects || {};
+  state.prospectEditor = {
+    id: null, companyName: "", tradeName: "", documentNumber: "", phone: "",
+    contactName: "", email: "", cityName: "", neighborhood: "", addressLine: "",
+    origin: "", serviceType: "", carsWeek: "", mainLine: "", payment: "",
+    closingTrigger: "", notes: "",
+    unitName: p.unitName || "", sellerName: p.canManage ? "" : (p.myName || ""),
+    saving: false,
+  };
+  requestRender();
+}
+
+function editarProspect(p) {
+  state.prospectEditor = { ...p, saving: false };
+  requestRender();
+}
+
+function fecharProspectEditor() { state.prospectEditor = null; requestRender(); }
+
+async function salvarProspect() {
+  const p = state.prospectEditor;
+  if (!p) return;
+  if (!p.companyName.trim()) { addMessage("error", "Informe o nome da oficina."); return; }
+  p.saving = true; requestRender();
+  try {
+    const r = await api("/api/prospects/save", { method: "POST", body: JSON.stringify(p) });
+    if (r.duplicated) {
+      addMessage("warn", r.message || "Este CNPJ já está cadastrado como prospect.");
+    } else if (r.converted) {
+      addMessage("success",
+        `Oficina já existe no cadastro como ${r.clientName}. Vinculada — ela já está na carteira.`);
+    } else {
+      addMessage("success", "Oficina registrada.");
+    }
+    state.prospectEditor = null;
+    await loadProspects(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.prospectEditor) state.prospectEditor.saving = false;
+    requestRender();
+  }
+}
+
+async function excluirProspect(prospectId) {
+  if (!confirm("Excluir este prospect? O histórico de contatos dele também some.")) return;
+  try {
+    await api("/api/prospects/delete", { method: "POST", body: JSON.stringify({ prospectId }) });
+    await loadProspects(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function marcarProspectPerdido(prospectId) {
+  const motivo = prompt("Por que este prospect foi perdido?");
+  if (motivo === null) return;
+  try {
+    await api("/api/prospects/lost", { method: "POST", body: JSON.stringify({ prospectId, reason: motivo }) });
+    addMessage("success", "Prospect marcado como perdido.");
+    await loadProspects(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function reconciliarProspects() {
+  try {
+    const r = await api("/api/prospects/reconcile", { method: "POST", body: "{}" });
+    addMessage("success", r.linked
+      ? `${r.linked} prospect(s) viraram cliente e o histórico foi migrado.`
+      : "Nenhum prospect novo encontrado no cadastro.");
+    await loadProspects(true);
+  } catch (e) { addMessage("error", e.message); }
+}
+
+/** Registrar contato em prospect reaproveita o formulário de interação. */
+function contatarProspect(p) {
+  state.crm.interactionForm = {
+    clientKey: p.clientKey,
+    clientCode: p.clientKey,
+    clientName: p.companyName,
+    unitName: p.unitName || "",
+    updatedPhone: p.phone || "",
+    primaryContactName: p.contactName || "",
+    contactNotes: "",
+    contactTypeCode: "LIGACAO",
+    resultCode: "FALOU_CLIENTE",
+    occurredAt: localDateTimeInput(),
+    notes: "",
+    questionUsed: "",
+    hadProgress: false,
+    offerTitle: "",
+    nextAction: "Qualificar com as 4 perguntas e fechar com um gatilho",
+    followupDueAt: "",
+    requestVisit: false, visitReason: "",
+    isProspect: true,
+  };
+  state.activeTab = "crm-interacao";
+  requestRender();
+}
+
+function prospectStatusCfg(status) {
+  return (state.prospects?.statuses || []).find((s) => s.id === status)
+    || { label: status, icon: "•", color: "#5f6368", bg: "#f1f3f4" };
+}
+
+function prospectStatusBadge(status) {
+  const c = prospectStatusCfg(status);
+  return `<span class="status-tag" style="background:${c.bg};color:${c.color}">${c.icon} ${escapeHtml(c.label)}</span>`;
+}
+
+function prospeccaoView() {
+  if (!state.prospects) { loadProspects(); return `<div class="loader panel">Carregando prospecção…</div>`; }
+  if (state.prospects.error) return `<div class="message error">${escapeHtml(state.prospects.error)}</div>`;
+
+  const d = state.prospects;
+  const f = state.prospectFilters;
+  const lista = d.prospects || [];
+  const fun = d.funnel || {};
+  const fase = d.unitPhase || {};
+  const podeGerir = Boolean(d.canManage);
+
+  const kpi = (rotulo, valor, sub, cor) => `
+    <div style="flex:1;min-width:130px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+      <div class="text-small" style="color:var(--muted)">${rotulo}</div>
+      <div style="font-size:22px;font-weight:800;color:${cor || "inherit"}">${valor}</div>
+      ${sub ? `<div class="text-small" style="color:var(--muted)">${sub}</div>` : ""}
+    </div>`;
+
+  return `
+    <div class="stack">
+      ${state.prospectEditor ? prospectEditorModal() : ""}
+
+      ${fase.isDeployment ? `
+        <div class="panel" style="padding:14px 18px;border-left:4px solid #f4c25f">
+          <div style="font-weight:800;font-size:14px">🚧 ${escapeHtml(fase.unitName || "Unidade")} em implantação</div>
+          <div class="text-small" style="margin-top:4px;line-height:1.55">
+            ${fase.openingDate ? `Inauguração prevista para ${shortDate(fase.openingDate)}. ` : ""}
+            Sem meta de faturamento nesta fase — o que mede o trabalho é o esforço de prospecção.
+            A carteira se forma sozinha: cada oficina cadastrada no Alfa vira cliente aqui,
+            levando junto o histórico de ligações.
+          </div>
+        </div>` : ""}
+
+      ${(d.activity || []).some((a) => a.target > 0) ? `
+        <div class="table-card">
+          <div class="section-title">
+            <div><h3>🎯 Metas de atividade — ${escapeHtml(d.competence || "")}</h3>
+              <div class="text-small">Comparadas com o ritmo esperado para o dia do mês, como os faróis.</div></div>
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;padding-top:8px">
+            ${d.activity.filter((a) => a.target > 0).map((a) => `
+              <div style="flex:1;min-width:150px;background:#fff;border:1px solid var(--line);
+                          border-left:3px solid ${a.onTrack === false ? "var(--bad)" : "var(--good)"};
+                          border-radius:0 10px 10px 0;padding:10px 12px">
+                <div class="text-small" style="color:var(--muted)">${a.icon} ${escapeHtml(a.label)}</div>
+                <div style="font-size:20px;font-weight:800;color:${a.onTrack === false ? "var(--bad)" : "var(--good)"}">
+                  ${number(a.actual)}<span style="font-size:13px;font-weight:500;color:var(--muted)"> / ${number(a.target)}</span>
+                </div>
+                <div class="text-small" style="color:var(--muted)">esperado até hoje: ${number(a.expectedToDate)}</div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${kpi("Prospects", number(fun.total || 0), `${number(fun.withoutContact || 0)} sem contato`)}
+        ${kpi("Qualificados", number(fun.byStatus?.QUALIFICADO || 0), "4 perguntas + gatilho", "var(--good)")}
+        ${kpi("Viraram cliente", number(fun.byStatus?.CADASTRADO || 0), `${fun.conversionPct || 0}% de conversão`, "var(--accent)")}
+        ${kpi("Parados há 7+ dias", number(fun.stale || 0), "precisam de retorno",
+              (fun.stale || 0) > 0 ? "var(--bad)" : "")}
+      </div>
+
+      <div class="form-card" style="padding:14px 18px">
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+          <input id="prospect-search" style="flex:1;min-width:200px"
+            placeholder="🔍 Buscar por nome, contato, CNPJ ou cidade — Enter"
+            value="${escapeHtml(f.search)}"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();applyProspectSearch();}" />
+          <button class="btn btn-secondary btn-sm" onclick="applyProspectSearch()">Buscar</button>
+          <button class="btn btn-primary btn-sm" onclick="novoProspect()">＋ Nova oficina</button>
+          ${podeGerir ? `<button class="btn btn-ghost btn-sm" onclick="reconciliarProspects()"
+            title="Procura no cadastro do Alfa os CNPJs dos prospects e vincula quem já foi cadastrado">↻ Buscar cadastros novos</button>` : ""}
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${(d.statuses || []).map((s) => `
+            <button type="button" onclick="setProspectStatus('${s.id}')" title="${escapeHtml(s.hint)}"
+              style="border:1px solid ${f.status === s.id ? s.color : "var(--line)"};
+                     background:${f.status === s.id ? s.bg : "#fff"};
+                     color:${f.status === s.id ? s.color : "var(--muted)"};
+                     border-radius:14px;padding:4px 12px;font-size:12px;
+                     font-weight:${f.status === s.id ? "700" : "500"};cursor:pointer">
+              ${s.icon} ${escapeHtml(s.label)} (${number(fun.byStatus?.[s.id] || 0)})
+            </button>`).join("")}
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Oficinas em prospecção</h3>
+            <div class="text-small">${lista.length} no filtro atual</div></div>
+        </div>
+        <div class="stack" style="padding-top:8px">
+          ${state.ui.loading.prospects ? '<div class="loader">Buscando…</div>' : ""}
+          ${lista.map((p) => prospectCard(p, podeGerir)).join("")
+            || emptyStateCard("Nenhuma oficina aqui ainda. Comece pelo botão Nova oficina.")}
+        </div>
+      </div>
+    </div>`;
+}
+
+function prospectCard(p, podeGerir) {
+  const parado = p.status !== "CADASTRADO" && p.status !== "PERDIDO"
+    && (p.daysSinceContact === null || p.daysSinceContact >= 7);
+  return `
+    <div class="crm-card clean" style="padding:14px;${parado ? "border-left:3px solid #e74c3c" : ""}">
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+        <div style="flex:1;min-width:240px">
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:3px">
+            ${prospectStatusBadge(p.status)}
+            ${p.isQualified ? '<span class="status-tag good">4 perguntas ✓</span>' : ""}
+            ${parado ? `<span class="status-tag bad">${p.daysSinceContact === null ? "Sem contato" : `${p.daysSinceContact} dias parado`}</span>` : ""}
+          </div>
+          <div style="font-weight:700;font-size:14px">${escapeHtml(p.companyName)}</div>
+          <div class="text-small" style="color:var(--muted)">
+            ${p.documentNumber ? escapeHtml(p.documentNumber) : "⚠ sem CNPJ"}
+            ${p.cityName ? ` · ${escapeHtml(p.cityName)}` : ""}
+            ${p.neighborhood ? ` · ${escapeHtml(p.neighborhood)}` : ""}
+            ${podeGerir ? ` · ${escapeHtml(p.sellerName)}` : ""}
+          </div>
+          <div class="text-small">
+            ${p.phone ? `📞 ${escapeHtml(p.phone)}` : "sem telefone"}
+            ${p.contactName ? ` · ${escapeHtml(p.contactName)}` : ""}
+            ${p.contactCount ? ` · ${number(p.contactCount)} contato(s)` : ""}
+          </div>
+          ${p.isQualified ? `
+            <div class="text-small" style="color:var(--muted);margin-top:3px">
+              ${escapeHtml(p.serviceType)} · ${number(p.carsWeek)} carros/semana ·
+              gira ${escapeHtml(p.mainLine)} · paga ${escapeHtml(p.payment)}
+            </div>` : ""}
+          ${p.clientCode ? `
+            <div class="text-small" style="color:var(--good);font-weight:600;margin-top:3px">
+              ✓ Virou cliente ${escapeHtml(p.clientCode)}${p.firstPurchaseAt ? ` · 1ª compra em ${shortDate(p.firstPurchaseAt)}` : " · ainda sem compra"}
+            </div>` : ""}
+          ${p.lostReason ? `<div class="text-small" style="color:var(--bad)">Perdido: ${escapeHtml(p.lostReason)}</div>` : ""}
+        </div>
+        <div style="text-align:right;min-width:130px">
+          ${p.nextTaskAt ? `<div class="text-small" style="color:var(--accent)">retorno ${shortDate(p.nextTaskAt)}</div>` : ""}
+          ${p.lastContactAt ? `<div class="text-small" style="color:var(--muted)">último ${shortDate(p.lastContactAt)}</div>` : ""}
+        </div>
+      </div>
+      <div class="actions" style="gap:6px;margin-top:10px;padding-top:8px;border-top:1px solid var(--line)">
+        ${p.clientCode
+          ? `<button class="btn btn-secondary btn-sm" onclick="openCrmClient('${jsAttr(p.clientCode)}', true)">Abrir ficha do cliente</button>`
+          : `<button class="btn btn-primary btn-sm" onclick='contatarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>📞 Registrar contato</button>`}
+        <button class="btn btn-ghost btn-sm" onclick='editarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>Editar</button>
+        ${p.status !== "CADASTRADO" && p.status !== "PERDIDO"
+          ? `<button class="btn btn-ghost btn-sm" onclick="marcarProspectPerdido(${p.id})">Perdido</button>` : ""}
+        ${podeGerir ? `<button class="btn btn-ghost btn-sm" onclick="excluirProspect(${p.id})">Excluir</button>` : ""}
+      </div>
+    </div>`;
+}
+
+function prospectEditorModal() {
+  const p = state.prospectEditor;
+  const d = state.prospects || {};
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharProspectEditor()">
+      <div class="panel modal-panel" data-keep-scroll="prospect-editor"
+           style="max-width:720px;margin:5vh auto;padding:22px;max-height:90vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${p.id ? "Editar oficina" : "Nova oficina"}</h3>
+            <div class="text-small">Oficina que ainda não está no cadastro do Alfa.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharProspectEditor()">Fechar</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-top:12px">
+          <div class="field"><label>Nome da oficina <span style="color:var(--bad)">*</span></label>
+            <input value="${escapeHtml(p.companyName)}" oninput="state.prospectEditor.companyName=this.value" /></div>
+          <div class="field"><label>Nome fantasia</label>
+            <input value="${escapeHtml(p.tradeName)}" oninput="state.prospectEditor.tradeName=this.value" /></div>
+        </div>
+
+        <div class="field">
+          <label>CNPJ <span style="color:var(--muted);font-weight:400">(o mais importante)</span></label>
+          <input value="${escapeHtml(p.documentNumber)}" oninput="state.prospectEditor.documentNumber=this.value"
+            placeholder="00.000.000/0000-00" />
+          <div class="text-small" style="color:var(--accent)">
+            É o CNPJ que faz o sistema reconhecer sozinho quando a oficina virar cliente e levar
+            todo o seu histórico de ligações para a ficha dela.
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div class="field"><label>Telefone</label>
+            <input value="${escapeHtml(p.phone)}" oninput="state.prospectEditor.phone=this.value" /></div>
+          <div class="field"><label>Contato</label>
+            <input value="${escapeHtml(p.contactName)}" oninput="state.prospectEditor.contactName=this.value"
+              placeholder="Quem decide a compra" /></div>
+          <div class="field"><label>E-mail</label>
+            <input value="${escapeHtml(p.email)}" oninput="state.prospectEditor.email=this.value" /></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:10px">
+          <div class="field"><label>Cidade</label>
+            <input value="${escapeHtml(p.cityName)}" oninput="state.prospectEditor.cityName=this.value" /></div>
+          <div class="field"><label>Bairro</label>
+            <input value="${escapeHtml(p.neighborhood)}" oninput="state.prospectEditor.neighborhood=this.value" /></div>
+          <div class="field"><label>Endereço</label>
+            <input value="${escapeHtml(p.addressLine)}" oninput="state.prospectEditor.addressLine=this.value" /></div>
+        </div>
+
+        ${d.canManage ? `
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+            <div class="field"><label>Vendedor responsável</label>
+              <select onchange="state.prospectEditor.sellerName=this.value">
+                <option value="">Selecione…</option>
+                ${(d.sellers || []).map((s) => `<option value="${escapeHtml(s)}" ${p.sellerName === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
+              </select></div>
+            <div class="field"><label>Unidade</label>
+              <select onchange="state.prospectEditor.unitName=this.value">
+                ${(d.units || []).map((u) => `<option value="${escapeHtml(u)}" ${p.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+              </select></div>
+          </div>` : ""}
+
+        <div class="subtle-card padded-card" style="margin-top:8px">
+          <div class="section-title">
+            <div><h3>As 4 perguntas</h3>
+              <div class="text-small">Preencha durante a ligação. Com as quatro respostas mais um
+                gatilho, o prospect vira <strong>qualificado</strong>.</div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">
+            <div class="field"><label>1. Manutenção rápida ou corretiva pesada?</label>
+              <select onchange="state.prospectEditor.serviceType=this.value">
+                <option value="">—</option>
+                ${["Rápida", "Pesada", "Ambas"].map((o) => `<option ${p.serviceType === o ? "selected" : ""}>${o}</option>`).join("")}
+              </select></div>
+            <div class="field"><label>2. Carros por semana</label>
+              <input type="number" min="0" value="${escapeHtml(String(p.carsWeek ?? ""))}"
+                oninput="state.prospectEditor.carsWeek=this.value" /></div>
+            <div class="field"><label>3. Onde mais gira peças?</label>
+              <select onchange="state.prospectEditor.mainLine=this.value">
+                <option value="">—</option>
+                ${["Suspensão", "Freio", "Motor", "Transmissão", "Direção", "Outra"].map((o) => `<option ${p.mainLine === o ? "selected" : ""}>${o}</option>`).join("")}
+              </select></div>
+            <div class="field"><label>4. Como costuma pagar?</label>
+              <select onchange="state.prospectEditor.payment=this.value">
+                <option value="">—</option>
+                ${["À vista/PIX", "Cartão", "Faturado"].map((o) => `<option ${p.payment === o ? "selected" : ""}>${o}</option>`).join("")}
+              </select></div>
+          </div>
+          <div class="field" style="margin-top:4px">
+            <label>Gatilho de fechamento aceito</label>
+            <select onchange="state.prospectEditor.closingTrigger=this.value">
+              <option value="">Ainda não fechei com nenhum</option>
+              ${(d.triggers || []).map((t) => `<option value="${t.id}" ${p.closingTrigger === t.id ? "selected" : ""}>${escapeHtml(t.label)}</option>`).join("")}
+            </select>
+            <div class="text-small" style="color:var(--muted)">
+              Sem gatilho, a prospecção não conta como válida no funil.
+            </div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-top:8px">
+          <div class="field"><label>Como chegou até ela</label>
+            <input value="${escapeHtml(p.origin)}" oninput="state.prospectEditor.origin=this.value"
+              placeholder="Indicação, rua, lista, internet" /></div>
+          <div class="field"><label>Observações</label>
+            <input value="${escapeHtml(p.notes)}" oninput="state.prospectEditor.notes=this.value" /></div>
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${p.saving ? "disabled" : ""} onclick="salvarProspect()">
+            ${p.saving ? "Salvando…" : "Salvar"}</button>
+          <button class="btn btn-ghost" onclick="fecharProspectEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 function assistantFab() {
@@ -3470,6 +3887,72 @@ function taskQuickRow(row, mostrarPrazo) {
     </div>`;
 }
 
+/**
+ * Fila de prospecção na Missão do Dia.
+ *
+ * Vendedor de unidade nova não tem carteira: a fila normal viria vazia e ele
+ * abriria o sistema todo dia para não ver nada. Aqui a mesma tela mostra as
+ * oficinas que ele está prospectando, com a mesma regra de prioridade — quem
+ * está parado há mais tempo primeiro.
+ */
+function filaProspeccao() {
+  const d = state.prospects;
+  if (!d || d.error) return "";
+  const emImplantacao = Boolean(d.unitPhase?.isDeployment);
+  const abertos = (d.prospects || []).filter(
+    (p) => ["NOVO", "EM_CONTATO", "QUALIFICADO"].includes(p.status));
+  // Só toma a tela de quem realmente precisa: unidade em implantação ou
+  // vendedor sem carteira montada.
+  const semCarteira = !(state.crm.agenda?.top5 || []).length;
+  if (!abertos.length || (!emImplantacao && !semCarteira)) return "";
+
+  const fila = abertos
+    .slice()
+    .sort((a, b) => (b.daysSinceContact ?? 999) - (a.daysSinceContact ?? 999))
+    .slice(0, 5);
+
+  return `
+    <div class="table-card" style="border-left:4px solid #27ae60">
+      <div class="section-title">
+        <div><h3>🌱 Prospecção do dia</h3>
+          <div class="text-small">
+            ${emImplantacao
+              ? "Unidade em implantação — a carteira se forma pelo que você prospectar agora."
+              : "Sua carteira ainda está pequena. Estas são as oficinas para trabalhar hoje."}
+          </div></div>
+        <div class="soft-badge">${abertos.length}</div>
+      </div>
+      <div class="stack" style="padding-top:8px">
+        ${fila.map((p) => `
+          <div class="crm-card clean" style="padding:12px">
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:start">
+              <div style="flex:1;min-width:220px">
+                <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:2px">
+                  ${prospectStatusBadge(p.status)}
+                  ${p.isQualified ? '<span class="status-tag good">4 perguntas ✓</span>' : ""}
+                </div>
+                <div style="font-weight:700;font-size:13px">${escapeHtml(p.companyName)}</div>
+                <div class="text-small" style="color:var(--muted)">
+                  ${p.phone ? `📞 ${escapeHtml(p.phone)}` : "sem telefone"}
+                  ${p.contactName ? ` · ${escapeHtml(p.contactName)}` : ""}
+                  ${p.cityName ? ` · ${escapeHtml(p.cityName)}` : ""}
+                </div>
+                <div class="text-small" style="color:${(p.daysSinceContact ?? 999) >= 7 ? "var(--bad)" : "var(--muted)"}">
+                  ${p.daysSinceContact === null ? "Nunca contatada" : `${p.daysSinceContact} dia(s) sem contato`}
+                  ${!p.documentNumber ? " · ⚠ sem CNPJ" : ""}
+                </div>
+              </div>
+              <button class="btn btn-primary btn-sm"
+                onclick='contatarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>📞 Registrar contato</button>
+            </div>
+          </div>`).join("")}
+      </div>
+      <div class="actions" style="padding-top:8px">
+        <button class="btn btn-ghost btn-sm" onclick="goToTab('prospeccao')">Ver todas as oficinas →</button>
+      </div>
+    </div>`;
+}
+
 function crmAgendaCard(item) {
   const expanded = Boolean(state.ui.crmAgendaExpanded[item.clientKey]);
   return `
@@ -3636,15 +4119,21 @@ function crmAgendaView() {
           </div>
         ` : ""}
 
-        <div>
-          <div class="section-title" style="margin-bottom:12px">
-            <h3>📋 TOP 5 — Contatos do dia</h3>
-            <div class="text-small">2 Bronze/Prata · 2 Ouro/Diamante · 1 prospecção/inativo</div>
-          </div>
-          <div class="stack">
-            ${top5.map((item) => agendaCardV2(item)).join("") || emptyStateCard("Sua fila está vazia. Todos os clientes estão ativos!")}
-          </div>
-        </div>
+        ${filaProspeccao()}
+
+        ${top5.length || !(state.prospects?.unitPhase?.isDeployment) ? `
+          <div>
+            <div class="section-title" style="margin-bottom:12px">
+              <h3>📋 TOP 5 — Contatos do dia</h3>
+              <div class="text-small">2 Bronze/Prata · 2 Ouro/Diamante · 1 prospecção/inativo</div>
+            </div>
+            <div class="stack">
+              ${top5.map((item) => agendaCardV2(item)).join("")
+                || emptyStateCard(state.prospects?.unitPhase?.isDeployment
+                    ? "Sua carteira ainda está sendo formada. Trabalhe a fila de prospecção acima."
+                    : "Sua fila está vazia. Todos os clientes estão ativos!")}
+            </div>
+          </div>` : ""}
 
         ${sellerHomeCards()}
       </div>
@@ -8996,6 +9485,11 @@ async function submitCrmInteraction() {
         hadProgress: form.resultCode === "GEROU_PEDIDO" || form.resultCode === "GEROU_ORCAMENTO",
       }),
     });
+    // Contato em prospect: recarrega para o status e o "dias sem contato"
+    // acompanharem o que acabou de acontecer.
+    if (String(form.clientCode || form.clientKey || "").startsWith("P-")) {
+      loadProspects(true);
+    }
     // Pedido de visita: sai depois da interação porque nasce dela. Se falhar,
     // o contato já está registrado — o vendedor não perde o trabalho.
     if (form.requestVisit) {
@@ -10381,6 +10875,7 @@ function topbarTitle() {
     "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
     "feedback":       { title: "Feedback e PDI",         description: "Feedback mensal com base no MEC, plano de desenvolvimento e ciência." },
     "visitas":        { title: "Visitas",                description: "Roteiro sugerido, registro da visita e efeito no faturamento." },
+    "prospeccao":     { title: "Prospecção",             description: "Oficinas que ainda não são clientes, qualificação e conversão." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
@@ -10625,6 +11120,7 @@ function dashboardView() {
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
+    { id: "prospeccao",    title: "Prospecção",       desc: "Oficinas novas",           icon: "🌱" },
     { id: "visitas",       title: "Visitas",          desc: "Roteiro e resultado",      icon: "🗺️",
       // Só o gestor tem o que responder. Para o vendedor, pedido pendente é
       // espera, não pendência — contador vermelho ali só geraria ansiedade.
@@ -10753,6 +11249,7 @@ function dashboardView() {
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "visitas"       ? visitasView()        : ""}
+          ${state.activeTab === "prospeccao"    ? prospeccaoView()     : ""}
           ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
