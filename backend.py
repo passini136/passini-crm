@@ -12557,6 +12557,60 @@ def import_city_mappings_csv(conn: sqlite3.Connection, company_id: int, user_id:
     return {"updated": updated, "resolved": resolved}
 
 
+def save_person_record(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Cadastra ou atualiza uma pessoa com função e unidade explícitas.
+
+    O ajuste antigo só mexia na unidade e ADIVINHAVA a função pelo sufixo do
+    nome — "(VENDAS)" virava Vendedor, o resto virava "Outro". Funciona para
+    quem já apareceu no faturamento, mas não para o vendedor de uma unidade que
+    ainda não vendeu nada: ele entrava classificado errado e sumia das listas
+    de equipe, meta e feedback.
+    """
+    nome = normalize_whitespace(payload.get("personName"))
+    if not nome:
+        raise ValueError("Informe o nome da pessoa.")
+    unidade = normalize_unit(payload.get("baseUnit"))
+    if not unidade:
+        raise ValueError("Informe a unidade.")
+    funcao = normalize_whitespace(payload.get("roleClassification")) or "Vendedor"
+    if funcao not in {"Vendedor", "Gerente", "Outro"}:
+        funcao = "Vendedor"
+    inicio = normalize_whitespace(payload.get("validFrom")) or today_in_brazil().isoformat()
+
+    existente = conn.execute(
+        "SELECT COUNT(*) n FROM people_records WHERE company_id = ? AND person_name = ?",
+        (company_id, nome),
+    ).fetchone()["n"]
+
+    if existente:
+        conn.execute(
+            "UPDATE people_records SET base_unit = ?, role_classification = ? "
+            "WHERE company_id = ? AND person_name = ?",
+            (unidade, funcao, company_id, nome),
+        )
+        acao = "atualizada"
+    else:
+        conn.execute(
+            """
+            INSERT INTO people_records
+                (company_id, person_name, role_classification, base_unit, valid_from, valid_to,
+                 source, is_active, created_at)
+            VALUES (?,?,?,?,?,?, 'cadastro_manual', 1, ?)
+            """,
+            (company_id, nome, funcao, unidade, inicio, None, now_iso()),
+        )
+        acao = "cadastrada"
+
+    audit_log(conn, company_id, user_id, "salvar", "people_records", nome,
+              {"funcao": funcao, "unidade": unidade})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": f"{nome} {acao} como {funcao} na unidade {unidade}.",
+            "personName": nome, "roleClassification": funcao, "baseUnit": unidade}
+
+
 def update_person_unit(conn: sqlite3.Connection, company_id: int, user_id: int, person_name: str | None, base_unit: str | None) -> str:
     """Corrige a unidade de um vendedor/pessoa. Aplica a todos os registros da pessoa
     (fica consistente entre competencias). Cria o registro se ainda nao existir."""
@@ -15783,6 +15837,25 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/people/save":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Perfil sem acesso."}))
+                            return
+                        resultado = save_person_record(conn, user["company_id"], user["id"], payload)
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path == "/api/admin/people/update-unit":
                 user = self._require_auth()

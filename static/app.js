@@ -10232,6 +10232,32 @@ function adminEditorCards() {
   return `
     <div class="grid-2">
       <div class="form-card">
+        <div class="section-title">
+          <div><h3>Cadastrar pessoa</h3>
+            <div class="text-small">Para quem ainda não apareceu no faturamento — vendedor de
+              unidade nova, por exemplo. Aqui a função é definida, não adivinhada pelo nome.</div></div>
+        </div>
+        <div class="two-column-form">
+          <div class="field"><label>Nome completo</label>
+            <input id="new-person-name" placeholder="Como aparece (ou vai aparecer) no faturamento" /></div>
+          <div class="field"><label>Função</label>
+            <select id="new-person-role">
+              <option value="Vendedor">Vendedor</option>
+              <option value="Gerente">Gerente</option>
+              <option value="Outro">Outro (não entra em metas nem ranking)</option>
+            </select></div>
+          <div class="field"><label>Unidade</label><select id="new-person-unit">${unitOptions}</select></div>
+          <div class="field"><label>Válido a partir de</label>
+            <input type="date" id="new-person-from" value="${dateInDays(0)}" /></div>
+        </div>
+        <div class="actions"><button class="btn btn-primary" onclick="submitNewPerson()">Cadastrar pessoa</button></div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Dica: use exatamente o nome que virá do Alfa quando ele começar a faturar — assim o
+          histórico dele não fica dividido em dois cadastros.
+        </div>
+      </div>
+
+      <div class="form-card">
         <div class="section-title"><div><h3>Ajustar vendedor × unidade</h3><div class="text-small">Busque o vendedor pelo nome e defina a unidade correta.</div></div></div>
         <div class="two-column-form">
           <div class="field"><label>Vendedor</label><input id="edit-seller-name" list="sellers-datalist" placeholder="Digite o nome" /></div>
@@ -11744,6 +11770,25 @@ async function submitAdminImport() {
   } catch (error) {
     addMessage("error", error.message);
   }
+}
+
+async function submitNewPerson() {
+  const nome = document.getElementById("new-person-name")?.value?.trim();
+  const funcao = document.getElementById("new-person-role")?.value;
+  const unidade = document.getElementById("new-person-unit")?.value;
+  const inicio = document.getElementById("new-person-from")?.value;
+  if (!nome || !unidade) { addMessage("error", "Informe o nome e a unidade."); return; }
+  try {
+    const r = await api("/api/admin/people/save", {
+      method: "POST",
+      body: JSON.stringify({ personName: nome, roleClassification: funcao,
+                             baseUnit: unidade, validFrom: inicio }),
+    });
+    addMessage("success", r.message || "Pessoa cadastrada.");
+    document.getElementById("new-person-name").value = "";
+    await loadAdmin();
+    loadProspects(true);
+  } catch (e) { addMessage("error", e.message); }
 }
 
 async function submitPersonUnit() {
