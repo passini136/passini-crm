@@ -632,8 +632,26 @@ def strip_accents(value: str | None) -> str:
     return "".join(char for char in unicodedata.normalize("NFKD", text) if not unicodedata.combining(char))
 
 
+# Chave de prospect: "P-12". O hífen É significativo e precisa sobreviver à
+# normalização — ver o comentário em normalize_client_key.
+PROSPECT_KEY_RE = re.compile(r"^P[\s-]*(\d+)$")
+
+
 def normalize_client_key(value: str | None) -> str:
-    text = strip_accents(value).upper()
+    """Chave do cliente, tolerante à bagunça do cadastro.
+
+    A limpeza troca qualquer pontuação por espaço — e isso quebrava os
+    prospects: "P-1" virava "P 1" na gravação da interação, enquanto a tela
+    continuava procurando "P-1". O contato existia, órfão, e a oficina ficava
+    "nunca contatada" para sempre, no vendedor e no gerente.
+
+    O caso do prospect é tratado ANTES da limpeza e devolve a forma canônica,
+    o que também conserta as linhas gravadas erradas quando forem lidas.
+    """
+    text = strip_accents(value).upper().strip()
+    prospect = PROSPECT_KEY_RE.match(text)
+    if prospect:
+        return f"P-{int(prospect.group(1))}"
     text = re.sub(r"[^A-Z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -2396,6 +2414,7 @@ def init_db() -> None:
         backfill_meeting_participant_users(conn, company_id)
         seed_help_content(conn, company_id)
         seed_territory_mappings(conn, company_id)
+        repair_prospect_keys(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -7642,6 +7661,37 @@ def only_digits(value: Any) -> str:
     return re.sub(r"\D", "", str(value or ""))
 
 
+def repair_prospect_keys(conn: sqlite3.Connection, company_id: int) -> None:
+    """Conserta interações e tarefas gravadas com "P 1" em vez de "P-1".
+
+    A normalização antiga trocava o hífen por espaço, então todo contato feito
+    em prospect virava órfão: a oficina continuava "nunca contatada" e a fila da
+    Missão do Dia nunca esvaziava. Roda uma vez, na subida.
+    """
+    total = 0
+    for tabela in ("crm_interactions", "crm_tasks"):
+        linhas = conn.execute(
+            f"SELECT id, client_key FROM {tabela} "
+            f"WHERE company_id = ? AND client_key GLOB 'P [0-9]*'",
+            (company_id,),
+        ).fetchall()
+        for linha in linhas:
+            corrigida = normalize_client_key(linha["client_key"])
+            if corrigida != linha["client_key"]:
+                conn.execute(f"UPDATE {tabela} SET client_key = ? WHERE id = ?",
+                             (corrigida, linha["id"]))
+                total += 1
+    if total:
+        conn.commit()
+        print(f"[prospects] {total} registro(s) religado(s) ao prospect correto")
+        for row in conn.execute(
+            "SELECT id FROM prospects WHERE company_id = ? AND status NOT IN ('CADASTRADO','PERDIDO')",
+            (company_id,),
+        ).fetchall():
+            _refresh_prospect_status(conn, company_id, int(row["id"]))
+        conn.commit()
+
+
 def prospect_client_key(prospect_id: int) -> str:
     """Chave usada nas interações e tarefas de um prospect.
 
@@ -10095,6 +10145,15 @@ def create_crm_interaction(
         ),
     )
     interaction_id = cursor.lastrowid
+
+    # Contato em prospect: o status é derivado do que aconteceu, então precisa
+    # ser recalculado aqui. Antes só era recalculado ao SALVAR o prospect — por
+    # isso a oficina seguia "a contatar" mesmo depois da ligação registrada.
+    if client_key.startswith(PROSPECT_KEY_PREFIX):
+        try:
+            _refresh_prospect_status(conn, company_id, int(client_key[len(PROSPECT_KEY_PREFIX):]))
+        except (ValueError, sqlite3.Error) as exc:
+            print(f"[prospects] status não atualizado para {client_key}: {exc}", flush=True)
 
     # Registrar o contato encerra as tarefas abertas daquele cliente para aquele
     # vendedor. Sem isso o retorno continuava aparecendo em "Retornos de hoje"
