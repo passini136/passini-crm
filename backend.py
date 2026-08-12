@@ -9234,6 +9234,63 @@ def crm_agenda_action_map(
     return {row["client_key"]: dict(row) for row in rows}
 
 
+# Rodízio da fila: ritmo diário assumido e limites da janela de descanso.
+ROTATION_DAILY_TARGET = 5      # os 5 contatos prioritários do dia
+ROTATION_MIN_DAYS = 7          # nunca voltar no mesmo dia nem na mesma semana
+ROTATION_MAX_DAYS = 90         # carteira gigante não pode congelar o cliente
+
+
+def last_active_contact_map(
+    conn: sqlite3.Connection, company_id: int, seller_name: str = ""
+) -> dict[str, str]:
+    """Data do último contato ATIVO por cliente.
+
+    Só o ativo conta: registro receptivo é o cliente que ligou, e isso não
+    significa que o vendedor trabalhou a carteira. Sem essa distinção bastaria
+    anotar o que chegou sozinho para o cliente sumir da fila.
+    """
+    if seller_name:
+        linhas = conn.execute(
+            """SELECT client_key, MAX(occurred_at) AS u FROM crm_interactions
+               WHERE company_id = ? AND UPPER(seller_name) = ? AND initiative = 'ATIVO'
+               GROUP BY client_key""",
+            (company_id, normalize_upper(seller_name)),
+        ).fetchall()
+    else:
+        linhas = conn.execute(
+            """SELECT client_key, MAX(occurred_at) AS u FROM crm_interactions
+               WHERE company_id = ? AND initiative = 'ATIVO'
+               GROUP BY client_key""",
+            (company_id,),
+        ).fetchall()
+    return {normalize_client_key(r["client_key"]): r["u"] for r in linhas if r["u"]}
+
+
+def rotation_window_days(rows: list[dict[str, Any]]) -> int:
+    """Quantos dias um cliente descansa depois de contatado.
+
+    A janela não é um número fixo: é o tempo que a carteira PRIORITÁRIA leva
+    para girar inteira no ritmo de 5 contatos por dia. Carteira de 100 clientes
+    prioritários gira em 20 dias; de 400, em 80. Assim "só volta depois que
+    todos rodarem" vira consequência da conta, não uma regra arbitrária que
+    envelhece quando a carteira muda de tamanho.
+    """
+    prioritarios = sum(1 for r in rows
+                       if r.get("primaryReasonCode") in CRM_PRIORITY_ORDER)
+    base = prioritarios or len(rows)
+    if not base:
+        return ROTATION_MIN_DAYS
+    dias = math.ceil(base / ROTATION_DAILY_TARGET)
+    return max(ROTATION_MIN_DAYS, min(dias, ROTATION_MAX_DAYS))
+
+
+def days_since(valor: str | None, referencia: date | None = None) -> int | None:
+    dt = parse_datetime_flexible((valor or "")[:10])
+    if not dt:
+        return None
+    return ((referencia or today_in_brazil()) - dt.date()).days
+
+
 def crm_priority_sort_key(summary: dict[str, Any]) -> tuple[Any, ...]:
     code = summary["primaryReasonCode"]
     priority_index = CRM_PRIORITY_ORDER.index(code) if code in CRM_PRIORITY_ORDER else len(CRM_PRIORITY_ORDER)
@@ -9254,6 +9311,7 @@ def list_crm_clients(
     limit: int | None = None,
     attach_context: bool = True,
     exclude_contacted_today: bool = False,
+    stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     seller_name = normalize_whitespace(filters.get("seller_name"))
     rows = crm_base_client_rows_cached(conn, company_id, filters)
@@ -9266,26 +9324,16 @@ def list_crm_clients(
     #     um contato feito às 21h30 virava "amanhã" e nunca casava com hoje.
     #  3. Sem vendedor no filtro (visão do gerente) a exclusão simplesmente não
     #     rodava. Agora considera o contato de QUALQUER vendedor do escopo.
-    contacted_today: set[str] = set()
+    ultimo_contato: dict[str, str] = {}
+    janela = 0
     if exclude_contacted_today:
-        today_str = today_in_brazil().isoformat()
-        if seller_name:
-            rows_today = conn.execute(
-                """SELECT DISTINCT client_key FROM crm_interactions
-                   WHERE company_id = ? AND UPPER(seller_name) = ?
-                     AND date(substr(replace(occurred_at, 'T', ' '), 1, 10)) = date(?)""",
-                (company_id, normalize_upper(seller_name), today_str),
-            ).fetchall()
-        else:
-            rows_today = conn.execute(
-                """SELECT DISTINCT client_key FROM crm_interactions
-                   WHERE company_id = ?
-                     AND date(substr(replace(occurred_at, 'T', ' '), 1, 10)) = date(?)""",
-                (company_id, today_str),
-            ).fetchall()
-        contacted_today = {normalize_client_key(r["client_key"]) for r in rows_today}
+        ultimo_contato = last_active_contact_map(conn, company_id, seller_name)
+        janela = rotation_window_days(rows)
+
     visible_rows: list[dict[str, Any]] = []
+    adiados: list[dict[str, Any]] = []
     now_dt = datetime.now()
+    hoje = today_in_brazil()
     for row in rows:
         action = action_map.get(row["clientKey"])
         row["agendaAction"] = action
@@ -9293,10 +9341,48 @@ def list_crm_clients(
             next_visible_at = parse_datetime_flexible(action.get("next_visible_at"))
             if next_visible_at and next_visible_at > now_dt:
                 continue
-        if normalize_client_key(row["clientKey"]) in contacted_today:
-            continue
+        chave = normalize_client_key(row["clientKey"])
+        row["lastActiveContactAt"] = ultimo_contato.get(chave, "")
+        if exclude_contacted_today and row["lastActiveContactAt"]:
+            dias = days_since(row["lastActiveContactAt"], hoje)
+            row["daysSinceActiveContact"] = dias
+            if dias is not None and dias < janela:
+                # Já foi trabalhado neste ciclo. Guarda de lado: se a fila
+                # inteira estiver nesta situação, ele volta como reciclado.
+                adiados.append(row)
+                continue
         visible_rows.append(row)
-    visible_rows.sort(key=crm_priority_sort_key)
+
+    # Fila esgotada = todo mundo já rodou. Em vez de deixar a tela vazia (e o
+    # vendedor sem o que fazer), recomeça o ciclo pelos contatados há mais tempo.
+    reciclado = False
+    if exclude_contacted_today and not visible_rows and adiados:
+        adiados.sort(key=lambda r: r.get("lastActiveContactAt") or "")
+        visible_rows = adiados
+        reciclado = True
+        for row in visible_rows:
+            row["recycled"] = True
+
+    if exclude_contacted_today:
+        # Dentro da mesma prioridade e classe, quem está há mais tempo sem
+        # contato vem primeiro — nunca contatado antes de todos. É o que faz a
+        # carteira girar inteira em vez de orbitar os mesmos nomes.
+        #
+        # A data entra ANTES do resto do critério de prioridade: deixá-la no
+        # fim fazia o nome do cliente decidir a ordem, e a fila voltava a ser
+        # sempre a mesma em ordem alfabética.
+        def chave_rodizio(r: dict[str, Any]) -> tuple[Any, ...]:
+            base = crm_priority_sort_key(r)
+            return (base[0], base[1], r.get("lastActiveContactAt") or "", *base[2:])
+
+        visible_rows.sort(key=chave_rodizio)
+    else:
+        visible_rows.sort(key=crm_priority_sort_key)
+
+    if stats is not None:
+        stats.update({"cycleDays": janela, "recycled": reciclado,
+                      "restingCount": len(adiados) if not reciclado else 0,
+                      "eligibleCount": len(visible_rows)})
     if limit is not None:
         visible_rows = visible_rows[:limit]
     attach_engagement_markers(conn, company_id, visible_rows)
@@ -15325,9 +15411,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 limit = max(1, min(int(query.get("limit", ["20"])[0]), 50))
+                estatisticas: dict[str, Any] = {}
                 with closing(get_connection()) as conn:
                     filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
-                    clients = list_crm_clients(conn, user["company_id"], filters, limit, exclude_contacted_today=True)
+                    clients = list_crm_clients(conn, user["company_id"], filters, limit,
+                                               exclude_contacted_today=True, stats=estatisticas)
                 self._set_headers(200)
                 self.wfile.write(
                     json_dumps(
@@ -15335,6 +15423,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             "top5": clients[:5],
                             "extended": clients[5:limit],
                             "total": len(clients),
+                            "rotation": estatisticas,
                         }
                     )
                 )

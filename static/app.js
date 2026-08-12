@@ -152,7 +152,7 @@ const state = {
   crm: {
     options: { contactTypes: [], contactResults: [] },
     summary: null,
-    agenda: { top5: [], extended: [], total: 0 },
+    agenda: { top5: [], extended: [], total: 0, rotation: null },
     clients: [],
     crmClientFilters: {
       status: "",
@@ -4433,6 +4433,24 @@ function contatosView() {
   `;
 }
 
+/** Explica o rodízio: por que o cliente contatado sumiu e quando ele volta. */
+function rodizioAviso() {
+  const r = state.crm.agenda?.rotation;
+  if (!r || !r.cycleDays) return "";
+  if (r.recycled) {
+    return `<div class="text-small" style="margin-bottom:10px;padding:10px 12px;border-radius:8px;
+         background:#eef7ee;border:1px solid #cfe3cf;color:#2f6d33">
+      <strong>Carteira inteira trabalhada.</strong> Todo mundo já foi contatado neste ciclo —
+      a fila recomeça pelos que estão há mais tempo sem contato.
+    </div>`;
+  }
+  if (!r.restingCount) return "";
+  return `<div class="text-small" style="margin-bottom:10px;color:var(--muted)">
+      ${number(r.restingCount)} cliente(s) em descanso: já foram contatados neste ciclo e voltam
+      depois que a carteira girar, em até ${number(r.cycleDays)} dias.
+    </div>`;
+}
+
 function goToTab(tab) {
   state.activeTab = tab;
   requestRender();
@@ -4702,6 +4720,7 @@ function crmAgendaView() {
               <h3>📋 TOP 5 — Contatos do dia</h3>
               <div class="text-small">2 Bronze/Prata · 2 Ouro/Diamante · 1 prospecção/inativo</div>
             </div>
+            ${rodizioAviso()}
             <div class="stack">
               ${top5.map((item) => agendaCardV2(item)).join("")
                 || emptyStateCard(state.prospects?.unitPhase?.isDeployment
