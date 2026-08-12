@@ -25,6 +25,8 @@ const state = {
   prospects: null,        // prospecção e fase da unidade
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
+  phaseEditor: null,           // fase da unidade (diretoria)
+  activityGoalEditor: null,    // metas de atividade
   assistant: null,        // tutorial, FAQ e dicas
   helpEditor: null,       // dica/FAQ em edição (diretoria)
   noteEditor: null,       // registro pontual em edição
@@ -1578,6 +1580,250 @@ function prospectStatusBadge(status) {
   return `<span class="status-tag" style="background:${c.bg};color:${c.color}">${c.icon} ${escapeHtml(c.label)}</span>`;
 }
 
+// ─── Configuração da fase e das metas de atividade ──────────────────────────
+//
+// Fica dentro da própria tela de Prospecção, e não em Configurações, porque é
+// aqui que a decisão faz sentido: quem abre esta tela está olhando a unidade
+// nova. Só aparece para quem pode gerenciar usuários.
+
+function abrirConfigFase(unidade) {
+  const d = state.prospects || {};
+  const atual = (d.phases || []).find((p) => p.unitName === unidade) || {};
+  state.phaseEditor = {
+    unitName: unidade || d.unitName || "",
+    phase: atual.phase || "IMPLANTACAO",
+    openingDate: atual.openingDate || "",
+    goalExemptUntil: atual.goalExemptUntil || "",
+    notes: atual.notes || "",
+    saving: false,
+  };
+  requestRender();
+}
+
+function fecharConfigFase() { state.phaseEditor = null; requestRender(); }
+
+async function salvarConfigFase() {
+  const f = state.phaseEditor;
+  if (!f) return;
+  if (!f.unitName) { addMessage("error", "Selecione a unidade."); return; }
+  f.saving = true; requestRender();
+  try {
+    await api("/api/prospects/phase", { method: "POST", body: JSON.stringify(f) });
+    addMessage("success", f.phase === "IMPLANTACAO"
+      ? `${f.unitName} marcada como em implantação.`
+      : `${f.unitName} voltou para operação normal.`);
+    state.phaseEditor = null;
+    await loadProspects(true);
+    loadDashboard();
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.phaseEditor) state.phaseEditor.saving = false;
+    requestRender();
+  }
+}
+
+function abrirMetasAtividade() {
+  const d = state.prospects || {};
+  const atuais = {};
+  (d.activity || []).forEach((a) => { atuais[a.id] = a.target || ""; });
+  state.activityGoalEditor = {
+    competence: d.competence || "",
+    unitName: d.unitName || (d.units || [])[0] || "",
+    sellerName: "",
+    targets: atuais,
+    saving: false,
+  };
+  requestRender();
+}
+
+function fecharMetasAtividade() { state.activityGoalEditor = null; requestRender(); }
+
+async function salvarMetasAtividade() {
+  const g = state.activityGoalEditor;
+  if (!g) return;
+  if (!g.unitName || !g.competence) { addMessage("error", "Informe unidade e competência."); return; }
+  g.saving = true; requestRender();
+  try {
+    // Uma chamada por indicador: o backend guarda cada meta separadamente,
+    // o que permite meta de unidade e meta individual convivendo.
+    const metricas = (state.prospects?.metrics || []).map((m) => m.id);
+    for (const metric of metricas) {
+      await api("/api/prospects/activity-goal", {
+        method: "POST",
+        body: JSON.stringify({
+          competence: g.competence, unitName: g.unitName,
+          sellerName: g.sellerName || "", metric,
+          target: Number(g.targets[metric] || 0),
+        }),
+      });
+    }
+    addMessage("success", "Metas de atividade salvas.");
+    state.activityGoalEditor = null;
+    await loadProspects(true);
+  } catch (e) {
+    addMessage("error", e.message);
+    if (state.activityGoalEditor) state.activityGoalEditor.saving = false;
+    requestRender();
+  }
+}
+
+function configFaseModal() {
+  const f = state.phaseEditor;
+  if (!f) return "";
+  const d = state.prospects || {};
+  const unidades = (state.options.units || []).length ? state.options.units : (d.units || []);
+  const competencias = state.options.competences || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharConfigFase()">
+      <div class="panel modal-panel" style="max-width:600px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>🚧 Fase da unidade</h3>
+            <div class="text-small">Define se a unidade é cobrada por meta de faturamento.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharConfigFase()">Fechar</button>
+        </div>
+
+        <div class="field" style="margin-top:12px"><label>Unidade</label>
+          <select onchange="abrirConfigFase(this.value)">
+            <option value="">Selecione…</option>
+            ${unidades.map((u) => `<option value="${escapeHtml(u)}" ${f.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+          </select></div>
+
+        <div class="field"><label>Situação</label>
+          <select onchange="state.phaseEditor.phase=this.value;requestRender()">
+            <option value="IMPLANTACAO" ${f.phase === "IMPLANTACAO" ? "selected" : ""}>Em implantação — sem meta de faturamento</option>
+            <option value="OPERACAO" ${f.phase === "OPERACAO" ? "selected" : ""}>Operação normal — com meta</option>
+          </select></div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <div class="field"><label>Data de inauguração</label>
+            <input type="date" value="${escapeHtml(f.openingDate)}"
+              oninput="state.phaseEditor.openingDate=this.value" /></div>
+          <div class="field"><label>Isenta de meta até</label>
+            <select onchange="state.phaseEditor.goalExemptUntil=this.value">
+              <option value="">Não usar</option>
+              ${competencias.map((c) => `<option value="${escapeHtml(c)}" ${f.goalExemptUntil === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+              ${["2026-08","2026-09","2026-10","2026-11","2026-12"].filter((c) => !competencias.includes(c))
+                .map((c) => `<option value="${escapeHtml(c)}" ${f.goalExemptUntil === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select></div>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:-4px">
+          A isenção continua valendo depois da inauguração. Para a Zona Norte: inaugura em agosto,
+          isenta até <strong>2026-12</strong>, e a meta entra em 2027.
+        </div>
+
+        <div class="field" style="margin-top:8px"><label>Observação</label>
+          <input value="${escapeHtml(f.notes)}" oninput="state.phaseEditor.notes=this.value"
+            placeholder="Ex.: inaugura 24/08, meta formal só em 2027" /></div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${f.saving ? "disabled" : ""} onclick="salvarConfigFase()">
+            ${f.saving ? "Salvando…" : "Salvar"}</button>
+          <button class="btn btn-ghost" onclick="fecharConfigFase()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function metasAtividadeModal() {
+  const g = state.activityGoalEditor;
+  if (!g) return "";
+  const d = state.prospects || {};
+  const unidades = (state.options.units || []).length ? state.options.units : (d.units || []);
+  const competencias = state.options.competences || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharMetasAtividade()">
+      <div class="panel modal-panel" style="max-width:620px;margin:7vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>🎯 Metas de atividade</h3>
+            <div class="text-small">O alvo de quem ainda não tem meta de faturamento.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharMetasAtividade()">Fechar</button>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:12px">
+          <div class="field"><label>Competência</label>
+            <select onchange="state.activityGoalEditor.competence=this.value">
+              ${competencias.map((c) => `<option value="${escapeHtml(c)}" ${g.competence === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Unidade</label>
+            <select onchange="state.activityGoalEditor.unitName=this.value">
+              ${unidades.map((u) => `<option value="${escapeHtml(u)}" ${g.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Vendedor</label>
+            <select onchange="state.activityGoalEditor.sellerName=this.value">
+              <option value="">Meta da unidade</option>
+              ${(d.sellers || []).map((s) => `<option value="${escapeHtml(s)}" ${g.sellerName === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
+            </select></div>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:-4px">
+          Deixe em "Meta da unidade" para valer para a equipe toda, ou escolha um vendedor
+          para definir o alvo individual dele.
+        </div>
+
+        <div class="subtle-card padded-card" style="margin-top:12px">
+          ${(d.metrics || []).map((m) => `
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;
+                        padding:8px 0;border-bottom:1px solid var(--line)">
+              <div style="flex:1">
+                <div style="font-weight:700;font-size:13px">${m.icon} ${escapeHtml(m.label)}</div>
+                <div class="text-small" style="color:var(--muted)">${escapeHtml(m.hint)}</div>
+              </div>
+              <input type="number" min="0" style="width:110px" value="${escapeHtml(String(g.targets[m.id] ?? ""))}"
+                oninput="state.activityGoalEditor.targets['${m.id}']=this.value" placeholder="0" />
+            </div>`).join("")}
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:6px">
+          Deixe em 0 o que não quiser acompanhar — indicador sem meta não aparece no painel.
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${g.saving ? "disabled" : ""} onclick="salvarMetasAtividade()">
+            ${g.saving ? "Salvando…" : "Salvar metas"}</button>
+          <button class="btn btn-ghost" onclick="fecharMetasAtividade()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function blocoConfiguracaoUnidade() {
+  const d = state.prospects || {};
+  if (!d.canSetPhase) return "";
+  const fases = d.phases || [];
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div><h3>⚙️ Configuração de unidade nova</h3>
+          <div class="text-small">Fase e metas de atividade. Visível apenas para a diretoria.</div></div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-secondary btn-sm" onclick="abrirConfigFase('')">🚧 Fase da unidade</button>
+          <button class="btn btn-secondary btn-sm" onclick="abrirMetasAtividade()">🎯 Metas de atividade</button>
+        </div>
+      </div>
+      ${fases.length ? `
+        <div class="stack" style="padding-top:8px">
+          ${fases.map((p) => `
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center;
+                        font-size:13px;padding:8px 10px;background:#f8f9fa;border-radius:6px">
+              <div>
+                <strong>${escapeHtml(p.unitName)}</strong>
+                <span class="status-tag" style="margin-left:6px;background:${p.isDeployment ? "#fef7e0" : "#e6f4ea"};
+                      color:${p.isDeployment ? "#b06000" : "#1e8e3e"}">
+                  ${p.isDeployment ? "Em implantação" : "Operação"}
+                </span>
+                <div class="text-small" style="color:var(--muted)">
+                  ${p.openingDate ? `inaugura ${shortDate(p.openingDate)}` : "sem data de inauguração"}
+                  ${p.goalExemptUntil ? ` · isenta de meta até ${escapeHtml(p.goalExemptUntil)}` : ""}
+                  ${p.notes ? ` · ${escapeHtml(p.notes)}` : ""}
+                </div>
+              </div>
+              <button class="btn btn-ghost btn-sm" onclick="abrirConfigFase('${jsAttr(p.unitName)}')">Editar</button>
+            </div>`).join("")}
+        </div>`
+      : `<div class="text-small" style="color:var(--muted);padding-top:8px">
+           Nenhuma unidade configurada. Toda unidade sem configuração é tratada como operação normal, com meta.
+         </div>`}
+    </div>`;
+}
+
 function prospeccaoView() {
   if (!state.prospects) { loadProspects(); return `<div class="loader panel">Carregando prospecção…</div>`; }
   if (state.prospects.error) return `<div class="message error">${escapeHtml(state.prospects.error)}</div>`;
@@ -1599,6 +1845,10 @@ function prospeccaoView() {
   return `
     <div class="stack">
       ${state.prospectEditor ? prospectEditorModal() : ""}
+      ${configFaseModal()}
+      ${metasAtividadeModal()}
+
+      ${blocoConfiguracaoUnidade()}
 
       ${fase.isDeployment ? `
         <div class="panel" style="padding:14px 18px;border-left:4px solid #f4c25f">
