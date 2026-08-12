@@ -784,6 +784,33 @@ async function runCrmClientSearch() {
   await loadCrmClients({ reason: "filter-change" });
 }
 
+/** "2026-07" → "jul/26". Cabeçalho de planilha não comporta "2026-07". */
+function competenceLabel(competencia) {
+  const partes = String(competencia || "").split("-");
+  if (partes.length < 2) return String(competencia || "");
+  const mes = MONTH_ABBR[Number(partes[1]) - 1] || partes[1];
+  return `${mes}/${partes[0].slice(2)}`;
+}
+
+/** Valor curto para caber no cabeçalho: R$ 1,2 mi / R$ 345,6 mil. */
+function shortMoneyHeader(valor) {
+  const n = Number(valor || 0);
+  if (Math.abs(n) >= 1e6) return `R$ ${(n / 1e6).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mi`;
+  if (Math.abs(n) >= 1e3) return `R$ ${(n / 1e3).toLocaleString("pt-BR", { maximumFractionDigits: 1 })} mil`;
+  return currency(n);
+}
+
+/** Subindo / estável / caindo — mesma leitura do indicador da tela. */
+function tendenciaCliente(atual, media) {
+  const a = Number(atual || 0);
+  const m = Number(media || 0);
+  if (!m) return a > 0 ? "Novo/retomando" : "Sem base";
+  const variacao = (a - m) / m;
+  if (variacao >= 0.1) return "Subindo";
+  if (variacao <= -0.1) return "Caindo";
+  return "Estável";
+}
+
 async function exportCrmClientsXLSX() {
   try {
     addMessage("info", "Gerando planilha…");
@@ -798,13 +825,13 @@ async function exportCrmClientsXLSX() {
     if (filters.classCode) query.set("classCode", filters.classCode);
     if (filters.personType) query.set("personType", filters.personType);
     if (filters.search) query.set("search", filters.search);
+    if (filters.itemCode) query.set("itemCode", filters.itemCode);
     query.set("page", "1");
     query.set("pageSize", "9999");
     const data = await api(`/api/crm/clients?${query.toString()}`);
     const rows = data.rows || [];
     if (!rows.length) { addMessage("warn", "Nenhum cliente encontrado para exportar."); return; }
 
-    // Carrega SheetJS dinamicamente se necessário
     if (!window.XLSX) {
       await new Promise((resolve, reject) => {
         const s = document.createElement("script");
@@ -815,42 +842,95 @@ async function exportCrmClientsXLSX() {
       });
     }
 
-    const headers = ["Código","Cliente","Unidade","Vendedor","Cidade","Status","Classe","Telefone","Contato principal","Compra no mês (R$)","Média trim. (R$)","Última compra","Dias sem compra","Motivo principal"];
+    // Competências vêm da memória de cálculo da média, que é a mesma base que a
+    // tela usa. Assim o cabeçalho nunca fica fora de sincronia com os valores.
+    const base = rows.find((r) => r.averageBasis?.months?.length)?.averageBasis;
+    const meses = base?.months?.map((m) => m.competence) || ["", "", ""];
+    const mesAtual = base?.currentCompetence || "";
+
+    // Somas de cada coluna, para o total ir no próprio cabeçalho.
+    const soma = (fn) => rows.reduce((acc, r) => acc + Number(fn(r) || 0), 0);
+    const totalAtual = soma((r) => r.currentRevenue);
+    const totalM1 = soma((r) => r.trimesterRevenue1);
+    const totalM2 = soma((r) => r.trimesterRevenue2);
+    const totalM3 = soma((r) => r.trimesterRevenue3);
+    const totalTri = totalM1 + totalM2 + totalM3;
+
+    const headers = [
+      "Código", "Cliente", "Unidade", "Vendedor", "Cidade", "Bairro",
+      "PJ/PF", "Status", "Classe", "Telefone", "Contato principal",
+      `${competenceLabel(mesAtual)} (atual) · ${shortMoneyHeader(totalAtual)}`,
+      `${competenceLabel(meses[0])} · ${shortMoneyHeader(totalM1)}`,
+      `${competenceLabel(meses[1])} · ${shortMoneyHeader(totalM2)}`,
+      `${competenceLabel(meses[2])} · ${shortMoneyHeader(totalM3)}`,
+      `Trimestre · ${shortMoneyHeader(totalTri)}`,
+      "Média trim. (R$)", "Tendência",
+      "Última compra", "Dias sem compra", "Último contato", "Motivo principal",
+    ];
+
     const sheetData = [
       headers,
-      ...rows.map(r => [
-        r.clientKey || "",
-        r.clientName || "",
-        r.unitName || "",
-        r.assignedSeller || "",
-        r.cityName || "",
-        r.statusCode || "",
-        r.classCode || "",
-        r.phone || "",
-        r.primaryContactName || "",
-        r.currentRevenue != null ? Number(r.currentRevenue) : 0,
-        r.averageRevenue != null ? Number(r.averageRevenue) : 0,
-        r.lastPurchaseAt ? r.lastPurchaseAt.slice(0, 10) : "",
-        r.daysWithoutPurchase != null ? Number(r.daysWithoutPurchase) : "",
-        r.primaryReason || "",
-      ]),
+      ...rows.map((r) => {
+        const m1 = Number(r.trimesterRevenue1 || 0);
+        const m2 = Number(r.trimesterRevenue2 || 0);
+        const m3 = Number(r.trimesterRevenue3 || 0);
+        return [
+          r.clientKey || "",
+          r.clientName || "",
+          r.unitName || "",
+          r.assignedSeller || "",
+          r.cityName || "",
+          r.neighborhood || "",
+          r.personType || "",
+          r.statusCode || "",
+          r.classCode || "",
+          r.updatedPhone || r.phone || "",
+          r.primaryContactName || "",
+          Number(r.currentRevenue || 0),
+          m1, m2, m3,
+          Number((m1 + m2 + m3).toFixed(2)),
+          Number(r.averageRevenue || 0),
+          tendenciaCliente(r.currentRevenue, r.averageRevenue),
+          r.lastPurchaseAt ? r.lastPurchaseAt.slice(0, 10) : "",
+          r.daysWithoutPurchase != null ? Number(r.daysWithoutPurchase) : "",
+          r.lastInteractionAt ? String(r.lastInteractionAt).slice(0, 10) : "",
+          r.primaryReason || "",
+        ];
+      }),
     ];
 
     const ws = XLSX.utils.aoa_to_sheet(sheetData);
-    // Larguras de colunas
+
+    // Formato de moeda nas colunas de valor. Sem isso o Excel mostra 1234.5 e
+    // quem abre a planilha perde tempo formatando antes de conseguir ler.
+    const colunasValor = [11, 12, 13, 14, 15, 16];
+    const totalLinhas = sheetData.length;
+    colunasValor.forEach((c) => {
+      for (let l = 1; l < totalLinhas; l++) {
+        const celula = ws[XLSX.utils.encode_cell({ r: l, c })];
+        if (celula && typeof celula.v === "number") celula.z = '#,##0.00';
+      }
+    });
+
     ws["!cols"] = [
-      {wch:10},{wch:35},{wch:14},{wch:28},{wch:18},{wch:12},{wch:10},
-      {wch:16},{wch:22},{wch:16},{wch:14},{wch:13},{wch:14},{wch:30},
+      { wch: 10 }, { wch: 38 }, { wch: 14 }, { wch: 28 }, { wch: 18 }, { wch: 20 },
+      { wch: 7 }, { wch: 12 }, { wch: 10 }, { wch: 16 }, { wch: 22 },
+      { wch: 20 }, { wch: 18 }, { wch: 18 }, { wch: 18 }, { wch: 20 },
+      { wch: 16 }, { wch: 14 }, { wch: 13 }, { wch: 14 }, { wch: 14 }, { wch: 34 },
     ];
+    ws["!freeze"] = { xSplit: 2, ySplit: 1 };
+    ws["!autofilter"] = { ref: XLSX.utils.encode_range({
+      s: { r: 0, c: 0 }, e: { r: totalLinhas - 1, c: headers.length - 1 } }) };
+
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Clientes");
-    XLSX.writeFile(wb, `clientes_${new Date().toISOString().slice(0,10)}.xlsx`);
-    addMessage("success", `Planilha exportada — ${rows.length} clientes.`);
+    XLSX.writeFile(wb, `clientes_${new Date().toISOString().slice(0, 10)}.xlsx`);
+    addMessage("success",
+      `Planilha exportada — ${rows.length} clientes · trimestre ${currency(totalTri)}.`);
   } catch (e) {
     addMessage("error", "Erro ao exportar: " + (e.message || e));
   }
 }
-
 async function ensureCrmClientTabLoaded(tab, silent = false) {
   const clientKey = state.crm.selectedClientKey;
   if (!clientKey) return;

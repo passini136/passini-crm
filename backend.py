@@ -7188,6 +7188,7 @@ def crm_base_client_scope_query(
             p.document_number,
             p.credit_limit,
             p.economic_group,
+            p.neighborhood,
             COALESCE(NULLIF(p.internal_seller_name, ''), NULLIF(p.external_seller_name, ''), s.summary_seller_name) AS assigned_seller,
             COALESCE(s.current_revenue, 0) AS current_revenue,
             COALESCE(s.last_purchase_at, p.last_sale_at) AS last_purchase_at
@@ -7433,6 +7434,7 @@ def crm_base_client_rows(
                     "monthsWithPurchase": months_with_purchase,
                     "formula": "soma dos 3 meses anteriores ÷ 3",
                 },
+                "neighborhood": normalize_upper(row["neighborhood"]),
                 "dropPct": round(drop_pct, 4),
                 "classCode": class_code,
                 "statusCode": status_code,
