@@ -12015,6 +12015,23 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
         "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
         "salesCities": [row["city_name"] for row in conn.execute("SELECT DISTINCT city_name FROM fact_sales_detail WHERE company_id = ? AND city_name IS NOT NULL AND TRIM(city_name) <> '' ORDER BY city_name", (company_id,)).fetchall()],
+        # Vendedor interno e externo do cadastro de clientes. É a fonte que
+        # enxerga quem AINDA NÃO VENDEU — vendedor recém-contratado e gerente
+        # não aparecem no faturamento, mas estão no cadastro desde o primeiro dia.
+        "clientSellers": [
+            row["nome"] for row in conn.execute(
+                """
+                SELECT DISTINCT nome FROM (
+                    SELECT TRIM(internal_seller_name) AS nome FROM crm_client_profiles
+                     WHERE company_id = ? AND internal_seller_name IS NOT NULL AND TRIM(internal_seller_name) <> ''
+                    UNION
+                    SELECT TRIM(external_seller_name) AS nome FROM crm_client_profiles
+                     WHERE company_id = ? AND external_seller_name IS NOT NULL AND TRIM(external_seller_name) <> ''
+                ) ORDER BY nome
+                """,
+                (company_id, company_id),
+            ).fetchall()
+        ],
         "salesCoverage": dict(zip(("min", "max", "total"), conn.execute("SELECT MIN(issue_date), MAX(issue_date), COUNT(*) FROM fact_sales_detail WHERE company_id = ? AND issue_date IS NOT NULL AND TRIM(issue_date) <> ''", (company_id,)).fetchone())),
         "cityMappings": [dict(row) for row in conn.execute("SELECT * FROM city_mappings WHERE company_id = ? ORDER BY city_name, valid_from DESC", (company_id,)).fetchall()],
         "vacations": [dict(row) for row in conn.execute("SELECT * FROM vacations WHERE company_id = ? ORDER BY start_date DESC", (company_id,)).fetchall()],
@@ -12609,6 +12626,61 @@ def save_person_record(
     invalidate_crm_cache(company_id)
     return {"message": f"{nome} {acao} como {funcao} na unidade {unidade}.",
             "personName": nome, "roleClassification": funcao, "baseUnit": unidade}
+
+
+def terminate_person(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Registra o desligamento de uma pessoa fechando a vigência do cadastro.
+
+    Não apaga nada: o histórico de venda, reunião e feedback continua íntegro.
+    Só define até quando ela é considerada ativa — assim ela para de aparecer
+    em lista de equipe, meta e presença, sem sumir dos meses em que trabalhou.
+    """
+    nome = normalize_whitespace(payload.get("personName"))
+    if not nome:
+        raise ValueError("Informe a pessoa.")
+
+    if payload.get("reactivate"):
+        conn.execute(
+            "UPDATE people_records SET valid_to = NULL, is_active = 1 "
+            "WHERE company_id = ? AND person_name = ?",
+            (company_id, nome),
+        )
+        audit_log(conn, company_id, user_id, "reativar", "people_records", nome, {})
+        conn.commit()
+        invalidate_crm_cache(company_id)
+        return {"message": f"{nome} reativado."}
+
+    # Aceita "AAAA-MM" (mês de desligamento) ou data completa.
+    bruto = normalize_whitespace(payload.get("terminationMonth")) or normalize_whitespace(payload.get("validTo"))
+    if not bruto:
+        raise ValueError("Informe o mês de desligamento.")
+    if len(bruto) == 7:
+        fim = last_day_of_competence(bruto).isoformat()
+    else:
+        fim = bruto[:10]
+
+    cur = conn.execute(
+        "UPDATE people_records SET valid_to = ?, is_active = 0 WHERE company_id = ? AND person_name = ?",
+        (fim, company_id, nome),
+    )
+    if not cur.rowcount:
+        raise ValueError(f"{nome} não está no cadastro de pessoas.")
+
+    # Conta de acesso também é desativada: quem saiu não deve continuar entrando.
+    contas = conn.execute(
+        "UPDATE users SET is_active = 0 WHERE company_id = ? AND UPPER(COALESCE(linked_person_name,'')) = ?",
+        (company_id, normalize_upper(nome)),
+    ).rowcount
+
+    audit_log(conn, company_id, user_id, "desligar", "people_records", nome,
+              {"validTo": fim, "contasDesativadas": contas})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": f"{nome} desligado em {fim}."
+                       + (f" {contas} conta(s) de acesso desativada(s)." if contas else ""),
+            "validTo": fim, "deactivatedUsers": int(contas or 0)}
 
 
 def update_person_unit(conn: sqlite3.Connection, company_id: int, user_id: int, person_name: str | None, base_unit: str | None) -> str:
@@ -15837,6 +15909,25 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/people/terminate":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if not user_can_manage_users(conn, user):
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Apenas a diretoria desliga pessoas."}))
+                            return
+                        resultado = terminate_person(conn, user["company_id"], user["id"], payload)
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path == "/api/admin/people/save":
                 user = self._require_auth()

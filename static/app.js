@@ -1076,7 +1076,25 @@ function sellerPeopleOptions({ onlySellers = false } = {}) {
     });
   });
 
-  // 2) Cadastrados que ainda não emitiram venda
+  // 2) Vendedor interno/externo do CADASTRO DE CLIENTES.
+  //    É a única fonte que enxerga quem ainda não vendeu: vendedor recém-
+  //    contratado e gerente não aparecem no faturamento, mas estão no cadastro
+  //    desde o primeiro dia. Sem isso eles ficavam de fora do vínculo.
+  (state.admin?.clientSellers || []).forEach((name) => {
+    if (!name) return;
+    const key = personMatchKey(name);
+    if (!key || resultado.has(key)) return;
+    const info = cadastro.get(key);
+    resultado.set(key, {
+      person_name: name,
+      base_unit: info?.base_unit || "",
+      role_classification: info?.role_classification || "",
+      inSales: false,
+      fromClients: true,
+    });
+  });
+
+  // 3) Cadastrados que ainda não emitiram venda
   cadastro.forEach((info, key) => {
     if (!resultado.has(key)) {
       resultado.set(key, { ...info, inSales: false });
@@ -10258,6 +10276,42 @@ function adminEditorCards() {
       </div>
 
       <div class="form-card">
+        <div class="section-title">
+          <div><h3>Desligamento</h3>
+            <div class="text-small">Fecha a vigência da pessoa. O histórico é preservado —
+              ela some das listas de equipe, meta e presença dos meses seguintes.</div></div>
+        </div>
+        <div class="two-column-form">
+          <div class="field"><label>Pessoa</label>
+            <input id="term-person-name" list="term-person-options" placeholder="Digite o nome" />
+            <datalist id="term-person-options">
+              ${(state.admin?.people || [])
+                .filter((p) => !p.valid_to)
+                .map((p) => p.person_name)
+                .filter((n, i, a) => a.indexOf(n) === i)
+                .map((n) => `<option value="${escapeHtml(n)}"></option>`).join("")}
+            </datalist></div>
+          <div class="field"><label>Mês de desligamento</label>
+            <input type="month" id="term-person-month" value="${new Date().toISOString().slice(0,7)}" /></div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" onclick="submitPersonTermination()">Registrar desligamento</button>
+          <button class="btn btn-ghost" onclick="submitPersonTermination(true)">Reativar</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          A conta de acesso vinculada também é desativada. Nada é apagado: os meses em que a
+          pessoa trabalhou continuam intactos no histórico e nos relatórios.
+        </div>
+        ${(state.admin?.people || []).some((p) => p.valid_to) ? `
+          <div class="text-small" style="font-weight:600;margin-top:10px">Já desligados:</div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">
+            ${[...new Map((state.admin.people || []).filter((p) => p.valid_to)
+                .map((p) => [p.person_name, p])).values()]
+              .map((p) => `<span class="status-tag" title="até ${escapeHtml(p.valid_to)}">${escapeHtml(p.person_name)} · ${escapeHtml(String(p.valid_to).slice(0,7))}</span>`).join("")}
+          </div>` : ""}
+      </div>
+
+      <div class="form-card">
         <div class="section-title"><div><h3>Ajustar vendedor × unidade</h3><div class="text-small">Busque o vendedor pelo nome e defina a unidade correta.</div></div></div>
         <div class="two-column-form">
           <div class="field"><label>Vendedor</label><input id="edit-seller-name" list="sellers-datalist" placeholder="Digite o nome" /></div>
@@ -10377,14 +10431,22 @@ function userEditorCard() {
           </div>
           <div class="field field-span-2">
             <label>Pessoa vinculada ${scope === "proprio" ? '<span style="color:var(--bad)">*</span>' : '<span style="color:var(--muted);font-weight:400">(recomendado)</span>'}</label>
-            <select id="user-linked-person" onchange="state.userEditor.linkedPersonName=this.value" ${scope === "proprio" ? "required" : ""}>
-              <option value="">${scope === "proprio" ? "Selecione…" : "Sem vínculo"}</option>
-              ${sellerOptions.map((p) => `<option value="${escapeHtml(p.person_name)}" ${editor.linkedPersonName === p.person_name ? "selected" : ""}>${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}</option>`).join("")}
-            </select>
+            <input id="user-linked-person" list="linked-person-options"
+              value="${escapeHtml(editor.linkedPersonName || "")}"
+              oninput="state.userEditor.linkedPersonName=this.value"
+              placeholder="${scope === "proprio" ? "Digite ou escolha o nome" : "Sem vínculo — digite ou escolha"}"
+              ${scope === "proprio" ? "required" : ""} />
+            <datalist id="linked-person-options">
+              ${sellerOptions.map((p) => `<option value="${escapeHtml(p.person_name)}">${escapeHtml(
+                  [p.base_unit, p.role_classification, p.fromClients ? "cadastro de clientes" : ""]
+                    .filter(Boolean).join(" · "))}</option>`).join("")}
+            </datalist>
             <div class="text-small" style="margin-top:4px;color:var(--muted)">
               ${scope === "proprio"
                 ? "É por este vínculo que o sistema sabe quais clientes são desta pessoa e que ela participou de uma reunião."
                 : "Liga a conta ao nome do cadastro. Sem isso, a pessoa não recebe a ciência quando é marcada como presente numa ata."}
+              A lista sugere nomes do faturamento, do cadastro de pessoas e do cadastro de clientes —
+              mas você pode <strong>digitar qualquer nome</strong> se ele ainda não aparecer.
             </div>
           </div>
           ${["unidade", "unidade_consolidado"].includes(scope) ? `
@@ -11770,6 +11832,27 @@ async function submitAdminImport() {
   } catch (error) {
     addMessage("error", error.message);
   }
+}
+
+async function submitPersonTermination(reativar) {
+  const nome = document.getElementById("term-person-name")?.value?.trim();
+  const mes = document.getElementById("term-person-month")?.value;
+  if (!nome) { addMessage("error", "Informe a pessoa."); return; }
+  if (!reativar && !mes) { addMessage("error", "Informe o mês de desligamento."); return; }
+  if (!reativar && !confirm(
+      `Registrar o desligamento de ${nome} em ${mes}?\n\n` +
+      "Ela sai das listas de equipe, meta e presença a partir daí, e a conta de acesso é " +
+      "desativada. O histórico dos meses trabalhados continua intacto.")) return;
+  try {
+    const r = await api("/api/admin/people/terminate", {
+      method: "POST",
+      body: JSON.stringify({ personName: nome, terminationMonth: mes, reactivate: Boolean(reativar) }),
+    });
+    addMessage("success", r.message || "Atualizado.");
+    document.getElementById("term-person-name").value = "";
+    await loadAdmin();
+    loadCrmData();
+  } catch (e) { addMessage("error", e.message); }
 }
 
 async function submitNewPerson() {
