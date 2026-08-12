@@ -11990,7 +11990,8 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
     users: list[dict[str, Any]] = []
     for row in conn.execute(
         """
-        SELECT id, username, full_name, linked_person_name, linked_units_json, role, is_active, created_at
+        SELECT id, username, full_name, linked_person_name, linked_units_json, role, profile_id,
+               is_active, created_at
         FROM users
         WHERE company_id = ?
         ORDER BY username

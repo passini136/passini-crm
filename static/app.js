@@ -1117,18 +1117,35 @@ function unclassifiedSellers() {
   return sellerPeopleOptions().filter((p) => p.inSales && !p.role_classification);
 }
 
+/** Unidades que podem ser marcadas no cadastro do usuário.
+ *
+ * Não dá para depender só de `state.options.units`: essa lista vem dos filtros
+ * do dashboard e chega vazia quando o usuário entra direto em Acessos. Vazia,
+ * a tela mostrava o título "Unidades vinculadas" sem nenhuma caixa para marcar
+ * — parecia que a opção tinha sumido. Aqui a lista é reconstruída também a
+ * partir do que já está gravado nos usuários e no cadastro de pessoas.
+ */
+function unitOptionsForEditor() {
+  const nomes = new Set(state.options.units || []);
+  (state.admin?.users || []).forEach((u) => (u.linked_units || []).forEach((x) => x && nomes.add(x)));
+  (state.admin?.people || []).forEach((p) => p.base_unit && nomes.add(p.base_unit));
+  (state.userEditor?.linkedUnits || []).forEach((x) => x && nomes.add(x));
+  return [...nomes].sort((a, b) => String(a).localeCompare(String(b), "pt-BR"));
+}
+
 function syncUserEditorOptions() {
-  const availableUnits = state.options.units || [];
-  state.userEditor.linkedUnits = (state.userEditor.linkedUnits || []).filter((unit) => availableUnits.includes(unit));
-  const people = sellerPeopleOptions();
-  if (state.userEditor.linkedPersonName
-      && !people.some((person) => person.person_name === state.userEditor.linkedPersonName)) {
-    state.userEditor.linkedPersonName = "";
-  }
-  if (state.userEditor.role === "Vendedor") {
-    state.userEditor.linkedUnits = [];
-  }
-  if (!["Gerente", "Analista"].includes(state.userEditor.role)) {
+  // O vínculo com a pessoa NÃO é mais apagado aqui. Ele era descartado quando o
+  // nome não estava na lista de vendedores — e agora ele pode vir da base de
+  // clientes PF, que nunca esteve nessa lista. O efeito era apagar em silêncio
+  // o vínculo de um gerente só por abrir a tela de edição dele.
+  const disponiveis = unitOptionsForEditor();
+  state.userEditor.linkedUnits = (state.userEditor.linkedUnits || [])
+    .filter((unit) => !disponiveis.length || disponiveis.includes(unit));
+  // Quem decide se há unidades é o ESCOPO do perfil, não o nome dele. Testar
+  // pelo nome ("Gerente", "Analista") zerava as unidades de qualquer perfil
+  // personalizado com escopo por unidade — e o salvamento então reclamava de
+  // um campo que a própria tela tinha acabado de limpar.
+  if (!["unidade", "unidade_consolidado"].includes(selectedUserProfileScope())) {
     state.userEditor.linkedUnits = [];
   }
   state.ui.personResults = null;
@@ -10405,6 +10422,7 @@ function userEditorCard() {
   const submitLabel = editor.id ? "Salvar ajustes" : "Criar usuário";
   const title = editor.id ? `Editar usuário: ${escapeHtml(editor.username)}` : "Novo usuário";
   const scope = selectedUserProfileScope();
+  const unidadesDisponiveis = unitOptionsForEditor();
   const chosen = accessProfileById(editor.profileId);
   const scopeInfo = (state.admin?.dataScopes || []).find((s) => s.id === scope);
 
@@ -10483,9 +10501,18 @@ function userEditorCard() {
           ${["unidade", "unidade_consolidado"].includes(scope) ? `
           <div class="field field-span-2">
             <label>Unidades vinculadas <span style="color:var(--bad)">*</span></label>
-            <div class="checkbox-grid">
-              ${(state.options.units || []).map((unit) => `<label class="checkbox-item"><input type="checkbox" ${editor.linkedUnits.includes(unit) ? "checked" : ""} onchange="toggleUserLinkedUnit('${unit}')" /><span>${escapeHtml(unit)}</span></label>`).join("")}
-            </div>
+            ${unidadesDisponiveis.length ? `
+              <div class="checkbox-grid">
+                ${unidadesDisponiveis.map((unit) => `<label class="checkbox-item"><input type="checkbox" ${editor.linkedUnits.includes(unit) ? "checked" : ""} onchange="toggleUserLinkedUnit('${jsAttr(unit)}')" /><span>${escapeHtml(unit)}</span></label>`).join("")}
+              </div>
+              <div class="text-small" style="margin-top:4px;color:var(--muted)">
+                Define quais unidades este perfil enxerga. É diferente da pessoa vinculada acima:
+                a unidade filtra os dados, a pessoa liga a conta ao nome nas atas e feedbacks.
+              </div>` : `
+              <div class="message">
+                Nenhuma unidade carregada. Abra o Dashboard uma vez e volte aqui —
+                a lista de unidades vem dos filtros e ainda não foi carregada nesta sessão.
+              </div>`}
           </div>` : ""}
           <div class="field field-span-2">
             <label>${passwordLabel}</label>
