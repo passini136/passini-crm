@@ -2114,6 +2114,19 @@ def init_db() -> None:
                 FOREIGN KEY (company_id) REFERENCES companies(id)
             );
 
+            CREATE TABLE IF NOT EXISTS client_name_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                sales_name_key TEXT NOT NULL,
+                sales_name TEXT NOT NULL,
+                client_code TEXT NOT NULL,
+                client_name TEXT NOT NULL,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, sales_name_key),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
             CREATE TABLE IF NOT EXISTS territory_mappings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -14215,6 +14228,86 @@ def sellers_available_for_assignment(
     return result
 
 
+def client_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, dict[str, str]]:
+    """Nome do faturamento → cliente do cadastro, conciliado à mão.
+
+    O relatório do Alfa às vezes escreve o cliente de um jeito que não casa com
+    o cadastro — "54.719.029 ISMAEL GREGORY" no faturamento e "ISMAEL GREGORY"
+    no cadastro. A normalização não resolve porque o CNPJ está grudado no nome.
+    Sem o vínculo, o cliente aparece como "sem cadastro" e o gerente não
+    consegue nem abrir a ficha para atribuir um vendedor.
+    """
+    return {
+        r["sales_name_key"]: {"clientCode": r["client_code"], "clientName": r["client_name"]}
+        for r in conn.execute(
+            "SELECT sales_name_key, client_code, client_name FROM client_name_aliases "
+            "WHERE company_id = ?", (company_id,),
+        ).fetchall()
+    }
+
+
+def save_client_alias(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    nome_faturamento = normalize_whitespace(payload.get("salesName"))
+    codigo = normalize_whitespace(payload.get("clientCode"))
+    if not nome_faturamento or not codigo:
+        raise ValueError("Informe o nome do faturamento e o cliente do cadastro.")
+    cliente = conn.execute(
+        "SELECT client_code, client_name, internal_seller_name, external_seller_name "
+        "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, codigo),
+    ).fetchone()
+    if not cliente:
+        raise ValueError(f"Cliente {codigo} não existe no cadastro.")
+
+    chave = normalize_client_key(nome_faturamento)
+    conn.execute(
+        """
+        INSERT INTO client_name_aliases
+            (company_id, sales_name_key, sales_name, client_code, client_name,
+             created_by_user_id, created_at)
+        VALUES (?,?,?,?,?,?,?)
+        ON CONFLICT(company_id, sales_name_key)
+        DO UPDATE SET client_code = excluded.client_code,
+                      client_name = excluded.client_name,
+                      created_by_user_id = excluded.created_by_user_id,
+                      created_at = excluded.created_at
+        """,
+        (company_id, chave, nome_faturamento, cliente["client_code"], cliente["client_name"],
+         user_id, now_iso()),
+    )
+    audit_log(conn, company_id, user_id, "conciliar", "client_name_aliases",
+              nome_faturamento, {"clientCode": cliente["client_code"]})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+
+    vendedor = normalize_whitespace(cliente["internal_seller_name"]) \
+        or normalize_whitespace(cliente["external_seller_name"])
+    return {
+        "message": f"{nome_faturamento} conciliado com {cliente['client_name']} ({cliente['client_code']}).",
+        "clientCode": cliente["client_code"],
+        "clientName": cliente["client_name"],
+        "sellerName": vendedor,
+        # Conciliar não atribui vendedor: se o cadastro já tem um, o cliente
+        # sai da lista sozinho; se não tem, continua aqui — que é o correto,
+        # porque a pendência real (falta de dono) segue de pé.
+        "stillUnassigned": not vendedor,
+    }
+
+
+def delete_client_alias(
+    conn: sqlite3.Connection, company_id: int, user_id: int, sales_name: str
+) -> dict[str, Any]:
+    chave = normalize_client_key(sales_name)
+    conn.execute("DELETE FROM client_name_aliases WHERE company_id = ? AND sales_name_key = ?",
+                 (company_id, chave))
+    audit_log(conn, company_id, user_id, "desfazer_conciliacao", "client_name_aliases", sales_name, {})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": "Conciliação desfeita."}
+
+
 def compute_unassigned_clients(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     min_months: int = 2, months_window: int = 6, limit: int = 200,
@@ -14238,6 +14331,17 @@ def compute_unassigned_clients(
         key = normalize_client_key(row["client_name"])
         if key:
             owned.add(key)
+    # Nome do faturamento conciliado com um cliente que JÁ tem vendedor também
+    # sai da lista — era só o nome que não casava.
+    for chave, destino in client_alias_map(conn, company_id).items():
+        dono = conn.execute(
+            "SELECT 1 FROM crm_client_profiles WHERE company_id = ? AND client_code = ? "
+            "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' "
+            "  OR TRIM(COALESCE(external_seller_name,'')) <> '')",
+            (company_id, destino["clientCode"]),
+        ).fetchone()
+        if dono:
+            owned.add(chave)
 
     # Código do cliente por nome — a ficha é aberta pelo código, mas esta lista
     # nasce do faturamento, que só tem o nome. Cliente sem cadastro fica sem
@@ -14251,6 +14355,11 @@ def compute_unassigned_clients(
         code = normalize_whitespace(row["client_code"])
         if key and code and key not in code_by_name:
             code_by_name[key] = code
+
+    # Conciliações feitas à mão têm prioridade sobre o casamento por nome.
+    aliases = client_alias_map(conn, company_id)
+    for chave, destino in aliases.items():
+        code_by_name[chave] = destino["clientCode"]
 
     allowed_units = crm_allowed_units_for_user(conn, user)
     city_unit = build_city_unit_map(conn, company_id, latest)
@@ -14307,6 +14416,7 @@ def compute_unassigned_clients(
         items.append({
             "clientKey": code_by_name.get(key),
             "clientName": r["client_name"],
+            "aliasOf": (aliases.get(key) or {}).get("clientName"),
             "cityName": r["city_name"],
             "unitName": unit,
             "months": int(r["meses"] or 0),
@@ -15240,7 +15350,9 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
-                    if not user_can_manage_visits(conn, user):
+                    # Gestão em geral, não só quem cuida de visita: a mesma busca
+                    # serve para conciliar cliente na tela Sem Vendedor.
+                    if data_scope_for_user(conn, user) == "proprio":
                         self._set_headers(403)
                         self.wfile.write(json_dumps({"error": "Busca disponível para a gestão."}))
                         return
@@ -16901,6 +17013,29 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn.commit()
                     self._set_headers(200)
                     self.wfile.write(json_dumps({"message": "Usuário excluído."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in {"/api/crm/clients/alias", "/api/crm/clients/alias/delete"}:
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps({"error": "Conciliação é da gestão."}))
+                            return
+                        if path.endswith("/delete"):
+                            res = delete_client_alias(conn, user["company_id"], user["id"],
+                                                      payload.get("salesName"))
+                        else:
+                            res = save_client_alias(conn, user["company_id"], user["id"], payload)
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(res))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(400)

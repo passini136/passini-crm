@@ -215,6 +215,7 @@ const state = {
     assignTask: null,      // modal de cobrar contato (gestao)
     scheduleContact: null, // modal de agendar contato (vendedor, para si mesmo)
     receptive: null,       // modal de registro receptivo (não conta na meta)
+    reconcile: null,       // modal de conciliação de cliente sem cadastro
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -5345,6 +5346,110 @@ async function loadUnassignedClients() {
   requestRender();
 }
 
+// ─── Conciliação de cliente sem cadastro ───────────────────────────────────
+
+function abrirConciliacao(nomeFaturamento) {
+  state.crm.reconcile = { salesName: nomeFaturamento, term: nomeFaturamento,
+                          results: null, searching: false, saving: false };
+  requestRender();
+  void buscarClienteConciliacao();
+}
+
+function fecharConciliacao() {
+  state.crm.reconcile = null;
+  requestRender();
+}
+
+async function buscarClienteConciliacao() {
+  const r = state.crm.reconcile;
+  if (!r) return;
+  const termo = (r.term || "").trim();
+  if (termo.length < 2) { addMessage("warn", "Digite ao menos 2 letras."); return; }
+  r.searching = true; requestRender();
+  try {
+    const resposta = await api(`/api/crm/clients/search?q=${encodeURIComponent(termo)}`);
+    if (state.crm.reconcile) state.crm.reconcile.results = resposta.clients || [];
+  } catch (error) {
+    addMessage("error", error.message);
+    if (state.crm.reconcile) state.crm.reconcile.results = [];
+  } finally {
+    if (state.crm.reconcile) state.crm.reconcile.searching = false;
+    requestRender();
+  }
+}
+
+async function confirmarConciliacao(clientCode) {
+  const r = state.crm.reconcile;
+  if (!r || r.saving) return;
+  r.saving = true; requestRender();
+  try {
+    const resposta = await api("/api/crm/clients/alias", {
+      method: "POST",
+      body: JSON.stringify({ salesName: r.salesName, clientCode }),
+    });
+    addMessage("success", resposta.message || "Cliente conciliado.");
+    if (resposta.stillUnassigned) {
+      addMessage("warn", "O cadastro deste cliente ainda está sem vendedor — ele segue na lista até você atribuir um.");
+    }
+    state.crm.reconcile = null;
+    await loadUnassignedClients();
+  } catch (error) {
+    addMessage("error", error.message);
+    if (state.crm.reconcile) state.crm.reconcile.saving = false;
+  }
+  requestRender();
+}
+
+function conciliacaoModal() {
+  const r = state.crm.reconcile;
+  if (!r) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharConciliacao()">
+      <div class="panel modal-panel" style="max-width:640px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>🔗 Conciliar cliente</h3>
+            <div class="text-small">No faturamento: <strong>${escapeHtml(r.salesName)}</strong></div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharConciliacao()">Fechar</button>
+        </div>
+
+        <div class="text-small" style="color:var(--muted);margin:10px 0">
+          Este nome não casa com nenhum cliente do cadastro — normalmente porque o relatório
+          traz o CNPJ grudado no nome. Busque o cliente correto para ligar os dois.
+        </div>
+
+        <div style="display:flex;gap:8px">
+          <input style="flex:1" value="${escapeHtml(r.term || "")}"
+            placeholder="Buscar por código, nome ou nome fantasia"
+            oninput="state.crm.reconcile.term=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClienteConciliacao();}" />
+          <button class="btn btn-secondary" type="button" onclick="buscarClienteConciliacao()">
+            ${r.searching ? "Buscando…" : "Buscar"}</button>
+        </div>
+
+        ${r.results ? `
+          <div style="border:1px solid var(--line);border-radius:8px;max-height:320px;overflow:auto;margin-top:10px">
+            ${r.results.length ? r.results.map((c) => `
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+                          padding:10px 12px;border-bottom:1px solid var(--line)">
+                <div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(c.client_name)}</div>
+                  <div class="text-small" style="color:var(--muted)">
+                    cód. ${escapeHtml(c.client_code)}${c.city_name ? ` · ${escapeHtml(c.city_name)}` : ""}
+                    ${c.seller_name ? ` · vendedor: ${escapeHtml(c.seller_name)}` : " · sem vendedor no cadastro"}
+                  </div>
+                </div>
+                <button class="btn btn-primary btn-sm" type="button" ${r.saving ? "disabled" : ""}
+                  onclick="confirmarConciliacao('${jsAttr(c.client_code)}')">Vincular</button>
+              </div>`).join("")
+              : '<div class="text-small" style="padding:12px;color:var(--muted)">Nenhum cliente encontrado. Tente pelo CNPJ ou por parte do nome.</div>'}
+          </div>` : ""}
+      </div>
+    </div>
+  `;
+}
+
 function semVendedorView() {
   const data = state.crm.unassigned;
   if (!data) { loadUnassignedClients(); return `<div class="loader panel">Buscando clientes sem vendedor…</div>`; }
@@ -5386,7 +5491,7 @@ function semVendedorView() {
       ${items.length ? `
         <div class="table-card">
           <div class="table-wrap">
-            <table>
+            <table class="table-sticky-actions">
               <thead>
                 <tr>
                   <th>Cliente</th><th>Cidade</th><th>Unidade</th>
@@ -5397,7 +5502,9 @@ function semVendedorView() {
               <tbody>
                 ${items.map((i) => `
                   <tr>
-                    <td><strong>${escapeHtml(i.clientName)}</strong></td>
+                    <td><strong>${escapeHtml(i.clientName)}</strong>
+                      ${i.aliasOf ? `<div class="text-small" style="color:var(--muted)">conciliado com ${escapeHtml(i.aliasOf)}</div>` : ""}
+                    </td>
                     <td class="text-small">${escapeHtml(i.cityName || "-")}</td>
                     <td class="text-small">${escapeHtml(i.unitName || "-")}</td>
                     <td><span class="soft-badge">${i.months} ${i.months === 1 ? "mês" : "meses"}</span></td>
@@ -5415,7 +5522,9 @@ function semVendedorView() {
                     <td style="text-align:right;white-space:nowrap">
                       ${i.clientKey
                         ? `<button class="btn btn-ghost btn-sm" type="button" onclick="openCrmClient('${escapeHtml(i.clientKey)}', false)">Ficha</button>`
-                        : `<span class="text-small" style="color:var(--muted)" title="Cliente não encontrado no cadastro do CRM — só aparece no faturamento">sem cadastro</span>`}
+                        : `<button class="btn btn-secondary btn-sm" type="button"
+                             title="O nome do faturamento não casa com o cadastro. Busque o cliente e faça o vínculo."
+                             onclick="abrirConciliacao('${jsAttr(i.clientName)}')">🔗 Conciliar</button>`}
                     </td>
                   </tr>`).join("")}
               </tbody>
@@ -12278,6 +12387,7 @@ function dashboardView() {
       ${assignTaskModal()}
       ${scheduleContactModal()}
       ${receptiveModal()}
+      ${conciliacaoModal()}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
       ${assistantFab()}
       ${helpEditorModal()}

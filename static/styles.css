@@ -551,6 +551,27 @@ button {
   z-index: 1;
 }
 
+/* Coluna de ações grudada na direita.
+   Com o menu lateral aberto a tabela passa a rolar na horizontal e a última
+   coluna simplesmente saía da tela — o botão existia mas era inalcançável sem
+   fechar o menu. */
+.table-sticky-actions th:last-child,
+.table-sticky-actions td:last-child {
+  position: sticky;
+  right: 0;
+  background: #fff;
+  box-shadow: -6px 0 8px -8px rgba(15, 40, 60, 0.35);
+  z-index: 2;
+}
+
+.table-sticky-actions thead th:last-child {
+  z-index: 3;
+}
+
+.table-sticky-actions tbody tr:nth-child(even) td:last-child {
+  background: #fafbfc;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
