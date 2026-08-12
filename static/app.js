@@ -4,6 +4,8 @@ const state = {
   dashboard: null,
   admin: null,
   territories: null,   // mapa de bairro/cidade por unidade (Administração → Territórios)
+  contacts: null,      // histórico de registros de contato
+  contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "", search: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
@@ -67,6 +69,7 @@ const state = {
       visitRoute: false,
       prospects: false,
       territories: false,
+      contacts: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     territoryCity: "",     // filtro de cidade na tela de territórios
@@ -209,6 +212,7 @@ const state = {
     copyFallback: null,  // modal de copia manual (HTTP sem clipboard API)
     assignTask: null,      // modal de cobrar contato (gestao)
     scheduleContact: null, // modal de agendar contato (vendedor, para si mesmo)
+    receptive: null,       // modal de registro receptivo (não conta na meta)
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -429,9 +433,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "reunioes", "feedback", "calendario"]);
+    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -4241,6 +4245,194 @@ function jsAttr(valor) {
     .replace(/</g, "&lt;");
 }
 
+// ─── Contatos: histórico e produtividade ───────────────────────────────────
+
+async function loadContacts() {
+  if (state.ui.loading.contacts) return;
+  setLoading("contacts", true);
+  try {
+    const f = state.contactFilters;
+    const q = new URLSearchParams();
+    Object.entries(f).forEach(([k, v]) => { if (v) q.set(k, v); });
+    state.contacts = await api(`/api/crm/contacts?${q.toString()}`);
+  } catch (error) {
+    addMessage("error", error.message);
+  } finally {
+    setLoading("contacts", false);
+  }
+  requestRender();
+}
+
+function setContactFilter(campo, valor) {
+  state.contactFilters[campo] = valor;
+  void loadContacts();
+}
+
+function contactPeriodPreset(preset) {
+  const hoje = new Date();
+  const iso = (d) => d.toISOString().slice(0, 10);
+  if (preset === "hoje") {
+    state.contactFilters.start = iso(hoje);
+    state.contactFilters.end = iso(hoje);
+  } else if (preset === "semana") {
+    const inicio = new Date(hoje); inicio.setDate(hoje.getDate() - 6);
+    state.contactFilters.start = iso(inicio);
+    state.contactFilters.end = iso(hoje);
+  } else {
+    state.contactFilters.start = iso(new Date(hoje.getFullYear(), hoje.getMonth(), 1));
+    state.contactFilters.end = iso(hoje);
+  }
+  void loadContacts();
+}
+
+/** Barra de ritmo: verde no ritmo, âmbar perto, vermelho atrás. */
+function paceBar(pct) {
+  const v = Math.max(0, Math.min(Number(pct) || 0, 130));
+  const cor = v >= 100 ? "var(--good)" : v >= 70 ? "#e0a800" : "var(--bad)";
+  return `<div style="display:flex;align-items:center;gap:8px">
+      <div style="flex:1;height:6px;border-radius:3px;background:#eceff1;overflow:hidden">
+        <div style="width:${Math.min(v, 100)}%;height:100%;background:${cor}"></div>
+      </div>
+      <strong style="font-size:12px;color:${cor}">${Math.round(v)}%</strong>
+    </div>`;
+}
+
+function contatosView() {
+  if (!state.contacts && !state.ui.loading.contacts) { void loadContacts(); }
+  if (!state.contacts) return `<div class="loader panel">Carregando contatos…</div>`;
+
+  const d = state.contacts;
+  const f = state.contactFilters;
+  const gerente = Boolean(d.isManagerView);
+  const t = d.totals || {};
+
+  const badgeIniciativa = (v) => v === "RECEPTIVO"
+    ? '<span class="soft-badge" style="background:#eef1f4;color:#5b6b76">receptivo</span>'
+    : '<span class="soft-badge">ativo</span>';
+
+  return `
+    <div class="stack">
+      <div class="form-card">
+        <div class="section-title">
+          <div>
+            <h3>Contatos</h3>
+            <div class="text-small">Tudo que foi registrado no período — ${escapeHtml(f.start)} a ${escapeHtml(f.end)}.</div>
+          </div>
+          <div class="actions">
+            <button class="btn btn-ghost btn-sm" type="button" onclick="contactPeriodPreset('hoje')">Hoje</button>
+            <button class="btn btn-ghost btn-sm" type="button" onclick="contactPeriodPreset('semana')">7 dias</button>
+            <button class="btn btn-ghost btn-sm" type="button" onclick="contactPeriodPreset('mes')">Mês</button>
+          </div>
+        </div>
+        <div class="two-column-form">
+          <div class="field"><label>De</label>
+            <input type="date" value="${escapeHtml(f.start)}" onchange="setContactFilter('start', this.value)" /></div>
+          <div class="field"><label>Até</label>
+            <input type="date" value="${escapeHtml(f.end)}" onchange="setContactFilter('end', this.value)" /></div>
+          ${gerente ? `
+          <div class="field"><label>Vendedor</label>
+            <select onchange="setContactFilter('seller', this.value)">
+              <option value="">Todos</option>
+              ${(d.sellerOptions || []).map((v) => `<option value="${escapeHtml(v)}" ${f.seller === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+            </select></div>` : ""}
+          <div class="field"><label>Tipo</label>
+            <select onchange="setContactFilter('type', this.value)">
+              <option value="">Todos</option>
+              ${(d.contactTypes || []).map((c) => `<option value="${escapeHtml(c.code)}" ${f.type === c.code ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Resultado</label>
+            <select onchange="setContactFilter('result', this.value)">
+              <option value="">Todos</option>
+              ${(d.contactResults || []).map((c) => `<option value="${escapeHtml(c.code)}" ${f.result === c.code ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Iniciativa</label>
+            <select onchange="setContactFilter('initiative', this.value)">
+              <option value="">Ativo e receptivo</option>
+              <option value="ATIVO" ${f.initiative === "ATIVO" ? "selected" : ""}>Só ativo (conta na meta)</option>
+              <option value="RECEPTIVO" ${f.initiative === "RECEPTIVO" ? "selected" : ""}>Só receptivo</option>
+            </select></div>
+          <div class="field field-span-2"><label>Cliente</label>
+            <input value="${escapeHtml(f.search || "")}" placeholder="Nome ou código — Enter para buscar"
+              onkeydown="if(event.key==='Enter'){setContactFilter('search', this.value);}" /></div>
+        </div>
+      </div>
+
+      <div class="kpi-grid">
+        ${kpiCard("Ligações ativas", number(t.ligacoes || 0),
+                  `Esperado até hoje: ${number(t.callsTargetToDate || 0)}`, "")}
+        ${kpiCard("Conversa efetiva", `${(t.talkRatePct || 0).toFixed(1)}%`,
+                  `${number(t.falou || 0)} de ${number(t.ativos || 0)} contatos ativos`, "")}
+        ${kpiCard("Gerou orçamento ou pedido", `${(t.conversionPct || 0).toFixed(1)}%`,
+                  `${number(t.converteu || 0)} registros`, "")}
+        ${kpiCard("Clientes distintos", number(t.clientes || 0),
+                  `${number(t.receptivos || 0)} registro(s) receptivo(s)`, "")}
+      </div>
+
+      ${gerente && (d.sellers || []).length ? `
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Por vendedor</h3>
+          <div class="text-small">A meta de ligações é o ritmo do mês, não o total fechado — cobrar 60 no dia 6 marcaria todo mundo como irregular.</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Vendedor</th><th style="min-width:150px">Ligações no ritmo</th>
+              <th style="text-align:right">Conversa</th><th style="text-align:right">Converteu</th>
+              <th style="text-align:right">Clientes</th><th style="text-align:right">Receptivos</th>
+              <th>Último registro</th>
+            </tr></thead>
+            <tbody>
+              ${d.sellers.map((v) => `
+                <tr>
+                  <td><strong>${escapeHtml(v.seller_name || "-")}</strong></td>
+                  <td>${paceBar(v.callsPacePct)}
+                      <div class="text-small" style="color:var(--muted)">${number(v.ligacoes || 0)} de ${number(v.callsTargetToDate || 0)}</div></td>
+                  <td style="text-align:right">${(v.talkRatePct || 0).toFixed(1)}%</td>
+                  <td style="text-align:right">${(v.conversionPct || 0).toFixed(1)}%</td>
+                  <td style="text-align:right">${number(v.clientes || 0)}</td>
+                  <td style="text-align:right" class="text-small">${number(v.receptivos || 0)}</td>
+                  <td class="text-small">${escapeHtml(shortDate(v.ultimo) || "-")}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ""}
+
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Registros</h3>
+          <div class="text-small">${number((d.items || []).length)} registro(s)${d.truncated ? " — mostrando os mais recentes, refine o período" : ""}.</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Quando</th><th>Cliente</th>${gerente ? "<th>Vendedor</th>" : ""}
+              <th>Tipo</th><th>Resultado</th><th>Observação</th><th>Retorno</th>
+            </tr></thead>
+            <tbody>
+              ${(d.items || []).length ? d.items.map((i) => `
+                <tr>
+                  <td class="text-small" style="white-space:nowrap">${escapeHtml(shortDate(i.occurred_at) || "-")}</td>
+                  <td class="text-small">
+                    <button class="btn btn-ghost btn-sm" type="button" style="padding:0;text-align:left"
+                      onclick="openCrmClient('${jsAttr(i.client_key)}')">${escapeHtml(i.client_name || i.client_key)}</button>
+                  </td>
+                  ${gerente ? `<td class="text-small">${escapeHtml(i.seller_name || "-")}</td>` : ""}
+                  <td class="text-small">${escapeHtml(i.type_label || i.contact_type_code)} ${badgeIniciativa(i.initiative)}</td>
+                  <td class="text-small">${escapeHtml(i.result_label || i.result_code)}</td>
+                  <td class="text-small" style="max-width:340px">${escapeHtml((i.notes || "").slice(0, 160))}${(i.notes || "").length > 160 ? "…" : ""}</td>
+                  <td class="text-small">${escapeHtml(i.followup_due_at ? shortDate(i.followup_due_at) : "-")}</td>
+                </tr>`).join("")
+                : `<tr><td colspan="${gerente ? 7 : 6}" class="text-small">Nenhum registro no período.</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function goToTab(tab) {
   state.activeTab = tab;
   requestRender();
@@ -5564,6 +5756,105 @@ function setScheduleReason(indice) {
   if (!state.crm.scheduleContact) return;
   state.crm.scheduleContact.reason = SCHEDULE_MOTIVOS[indice] || state.crm.scheduleContact.reason;
   requestRender();
+}
+
+// ─── Registro receptivo ────────────────────────────────────────────────────
+
+const RECEPTIVE_TYPES = [
+  { code: "LIGACAO_RECEBIDA",  label: "Ligação recebida",  hint: "O cliente ligou para a Passini" },
+  { code: "MENSAGEM_RECEBIDA", label: "Mensagem recebida", hint: "WhatsApp, e-mail ou recado" },
+  { code: "ANOTACAO",          label: "Anotação",          hint: "Informação sobre o cliente" },
+];
+
+function openReceptiveModal(clientKey) {
+  const client = state.crm.selectedClient?.summary || {};
+  if (!clientKey) return;
+  state.crm.receptive = {
+    clientKey,
+    clientName: client.clientName || clientKey,
+    typeCode: "LIGACAO_RECEBIDA",
+    notes: "",
+    saving: false,
+  };
+  requestRender();
+}
+
+function closeReceptiveModal() {
+  state.crm.receptive = null;
+  requestRender();
+}
+
+async function salvarRegistroReceptivo() {
+  const r = state.crm.receptive;
+  if (!r || r.saving) return;
+  if (!r.notes.trim()) { addMessage("error", "Escreva o que aconteceu."); return; }
+  state.crm.receptive.saving = true;
+  requestRender();
+  try {
+    await api("/api/crm/interactions", {
+      method: "POST",
+      body: JSON.stringify({
+        clientKey: r.clientKey,
+        clientName: r.clientName,
+        contactTypeCode: r.typeCode,
+        initiative: "RECEPTIVO",
+        notes: r.notes.trim(),
+      }),
+    });
+    addMessage("success", "Registro salvo no histórico do cliente.");
+    state.crm.receptive = null;
+    state.contacts = null;                     // força recarregar a tela Contatos
+    await openCrmClient(r.clientKey, false);   // atualiza a ficha aberta
+  } catch (error) {
+    addMessage("error", error.message);
+    if (state.crm.receptive) state.crm.receptive.saving = false;
+  }
+  requestRender();
+}
+
+function receptiveModal() {
+  const r = state.crm.receptive;
+  if (!r) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="closeReceptiveModal()">
+      <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>📝 Registro receptivo</h3>
+            <div class="text-small">${escapeHtml(r.clientName)}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="closeReceptiveModal()">Fechar</button>
+        </div>
+
+        <div class="field" style="margin-top:12px">
+          <label>O que foi</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            ${RECEPTIVE_TYPES.map((t) => `
+              <button class="btn btn-sm ${r.typeCode === t.code ? "btn-primary" : "btn-ghost"}"
+                title="${escapeHtml(t.hint)}"
+                onclick="state.crm.receptive.typeCode='${t.code}';requestRender()">${escapeHtml(t.label)}</button>`).join("")}
+          </div>
+        </div>
+
+        <div class="field">
+          <label>O que aconteceu</label>
+          <textarea rows="4" placeholder="Ex: ligou perguntando prazo da peça X; combinei retornar com o preço"
+            oninput="state.crm.receptive.notes=this.value">${escapeHtml(r.notes)}</textarea>
+        </div>
+
+        <div class="text-small" style="color:var(--muted);background:#f5f7f9;border-radius:8px;padding:10px 12px">
+          Entra no histórico do cliente e na tela Contatos, mas <strong>não conta na meta de ligações
+          ativas</strong> — a meta mede o que você foi buscar, não o que chegou sozinho.
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" ${r.saving ? "disabled" : ""} onclick="salvarRegistroReceptivo()">
+            ${r.saving ? "Salvando…" : "Salvar registro"}</button>
+          <button class="btn btn-ghost" onclick="closeReceptiveModal()">Cancelar</button>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function scheduleContactModal() {
@@ -8652,6 +8943,35 @@ function sellerClientCard(item) {
   `;
 }
 
+/** Sinais de relacionamento na lista da carteira.
+ *
+ * Quatro marcas curtas em vez de quatro colunas: a carteira já tem doze e mais
+ * colunas tornariam a leitura impossível. Cada marca tem title, então o
+ * ponteiro conta a data sem ocupar espaço.
+ */
+function engagementMarks(e) {
+  if (!e) return '<span class="text-small" style="color:var(--muted)">—</span>';
+  const marca = (icone, cor, titulo) =>
+    `<span title="${escapeHtml(titulo)}" style="font-size:13px;color:${cor};margin-right:4px">${icone}</span>`;
+  const partes = [];
+  if (e.neverContacted) {
+    partes.push(marca("○", "var(--bad)", "Nunca contatado — nenhum registro na ficha"));
+  } else if (e.activeRecent) {
+    partes.push(marca("●", "var(--good)",
+      `Contato ativo em ${shortDate(e.lastActiveContactAt) || "período recente"}`));
+  } else if (e.lastActiveContactAt) {
+    partes.push(marca("●", "#c9ced3",
+      `Último contato ativo em ${shortDate(e.lastActiveContactAt)} — fora dos 30 dias`));
+  }
+  if (e.lastVisitAt) {
+    partes.push(marca("◆", "var(--accent)", `Visita em ${shortDate(e.lastVisitAt)}`));
+  }
+  if (e.pendingFollowupAt) {
+    partes.push(marca("↩", "#e0a800", `Retorno pendente para ${shortDate(e.pendingFollowupAt)}`));
+  }
+  return partes.join("") || '<span class="text-small" style="color:var(--muted)">—</span>';
+}
+
 function crmClientsView() {
   if (!state.crm.summary) return `<div class="loader panel">Carregando clientes CRM...</div>`;
   const rows = filteredCrmClients();
@@ -8904,6 +9224,7 @@ function crmClientsView() {
                 <tr>
                   <th>Código</th>
                   <th>Cliente</th>
+                  <th title="Contato ativo, visita, retorno pendente ou nunca contatado">Sinais</th>
                   <th>Vendedor</th>
                   <th>Cidade</th>
                   <th>Status</th>
@@ -8921,6 +9242,7 @@ function crmClientsView() {
                   <tr class="${Number(item.currentRevenue || 0) > 0 ? "" : "crm-row-no-purchase"}">
                     <td><strong>${escapeHtml(item.clientKey || "-")}</strong></td>
                     <td><strong>${escapeHtml(item.clientName)}</strong><div class="text-small">${escapeHtml(item.unitName || "-")}</div></td>
+                    <td style="white-space:nowrap">${engagementMarks(item.engagement)}</td>
                     <td><span class="${item.assignedSeller ? "" : "text-small"}" style="${item.assignedSeller ? "" : "color:var(--muted)"}">${escapeHtml(item.assignedSeller || "Sem vendedor")}</span></td>
                     <td>${escapeHtml(item.cityName || "-")}</td>
                     <td>${crmStatusBadge(item.statusCode)}</td>
@@ -8937,7 +9259,7 @@ function crmClientsView() {
                       </div>
                     </td>
                   </tr>
-                `).join("") || '<tr><td colspan="12">Nenhum cliente encontrado com os filtros selecionados.</td></tr>'}
+                `).join("") || '<tr><td colspan="13">Nenhum cliente encontrado com os filtros selecionados.</td></tr>'}
               </tbody>
             </table>
           </div>
@@ -8966,6 +9288,11 @@ function clientDrawerView() {
         <div class="client-drawer-actions">
           <button class="btn btn-primary" ${client.clientKey ? "" : "disabled"} onclick="prefillInteractionFromAgenda('${escapeHtml(client.clientKey || "")}')">Registrar contato</button>
           <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"} onclick="openContactUpdateModal('${escapeHtml(client.clientKey || "")}')">Atualizar contato</button>
+          <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
+            onclick="openReceptiveModal('${escapeHtml(client.clientKey || "")}')"
+            title="Ligação que você recebeu, mensagem trocada ou informação sobre o cliente. Não conta na meta de ligações ativas.">
+            📝 Registro receptivo
+          </button>
           ${roleIsSeller() ? `
             <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
               onclick="openScheduleContactModal('${escapeHtml(client.clientKey || "")}')"
@@ -11533,6 +11860,7 @@ function topbarTitle() {
     "feedback":       { title: "Feedback e PDI",         description: "Feedback mensal com base no MEC, plano de desenvolvimento e ciência." },
     "visitas":        { title: "Visitas",                description: "Roteiro sugerido, registro da visita e efeito no faturamento." },
     "prospeccao":     { title: "Prospecção",             description: "Oficinas que ainda não são clientes, qualificação e conversão." },
+    "contatos":       { title: "Contatos",               description: "Histórico dos registros e produtividade por vendedor." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
@@ -11778,6 +12106,7 @@ function dashboardView() {
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
     { id: "prospeccao",    title: "Prospecção",       desc: "Oficinas novas",           icon: "🌱" },
+    { id: "contatos",      title: "Contatos",         desc: "Histórico e produtividade", icon: "📇" },
     { id: "visitas",       title: "Visitas",          desc: "Roteiro e resultado",      icon: "🗺️",
       // Só o gestor tem o que responder. Para o vendedor, pedido pendente é
       // espera, não pendência — contador vermelho ali só geraria ansiedade.
@@ -11907,6 +12236,7 @@ function dashboardView() {
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "visitas"       ? visitasView()        : ""}
           ${state.activeTab === "prospeccao"    ? prospeccaoView()     : ""}
+          ${state.activeTab === "contatos"      ? contatosView()       : ""}
           ${state.activeTab === "sem-vendedor"  ? semVendedorView()    : ""}
           ${state.activeTab === "crm-interacao" ? crmInteractionView() : ""}
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
@@ -11926,6 +12256,7 @@ function dashboardView() {
       ${copyFallbackModal()}
       ${assignTaskModal()}
       ${scheduleContactModal()}
+      ${receptiveModal()}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
       ${assistantFab()}
       ${helpEditorModal()}

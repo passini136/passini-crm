@@ -223,6 +223,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
     {"id": "visitas",        "label": "Visitas",            "group": "CRM"},
     {"id": "prospeccao",     "label": "Prospecção",         "group": "CRM"},
+    {"id": "contatos",       "label": "Contatos",           "group": "CRM"},
     # Desenvolvimento
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Desenvolvimento"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Desenvolvimento"},
@@ -277,7 +278,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
-            "visitas", "prospeccao", "reunioes", "feedback",
+            "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -300,7 +301,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "visitas", "prospeccao", "reunioes", "feedback",
+            "meu-placar", "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "calendario",
         ],
         "data_scope": "proprio",
@@ -532,7 +533,18 @@ CRM_CONTACT_TYPES = [
     ("VISITA", "Visita"),
     ("ORCAMENTO", "Orcamento/Cotacao"),
     ("OUTRO", "Outro"),
+    # Receptivos: o cliente procurou a Passini. Registram histórico e NÃO
+    # entram na meta de ligações ativas.
+    ("LIGACAO_RECEBIDA", "Ligacao recebida"),
+    ("MENSAGEM_RECEBIDA", "Mensagem recebida"),
+    ("ANOTACAO", "Anotacao sobre o cliente"),
 ]
+
+# Tipos que só existem no modo receptivo. A tela usa esta lista para montar o
+# formulário curto da ficha do cliente.
+CRM_RECEPTIVE_TYPES = ["LIGACAO_RECEBIDA", "MENSAGEM_RECEBIDA", "ANOTACAO"]
+INITIATIVE_ACTIVE = "ATIVO"
+INITIATIVE_RECEPTIVE = "RECEPTIVO"
 
 CRM_CONTACT_RESULTS = [
     ("FALOU_CLIENTE", "Falou com o cliente", 0, 0),
@@ -994,6 +1006,14 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_phone TEXT")
     if "contact_name" not in interaction_columns:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_name TEXT")
+    if "initiative" not in interaction_columns:
+        # ATIVO = o vendedor procurou o cliente. É o que conta na meta.
+        # RECEPTIVO = o cliente procurou, ou é uma anotação sobre ele. Registra
+        # o histórico sem inflar o placar — senão bastaria anotar as ligações
+        # recebidas para "bater" a meta sem prospectar ninguém.
+        conn.execute("ALTER TABLE crm_interactions ADD COLUMN initiative TEXT NOT NULL DEFAULT 'ATIVO'")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_crm_interactions_initiative "
+                     "ON crm_interactions(company_id, initiative, occurred_at)")
 
     profile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(crm_client_profiles)").fetchall()}
     if "updated_phone" not in profile_columns:
@@ -4986,7 +5006,7 @@ def seller_indicators_for_feedback(
             marcadores_i = ",".join("?" for _ in variantes_i) or "''"
             ligacoes_i = conn.execute(
                 f"""SELECT COUNT(*) n FROM crm_interactions
-                    WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+                    WHERE company_id = ? AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
                       AND UPPER(seller_name) IN ({marcadores_i})
                       AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)""",
                 (company_id, *[normalize_upper(v) for v in variantes_i], inicio_i, fim_i),
@@ -5034,7 +5054,7 @@ def seller_indicators_for_feedback(
         f"""
         SELECT COUNT(*) n FROM crm_interactions
         WHERE company_id = ? AND UPPER(seller_name) IN ({marcadores})
-          AND contact_type_code = 'LIGACAO'
+          AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
           AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
         """,
         (company_id, *nomes_upper, inicio, fim),
@@ -5043,6 +5063,7 @@ def seller_indicators_for_feedback(
         f"""
         SELECT COUNT(*) n FROM crm_interactions
         WHERE company_id = ? AND UPPER(seller_name) IN ({marcadores})
+          AND initiative = 'ATIVO'
           AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)
         """,
         (company_id, *nomes_upper, inicio, fim),
@@ -6132,7 +6153,7 @@ def suggest_visits(
         for r in conn.execute(
             """
             SELECT DISTINCT client_key FROM crm_interactions
-            WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+            WHERE company_id = ? AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
               AND date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?)
             """,
             (company_id, limite_ligacao),
@@ -6302,14 +6323,14 @@ def visit_request_eligibility(
         """
         SELECT COUNT(*) n, MAX(occurred_at) ultima
         FROM crm_interactions
-        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO'
+        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
           AND date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?)
         """,
         (company_id, client_key, limite),
     ).fetchone()
     total = conn.execute(
         "SELECT COUNT(*) n FROM crm_interactions WHERE company_id = ? AND client_key = ? "
-        "AND contact_type_code = 'LIGACAO'",
+        "AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'",
         (company_id, client_key),
     ).fetchone()["n"]
     return {
@@ -6664,7 +6685,7 @@ def client_contact_effect(
                SUM(CASE WHEN date(substr(replace(occurred_at,'T',' '),1,10)) >= date(?) THEN 1 ELSE 0 END) recentes,
                MAX(occurred_at) ultima
         FROM crm_interactions
-        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO'
+        WHERE company_id = ? AND client_key = ? AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
         """,
         ((today_in_brazil() - timedelta(days=VISIT_CALL_WINDOW_DAYS)).isoformat(), company_id, client_key),
     ).fetchone()
@@ -6742,6 +6763,165 @@ def task_assignable_people(
         pessoas.insert(0, {"personName": eu, "personKey": person_key(eu),
                            "unitName": "", "role": "Gestão", "hasLogin": True})
     return pessoas
+
+
+# ─── Histórico de contatos ──────────────────────────────────────────────────
+
+CALL_GOAL_MONTH = 60  # piso do MEC: 60 ligações ativas no mês
+
+
+def contact_history(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    filtros: dict[str, Any],
+) -> dict[str, Any]:
+    """Histórico de registros com KPIs por vendedor.
+
+    Uma consulta só traz as linhas; os indicadores saem de uma agregação
+    separada, para o KPI não mudar quando o gerente pagina ou filtra por tipo.
+    Vendedor vê os dele; gerente vê os da equipe; diretor vê tudo.
+    """
+    inicio = normalize_whitespace(filtros.get("start"))
+    fim = normalize_whitespace(filtros.get("end"))
+    if not inicio or not fim:
+        hoje = today_in_brazil()
+        inicio = inicio or hoje.replace(day=1).isoformat()
+        fim = fim or hoje.isoformat()
+
+    condicoes = ["i.company_id = ?",
+                 "date(substr(replace(i.occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)"]
+    params: list[Any] = [company_id, inicio, fim]
+
+    visiveis = task_visible_sellers(conn, company_id, user)
+    if visiveis is not None:
+        if not visiveis:
+            return {"items": [], "sellers": [], "totals": {}, "start": inicio, "end": fim,
+                    "sellerOptions": []}
+        marcadores = ",".join("?" for _ in visiveis)
+        condicoes.append(f"UPPER(i.seller_name) IN ({marcadores})")
+        params.extend(normalize_upper(v) for v in visiveis)
+
+    vendedor = normalize_whitespace(filtros.get("seller"))
+    if vendedor:
+        condicoes.append("UPPER(i.seller_name) = ?")
+        params.append(normalize_upper(vendedor))
+    tipo = normalize_upper(filtros.get("type"))
+    if tipo:
+        condicoes.append("i.contact_type_code = ?")
+        params.append(tipo)
+    resultado = normalize_upper(filtros.get("result"))
+    if resultado:
+        condicoes.append("i.result_code = ?")
+        params.append(resultado)
+    iniciativa = normalize_upper(filtros.get("initiative"))
+    if iniciativa in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE}:
+        condicoes.append("i.initiative = ?")
+        params.append(iniciativa)
+    busca = normalize_whitespace(filtros.get("search"))
+    if busca:
+        condicoes.append("(UPPER(i.client_name) LIKE ? OR i.client_key LIKE ?)")
+        params.extend([f"%{normalize_upper(busca)}%", f"%{busca}%"])
+
+    onde = " AND ".join(condicoes)
+    limite = min(int(filtros.get("limit") or 300), 1000)
+
+    itens = [dict(r) for r in conn.execute(
+        f"""
+        SELECT i.id, i.client_key, i.client_name, i.seller_name, i.unit_name,
+               i.contact_type_code, i.result_code, i.occurred_at, i.notes,
+               i.next_action, i.followup_due_at, i.initiative, i.offer_title,
+               t.label AS type_label, r.label AS result_label
+        FROM crm_interactions i
+        LEFT JOIN crm_contact_types t ON t.code = i.contact_type_code
+        LEFT JOIN crm_contact_results r ON r.code = i.result_code
+        WHERE {onde}
+        ORDER BY i.occurred_at DESC, i.id DESC
+        LIMIT ?
+        """,
+        (*params, limite),
+    ).fetchall()]
+
+    # ── KPIs por vendedor ─────────────────────────────────────────────────
+    # Sem o LIMIT: o indicador tem de refletir o período inteiro, não a página.
+    agregado = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS registros,
+            SUM(CASE WHEN i.initiative = 'ATIVO' THEN 1 ELSE 0 END) AS ativos,
+            SUM(CASE WHEN i.initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptivos,
+            SUM(CASE WHEN i.initiative = 'ATIVO' AND i.contact_type_code = 'LIGACAO'
+                     THEN 1 ELSE 0 END) AS ligacoes,
+            SUM(CASE WHEN i.initiative = 'ATIVO' AND i.result_code = 'FALOU_CLIENTE'
+                     THEN 1 ELSE 0 END) AS falou,
+            SUM(CASE WHEN i.initiative = 'ATIVO'
+                      AND i.result_code IN ('GEROU_ORCAMENTO','GEROU_PEDIDO')
+                     THEN 1 ELSE 0 END) AS converteu,
+            COUNT(DISTINCT CASE WHEN i.initiative = 'ATIVO' THEN i.client_key END) AS clientes
+        FROM crm_interactions i
+        WHERE {onde}
+        """,
+        params,
+    ).fetchone()
+
+    por_vendedor = [dict(r) for r in conn.execute(
+        f"""
+        SELECT i.seller_name,
+            COUNT(*) AS registros,
+            SUM(CASE WHEN i.initiative = 'ATIVO' THEN 1 ELSE 0 END) AS ativos,
+            SUM(CASE WHEN i.initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptivos,
+            SUM(CASE WHEN i.initiative = 'ATIVO' AND i.contact_type_code = 'LIGACAO'
+                     THEN 1 ELSE 0 END) AS ligacoes,
+            SUM(CASE WHEN i.initiative = 'ATIVO' AND i.result_code = 'FALOU_CLIENTE'
+                     THEN 1 ELSE 0 END) AS falou,
+            SUM(CASE WHEN i.initiative = 'ATIVO'
+                      AND i.result_code IN ('GEROU_ORCAMENTO','GEROU_PEDIDO')
+                     THEN 1 ELSE 0 END) AS converteu,
+            COUNT(DISTINCT CASE WHEN i.initiative = 'ATIVO' THEN i.client_key END) AS clientes,
+            MAX(i.occurred_at) AS ultimo
+        FROM crm_interactions i
+        WHERE {onde}
+        GROUP BY i.seller_name
+        ORDER BY ligacoes DESC, i.seller_name
+        """,
+        params,
+    ).fetchall()]
+
+    # Meta de ligações no RITMO do período, não a meta fechada do mês. Cobrar 60
+    # no dia 6 marcaria todo mundo como irregular — é a mesma regra dos faróis.
+    competencia = inicio[:7]
+    calendario = get_business_calendar(conn, company_id, competencia)
+    decorridos = int(calendario.get("elapsedWorkingDays") or 0)
+    totais = int(calendario.get("totalWorkingDays") or 0)
+    ritmo = safe_div(decorridos, totais) if totais else 1.0
+    meta_ate_hoje = round(CALL_GOAL_MONTH * ritmo) if ritmo else CALL_GOAL_MONTH
+
+    def enriquece(linha: dict[str, Any]) -> dict[str, Any]:
+        ativos = int(linha.get("ativos") or 0)
+        ligacoes = int(linha.get("ligacoes") or 0)
+        return {
+            **linha,
+            "callsTargetToDate": meta_ate_hoje,
+            "callsPacePct": round(safe_div(ligacoes, meta_ate_hoje) * 100, 1) if meta_ate_hoje else None,
+            "talkRatePct": round(safe_div(int(linha.get("falou") or 0), ativos) * 100, 1) if ativos else 0.0,
+            "conversionPct": round(safe_div(int(linha.get("converteu") or 0), ativos) * 100, 1) if ativos else 0.0,
+        }
+
+    escopo = data_scope_for_user(conn, user)
+    return {
+        "start": inicio,
+        "end": fim,
+        "items": itens,
+        "truncated": len(itens) >= limite,
+        "totals": enriquece(dict(agregado) if agregado else {}),
+        "sellers": [enriquece(l) for l in por_vendedor],
+        "sellerOptions": sorted({l["seller_name"] for l in por_vendedor if l["seller_name"]}),
+        "contactTypes": [dict(r) for r in conn.execute(
+            "SELECT code, label FROM crm_contact_types WHERE is_active = 1 ORDER BY code").fetchall()],
+        "contactResults": [dict(r) for r in conn.execute(
+            "SELECT code, label FROM crm_contact_results WHERE is_active = 1 ORDER BY code").fetchall()],
+        "receptiveTypes": CRM_RECEPTIVE_TYPES,
+        "callGoalMonth": CALL_GOAL_MONTH,
+        "isManagerView": escopo != "proprio",
+    }
 
 
 def task_visible_sellers(
@@ -7620,7 +7800,7 @@ def activity_progress(
 
     ligacoes = conta(
         f"""SELECT COUNT(*) n FROM crm_interactions
-            WHERE company_id = ? AND contact_type_code = 'LIGACAO'
+            WHERE company_id = ? AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO'
               AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?){cond_v}""",
         (company_id, inicio, fim, *p_v),
     )
@@ -9069,9 +9249,90 @@ def list_crm_clients(
     visible_rows.sort(key=crm_priority_sort_key)
     if limit is not None:
         visible_rows = visible_rows[:limit]
+    attach_engagement_markers(conn, company_id, visible_rows)
     if not attach_context:
         return visible_rows
     return crm_attach_context(conn, company_id, visible_rows)
+
+
+ENGAGEMENT_RECENT_DAYS = 30
+
+
+def attach_engagement_markers(
+    conn: sqlite3.Connection, company_id: int, rows: list[dict[str, Any]]
+) -> None:
+    """Marca cada cliente da lista com o que já aconteceu com ele.
+
+    Quatro sinais, decididos com o Felipe: contato ativo nos últimos 30 dias,
+    visita registrada, retorno pendente e nunca contatado. O último é o que
+    mais importa — mostra o vazio, não só o cheio.
+
+    Tudo em três consultas em lote sobre as chaves JÁ VISÍVEIS. Uma consulta por
+    linha derrubaria a carteira, que tem centenas de clientes por vendedor.
+    """
+    if not rows:
+        return
+    chaves = [normalize_client_key(r.get("clientKey")) for r in rows if r.get("clientKey")]
+    if not chaves:
+        return
+    marcadores = ",".join("?" for _ in chaves)
+    limite = (today_in_brazil() - timedelta(days=ENGAGEMENT_RECENT_DAYS)).isoformat()
+
+    contatos: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        f"""
+        SELECT client_key,
+               MAX(CASE WHEN initiative = 'ATIVO' THEN occurred_at END) AS ultimo_ativo,
+               MAX(occurred_at) AS ultimo_qualquer,
+               COUNT(*) AS total
+        FROM crm_interactions
+        WHERE company_id = ? AND client_key IN ({marcadores})
+        GROUP BY client_key
+        """,
+        (company_id, *chaves),
+    ).fetchall():
+        contatos[normalize_client_key(r["client_key"])] = dict(r)
+
+    visitas: dict[str, str] = {}
+    for r in conn.execute(
+        f"""
+        SELECT client_key, MAX(COALESCE(occurred_at, scheduled_for)) AS ultima
+        FROM visits
+        WHERE company_id = ? AND client_key IN ({marcadores}) AND status <> 'CANCELADA'
+        GROUP BY client_key
+        """,
+        (company_id, *chaves),
+    ).fetchall():
+        if r["ultima"]:
+            visitas[normalize_client_key(r["client_key"])] = r["ultima"]
+
+    pendentes: dict[str, str] = {}
+    for r in conn.execute(
+        f"""
+        SELECT client_key, MIN(due_at) AS proxima
+        FROM crm_tasks
+        WHERE company_id = ? AND client_key IN ({marcadores})
+          AND status IN ('ABERTA','REAGENDADA','ATRASADA')
+        GROUP BY client_key
+        """,
+        (company_id, *chaves),
+    ).fetchall():
+        pendentes[normalize_client_key(r["client_key"])] = r["proxima"]
+
+    for row in rows:
+        chave = normalize_client_key(row.get("clientKey"))
+        info = contatos.get(chave) or {}
+        ultimo_ativo = info.get("ultimo_ativo")
+        row["engagement"] = {
+            "lastActiveContactAt": ultimo_ativo,
+            "activeRecent": bool(ultimo_ativo and ultimo_ativo[:10] >= limite),
+            "lastVisitAt": visitas.get(chave),
+            "pendingFollowupAt": pendentes.get(chave),
+            # "Nunca contatado" é ausência de QUALQUER toque: nenhum registro
+            # (ativo ou receptivo) E nenhuma visita. Marcar de vermelho um
+            # cliente que o gerente visitou queimaria a confiança no sinal.
+            "neverContacted": not info.get("total") and chave not in visitas,
+        }
 
 
 def crm_matches_search(row: dict[str, Any], search_value: str) -> bool:
@@ -9627,8 +9888,10 @@ def crm_summary_for_user(
     contacts_today = conn.execute(
         """
         SELECT
-            COUNT(*) AS total_contacts,
-            SUM(CASE WHEN result_code NOT IN ('NAO_ATENDEU','PEDIU_RETORNO') THEN 1 ELSE 0 END) AS active_contacts,
+            SUM(CASE WHEN initiative = 'ATIVO' THEN 1 ELSE 0 END) AS total_contacts,
+            SUM(CASE WHEN initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptive_contacts,
+            SUM(CASE WHEN result_code NOT IN ('NAO_ATENDEU','PEDIU_RETORNO')
+                      AND initiative = 'ATIVO' THEN 1 ELSE 0 END) AS active_contacts,
             SUM(CASE WHEN result_code = 'FALOU_CLIENTE' THEN 1 ELSE 0 END) AS success_contacts,
             SUM(CASE WHEN result_code = 'GEROU_ORCAMENTO' THEN 1 ELSE 0 END) AS generated_quotes,
             SUM(CASE WHEN result_code = 'GEROU_PEDIDO' THEN 1 ELSE 0 END) AS generated_orders
@@ -9759,6 +10022,19 @@ def create_crm_interaction(
         raise ValueError("Cliente invalido para registro de interacao")
     if not contact_type_code:
         raise ValueError("Tipo de contato obrigatorio")
+    # RECEPTIVO: o cliente procurou, ou é uma anotação sobre ele. Entra no
+    # histórico e na ficha, mas fica fora da meta de ligações ativas — senão
+    # bastaria anotar o que chegou sozinho para "bater" a meta sem prospectar.
+    iniciativa = (normalize_upper(payload.get("initiative")) or INITIATIVE_ACTIVE)
+    if iniciativa not in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE}:
+        iniciativa = INITIATIVE_ACTIVE
+    if contact_type_code in CRM_RECEPTIVE_TYPES:
+        iniciativa = INITIATIVE_RECEPTIVE
+    if iniciativa == INITIATIVE_RECEPTIVE and not result_code:
+        # No registro receptivo o resultado não é a pergunta certa: ninguém
+        # "não atendeu" uma mensagem que chegou. O padrão evita um campo a mais
+        # numa tela que precisa ser de dois cliques.
+        result_code = "OUTRO"
     if not result_code:
         raise ValueError("Resultado do contato obrigatorio")
     if not notes:
@@ -9792,8 +10068,9 @@ def create_crm_interaction(
             company_id, client_key, client_name, seller_name, unit_name,
             contact_phone, contact_name,
             contact_type_code, result_code, occurred_at, notes, question_used,
-            had_progress, offer_title, next_action, followup_due_at, created_at, created_by_user_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            had_progress, offer_title, next_action, followup_due_at, initiative,
+            created_at, created_by_user_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             company_id,
@@ -9812,6 +10089,7 @@ def create_crm_interaction(
             normalize_whitespace(payload.get("offerTitle")),
             next_action,
             followup_due_at or None,
+            iniciativa,
             now_iso(),
             user["id"],
         ),
@@ -13454,7 +13732,8 @@ def compute_seller_score(conn: sqlite3.Connection, company_id: int, user: sqlite
         """SELECT COUNT(*) AS cnt FROM crm_interactions
            WHERE company_id = ? AND seller_name = ?
              AND substr(occurred_at, 1, 7) = ?
-             AND result_code NOT IN ('NAO_ATENDEU', 'PEDIU_RETORNO')""",
+             AND result_code NOT IN ('NAO_ATENDEU', 'PEDIU_RETORNO')
+             AND initiative = 'ATIVO'""",
         (company_id, seller_name, competence),
     ).fetchone()
     calls_actual = int(calls_row["cnt"]) if calls_row else 0
@@ -13569,7 +13848,9 @@ def compute_team_score(conn: sqlite3.Connection, company_id: int, user: sqlite3.
     calls_map: dict[str, int] = {
         normalize_whitespace(r["seller_name"]): int(r["cnt"])
         for r in conn.execute(
-            "SELECT seller_name, COUNT(*) AS cnt FROM crm_interactions WHERE company_id = ? AND substr(occurred_at,1,7) = ? AND result_code NOT IN ('NAO_ATENDEU', 'PEDIU_RETORNO') GROUP BY seller_name",
+            "SELECT seller_name, COUNT(*) AS cnt FROM crm_interactions WHERE company_id = ? "
+            "AND substr(occurred_at,1,7) = ? AND result_code NOT IN ('NAO_ATENDEU', 'PEDIU_RETORNO') "
+            "AND initiative = 'ATIVO' GROUP BY seller_name",
             (company_id, competence),
         ).fetchall()
     }
@@ -13920,8 +14201,9 @@ def compute_team_activity_today(
     contacts_rows = conn.execute(
         """
         SELECT seller_name,
-               COUNT(*) AS total,
-               SUM(CASE WHEN result_code NOT IN ('NAO_ATENDEU','PEDIU_RETORNO') THEN 1 ELSE 0 END) AS active
+               SUM(CASE WHEN initiative = 'ATIVO' THEN 1 ELSE 0 END) AS total,
+               SUM(CASE WHEN result_code NOT IN ('NAO_ATENDEU','PEDIU_RETORNO')
+                         AND initiative = 'ATIVO' THEN 1 ELSE 0 END) AS active
         FROM crm_interactions
         WHERE company_id = ? AND substr(occurred_at,1,10) = ?
         GROUP BY seller_name
@@ -15232,6 +15514,18 @@ class AppHandler(BaseHTTPRequestHandler):
                             data[sensitive] = []
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
+                return
+            if path == "/api/crm/contacts":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                filtros = {k: query.get(k, [""])[0] for k in
+                           ("start", "end", "seller", "type", "result", "initiative", "search", "limit")}
+                with closing(get_connection()) as conn:
+                    dados = contact_history(conn, user["company_id"], user, filtros)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
                 return
             if path == "/api/admin/territories":
                 user = self._require_auth()
