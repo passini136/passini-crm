@@ -3,6 +3,7 @@ const state = {
   options: { competences: [], units: [], sellers: [], cities: [] },
   dashboard: null,
   admin: null,
+  territories: null,   // mapa de bairro/cidade por unidade (Administração → Territórios)
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
@@ -65,8 +66,11 @@ const state = {
       visits: false,
       visitRoute: false,
       prospects: false,
+      territories: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
+    territoryCity: "",     // filtro de cidade na tela de territórios
+    territoryDraft: null,  // linha em edição/criação no mapa de territórios
     personResults: null,   // resultados da busca de pessoa a vincular
     personSearching: false,
     personQuery: "",
@@ -321,6 +325,9 @@ async function setCrmClientDetailTab(tab) {
 
 function setAdminSection(section) {
   state.adminSection = section;
+  if (section === "territorios" && !state.territories && !state.ui.loading.territories) {
+    void loadTerritories();
+  }
   if (section === "auditoria-integridade") {
     if (!state.integrityAudit.competence) {
       state.integrityAudit.competence = state.filters.competenceEnd || state.filters.competenceStart || state.options.competences[0] || "";
@@ -989,6 +996,82 @@ async function loadAdmin() {
   } finally {
     setLoading("admin", false);
   }
+  requestRender();
+}
+
+async function loadTerritories() {
+  setLoading("territories", true);
+  try {
+    state.territories = await api("/api/admin/territories");
+  } catch (error) {
+    addMessage("error", error.message);
+  } finally {
+    setLoading("territories", false);
+  }
+  requestRender();
+}
+
+function novoTerritorio(cidade, bairro) {
+  state.ui.territoryDraft = {
+    id: "",
+    cityName: cidade || "",
+    neighborhood: bairro || "",
+    unitName: "",
+    validFrom: state.territories?.defaultValidFrom || "2026-09-01",
+    notes: "",
+  };
+  requestRender();
+}
+
+function editarTerritorio(id) {
+  const item = (state.territories?.territories || []).find((t) => Number(t.id) === Number(id));
+  if (!item) return;
+  state.ui.territoryDraft = {
+    id: item.id,
+    cityName: item.city_name,
+    neighborhood: item.neighborhood === "*" ? "" : item.neighborhood,
+    unitName: item.unit_name,
+    validFrom: item.valid_from,
+    notes: item.notes || "",
+  };
+  requestRender();
+}
+
+function fecharTerritorio() {
+  state.ui.territoryDraft = null;
+  requestRender();
+}
+
+async function salvarTerritorio() {
+  const d = state.ui.territoryDraft;
+  if (!d) return;
+  if (!d.cityName.trim()) { addMessage("error", "Informe a cidade."); return; }
+  if (!d.unitName) { addMessage("error", "Escolha a unidade."); return; }
+  try {
+    const r = await api("/api/admin/territories/save", { method: "POST", body: JSON.stringify(d) });
+    addMessage("success", r.message || "Território salvo.");
+    state.ui.territoryDraft = null;
+    state.territories = null;
+    await loadTerritories();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function excluirTerritorio(id) {
+  if (!window.confirm("Remover este território? A cidade volta a valer pela regra antiga.")) return;
+  try {
+    const r = await api("/api/admin/territories/delete", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", r.message || "Território removido.");
+    state.territories = null;
+    await loadTerritories();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+function setTerritoryCity(cidade) {
+  state.ui.territoryCity = cidade;
   requestRender();
 }
 
@@ -8911,7 +8994,19 @@ function clientDrawerView() {
                 <div><span>Status</span><strong>${escapeHtml(client.statusCode || "-")}</strong></div>
                 <div><span>Telefone atualizado</span><strong>${escapeHtml(client.updatedPhone || client.phone || profile.updatedPhone || profile.phone || "Não informado")}</strong></div>
                 <div><span>Contato principal</span><strong>${escapeHtml(client.primaryContactName || profile.primaryContactName || "Não informado")}</strong></div>
+                ${profile.territory ? `
+                <div><span>Território</span><strong>${escapeHtml(profile.territory.unit || "compartilhado")}</strong>
+                  <div class="text-small" style="color:var(--muted)">${escapeHtml(profile.territory.reason || "")}</div>
+                </div>` : ""}
               </div>
+              ${profile.territory && profile.territory.unit && client.unitName
+                 && profile.territory.unit !== client.unitName ? `
+                <div class="text-small" style="margin-top:8px;padding:8px 10px;border-radius:8px;
+                     background:#fff8e6;border:1px solid #f0d68a;color:#7a5c00">
+                  O bairro é território da <strong>${escapeHtml(profile.territory.unit)}</strong>, mas quem
+                  atende hoje é a <strong>${escapeHtml(client.unitName)}</strong>. A carteira não muda sozinha —
+                  vale a decisão do gerente.
+                </div>` : ""}
             </div>
             <div class="subtle-card padded-card">
               <div class="section-title"><h3>Situação comercial</h3></div>
@@ -10369,6 +10464,139 @@ function adminEditorCards() {
   `;
 }
 
+function territoriosView() {
+  if (state.ui.loading.territories) return `<div class="loader panel">Carregando territórios...</div>`;
+  const dados = state.territories;
+  if (!dados) return `<div class="loader panel">Carregando territórios...</div>`;
+
+  const todos = dados.territories || [];
+  const unidades = [...(dados.units || []), dados.sharedLabel || "COMPARTILHADA"];
+  const cidades = [...new Set(todos.map((t) => t.city_name))].sort((a, b) => a.localeCompare(b, "pt-BR"));
+  const cidadeFiltro = state.ui.territoryCity;
+  const lista = cidadeFiltro ? todos.filter((t) => t.city_name === cidadeFiltro) : todos;
+  const faltando = dados.coverage?.missing || [];
+  const draft = state.ui.territoryDraft;
+
+  const badgeUnidade = (u) => u === (dados.sharedLabel || "COMPARTILHADA")
+    ? `<span class="soft-badge" style="background:#eef1f4;color:#5b6b76">compartilhada</span>`
+    : `<span class="soft-badge">${escapeHtml(u)}</span>`;
+
+  return `
+    <div class="stack">
+      <div class="form-card">
+        <div class="section-title">
+          <div>
+            <h3>Territórios</h3>
+            <div class="text-small">Quem é dono de cada bairro e cidade.</div>
+          </div>
+          <button class="btn btn-primary btn-sm" type="button" onclick="novoTerritorio()">+ Adicionar</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);line-height:1.6">
+          Porto Alegre tem duas unidades, então a cidade sozinha não diz mais de quem é o cliente.
+          Este mapa <strong>decide a prospecção, o agrupamento do roteiro de visita e o território
+          mostrado na ficha</strong>. Ele <strong>não decide faturamento</strong>: a venda continua
+          contando para a unidade do vendedor que a fez.
+          Cidade marcada como <em>compartilhada</em> é de propósito — quem manda ali é o vendedor
+          que já atende o cliente.
+        </div>
+      </div>
+
+      ${faltando.length ? `
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Bairros sem dono</h3>
+          <div class="text-small">Têm cliente na base, mas caíram na regra da cidade. ${dados.coverage.total} no total.</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Cidade</th><th>Bairro</th><th style="text-align:right">Clientes</th><th></th></tr></thead>
+            <tbody>
+              ${faltando.slice(0, 25).map((f) => `
+                <tr>
+                  <td class="text-small">${escapeHtml(f.city)}</td>
+                  <td class="text-small"><strong>${escapeHtml(f.neighborhood)}</strong></td>
+                  <td class="text-small" style="text-align:right">${number(f.clients)}</td>
+                  <td style="text-align:right">
+                    <button class="btn btn-ghost btn-sm" type="button"
+                      onclick="novoTerritorio('${jsAttr(f.city)}','${jsAttr(f.neighborhood)}')">Mapear</button>
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>` : ""}
+
+      ${draft ? `
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>${draft.id ? "Editar território" : "Novo território"}</h3></div>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="fecharTerritorio()">Cancelar</button>
+        </div>
+        <div class="two-column-form">
+          <div class="field">
+            <label>Cidade</label>
+            <input value="${escapeHtml(draft.cityName)}" oninput="state.ui.territoryDraft.cityName=this.value" />
+          </div>
+          <div class="field">
+            <label>Bairro <span style="color:var(--muted);font-weight:400">(vazio = cidade inteira)</span></label>
+            <input value="${escapeHtml(draft.neighborhood)}" oninput="state.ui.territoryDraft.neighborhood=this.value" />
+          </div>
+          <div class="field">
+            <label>Unidade</label>
+            <select onchange="state.ui.territoryDraft.unitName=this.value">
+              <option value="">Selecione…</option>
+              ${unidades.map((u) => `<option value="${escapeHtml(u)}" ${draft.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="field">
+            <label>Vale a partir de</label>
+            <input type="date" value="${escapeHtml(draft.validFrom)}" onchange="state.ui.territoryDraft.validFrom=this.value" />
+          </div>
+          <div class="field field-span-2">
+            <label>Observação</label>
+            <input value="${escapeHtml(draft.notes || "")}" oninput="state.ui.territoryDraft.notes=this.value" />
+          </div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-primary" type="button" onclick="salvarTerritorio()">Salvar território</button>
+        </div>
+      </div>` : ""}
+
+      <div class="form-card">
+        <div class="section-title">
+          <div><h3>Mapa atual</h3><div class="text-small">${lista.length} de ${todos.length} registros.</div></div>
+          <select onchange="setTerritoryCity(this.value)" style="max-width:240px">
+            <option value="">Todas as cidades</option>
+            ${cidades.map((c) => `<option value="${escapeHtml(c)}" ${cidadeFiltro === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Cidade</th><th>Bairro</th><th>Unidade</th><th>Desde</th><th>Origem</th><th style="text-align:right">Ações</th></tr></thead>
+            <tbody>
+              ${lista.length ? lista.map((t) => `
+                <tr>
+                  <td class="text-small">${escapeHtml(t.city_name)}</td>
+                  <td class="text-small">${t.neighborhood === "*"
+                      ? '<em style="color:var(--muted)">toda a cidade</em>'
+                      : `<strong>${escapeHtml(t.neighborhood)}</strong>`}</td>
+                  <td>${badgeUnidade(t.unit_name)}</td>
+                  <td class="text-small">${escapeHtml(t.valid_from)}</td>
+                  <td class="text-small" style="color:var(--muted)">${escapeHtml(t.source)}</td>
+                  <td style="text-align:right;white-space:nowrap">
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="editarTerritorio(${Number(t.id)})">Editar</button>
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="excluirTerritorio(${Number(t.id)})">Excluir</button>
+                  </td>
+                </tr>`).join("")
+                : '<tr><td colspan="6" class="text-small">Nenhum território mapeado.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 administracaoView = function administracaoViewOverride() {
   if (!state.admin) return `<div class="loader panel">Carregando administração...</div>`;
   const section = state.adminSection || "cadastros";
@@ -10382,12 +10610,16 @@ administracaoView = function administracaoViewOverride() {
       </div>
       <div class="actions">
         <button class="btn ${section === "cadastros" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('cadastros')">Cadastros e pendências</button>
+        <button class="btn ${section === "territorios" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('territorios')">Territórios</button>
         <button class="btn ${section === "auditoria-integridade" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('auditoria-integridade')">Auditoria de Integridade</button>
       </div>
     </div>
   `;
   if (section === "auditoria-integridade") {
     return `<div class="stack">${adminSectionNav}${integrityAuditView()}</div>`;
+  }
+  if (section === "territorios") {
+    return `<div class="stack">${adminSectionNav}${territoriosView()}</div>`;
   }
   return `
     <div class="stack">

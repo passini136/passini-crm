@@ -2076,6 +2076,24 @@ def init_db() -> None:
                 FOREIGN KEY (company_id) REFERENCES companies(id)
             );
 
+            CREATE TABLE IF NOT EXISTS territory_mappings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                city_name TEXT NOT NULL,
+                neighborhood TEXT NOT NULL,
+                unit_name TEXT NOT NULL,
+                valid_from TEXT NOT NULL,
+                valid_to TEXT,
+                source TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, city_name, neighborhood, valid_from),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_territory_lookup
+                ON territory_mappings(company_id, city_name, neighborhood);
+
             CREATE TABLE IF NOT EXISTS client_registry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -2357,6 +2375,7 @@ def init_db() -> None:
         seed_kpi_thresholds(conn, company_id)
         backfill_meeting_participant_users(conn, company_id)
         seed_help_content(conn, company_id)
+        seed_territory_mappings(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -2479,6 +2498,262 @@ def current_role_and_unit(conn: sqlite3.Connection, company_id: int, person_name
     if row:
         return row["role_classification"], row["base_unit"]
     return None, None
+
+
+# ─── Territórios: bairro decide, cidade é o segundo nível ───────────────────
+
+TERRITORIO_COMPARTILHADO = "COMPARTILHADA"
+TERRITORIO_CIDADE_INTEIRA = "*"
+
+
+def territory_default_valid_from() -> str:
+    try:
+        import territorio_seed as semente
+        return semente.TERRITORIO_VIGENCIA
+    except (ModuleNotFoundError, AttributeError):
+        return today_in_brazil().isoformat()
+
+
+def seed_territory_mappings(conn: sqlite3.Connection, company_id: int) -> None:
+    """Carrega o mapa de territórios aprovado, sem sobrescrever ajuste manual.
+
+    Roda a cada boot. O INSERT OR IGNORE somado ao UNIQUE(cidade, bairro,
+    vigência) garante que uma linha já editada pela tela de Administração não
+    volte ao valor original — a semente preenche o que falta e nada mais.
+    """
+    try:
+        import territorio_seed as semente
+    except ModuleNotFoundError:
+        print("[territorio] territorio_seed.py não encontrado — mapa não carregado")
+        return
+
+    vigencia = semente.TERRITORIO_VIGENCIA
+    agora = now_iso()
+    linhas: list[tuple[Any, ...]] = []
+
+    for bairro, unidade in semente.BAIRROS_POA.items():
+        linhas.append((company_id, "PORTO ALEGRE", normalize_upper(strip_accents(bairro)),
+                       unidade, vigencia, None, "semente_2026_09", None, agora))
+    for cidade, unidade in semente.CIDADES_EXCLUSIVAS.items():
+        linhas.append((company_id, normalize_upper(strip_accents(cidade)), TERRITORIO_CIDADE_INTEIRA,
+                       unidade, vigencia, None, "semente_2026_09",
+                       "Cidade inteira da unidade", agora))
+    for cidade in semente.CIDADES_COMPARTILHADAS:
+        linhas.append((company_id, normalize_upper(strip_accents(cidade)), TERRITORIO_CIDADE_INTEIRA,
+                       TERRITORIO_COMPARTILHADO, vigencia, None, "semente_2026_09",
+                       "Sem mapa de propósito: a unidade vem do vendedor que atende", agora))
+
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO territory_mappings
+            (company_id, city_name, neighborhood, unit_name, valid_from, valid_to,
+             source, notes, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        linhas,
+    )
+    conn.commit()
+
+
+def resolve_territory_unit(
+    conn: sqlite3.Connection, company_id: int,
+    city_name: str | None, neighborhood: str | None,
+    competence: str | None = None,
+) -> str | None:
+    """Unidade dona do território. None = decide o vendedor que atende.
+
+    Cascata, do mais específico para o mais genérico:
+      1. cidade + bairro   (Porto Alegre, dividida entre Zona Norte e Sul)
+      2. cidade inteira    (Gravataí, Alvorada, Cachoeirinha → Zona Norte)
+      3. mapa antigo de cidades (city_mappings), que segue valendo no interior
+      4. None
+
+    Uma cidade marcada COMPARTILHADA devolve None de propósito: Canoas e Viamão
+    são atendidas pelas duas unidades e quem manda é o vendedor com histórico,
+    não o mapa. Devolver uma unidade ali tiraria carteira de quem já atende.
+    """
+    cidade = normalize_upper(strip_accents(city_name))
+    if not cidade:
+        return None
+    competence = competence or date.today().strftime("%Y-%m")
+    alvo = first_day_of_competence(competence).isoformat()
+    bairro = normalize_upper(strip_accents(neighborhood))
+
+    for chave in ([bairro] if bairro else []) + [TERRITORIO_CIDADE_INTEIRA]:
+        row = conn.execute(
+            """
+            SELECT unit_name FROM territory_mappings
+            WHERE company_id = ? AND city_name = ? AND neighborhood = ?
+              AND date(valid_from) <= date(?)
+              AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
+            ORDER BY date(valid_from) DESC LIMIT 1
+            """,
+            (company_id, cidade, chave, alvo, alvo),
+        ).fetchone()
+        if row:
+            unidade = normalize_unit(row["unit_name"])
+            return None if unidade == TERRITORIO_COMPARTILHADO else unidade
+
+    return resolve_city_unit(conn, company_id, city_name, competence)
+
+
+def territory_for_client(
+    conn: sqlite3.Connection, company_id: int, client_code: str,
+    competence: str | None = None,
+) -> dict[str, Any]:
+    """Território do cliente já pronto para a tela, com o motivo da decisão."""
+    perfil = conn.execute(
+        "SELECT city_name, neighborhood FROM crm_client_profiles "
+        "WHERE company_id = ? AND client_code = ?",
+        (company_id, client_code),
+    ).fetchone()
+    if not perfil:
+        return {"unit": None, "city": "", "neighborhood": "", "reason": "cliente sem cadastro"}
+    cidade = normalize_whitespace(perfil["city_name"])
+    bairro = normalize_whitespace(perfil["neighborhood"])
+    unidade = resolve_territory_unit(conn, company_id, cidade, bairro, competence)
+    if unidade:
+        motivo = f"bairro {bairro}" if bairro and territory_has_neighborhood(
+            conn, company_id, cidade, bairro) else f"cidade {cidade}"
+    elif territory_city_is_shared(conn, company_id, cidade):
+        motivo = "cidade compartilhada — vale o vendedor que atende"
+    elif bairro:
+        # Diferente de compartilhado: aqui ninguém decidiu ainda. Aparece no
+        # relatório "bairros sem dono" para o mapa não envelhecer calado.
+        motivo = f"bairro {bairro} ainda sem dono no mapa"
+    else:
+        motivo = "cliente sem bairro no cadastro"
+    return {"unit": unidade, "city": cidade, "neighborhood": bairro, "reason": motivo}
+
+
+def territory_city_is_shared(
+    conn: sqlite3.Connection, company_id: int, city_name: str
+) -> bool:
+    row = conn.execute(
+        "SELECT unit_name FROM territory_mappings WHERE company_id = ? AND city_name = ? "
+        "AND neighborhood = ?",
+        (company_id, normalize_upper(strip_accents(city_name)), TERRITORIO_CIDADE_INTEIRA),
+    ).fetchone()
+    return bool(row) and normalize_unit(row["unit_name"]) == TERRITORIO_COMPARTILHADO
+
+
+def territory_has_neighborhood(
+    conn: sqlite3.Connection, company_id: int, city_name: str, neighborhood: str
+) -> bool:
+    return bool(conn.execute(
+        "SELECT 1 FROM territory_mappings WHERE company_id = ? AND city_name = ? AND neighborhood = ?",
+        (company_id, normalize_upper(strip_accents(city_name)),
+         normalize_upper(strip_accents(neighborhood))),
+    ).fetchone())
+
+
+def list_territory_mappings(
+    conn: sqlite3.Connection, company_id: int, city: str = ""
+) -> list[dict[str, Any]]:
+    sql = ("SELECT id, city_name, neighborhood, unit_name, valid_from, valid_to, source, notes "
+           "FROM territory_mappings WHERE company_id = ?")
+    params: list[Any] = [company_id]
+    if city:
+        sql += " AND city_name = ?"
+        params.append(normalize_upper(strip_accents(city)))
+    sql += " ORDER BY city_name, (neighborhood = '*') DESC, neighborhood"
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def save_territory_mapping(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    cidade = normalize_upper(strip_accents(payload.get("cityName")))
+    if not cidade:
+        raise ValueError("Informe a cidade.")
+    bairro = normalize_upper(strip_accents(payload.get("neighborhood"))) or TERRITORIO_CIDADE_INTEIRA
+    unidade = normalize_unit(payload.get("unitName"))
+    if not unidade:
+        raise ValueError("Informe a unidade.")
+    if unidade != TERRITORIO_COMPARTILHADO and unidade not in CANONICAL_UNITS:
+        raise ValueError(f"Unidade desconhecida: {unidade}")
+    vigencia = normalize_whitespace(payload.get("validFrom")) or today_in_brazil().isoformat()
+    registro_id = payload.get("id")
+
+    if registro_id:
+        conn.execute(
+            "UPDATE territory_mappings SET city_name = ?, neighborhood = ?, unit_name = ?, "
+            "valid_from = ?, valid_to = ?, notes = ? WHERE company_id = ? AND id = ?",
+            (cidade, bairro, unidade, vigencia,
+             normalize_whitespace(payload.get("validTo")) or None,
+             normalize_whitespace(payload.get("notes")) or None, company_id, int(registro_id)),
+        )
+        acao = "atualizado"
+    else:
+        conn.execute(
+            """
+            INSERT INTO territory_mappings
+                (company_id, city_name, neighborhood, unit_name, valid_from, valid_to,
+                 source, notes, created_at)
+            VALUES (?,?,?,?,?,?,'manual',?,?)
+            ON CONFLICT(company_id, city_name, neighborhood, valid_from)
+            DO UPDATE SET unit_name = excluded.unit_name, notes = excluded.notes, valid_to = NULL
+            """,
+            (company_id, cidade, bairro, unidade, vigencia,
+             normalize_whitespace(payload.get("validTo")) or None,
+             normalize_whitespace(payload.get("notes")) or None, now_iso()),
+        )
+        acao = "salvo"
+
+    audit_log(conn, company_id, user_id, "salvar", "territory_mappings",
+              f"{cidade}/{bairro}", {"unidade": unidade, "vigencia": vigencia})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    rotulo = "toda a cidade" if bairro == TERRITORIO_CIDADE_INTEIRA else bairro
+    return {"message": f"Território {acao}: {rotulo} ({cidade}) → {unidade}."}
+
+
+def delete_territory_mapping(
+    conn: sqlite3.Connection, company_id: int, user_id: int, registro_id: Any
+) -> dict[str, Any]:
+    conn.execute("DELETE FROM territory_mappings WHERE company_id = ? AND id = ?",
+                 (company_id, int(registro_id)))
+    audit_log(conn, company_id, user_id, "excluir", "territory_mappings", str(registro_id), {})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": "Território removido. A cidade volta a valer pela regra antiga."}
+
+
+def territory_coverage_report(
+    conn: sqlite3.Connection, company_id: int, competence: str | None = None
+) -> dict[str, Any]:
+    """Bairros com cliente na base que ainda não têm dono no mapa.
+
+    É o relatório que impede o mapa de envelhecer em silêncio: bairro novo
+    aparece no cadastro do Alfa e ninguém percebe que ele caiu na regra da
+    cidade.
+    """
+    faltando: list[dict[str, Any]] = []
+    for r in conn.execute(
+        """
+        SELECT UPPER(TRIM(city_name)) AS cidade, UPPER(TRIM(COALESCE(neighborhood,''))) AS bairro,
+               COUNT(*) AS clientes
+        FROM crm_client_profiles
+        WHERE company_id = ? AND city_name IS NOT NULL AND TRIM(city_name) <> ''
+        GROUP BY cidade, bairro
+        ORDER BY clientes DESC
+        """,
+        (company_id,),
+    ).fetchall():
+        cidade = normalize_upper(strip_accents(r["cidade"]))
+        bairro = normalize_upper(strip_accents(r["bairro"]))
+        if not bairro:
+            continue
+        tem_cidade = bool(conn.execute(
+            "SELECT 1 FROM territory_mappings WHERE company_id = ? AND city_name = ?",
+            (company_id, cidade)).fetchone())
+        if not tem_cidade:
+            continue  # cidade fora do mapa novo: segue na regra antiga, tudo bem
+        if territory_city_is_shared(conn, company_id, cidade):
+            continue  # Canoas e Viamão são compartilhadas de propósito, não é lacuna
+        if not territory_has_neighborhood(conn, company_id, cidade, bairro):
+            faltando.append({"city": cidade, "neighborhood": bairro, "clients": r["clientes"]})
+    return {"missing": faltando[:200], "total": len(faltando)}
 
 
 def resolve_city_unit(conn: sqlite3.Connection, company_id: int, city_name: str | None, competence: str | None = None) -> str | None:
@@ -7515,7 +7790,18 @@ def save_prospect(
     else:
         vendedor = normalize_whitespace(payload.get("sellerName")) or meeting_person_identity(user)
 
-    unidade = normalize_unit(payload.get("unitName")) or seller_unit_name(conn, company_id, vendedor)
+    # Quem é o dono do prospect: primeiro o que foi escolhido na tela, depois o
+    # TERRITÓRIO (bairro/cidade) e só então a unidade do vendedor. O território
+    # vem antes porque é ele que direciona a prospecção — um bairro da Zona
+    # Norte prospectado por engano pela Zona Sul entra na unidade certa.
+    # O território devolve None em cidade compartilhada (Canoas, Viamão) e aí
+    # manda o vendedor, que é exatamente a regra combinada.
+    unidade = (
+        normalize_unit(payload.get("unitName"))
+        or resolve_territory_unit(conn, company_id,
+                                  payload.get("cityName"), payload.get("neighborhood"))
+        or seller_unit_name(conn, company_id, vendedor)
+    )
     permitidas = crm_allowed_units_for_user(conn, user)
     if permitidas is not None and permitidas and unidade not in permitidas:
         unidade = permitidas[0]
@@ -9315,6 +9601,11 @@ def get_crm_client_360(
             "updatedPhone": profile["updated_phone"],
             "primaryContactName": profile["primary_contact_name"],
             "contactNotes": profile["contact_notes"],
+            # Território é informativo na ficha: mostra de quem o bairro é,
+            # mesmo quando o vendedor que atende é de outra unidade. A carteira
+            # NÃO muda por causa disso — serve para o gerente enxergar a
+            # sobreposição e decidir se troca o atendimento.
+            "territory": territory_for_client(conn, company_id, profile["client_code"]),
         }
     summary_payload = {**summary, "clientCode": summary.get("clientCode") or summary.get("clientKey")}
     return {
@@ -14942,6 +15233,28 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
                 return
+            if path == "/api/admin/territories":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    if data_scope_for_user(conn, user) == "proprio":
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Perfil sem acesso."}))
+                        return
+                    cidade = normalize_whitespace(parse_qs(parsed.query).get("city", [""])[0])
+                    itens = list_territory_mappings(conn, user["company_id"], cidade)
+                    cobertura = territory_coverage_report(conn, user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "territories": itens,
+                    "coverage": cobertura,
+                    "units": CANONICAL_UNITS,
+                    "sharedLabel": TERRITORIO_COMPARTILHADO,
+                    "cityWide": TERRITORIO_CIDADE_INTEIRA,
+                    "defaultValidFrom": territory_default_valid_from(),
+                }))
+                return
             if path.startswith("/api/templates/"):
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):
@@ -16082,6 +16395,25 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn.commit()
                     self._set_headers(200)
                     self.wfile.write(json_dumps({"message": "Usuário excluído."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in {"/api/admin/territories/save", "/api/admin/territories/delete"}:
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path.endswith("/save"):
+                            res = save_territory_mapping(conn, user["company_id"], user["id"], payload)
+                        else:
+                            res = delete_territory_mapping(conn, user["company_id"], user["id"],
+                                                           payload.get("id"))
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(res))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(400)
