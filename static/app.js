@@ -67,6 +67,9 @@ const state = {
       prospects: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
+    personResults: null,   // resultados da busca de pessoa a vincular
+    personSearching: false,
+    personQuery: "",
     assistantOpen: false,
     assistantBubble: true,   // balão de chamada, some no primeiro clique
     assistantTab: "dicas",
@@ -1128,6 +1131,8 @@ function syncUserEditorOptions() {
   if (!["Gerente", "Analista"].includes(state.userEditor.role)) {
     state.userEditor.linkedUnits = [];
   }
+  state.ui.personResults = null;
+  state.ui.personQuery = "";
 }
 
 function resetUserEditor() {
@@ -1136,6 +1141,7 @@ function resetUserEditor() {
     username: "",
     fullName: "",
     linkedPersonName: "",
+    linkedPersonSource: "",
     linkedUnits: [],
     role: "Administrador",
     profileId: "",
@@ -1182,6 +1188,7 @@ function editUser(userId) {
     username: user.username || "",
     fullName: user.full_name || "",
     linkedPersonName: user.linked_person_name || "",
+    linkedPersonSource: user.linked_person_name ? "vínculo já gravado" : "",
     linkedUnits: [...(user.linked_units || [])],
     role: user.role || "Administrador",
     profileId: profile ? profile.id : "",
@@ -1189,6 +1196,8 @@ function editUser(userId) {
     isActive: Boolean(user.is_active),
   };
   syncUserEditorOptions();
+  state.ui.personResults = null;
+  state.ui.personQuery = "";
   requestRender();
   document.getElementById("user-editor-card")?.scrollIntoView({ behavior: "smooth", block: "center" });
 }
@@ -10390,7 +10399,6 @@ administracaoView = function administracaoViewOverride() {
 };
 
 function userEditorCard() {
-  const sellerOptions = sellerPeopleOptions();
   const profiles = accessProfiles();
   const editor = state.userEditor;
   const passwordLabel = editor.id ? "Nova senha (deixe vazio para manter)" : "Senha inicial";
@@ -10431,22 +10439,45 @@ function userEditorCard() {
           </div>
           <div class="field field-span-2">
             <label>Pessoa vinculada ${scope === "proprio" ? '<span style="color:var(--bad)">*</span>' : '<span style="color:var(--muted);font-weight:400">(recomendado)</span>'}</label>
-            <input id="user-linked-person" list="linked-person-options"
-              value="${escapeHtml(editor.linkedPersonName || "")}"
-              oninput="state.userEditor.linkedPersonName=this.value"
-              placeholder="${scope === "proprio" ? "Digite ou escolha o nome" : "Sem vínculo — digite ou escolha"}"
-              ${scope === "proprio" ? "required" : ""} />
-            <datalist id="linked-person-options">
-              ${sellerOptions.map((p) => `<option value="${escapeHtml(p.person_name)}">${escapeHtml(
-                  [p.base_unit, p.role_classification, p.fromClients ? "cadastro de clientes" : ""]
-                    .filter(Boolean).join(" · "))}</option>`).join("")}
-            </datalist>
+            ${editor.linkedPersonName ? `
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+                          background:#f5f9ff;border:1px solid var(--accent);border-radius:10px;padding:10px 12px">
+                <div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(editor.linkedPersonName)}</div>
+                  ${editor.linkedPersonSource ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(editor.linkedPersonSource)}</div>` : ""}
+                </div>
+                <button type="button" class="btn btn-ghost btn-sm" onclick="limparPessoaVinculada()">Trocar</button>
+              </div>` : `
+              <div style="display:flex;gap:8px">
+                <input id="person-search-input" style="flex:1"
+                  value="${escapeHtml(state.ui.personQuery || "")}"
+                  placeholder="Buscar por nome — 3 letras já bastam"
+                  oninput="state.ui.personQuery=this.value"
+                  onkeydown="if(event.key==='Enter'){event.preventDefault();buscarPessoaVinculada();}" />
+                <button type="button" class="btn btn-secondary" onclick="buscarPessoaVinculada()">
+                  ${state.ui.personSearching ? "Buscando…" : "Buscar"}</button>
+              </div>
+              ${state.ui.personResults ? `
+                <div style="border:1px solid var(--line);border-radius:8px;max-height:220px;overflow:auto;margin-top:8px">
+                  ${state.ui.personResults.map((c, i) => `
+                    <button type="button" onclick="escolherPessoaVinculada(${i})"
+                      style="width:100%;text-align:left;border:none;background:#fff;cursor:pointer;
+                             padding:8px 10px;border-bottom:1px solid var(--line)">
+                      <div style="font-weight:700;font-size:13px">${escapeHtml(c.personName)}</div>
+                      <div class="text-small" style="color:var(--muted)">
+                        ${escapeHtml(c.source)}${c.detail ? ` · ${escapeHtml(c.detail)}` : ""}
+                      </div>
+                    </button>`).join("")
+                    || '<div class="text-small" style="padding:10px;color:var(--muted)">Nenhuma pessoa encontrada com esse nome.</div>'}
+                </div>` : ""}`}
             <div class="text-small" style="margin-top:4px;color:var(--muted)">
               ${scope === "proprio"
                 ? "É por este vínculo que o sistema sabe quais clientes são desta pessoa e que ela participou de uma reunião."
                 : "Liga a conta ao nome do cadastro. Sem isso, a pessoa não recebe a ciência quando é marcada como presente numa ata."}
-              A lista sugere nomes do faturamento, do cadastro de pessoas e do cadastro de clientes —
-              mas você pode <strong>digitar qualquer nome</strong> se ele ainda não aparecer.
+              A busca varre quatro fontes: cadastro de pessoas, faturamento, vendedor no cadastro
+              de clientes e <strong>cliente pessoa física</strong> — onde todo funcionário aparece,
+              mesmo sem venda. Não dá para digitar à mão: um caractere trocado quebra o vínculo
+              em silêncio, e o problema só aparece semanas depois.
             </div>
           </div>
           ${["unidade", "unidade_consolidado"].includes(scope) ? `
@@ -10652,7 +10683,6 @@ function personEditorCard() {
 
 configuracoesView = function adminViewGoalsSellerUnitFinal() {
   if (!state.admin) return `<div class="loader panel">Carregando configurações...</div>`;
-  const sellerOptions = sellerPeopleOptions();
   const userPasswordLabel = state.userEditor.id ? "Nova senha (opcional)" : "Senha inicial";
   const userSubmitLabel = state.userEditor.id ? "Salvar ajustes do usuário" : "Salvar usuário";
   const userTitle = state.userEditor.id ? "Editar usuário" : "Criar usuário";
@@ -11834,6 +11864,50 @@ async function submitAdminImport() {
   }
 }
 
+// ─── Busca da pessoa a vincular ─────────────────────────────────────────────
+
+async function buscarPessoaVinculada() {
+  const campo = document.getElementById("person-search-input");
+  const termo = ((campo ? campo.value : state.ui.personQuery) || "").trim();
+  state.ui.personQuery = termo;
+  if (termo.length < 3) { addMessage("warn", "Digite ao menos 3 letras."); return; }
+  state.ui.personSearching = true; requestRender();
+  try {
+    const r = await api("/api/admin/people/search", {
+      method: "POST", body: JSON.stringify({ q: termo }),
+    });
+    state.ui.personResults = r.candidates || [];
+    if (!state.ui.personResults.length) {
+      addMessage("warn", "Nenhuma pessoa encontrada. Confira a grafia ou cadastre a pessoa primeiro.");
+    }
+  } catch (e) {
+    addMessage("error", e.message);
+    state.ui.personResults = [];
+  } finally {
+    state.ui.personSearching = false;
+    requestRender();
+  }
+}
+
+function escolherPessoaVinculada(indice) {
+  const c = (state.ui.personResults || [])[indice];
+  if (!c || !state.userEditor) return;
+  state.userEditor.linkedPersonName = c.personName;
+  state.userEditor.linkedPersonSource = [c.source, c.detail].filter(Boolean).join(" · ");
+  state.ui.personResults = null;
+  state.ui.personQuery = "";
+  requestRender();
+}
+
+function limparPessoaVinculada() {
+  if (!state.userEditor) return;
+  state.userEditor.linkedPersonName = "";
+  state.userEditor.linkedPersonSource = "";
+  state.ui.personResults = null;
+  state.ui.personQuery = "";
+  requestRender();
+}
+
 async function submitPersonTermination(reativar) {
   const nome = document.getElementById("term-person-name")?.value?.trim();
   const mes = document.getElementById("term-person-month")?.value;
@@ -11914,8 +11988,8 @@ async function saveUser(event) {
   const scope = profile.dataScope;
   // Lê o vínculo para qualquer perfil — obrigatório só para vendedor, mas
   // salvo sempre: é o que liga a conta ao nome nas listas de presença das atas.
-  const linkedPerson = document.getElementById("user-linked-person")?.value
-    || editor.linkedPersonName || "";
+  // Vem só da busca — não há mais campo de digitação livre.
+  const linkedPerson = (editor.linkedPersonName || "").trim();
   const linkedUnits = ["unidade", "unidade_consolidado"].includes(scope) ? (editor.linkedUnits || []) : [];
 
   if (scope === "proprio" && !linkedPerson) {
@@ -12027,6 +12101,8 @@ async function deleteProfile(profileId) {
 
 function cancelUserEdit() {
   resetUserEditor();
+  state.ui.personResults = null;
+  state.ui.personQuery = "";
   requestRender();
 }
 

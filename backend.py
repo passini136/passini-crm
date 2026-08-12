@@ -12628,6 +12628,107 @@ def save_person_record(
             "personName": nome, "roleClassification": funcao, "baseUnit": unidade}
 
 
+def search_person_candidates(
+    conn: sqlite3.Connection, company_id: int, termo: str, limite: int = 30
+) -> list[dict[str, Any]]:
+    """Busca a pessoa para vincular a uma conta, em todas as fontes que existem.
+
+    A digitação livre foi removida de propósito: um caractere trocado quebra o
+    vínculo em silêncio, e o efeito só aparece semanas depois — a pessoa não
+    recebe ciência de reunião nem feedback. Aqui ela só pode ESCOLHER algo que
+    existe de verdade.
+
+    Quatro fontes, da mais confiável para a menos:
+      1. cadastro de pessoas (já classificado, com unidade)
+      2. vendedor no faturamento (quem já vendeu)
+      3. vendedor interno/externo do cadastro de clientes (quem ainda não vendeu)
+      4. cliente PESSOA FÍSICA — todo funcionário tem cadastro próprio de PF
+    """
+    texto = normalize_whitespace(termo)
+    if len(texto) < 3:
+        return []
+    alvo = f"%{normalize_upper(strip_accents(texto))}%"
+
+    # Sem isto, procurar "jose" não acha "JOSÉ" — o SQLite não conhece acento.
+    # A função vive só nesta conexão; não muda nada no banco.
+    conn.create_function(
+        "sem_acento", 1,
+        lambda v: normalize_upper(strip_accents(v)) if v is not None else None)
+
+    encontrados: dict[str, dict[str, Any]] = {}
+
+    def adiciona(nome: str, fonte: str, detalhe: str = "") -> None:
+        nome = normalize_whitespace(nome)
+        chave = person_key(nome)
+        if not nome or not chave:
+            return
+        if chave in encontrados:
+            # Mantém a fonte mais confiável, mas acumula o detalhe.
+            if detalhe and detalhe not in encontrados[chave]["detail"]:
+                encontrados[chave]["detail"] += f" · {detalhe}"
+            return
+        encontrados[chave] = {"personName": nome, "source": fonte, "detail": detalhe}
+
+    hoje = today_in_brazil().isoformat()
+    for r in conn.execute(
+        """
+        SELECT DISTINCT person_name, base_unit, role_classification, valid_to
+        FROM people_records
+        WHERE company_id = ? AND sem_acento(person_name) LIKE ?
+        ORDER BY person_name LIMIT ?
+        """,
+        (company_id, alvo, limite),
+    ).fetchall():
+        desligado = bool(r["valid_to"] and r["valid_to"] < hoje)
+        adiciona(r["person_name"], "Cadastro de pessoas",
+                 " · ".join(filter(None, [r["base_unit"], r["role_classification"],
+                                          "DESLIGADO" if desligado else ""])))
+
+    for r in conn.execute(
+        "SELECT DISTINCT seller_name FROM fact_sales_detail "
+        "WHERE company_id = ? AND sem_acento(seller_name) LIKE ? ORDER BY seller_name LIMIT ?",
+        (company_id, alvo, limite),
+    ).fetchall():
+        adiciona(r["seller_name"], "Faturamento", "já emitiu venda")
+
+    for r in conn.execute(
+        """
+        SELECT DISTINCT nome FROM (
+            SELECT TRIM(internal_seller_name) AS nome FROM crm_client_profiles
+             WHERE company_id = ? AND sem_acento(internal_seller_name) LIKE ?
+            UNION
+            SELECT TRIM(external_seller_name) AS nome FROM crm_client_profiles
+             WHERE company_id = ? AND sem_acento(external_seller_name) LIKE ?
+        ) WHERE nome <> '' ORDER BY nome LIMIT ?
+        """,
+        (company_id, alvo, company_id, alvo, limite),
+    ).fetchall():
+        adiciona(r["nome"], "Vendedor no cadastro de clientes", "")
+
+    # Cliente pessoa física: é onde todo funcionário aparece, mesmo sem venda.
+    for r in conn.execute(
+        """
+        SELECT p.client_code, p.client_name, p.document_number, p.city_name
+        FROM crm_client_profiles p
+        LEFT JOIN client_registry r
+          ON r.company_id = p.company_id AND r.normalized_client_name = UPPER(TRIM(p.client_name))
+        WHERE p.company_id = ? AND sem_acento(p.client_name) LIKE ?
+          AND (r.person_type = 'PF'
+               OR LENGTH(REPLACE(REPLACE(REPLACE(COALESCE(p.document_number,''),'.',''),'/',''),'-','')) = 11)
+        ORDER BY p.client_name LIMIT ?
+        """,
+        (company_id, alvo, limite),
+    ).fetchall():
+        adiciona(r["client_name"], "Cliente pessoa física",
+                 " · ".join(filter(None, [f"cód. {r['client_code']}", r["city_name"] or ""])))
+
+    ordem = {"Cadastro de pessoas": 0, "Faturamento": 1,
+             "Vendedor no cadastro de clientes": 2, "Cliente pessoa física": 3}
+    resultado = sorted(encontrados.values(),
+                       key=lambda x: (ordem.get(x["source"], 9), x["personName"]))
+    return resultado[:limite]
+
+
 def terminate_person(
     conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -15909,6 +16010,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/people/search":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                with closing(get_connection()) as conn:
+                    if data_scope_for_user(conn, user) == "proprio":
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Perfil sem acesso."}))
+                        return
+                    itens = search_person_candidates(
+                        conn, user["company_id"], normalize_whitespace(payload.get("q")))
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"candidates": itens}))
                 return
             if path == "/api/admin/people/terminate":
                 user = self._require_auth()
