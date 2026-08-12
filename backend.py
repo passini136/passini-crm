@@ -12002,6 +12002,11 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         linked_units = normalize_unit_list(item.get("linked_units_json"))
         item["linked_units"] = linked_units
         item["linked_units_display"] = ", ".join(linked_units)
+        # Unidade do VENDEDOR. Ela não fica na conta: mora no cadastro de
+        # pessoas, e é de lá que sai o filtro da carteira, a meta e a leitura
+        # de unidade em implantação. Sem devolver aqui, a tela de Acessos não
+        # tinha como mostrar que um vendedor recém-criado está sem unidade.
+        item["person_unit"] = person_base_unit(conn, company_id, item.get("linked_person_name"))
         users.append(item)
     profiles = list_access_profiles(conn, company_id)
     profile_name_by_id = {p["id"]: p["name"] for p in profiles}
@@ -12487,6 +12492,23 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
     password = (payload.get("password") or "").strip()
     user_id = payload.get("id")
 
+    # Unidade do vendedor. A conta não guarda esse dado — quem guarda é o
+    # cadastro de pessoas, que alimenta carteira, meta, feedback e visita. A
+    # tela de Acessos só serve de atalho para preencher lá, evitando que um
+    # vendedor recém-criado (Zona Norte, por exemplo) fique sem unidade e
+    # desapareça de todas as listas de equipe.
+    base_unit = normalize_unit(payload.get("base_unit"))
+
+    def aplicar_unidade_da_pessoa() -> None:
+        # Só depois que a conta foi gravada — assim um login duplicado não
+        # deixa um cadastro de pessoa criado pela metade.
+        if base_unit and linked_person:
+            save_person_record(conn, company_id, actor_user_id, {
+                "personName": linked_person,
+                "baseUnit": base_unit,
+                "roleClassification": "Vendedor" if data_scope == "proprio" else "Gerente",
+            })
+
     if user_id:
         existing = conn.execute("SELECT * FROM users WHERE company_id = ? AND id = ?", (company_id, user_id)).fetchone()
         if not existing:
@@ -12502,6 +12524,7 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
             pwd_hash, salt = pbkdf2_hash(password)
             conn.execute("UPDATE users SET password_hash = ?, password_salt = ? WHERE company_id = ? AND id = ?", (pwd_hash, salt, company_id, user_id))
         audit_log(conn, company_id, actor_user_id, "atualizar", "users", str(user_id), {"username": username, "role": role})
+        aplicar_unidade_da_pessoa()
         return {"id": user_id, "created": False}
 
     if not password:
@@ -12515,6 +12538,7 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
         (company_id, username, full_name, linked_person, linked_units_json, pwd_hash, salt, role, profile_id, now_iso()),
     )
     audit_log(conn, company_id, actor_user_id, "criar", "users", str(cur.lastrowid), {"username": username, "role": role})
+    aplicar_unidade_da_pessoa()
     return {"id": cur.lastrowid, "created": True}
 
 
@@ -12598,6 +12622,32 @@ def import_city_mappings_csv(conn: sqlite3.Connection, company_id: int, user_id:
     )
     resolved = cur.rowcount if (cur.rowcount and cur.rowcount > 0) else 0
     return {"updated": updated, "resolved": resolved}
+
+
+def person_base_unit(
+    conn: sqlite3.Connection, company_id: int, person_name: str | None
+) -> str:
+    """Unidade base da pessoa no cadastro, casando o nome pela chave normalizada."""
+    nome = normalize_whitespace(person_name)
+    if not nome:
+        return ""
+    row = conn.execute(
+        "SELECT base_unit FROM people_records WHERE company_id = ? AND person_name = ? "
+        "AND base_unit IS NOT NULL AND TRIM(base_unit) <> '' "
+        "ORDER BY valid_from DESC LIMIT 1",
+        (company_id, nome),
+    ).fetchone()
+    if row:
+        return normalize_unit(row["base_unit"])
+    alvo = person_key(nome)
+    for r in conn.execute(
+        "SELECT person_name, base_unit FROM people_records WHERE company_id = ? "
+        "AND base_unit IS NOT NULL AND TRIM(base_unit) <> '' ORDER BY valid_from DESC",
+        (company_id,),
+    ).fetchall():
+        if person_key(r["person_name"]) == alvo:
+            return normalize_unit(r["base_unit"])
+    return ""
 
 
 def save_person_record(

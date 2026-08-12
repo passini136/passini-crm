@@ -104,6 +104,8 @@ const state = {
     username: "",
     fullName: "",
     linkedPersonName: "",
+    linkedPersonSource: "",
+    baseUnit: "",
     linkedUnits: [],
     role: "Administrador",
     profileId: "",
@@ -1161,6 +1163,7 @@ function resetUserEditor() {
     fullName: "",
     linkedPersonName: "",
     linkedPersonSource: "",
+    baseUnit: "",
     linkedUnits: [],
     role: "Administrador",
     profileId: "",
@@ -1208,6 +1211,7 @@ function editUser(userId) {
     fullName: user.full_name || "",
     linkedPersonName: user.linked_person_name || "",
     linkedPersonSource: user.linked_person_name ? "vínculo já gravado" : "",
+    baseUnit: user.person_unit || "",
     linkedUnits: [...(user.linked_units || [])],
     role: user.role || "Administrador",
     profileId: profile ? profile.id : "",
@@ -10500,6 +10504,21 @@ function userEditorCard() {
               em silêncio, e o problema só aparece semanas depois.
             </div>
           </div>
+          ${scope === "proprio" ? `
+          <div class="field field-span-2">
+            <label>Unidade do vendedor ${editor.baseUnit ? "" : '<span style="color:var(--bad)">*</span>'}</label>
+            ${unidadesDisponiveis.length ? `
+              <select id="user-base-unit" onchange="state.userEditor.baseUnit=this.value">
+                <option value="">Selecione a unidade…</option>
+                ${unidadesDisponiveis.map((u) => `<option value="${escapeHtml(u)}" ${editor.baseUnit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+              </select>` : `
+              <div class="message">Nenhuma unidade carregada. Recarregue a tela.</div>`}
+            <div class="text-small" style="margin-top:4px;color:var(--muted)">
+              ${editor.baseUnit
+                ? "Gravada no cadastro de pessoas — é de lá que saem carteira, meta, feedback e roteiro de visita. Alterar aqui atualiza o cadastro."
+                : '<span style="color:var(--bad)">Este vendedor está sem unidade.</span> Sem ela ele não entra nas listas de equipe, meta e visita. Escolha a unidade e salve.'}
+            </div>
+          </div>` : ""}
           ${["unidade", "unidade_consolidado"].includes(scope) ? `
           <div class="field field-span-2">
             <label>Unidades vinculadas <span style="color:var(--bad)">*</span></label>
@@ -10644,7 +10663,9 @@ function acessosView() {
                     : '<div style="color:var(--bad)">sem pessoa vinculada</div>',
                   row.linked_units_display
                     ? `<div style="color:var(--muted)">${escapeHtml(row.linked_units_display)}</div>`
-                    : '<div style="color:var(--muted)">Toda a empresa</div>',
+                    : (row.person_unit
+                        ? `<div style="color:var(--muted)">unidade da pessoa: ${escapeHtml(row.person_unit)}</div>`
+                        : '<div style="color:var(--muted)">Toda a empresa</div>'),
                 ].join("");
                 return `
                 <tr>
@@ -12031,6 +12052,10 @@ async function saveUser(event) {
   if (scope === "proprio" && !linkedPerson) {
     addMessage("error", "Este perfil exige vincular a pessoa (vendedor)."); return;
   }
+  if (scope === "proprio" && !(editor.baseUnit || "").trim()) {
+    addMessage("error", "Escolha a unidade do vendedor — é ela que define carteira, meta e equipe.");
+    return;
+  }
   if (["unidade", "unidade_consolidado"].includes(scope) && !linkedUnits.length) {
     addMessage("error", "Este perfil exige ao menos uma unidade vinculada."); return;
   }
@@ -12043,6 +12068,7 @@ async function saveUser(event) {
     role: profile.name,
     linked_person_name: linkedPerson,
     linked_units: linkedUnits,
+    base_unit: scope === "proprio" ? (editor.baseUnit || "") : "",
     password,
   };
   try {
