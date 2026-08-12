@@ -72,6 +72,8 @@ const state = {
       contacts: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
+    bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
+    bulkCityUnit: "",      // unidade escolhida para o lote
     territoryCity: "",     // filtro de cidade na tela de territórios
     territoryDraft: null,  // linha em edição/criação no mapa de territórios
     personResults: null,   // resultados da busca de pessoa a vincular
@@ -4004,9 +4006,9 @@ function pendingIssueCards() {
                   ${state.options.units.map((unit) => `<option value="${escapeHtml(unit)}">${escapeHtml(unit)}</option>`).join("")}
                 </select>
               </div>
-              <div class="field">
-                <label>Vigência inicial</label>
-                <input id="issue-city-valid-from-${issue.id}" type="date" value="${pendingIssueDefaultDate(issue)}" />
+              <div class="field field-span-2 text-small" style="color:var(--muted);align-self:end">
+                Vale para <strong>todos os períodos</strong>, inclusive os meses já fechados —
+                cidade não troca de unidade com o tempo.
               </div>
             </div>
             <div class="actions">
@@ -10973,7 +10975,7 @@ administracaoView = function administracaoViewOverride() {
       ${adminEditorCards()}
       <div class="form-card">
         <div class="section-title"><div><h3>Pendências</h3><div class="text-small">Resolva vínculos e correspondências sem abrir telas gigantes.</div></div></div>
-        <div class="stack">${pendingIssueCards()}</div>
+        <div class="stack">${cidadesPendentesEmLote()}${pendingIssueCards()}</div>
       </div>
       ${userCanManageUsers() ? `
       <div class="form-card">
@@ -12319,6 +12321,98 @@ async function ignoreIssue(issueId) {
   }
 }
 
+// ─── Cidades pendentes em lote ─────────────────────────────────────────────
+
+function toggleCidadePendente(cidade) {
+  const atual = state.ui.bulkCities;
+  if (atual.has(cidade)) atual.delete(cidade); else atual.add(cidade);
+  requestRender();
+}
+
+function marcarTodasCidades(cidades, marcar) {
+  cidades.forEach((c) => (marcar ? state.ui.bulkCities.add(c) : state.ui.bulkCities.delete(c)));
+  requestRender();
+}
+
+async function aplicarUnidadeEmLote() {
+  const cidades = [...state.ui.bulkCities];
+  const unidade = state.ui.bulkCityUnit;
+  if (!cidades.length) { addMessage("error", "Marque ao menos uma cidade."); return; }
+  if (!unidade) { addMessage("error", "Escolha a unidade."); return; }
+  try {
+    const r = await api("/api/admin/issues/cities/bulk", {
+      method: "POST",
+      body: JSON.stringify({ cities: cidades, unitName: unidade }),
+    });
+    addMessage("success", r.message || "Cidades direcionadas.");
+    state.ui.bulkCities = new Set();
+    state.ui.bulkCityUnit = "";
+    await loadAdmin();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+/** Resolve várias cidades de uma vez. Uma a uma, com três campos cada, a
+ *  pendência simplesmente não era feita — e cidade sem unidade tira o
+ *  faturamento do painel. */
+function cidadesPendentesEmLote() {
+  const pendentes = (state.admin?.issues || [])
+    .filter((i) => i.issue_type === "cidade_sem_correspondencia" && i.status === "pendente");
+  if (pendentes.length < 2) return "";
+
+  const cidades = [...new Set(pendentes.map((i) => i.reference_value))]
+    .sort((a, b) => String(a).localeCompare(String(b), "pt-BR"));
+  const marcadas = state.ui.bulkCities;
+  const unidades = unitOptionsForEditor();
+
+  return `
+    <div class="form-card">
+      <div class="section-title">
+        <div>
+          <h3>Direcionar cidades em lote</h3>
+          <div class="text-small">${number(cidades.length)} cidade(s) sem unidade. Marque as da mesma região e aplique de uma vez.</div>
+        </div>
+        <div class="actions">
+          <button class="btn btn-ghost btn-sm" type="button"
+            onclick='marcarTodasCidades(${JSON.stringify(cidades).replace(/'/g, "&#39;")}, true)'>Marcar todas</button>
+          <button class="btn btn-ghost btn-sm" type="button"
+            onclick='marcarTodasCidades(${JSON.stringify(cidades).replace(/'/g, "&#39;")}, false)'>Limpar</button>
+        </div>
+      </div>
+
+      <div class="checkbox-grid" style="max-height:260px;overflow:auto">
+        ${cidades.map((c) => `
+          <label class="checkbox-item">
+            <input type="checkbox" ${marcadas.has(c) ? "checked" : ""}
+              onchange="toggleCidadePendente('${jsAttr(c)}')" />
+            <span>${escapeHtml(c)}</span>
+          </label>`).join("")}
+      </div>
+
+      <div class="two-column-form" style="margin-top:12px">
+        <div class="field">
+          <label>Unidade para as ${number(marcadas.size)} cidade(s) marcada(s)</label>
+          <select onchange="state.ui.bulkCityUnit=this.value;requestRender()">
+            <option value="">Selecione a unidade…</option>
+            ${unidades.map((u) => `<option value="${escapeHtml(u)}" ${state.ui.bulkCityUnit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="field" style="align-self:end">
+          <button class="btn btn-primary" type="button" ${marcadas.size && state.ui.bulkCityUnit ? "" : "disabled"}
+            onclick="aplicarUnidadeEmLote()">
+            Aplicar a ${number(marcadas.size)} cidade(s)
+          </button>
+        </div>
+      </div>
+      <div class="text-small" style="color:var(--muted)">
+        Vale para todos os períodos, inclusive os meses já fechados. O faturamento dessas
+        cidades volta a aparecer no painel da unidade escolhida.
+      </div>
+    </div>
+  `;
+}
+
 async function resolveIssue(issueId, type) {
   let payload = { issueId, action: "resolve" };
   if (type === "seller") {
@@ -12331,9 +12425,8 @@ async function resolveIssue(issueId, type) {
   } else if (type === "city") {
     const city = document.getElementById(`issue-city-name-${issueId}`)?.value?.trim();
     const unit = document.getElementById(`issue-city-unit-${issueId}`)?.value?.trim();
-    const validFrom = document.getElementById(`issue-city-valid-from-${issueId}`)?.value;
     if (!city || !unit) { addMessage("error", "Informe cidade e unidade principal."); return; }
-    payload = { ...payload, city_name: city, principal_unit: unit, valid_from: validFrom };
+    payload = { ...payload, city_name: city, principal_unit: unit };
   }
   try {
     await api("/api/admin/issues/resolve", { method: "POST", body: JSON.stringify(payload) });

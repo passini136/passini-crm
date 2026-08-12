@@ -2795,6 +2795,77 @@ def territory_coverage_report(
     return {"missing": faltando[:200], "total": len(faltando)}
 
 
+# Cidade não muda de unidade com o tempo: a loja que atende Gravataí hoje é a
+# que atendia em 2024. Vincular o mapa a uma competência só criava buraco no
+# passado — o mês anterior ficava sem unidade e voltava como pendência.
+CITY_MAPPING_EPOCH = "2000-01-01"
+
+
+def map_city_to_unit(
+    conn: sqlite3.Connection, company_id: int, city_name: str, unit_name: str,
+    state_name: str | None = None, country_name: str | None = None,
+) -> None:
+    """Aponta a cidade para a unidade em TODOS os períodos, passados inclusive.
+
+    Apaga as faixas antigas daquela cidade antes de gravar. Sem isso sobrava
+    uma linha com vigência recente competindo com a nova, e o resultado
+    dependia da ordem de leitura.
+    """
+    cidade = normalize_upper(city_name)
+    unidade = normalize_unit(unit_name)
+    if not cidade or not unidade:
+        raise ValueError("Informe cidade e unidade.")
+    conn.execute("DELETE FROM city_mappings WHERE company_id = ? AND city_name = ?",
+                 (company_id, cidade))
+    conn.execute(
+        """
+        INSERT INTO city_mappings
+            (company_id, city_name, principal_unit, state_name, country_name,
+             valid_from, valid_to, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, 'resolucao_pendencia', ?)
+        """,
+        (company_id, cidade, unidade, state_name, country_name, CITY_MAPPING_EPOCH, now_iso()),
+    )
+
+
+def resolve_city_issues_bulk(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Direciona várias cidades pendentes para a mesma unidade de uma vez.
+
+    Depois de uma importação grande a lista de cidades novas vem com dezenas de
+    nomes, quase todos da mesma região. Resolver uma a uma, com três campos
+    cada, é o tipo de trabalho que faz a pendência ser ignorada — e cidade sem
+    unidade tira o faturamento do painel.
+    """
+    unidade = normalize_unit(payload.get("unitName"))
+    if not unidade:
+        raise ValueError("Escolha a unidade.")
+    if unidade not in CANONICAL_UNITS:
+        raise ValueError(f"Unidade desconhecida: {unidade}")
+    cidades = [normalize_upper(c) for c in (payload.get("cities") or []) if normalize_upper(c)]
+    if not cidades:
+        raise ValueError("Selecione ao menos uma cidade.")
+
+    for cidade in cidades:
+        map_city_to_unit(conn, company_id, cidade, unidade)
+        conn.execute(
+            """
+            UPDATE import_issues SET status = 'resolvida'
+            WHERE company_id = ? AND issue_type = 'cidade_sem_correspondencia'
+              AND reference_value = ? AND status = 'pendente'
+            """,
+            (company_id, cidade),
+        )
+    audit_log(conn, company_id, user_id, "resolver_lote", "import_issue",
+              ", ".join(cidades[:10]), {"unidade": unidade, "cidades": len(cidades)})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": f"{len(cidades)} cidade(s) direcionada(s) para {unidade}, "
+                       f"valendo para todos os períodos.",
+            "resolved": len(cidades), "unitName": unidade}
+
+
 def resolve_city_unit(conn: sqlite3.Connection, company_id: int, city_name: str | None, competence: str | None = None) -> str | None:
     normalized_city = normalize_upper(city_name)
     if not normalized_city:
@@ -12840,19 +12911,12 @@ def resolve_import_issue(conn: sqlite3.Connection, company_id: int, user_id: int
     elif issue["issue_type"] == "cidade_sem_correspondencia":
         city_name = normalize_upper(payload.get("city_name") or issue["reference_value"])
         principal_unit = normalize_unit(payload.get("principal_unit"))
-        valid_from = payload.get("valid_from") or first_day_of_competence(issue["competence"]).isoformat()
-        valid_to = payload.get("valid_to")
         if not city_name or not principal_unit:
             raise ValueError("Informe cidade e unidade principal para resolver a cidade")
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO city_mappings
-                (company_id, city_name, principal_unit, state_name, country_name, valid_from, valid_to, source, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (company_id, city_name, principal_unit, payload.get("state_name"), payload.get("country_name"), valid_from, valid_to, "resolucao_pendencia", now_iso()),
-        )
-        updates.update({"city_name": city_name, "principal_unit": principal_unit, "valid_from": valid_from})
+        map_city_to_unit(conn, company_id, city_name, principal_unit,
+                         payload.get("state_name"), payload.get("country_name"))
+        updates.update({"city_name": city_name, "principal_unit": principal_unit,
+                        "valid_from": CITY_MAPPING_EPOCH})
         new_status = "resolvida"
     else:
         raise ValueError("Tipo de pendência ainda não suportado")
@@ -16837,6 +16901,21 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn.commit()
                     self._set_headers(200)
                     self.wfile.write(json_dumps({"message": "Usuário excluído."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/admin/issues/cities/bulk":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        res = resolve_city_issues_bulk(conn, user["company_id"], user["id"], payload)
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(res))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(400)
