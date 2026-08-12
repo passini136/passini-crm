@@ -78,21 +78,31 @@ achou_problema = False
 
 # 1. Conta sem vínculo cujo nome não casa com nenhuma pessoa do cadastro
 nomes_pessoas = [p["person_name"] for p in pessoas]
+unidade_por_pessoa = {p["person_name"]: (p["base_unit"] or "?") for p in pessoas}
 for u in usuarios:
     if u["linked_person_name"] or u["username"] == "admin":
         continue
-    candidatos = [
-        n for n in nomes_pessoas
-        if backend.short_person_key(n) == backend.short_person_key(u["full_name"])
-        or backend.person_key(n).startswith(backend.person_key(u["full_name"]).split()[0])
-    ]
+    # Candidato só quando TODAS as palavras do nome do usuário aparecem no nome
+    # do cadastro. A regra anterior comparava só o começo do primeiro nome e
+    # sugeria "ANDREI BRAGA" para "Andre Christ" — sugestão errada é pior que
+    # nenhuma, porque leva a vincular a pessoa errada.
+    palavras_usuario = [w for w in backend.person_key(u["full_name"]).split() if len(w) > 2]
+    candidatos = []
+    if palavras_usuario:
+        for n in nomes_pessoas:
+            alvo = backend.person_key(n).split()
+            if all(w in alvo for w in palavras_usuario):
+                candidatos.append(n)
     unicos = list(dict.fromkeys(candidatos))[:5]
     if unicos:
         achou_problema = True
-        print(f"\n  Conta '{u['username']}' ({u['full_name']}) está SEM pessoa vinculada.")
+        # Se já casa pelo nome completo, o vínculo é recomendado mas não urgente.
+        ja_casa = backend.resolve_user_for_person(conn, company_id, unicos[0]) == u["id"]
+        marca = " (já funciona pelo nome, vincular é só garantia)" if ja_casa else " — PRECISA VINCULAR"
+        print(f"\n  Conta '{u['username']}' ({u['full_name']}) está SEM pessoa vinculada{marca}.")
         print("  Candidatos no cadastro:")
         for c in unicos:
-            print(f"     - {c}")
+            print(f"     - {c}  [{unidade_por_pessoa.get(c, '?')}]")
 
 # 2. Duas contas apontando para a mesma pessoa
 from collections import Counter as _Counter  # noqa: E402
