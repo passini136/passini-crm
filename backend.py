@@ -9807,6 +9807,39 @@ def item_purchase_details(
     return detalhes
 
 
+def sort_by_search_relevance(
+    rows: list[dict[str, Any]], termo: str
+) -> list[dict[str, Any]]:
+    """Põe na frente quem casou pelo CÓDIGO exato.
+
+    A busca varre código, nome, cidade, telefone e contato — então digitar
+    "99856" também traz quem tem 99856 no telefone. Sem ordenar por relevância,
+    o cliente procurado aparecia no fim de uma lista de homônimos acidentais, o
+    que na prática equivale a não ter encontrado.
+
+    A ordenação é ESTÁVEL: dentro de cada faixa, a ordem de prioridade da
+    carteira (inativo primeiro, classe, etc.) continua valendo.
+    """
+    alvo = normalize_upper(termo)
+    if not alvo:
+        return rows
+
+    def faixa(row: dict[str, Any]) -> int:
+        codigo = normalize_upper(row.get("clientKey") or row.get("clientCode"))
+        nome = normalize_upper(row.get("clientName"))
+        if codigo == alvo:
+            return 0                      # o código que a pessoa digitou
+        if codigo.startswith(alvo):
+            return 1                      # código que começa com o termo
+        if nome.startswith(alvo):
+            return 2                      # nome que começa com o termo
+        if alvo in codigo:
+            return 3                      # termo em algum lugar do código
+        return 4                          # casou por nome, cidade, telefone…
+
+    return sorted(rows, key=faixa)
+
+
 def filter_crm_client_rows(
     rows: list[dict[str, Any]], filters: dict[str, str | None],
     item_buyers: set[str] | None = None,
@@ -9865,6 +9898,7 @@ def query_crm_clients_page(
     item_details = item_purchase_details(conn, company_id, filters.get("itemCode"))
     item_buyers = None if item_details is None else set(item_details.keys())
     filtered_rows = filter_crm_client_rows(all_rows, filters, item_buyers)
+    filtered_rows = sort_by_search_relevance(filtered_rows, filters.get("search") or "")
     total = len(filtered_rows)
     safe_page_size = min(max(int(page_size or 50), 1), 100)
     total_pages = max(math.ceil(total / safe_page_size), 1) if total else 1
