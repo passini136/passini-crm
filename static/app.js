@@ -5354,7 +5354,7 @@ async function loadUnassignedClients() {
 
 function abrirConciliacao(nomeFaturamento) {
   state.crm.reconcile = { salesName: nomeFaturamento, code: "", found: null,
-                          searching: false, saving: false, notFound: false };
+                          candidates: null, searching: false, saving: false, notFound: false };
   requestRender();
 }
 
@@ -5368,11 +5368,17 @@ async function buscarClientePorCodigo() {
   if (!r) return;
   const codigo = (r.code || "").trim();
   if (!codigo) { addMessage("warn", "Informe o código do cliente."); return; }
-  r.searching = true; r.found = null; r.notFound = false; requestRender();
+  r.searching = true; r.found = null; r.notFound = false; r.candidates = null;
+  requestRender();
   try {
-    const resposta = await api(`/api/crm/clients/by-code?code=${encodeURIComponent(codigo)}`);
+    // Manda o nome do faturamento junto: não achando o código, o servidor
+    // devolve candidatos por razão social em vez de só dizer "não existe".
+    const url = `/api/crm/clients/by-code?code=${encodeURIComponent(codigo)}`
+              + `&name=${encodeURIComponent(r.salesName || "")}`;
+    const resposta = await api(url);
     if (state.crm.reconcile) {
       state.crm.reconcile.found = resposta.client || null;
+      state.crm.reconcile.candidates = resposta.candidates || [];
       state.crm.reconcile.notFound = !resposta.client;
     }
   } catch (error) {
@@ -5381,6 +5387,36 @@ async function buscarClientePorCodigo() {
     if (state.crm.reconcile) state.crm.reconcile.searching = false;
     requestRender();
   }
+}
+
+/** Sugere candidatos pela razão social, sem exigir o código. */
+async function sugerirPorRazaoSocial() {
+  const r = state.crm.reconcile;
+  if (!r) return;
+  r.searching = true; r.candidates = null; requestRender();
+  try {
+    const resposta = await api(
+      `/api/crm/clients/by-code?code=&name=${encodeURIComponent(r.salesName || "")}`);
+    if (state.crm.reconcile) {
+      state.crm.reconcile.candidates = resposta.candidates || [];
+      state.crm.reconcile.notFound = false;
+    }
+  } catch (error) {
+    addMessage("error", error.message);
+  } finally {
+    if (state.crm.reconcile) state.crm.reconcile.searching = false;
+    requestRender();
+  }
+}
+
+function escolherCandidato(codigo) {
+  const r = state.crm.reconcile;
+  if (!r) return;
+  r.found = (r.candidates || []).find((c) => String(c.client_code) === String(codigo)) || null;
+  r.code = codigo;
+  r.candidates = null;
+  r.notFound = false;
+  requestRender();
 }
 
 async function confirmarConciliacao() {
@@ -5451,8 +5487,35 @@ function conciliacaoModal() {
             <button class="btn btn-ghost" onclick="fecharConciliacao()">Cancelar</button>
           </div>` : ""}
 
-        ${r.notFound ? `<div class="text-small" style="margin-top:12px;color:var(--bad)">
-          Nenhum cliente com este código no cadastro. Confira no Alfa.</div>` : ""}
+        ${r.notFound && !(r.candidates || []).length ? `
+          <div class="text-small" style="margin-top:12px;color:var(--bad)">
+            Nenhum cliente com este código no cadastro do CRM. Ele pode existir no Alfa e
+            ainda não ter entrado na última importação de cadastro de clientes.
+          </div>` : ""}
+
+        ${!c ? `
+          <div style="margin-top:12px">
+            <button class="btn btn-ghost btn-sm" type="button" onclick="sugerirPorRazaoSocial()">
+              Não sei o código — buscar pela razão social
+            </button>
+          </div>` : ""}
+
+        ${(r.candidates || []).length ? `
+          <div style="border:1px solid var(--line);border-radius:8px;max-height:260px;overflow:auto;margin-top:10px">
+            <div class="text-small" style="padding:8px 10px;background:#f5f7f9;color:var(--muted)">
+              ${number(r.candidates.length)} candidato(s) por razão social
+            </div>
+            ${r.candidates.map((cd) => `
+              <button type="button" onclick="escolherCandidato('${jsAttr(cd.client_code)}')"
+                style="width:100%;text-align:left;border:none;background:#fff;cursor:pointer;
+                       padding:8px 10px;border-bottom:1px solid var(--line)">
+                <div style="font-weight:700;font-size:13px">${escapeHtml(cd.client_name)}</div>
+                <div class="text-small" style="color:var(--muted)">
+                  cód. ${escapeHtml(cd.client_code)}${cd.city_name ? ` · ${escapeHtml(cd.city_name)}` : ""}
+                  ${cd.seller_name ? ` · ${escapeHtml(cd.seller_name)}` : " · sem vendedor"}
+                </div>
+              </button>`).join("")}
+          </div>` : ""}
       </div>
     </div>
   `;

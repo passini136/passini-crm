@@ -14349,6 +14349,33 @@ def sellers_available_for_assignment(
     return result
 
 
+# Sufixos societários que o cadastro carrega e o faturamento nem sempre traz.
+# "POWERTECH CAR SERVICE LTDA" no faturamento contra "POWERTECH CAR SERVICE
+# LTDA - ME" no cadastro: para o computador são dois clientes diferentes; para
+# quem opera, obviamente o mesmo.
+COMPANY_SUFFIX_TOKENS = {
+    "LTDA", "ME", "EPP", "EIRELI", "MEI", "SA", "S", "A", "CIA", "EI",
+    "LIMITADA", "COMERCIO", "E", "DE", "DA", "DO",
+}
+
+
+def company_match_key(nome: str | None) -> str:
+    """Chave tolerante para casar cliente entre faturamento e cadastro.
+
+    Tira acento, pontuação, o documento colado no começo do nome e os sufixos
+    societários do fim. NÃO substitui a chave exata: é usada só como segunda
+    tentativa, e apenas quando aponta para um único cliente — nome parecido
+    demais é justamente o caso em que errar dói.
+    """
+    texto = normalize_upper(strip_accents(nome))
+    texto = re.sub(r"[^A-Z0-9 ]", " ", texto)
+    texto = re.sub(r"^[0-9 ]+", "", texto)
+    tokens = [t for t in texto.split() if t]
+    while tokens and tokens[-1] in COMPANY_SUFFIX_TOKENS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
 def build_document_client_map(
     conn: sqlite3.Connection, company_id: int
 ) -> tuple[dict[str, str], dict[str, set[str]]]:
@@ -14410,20 +14437,60 @@ def client_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, dic
     }
 
 
+CLIENT_LOOKUP_COLUMNS = (
+    "client_code, client_name, trade_name, city_name, document_number, "
+    "COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name"
+)
+
+
 def find_client_by_code(
     conn: sqlite3.Connection, company_id: int, codigo: str
 ) -> dict[str, Any] | None:
-    """Cliente pelo código do Alfa — é o dado que o gerente tem em mãos."""
+    """Cliente pelo código do Alfa, tolerante à forma como o código foi gravado.
+
+    Tenta na ordem: igual, sem zeros à esquerda e comparando só os dígitos. O
+    cadastro às vezes chega com o código como texto ("076614") e a pessoa
+    digita como número — recusar por isso seria implicância do sistema.
+    """
     code = normalize_whitespace(codigo)
     if not code:
         return None
-    row = conn.execute(
-        "SELECT client_code, client_name, trade_name, city_name, document_number, "
-        "       COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name "
-        "FROM crm_client_profiles WHERE company_id = ? AND TRIM(client_code) = ?",
-        (company_id, code),
-    ).fetchone()
-    return dict(row) if row else None
+    tentativas = [code, code.lstrip("0"), only_digits(code)]
+    for alvo in [t for t in dict.fromkeys(tentativas) if t]:
+        row = conn.execute(
+            f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
+            "WHERE company_id = ? AND (TRIM(client_code) = ? "
+            "   OR CAST(TRIM(client_code) AS INTEGER) = CAST(? AS INTEGER))",
+            (company_id, alvo, alvo),
+        ).fetchone()
+        if row:
+            return dict(row)
+    return None
+
+
+def search_clients_by_name(
+    conn: sqlite3.Connection, company_id: int, termo: str, limite: int = 20
+) -> list[dict[str, Any]]:
+    """Candidatos por razão social — o caminho quando o código não é conhecido."""
+    texto = normalize_whitespace(termo)
+    if len(texto) < 3:
+        return []
+    chave = company_match_key(texto)
+    alvo = f"%{normalize_upper(strip_accents(texto))}%"
+    linhas = [dict(r) for r in conn.execute(
+        f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
+        "WHERE company_id = ? AND (UPPER(client_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?) "
+        "ORDER BY client_name LIMIT ?",
+        (company_id, alvo, alvo, limite),
+    ).fetchall()]
+    if linhas or not chave:
+        return linhas
+    # Nada com o texto inteiro: tenta pela chave sem sufixo societário, que é o
+    # caso de "POWERTECH CAR SERVICE LTDA" contra "... LTDA - ME".
+    return [r for r in conn.execute(
+        f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall() if company_match_key(r["client_name"]) == chave][:limite]
 
 
 def save_client_alias(
@@ -14501,6 +14568,18 @@ def compute_unassigned_clients(
     # Segunda tentativa automática: documento embutido no nome do faturamento.
     docs_exatos, docs_raiz = build_document_client_map(conn, company_id)
 
+    # Terceira: nome sem sufixo societário. Guarda o conjunto de códigos por
+    # chave para poder recusar quando houver mais de um candidato.
+    codes_by_company: dict[str, set[str]] = defaultdict(set)
+    for row in conn.execute(
+        "SELECT client_code, client_name FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        chave_empresa = company_match_key(row["client_name"])
+        codigo = normalize_whitespace(row["client_code"])
+        if chave_empresa and codigo:
+            codes_by_company[chave_empresa].add(codigo)
+
     # Conciliação manual só PREENCHE lacuna: entra depois do casamento por nome
     # e nunca sobrescreve um código que já foi encontrado sozinho.
     aliases = client_alias_map(conn, company_id)
@@ -14567,6 +14646,9 @@ def compute_unassigned_clients(
             continue
         if key not in code_by_name:
             achado = client_code_from_name_digits(r["client_name"], docs_exatos, docs_raiz)
+            if not achado:
+                candidatos = codes_by_company.get(company_match_key(r["client_name"])) or set()
+                achado = next(iter(candidatos)) if len(candidatos) == 1 else None
             if achado:
                 code_by_name[key] = achado
         # Casou por documento (ou por conciliação) com um cliente que tem
@@ -16024,11 +16106,15 @@ class AppHandler(BaseHTTPRequestHandler):
                         self._set_headers(403)
                         self.wfile.write(json_dumps({"error": "Consulta da gestão."}))
                         return
-                    achado = find_client_by_code(
-                        conn, user["company_id"],
-                        parse_qs(parsed.query).get("code", [""])[0])
+                consulta = parse_qs(parsed.query)
+                achado = find_client_by_code(
+                    conn, user["company_id"], consulta.get("code", [""])[0])
+                candidatos = ([] if achado else
+                              search_clients_by_name(conn, user["company_id"],
+                                                     consulta.get("name", [""])[0]))
                 self._set_headers(200)
-                self.wfile.write(json_dumps({"client": achado}))
+                self.wfile.write(json_dumps({"client": achado,
+                                             "candidates": [dict(c) for c in candidatos]}))
                 return
             if path == "/api/admin/territories":
                 user = self._require_auth()
