@@ -9512,6 +9512,34 @@ function coberturaModal() {
     </div>`;
 }
 
+/** Saída para o vendedor quando a busca na própria carteira não achou nada.
+ *
+ * O caso real: ele atende um cliente de outro vendedor e procura pelo nome.
+ * Não acha, porque a carteira dele não tem esse cliente — e ficava sem saber
+ * que existe um caminho. Aqui o aviso aparece só quando ele buscou algo, e
+ * deixa claro que o atalho é pelo CÓDIGO, não pelo nome.
+ */
+function buscaSemResultadoVendedor(rows) {
+  const termo = (state.crm.crmClientFilters?.search || "").trim();
+  if (!termo || rows.length) return "";
+  const pareceCodigo = /^\d+$/.test(termo);
+  return `
+    <div class="form-card" style="border-left:4px solid var(--accent)">
+      <div style="font-weight:700;font-size:14px">Nada encontrado na sua carteira para "${escapeHtml(termo)}"</div>
+      <div class="text-small" style="color:var(--muted);margin-top:6px;line-height:1.6">
+        Se este cliente é de outra carteira, você ainda pode atendê-lo — mas a busca aí é
+        <strong>pelo código</strong>, não pelo nome. Peça o código ao cliente.
+        ${pareceCodigo ? "" : `<br>O que você digitou não parece um código.`}
+      </div>
+      <div class="actions" style="margin-top:10px">
+        <button class="btn btn-primary btn-sm" type="button"
+          onclick="abrirApoio('${pareceCodigo ? jsAttr(termo) : ""}')">
+          🤝 Atender cliente de outra carteira pelo código
+        </button>
+      </div>
+    </div>`;
+}
+
 function crmClientsView() {
   if (!state.crm.summary) return `<div class="loader panel">Carregando clientes CRM...</div>`;
   const rows = filteredCrmClients();
@@ -9548,6 +9576,7 @@ function crmClientsView() {
             Filtro ativo — mostrando ${number(rows.length)} cliente(s) da sua carteira.
             A ordem dos blocos continua a mesma: urgentes primeiro.
           </div>` : ""}
+        ${buscaSemResultadoVendedor(rows)}
         ${groupSection("🔴 Urgente — Contatar agora", "#e74c3c", urgent, "✅ Nenhum pré-inativo ou inativo.")}
         ${groupSection("🟡 Ativos sem compra este mês", "#f39c12", noSale, "✅ Todos os ativos já compraram este mês.")}
         ${groupSection("🟢 Ativos com compra", "#27ae60", active, "Nenhum ativo com compra este mês.")}
