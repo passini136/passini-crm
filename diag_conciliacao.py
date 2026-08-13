@@ -69,24 +69,28 @@ if ultimo_import:
     ).fetchone()["n"]
     print(f"  Clientes tocados nessa importação: {carregados}")
 
-# Quantos clientes do faturamento não existem no cadastro, de forma alguma
-sem_cadastro = conn.execute(
-    """
-    SELECT COUNT(*) n FROM (
-        SELECT DISTINCT f.client_name FROM fact_sales_detail f
-        WHERE f.company_id = ?
-          AND NOT EXISTS (SELECT 1 FROM crm_client_profiles p
-                          WHERE p.company_id = f.company_id
-                            AND UPPER(TRIM(p.client_name)) = UPPER(TRIM(f.client_name)))
-    )
-    """,
-    (company_id,),
-).fetchone()["n"]
-faturados = conn.execute(
-    "SELECT COUNT(DISTINCT client_name) n FROM fact_sales_detail WHERE company_id = ?",
-    (company_id,),
-).fetchone()["n"]
-print(f"  Clientes no faturamento: {faturados} · sem nome igual no cadastro: {sem_cadastro}")
+# Cobertura do cadastro sobre o faturamento.
+#
+# A primeira versão disto usava NOT EXISTS correlacionado com UPPER(TRIM(...))
+# dos dois lados: sem índice utilizável, o SQLite varria o cadastro inteiro para
+# CADA nome do faturamento e o diagnóstico simplesmente não terminava. Duas
+# leituras sequenciais e um set em memória resolvem em segundos.
+nomes_cadastro = {
+    backend.normalize_client_key(r["client_name"])
+    for r in conn.execute(
+        "SELECT client_name FROM crm_client_profiles WHERE company_id = ?", (company_id,)
+    ).fetchall()
+}
+nomes_faturamento = {
+    backend.normalize_client_key(r["client_name"])
+    for r in conn.execute(
+        "SELECT DISTINCT client_name FROM fact_sales_detail WHERE company_id = ?", (company_id,)
+    ).fetchall()
+}
+sem_cadastro = len(nomes_faturamento - nomes_cadastro)
+print(f"  Clientes no faturamento: {len(nomes_faturamento)} · "
+      f"sem nome igual no cadastro: {sem_cadastro} "
+      f"({100 * sem_cadastro / max(len(nomes_faturamento), 1):.1f}%)")
 print("\n  >> Se o MAIOR código acima for menor que os códigos novos do Alfa, ou se")
 print("     'sem nome igual' for muito alto, a exportação do cadastro veio incompleta.\n")
 
@@ -177,6 +181,7 @@ if not usuario:
     print("Nenhum usuário diretor/administrador para simular a tela.")
     sys.exit(1)
 
+print("Montando a lista Sem Vendedor (pode levar alguns segundos)...", flush=True)
 dados = backend.compute_unassigned_clients(conn, company_id, usuario, limit=500)
 sem_codigo = [i for i in dados["items"] if not i.get("clientKey")]
 print(f"SEM VENDEDOR: {dados['total']} cliente(s), {len(sem_codigo)} sem código no CRM\n")
