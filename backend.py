@@ -14110,7 +14110,44 @@ def terminate_person(
         (fim, company_id, nome),
     )
     if not cur.rowcount:
-        raise ValueError(f"{nome} não está no cadastro de pessoas.")
+        # Quem saiu antes do cadastro de pessoas existir só aparece no
+        # faturamento e no cadastro de clientes. Antes o desligamento era
+        # recusado ("não está no cadastro") e esses nomes ficavam para sempre
+        # nas listas de vendedor. Aqui o registro nasce JÁ FECHADO: o histórico
+        # dos meses trabalhados continua válido e ela some dos meses seguintes.
+        conhecida = conn.execute(
+            """
+            SELECT 1 FROM fact_sales_detail
+             WHERE company_id = ? AND UPPER(TRIM(seller_name)) = ? LIMIT 1
+            """,
+            (company_id, normalize_upper(nome)),
+        ).fetchone() or conn.execute(
+            """
+            SELECT 1 FROM crm_client_profiles
+             WHERE company_id = ? AND (UPPER(TRIM(internal_seller_name)) = ?
+                                    OR UPPER(TRIM(external_seller_name)) = ?) LIMIT 1
+            """,
+            (company_id, normalize_upper(nome), normalize_upper(nome)),
+        ).fetchone()
+        if not conhecida:
+            raise ValueError(f"{nome} não aparece no cadastro nem no faturamento. "
+                             "Confira a grafia do nome.")
+        primeira_venda = conn.execute(
+            "SELECT MIN(issue_date) d FROM fact_sales_detail "
+            "WHERE company_id = ? AND UPPER(TRIM(seller_name)) = ?",
+            (company_id, normalize_upper(nome)),
+        ).fetchone()["d"]
+        inicio = (primeira_venda or "2020-01-01")[:10]
+        conn.execute(
+            """
+            INSERT INTO people_records
+                (company_id, person_name, role_classification, base_unit, valid_from, valid_to,
+                 source, is_active, created_at)
+            VALUES (?,?,?,?,?,?, 'desligamento_retroativo', 0, ?)
+            """,
+            (company_id, nome, "Vendedor",
+             normalize_unit(payload.get("baseUnit")) or "", inicio, fim, now_iso()),
+        )
 
     # Conta de acesso também é desativada: quem saiu não deve continuar entrando.
     contas = conn.execute(

@@ -11409,10 +11409,16 @@ function adminEditorCards() {
           <div class="field"><label>Pessoa</label>
             <input id="term-person-name" list="term-person-options" placeholder="Digite o nome" />
             <datalist id="term-person-options">
-              ${(state.admin?.people || [])
-                .filter((p) => !p.valid_to)
-                .map((p) => p.person_name)
-                .filter((n, i, a) => a.indexOf(n) === i)
+              ${/* Inclui quem só aparece no faturamento ou no cadastro de clientes.
+                    Quem saiu antes de existir cadastro de pessoas não estava aqui,
+                    e por isso não havia como registrar o desligamento. */""}
+              ${[...new Set([
+                  ...(state.admin?.people || []).filter((p) => !p.valid_to).map((p) => p.person_name),
+                  ...(state.admin?.salesSellers || []),
+                  ...(state.admin?.clientSellers || []),
+                ].filter(Boolean))]
+                .filter((n) => !(state.admin?.people || []).some((p) => p.person_name === n && p.valid_to))
+                .sort((a, b) => a.localeCompare(b, "pt-BR"))
                 .map((n) => `<option value="${escapeHtml(n)}"></option>`).join("")}
             </datalist></div>
           <div class="field"><label>Mês de desligamento</label>
@@ -11444,7 +11450,17 @@ function adminEditorCards() {
         <div class="actions"><button class="btn btn-primary" onclick="submitPersonUnit()">Salvar vendedor</button></div>
         ${pendingSellers.length
           ? `<div class="text-small" style="margin-top:10px;font-weight:600">Vendedores sem unidade (${pendingSellers.length}) — clique para preencher:</div>
-        <div class="actions" style="flex-wrap:wrap;gap:6px;margin-top:6px">${pendingSellers.slice(0, 60).map((n) => `<button type="button" class="btn btn-ghost btn-sm" onclick="document.getElementById('edit-seller-name').value=this.textContent.trim();document.getElementById('edit-seller-name').focus()">${escapeHtml(n)}</button>`).join("")}</div>`
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">${pendingSellers.slice(0, 60).map((n) => `
+            <span style="display:inline-flex;align-items:center;border:1px solid var(--line);border-radius:8px;overflow:hidden">
+              <button type="button" class="btn btn-ghost btn-sm" style="border:none;border-radius:0"
+                onclick="document.getElementById('edit-seller-name').value='${jsAttr(n)}';document.getElementById('edit-seller-name').focus()">${escapeHtml(n)}</button>
+              <button type="button" class="btn btn-ghost btn-sm" style="border:none;border-radius:0;border-left:1px solid var(--line);color:var(--bad)"
+                title="Não trabalha mais na Passini — registrar desligamento"
+                onclick="prepararDesligamento('${jsAttr(n)}')">saiu</button>
+            </span>`).join("")}</div>
+        <div class="text-small" style="color:var(--muted);margin-top:6px">
+          Clique no nome para definir a unidade, ou em <strong>saiu</strong> para registrar o desligamento.
+        </div>`
           : `<div class="text-small" style="margin-top:10px;color:var(--muted)">Nenhum vendedor sem unidade. ✅</div>`}
         <datalist id="sellers-datalist">${sellerOpts}</datalist>
       </div>
@@ -13293,6 +13309,16 @@ function limparPessoaVinculada() {
   state.ui.personResults = null;
   state.ui.personQuery = "";
   requestRender();
+}
+
+/** Leva o nome para o formulário de desligamento e rola até ele. */
+function prepararDesligamento(nome) {
+  const campo = document.getElementById("term-person-name");
+  if (!campo) return;
+  campo.value = nome;
+  campo.focus();
+  campo.scrollIntoView({ behavior: "smooth", block: "center" });
+  addMessage("info", `Informe o mês em que ${nome} saiu e clique em Registrar desligamento.`);
 }
 
 async function submitPersonTermination(reativar) {
