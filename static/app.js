@@ -215,6 +215,10 @@ const state = {
     assignTask: null,      // modal de cobrar contato (gestao)
     scheduleContact: null, // modal de agendar contato (vendedor, para si mesmo)
     reconcile: null,       // modal de conciliação por código (só "sem cadastro")
+    support: null,         // modal de atendimento de cliente de outra carteira
+    coverages: null,       // coberturas de carteira (férias, ausência)
+    coverageOf: "",        // carteira coberta que o vendedor está enxergando agora
+    coverageEditor: null,  // modal do gerente para autorizar cobertura
     receptive: null,       // modal de registro receptivo (não conta na meta)
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
@@ -9173,9 +9177,345 @@ function engagementMarks(e) {
   return partes.join("") || '<span class="text-small" style="color:var(--muted)">—</span>';
 }
 
+// ─── Atendimento de apoio (cliente de outra carteira) ──────────────────────
+//
+// Só por CÓDIGO exato, e sem valores na ficha. As duas restrições são de
+// propósito: por nome, o vendedor varreria a carteira do colega; com
+// faturamento, veria o resultado dele. Aqui vai o que serve para ATENDER.
+
+function abrirApoio(codigoSugerido) {
+  state.crm.support = { code: codigoSugerido || "", client: null, searching: false,
+                        notes: "", typeCode: "LIGACAO", saving: false, notFound: false };
+  requestRender();
+}
+
+function fecharApoio() {
+  state.crm.support = null;
+  requestRender();
+}
+
+async function buscarClienteApoio() {
+  const a = state.crm.support;
+  if (!a) return;
+  const codigo = (a.code || "").trim();
+  if (!codigo) { addMessage("warn", "Informe o código do cliente."); return; }
+  a.searching = true; a.client = null; a.notFound = false; requestRender();
+  try {
+    const r = await api(`/api/crm/client/support?code=${encodeURIComponent(codigo)}`);
+    if (state.crm.support) state.crm.support.client = r.client || null;
+  } catch (error) {
+    if (state.crm.support) state.crm.support.notFound = true;
+  } finally {
+    if (state.crm.support) state.crm.support.searching = false;
+    requestRender();
+  }
+}
+
+/** Abre a ficha COMPLETA de um cliente fora da carteira (histórico e vendas). */
+async function abrirFichaApoio(codigo) {
+  state.crm.support = null;
+  await openCrmClient(codigo, true, true, { outside: true });
+}
+
+async function registrarApoio() {
+  const a = state.crm.support;
+  if (!a || !a.client || a.saving) return;
+  if (!a.notes.trim()) { addMessage("error", "Escreva o que foi tratado."); return; }
+  a.saving = true; requestRender();
+  try {
+    await api("/api/crm/interactions", {
+      method: "POST",
+      body: JSON.stringify({
+        clientKey: a.client.client_code,
+        clientName: a.client.client_name,
+        contactTypeCode: a.typeCode,
+        resultCode: "FALOU_CLIENTE",
+        initiative: a.client.isOwnClient ? "ATIVO" : "APOIO",
+        notes: a.notes.trim(),
+      }),
+    });
+    addMessage("success", a.client.isOwnClient
+      ? "Contato registrado na sua carteira."
+      : "Atendimento registrado. O vendedor responsável recebeu uma tarefa para retomar o contato.");
+    state.crm.support = null;
+    state.contacts = null;
+    await loadCrmData();
+  } catch (error) {
+    addMessage("error", error.message);
+    if (state.crm.support) state.crm.support.saving = false;
+  }
+  requestRender();
+}
+
+function apoioModal() {
+  const a = state.crm.support;
+  if (!a) return "";
+  const c = a.client;
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharApoio()">
+      <div class="panel modal-panel" style="max-width:600px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>🤝 Atender cliente de outra carteira</h3>
+            <div class="text-small">Busque pelo código que o cliente informou.</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharApoio()">Fechar</button>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <input style="flex:1" value="${escapeHtml(a.code || "")}"
+            placeholder="Código do cliente"
+            oninput="state.crm.support.code=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClienteApoio();}" />
+          <button class="btn btn-secondary" type="button" onclick="buscarClienteApoio()">
+            ${a.searching ? "Buscando…" : "Buscar"}</button>
+        </div>
+
+        ${a.notFound ? `<div class="text-small" style="margin-top:10px;color:var(--bad)">
+          Nenhum cliente com este código. Confirme o número com o cliente.</div>` : ""}
+
+        ${c ? `
+          <div class="actions" style="margin-top:12px">
+            <button class="btn btn-secondary btn-sm" type="button"
+              onclick="abrirFichaApoio('${jsAttr(c.client_code)}')">Abrir ficha completa</button>
+          </div>
+          <div style="margin-top:14px;background:#f5f9ff;border:1px solid var(--accent);border-radius:10px;padding:12px">
+            <div style="font-weight:700;font-size:15px">${escapeHtml(c.client_name)}</div>
+            <div class="text-small" style="color:var(--muted);margin-top:2px">
+              cód. ${escapeHtml(c.client_code)}
+              ${c.document_number ? ` · ${escapeHtml(c.document_number)}` : ""}
+            </div>
+            <div class="crm-mini-grid crm-detail-grid" style="margin-top:10px">
+              <div><span>Telefone</span><strong>${escapeHtml(c.updated_phone || c.phone || "Não informado")}</strong></div>
+              <div><span>Contato</span><strong>${escapeHtml(c.primary_contact_name || "Não informado")}</strong></div>
+              <div><span>Cidade</span><strong>${escapeHtml([c.city_name, c.neighborhood].filter(Boolean).join(" · ") || "-")}</strong></div>
+              <div><span>Endereço</span><strong>${escapeHtml([c.address_line, c.address_number].filter(Boolean).join(", ") || "-")}</strong></div>
+              <div><span>Última compra</span><strong>${escapeHtml(shortDate(c.last_sale_at) || "-")}</strong></div>
+              <div><span>Vendedor responsável</span><strong>${escapeHtml(c.owner_name || "Sem vendedor")}</strong></div>
+            </div>
+            ${c.contact_notes ? `<div class="text-small" style="margin-top:8px;color:var(--muted)">
+              Observações do cadastro: ${escapeHtml(c.contact_notes)}</div>` : ""}
+          </div>
+
+          ${(c.openTasks || []).length ? `
+            <div class="text-small" style="margin-top:10px;padding:8px 10px;border-radius:8px;background:#fff8e6;border:1px solid #f0d68a;color:#7a5c00">
+              <strong>Retorno em aberto:</strong>
+              ${c.openTasks.map((t) => `${escapeHtml(t.title)} (${escapeHtml(shortDate(t.due_at) || "")})`).join(" · ")}
+            </div>` : ""}
+
+          ${(c.interactions || []).length ? `
+            <div style="margin-top:10px">
+              <div class="text-small" style="font-weight:700;margin-bottom:4px">Últimos contatos</div>
+              <div style="border:1px solid var(--line);border-radius:8px;max-height:140px;overflow:auto">
+                ${c.interactions.map((i) => `
+                  <div style="padding:6px 10px;border-bottom:1px solid var(--line)" class="text-small">
+                    <strong>${escapeHtml(shortDate(i.occurred_at) || "")}</strong> ·
+                    ${escapeHtml(i.seller_name || "")} · ${escapeHtml(i.type_label || "")}
+                    <div style="color:var(--muted)">${escapeHtml((i.notes || "").slice(0, 90))}</div>
+                  </div>`).join("")}
+              </div>
+            </div>` : ""}
+
+          <div class="field" style="margin-top:12px">
+            <label>O que foi tratado</label>
+            <textarea rows="3" placeholder="Ex: cliente pediu preço da pastilha X, passei o orçamento"
+              oninput="state.crm.support.notes=this.value">${escapeHtml(a.notes)}</textarea>
+          </div>
+
+          ${c.isOwnClient ? `
+            <div class="text-small" style="color:var(--muted)">
+              Este cliente é da sua carteira — o contato conta normalmente na sua meta.
+            </div>` : `
+            <div class="text-small" style="color:var(--muted);background:#f5f7f9;border-radius:8px;padding:10px 12px">
+              Atendimento de apoio: <strong>não conta na sua meta de ligações</strong>, mas fica no
+              seu histórico e o gerente enxerga. ${escapeHtml(c.owner_name || "O responsável")}
+              recebe uma tarefa para retomar o contato.
+            </div>`}
+
+          <div class="actions" style="margin-top:12px">
+            <button class="btn btn-primary" ${a.saving ? "disabled" : ""} onclick="registrarApoio()">
+              ${a.saving ? "Registrando…" : "Registrar atendimento"}</button>
+            <button class="btn btn-ghost" onclick="fecharApoio()">Cancelar</button>
+          </div>` : ""}
+      </div>
+    </div>
+  `;
+}
+
+// ─── Cobertura de carteira ─────────────────────────────────────────────────
+//
+// O gerente autoriza, com prazo, um vendedor a enxergar a carteira de outro.
+// Para o vendedor isso aparece como um par de chips no topo da Carteira —
+// "Minha carteira" e o nome de quem ele cobre. Duas listas separadas, sem
+// misturar os clientes e sem poluir a tela de quem não tem cobertura nenhuma.
+
+async function loadCoverages() {
+  try {
+    state.crm.coverages = await api("/api/crm/coverages");
+  } catch (error) {
+    state.crm.coverages = { mine: [], canManage: false };
+  }
+  requestRender();
+}
+
+function trocarCarteira(nome) {
+  state.crm.coverageOf = nome || "";
+  state.crm.pagination.page = 1;
+  void loadCrmClients();
+}
+
+function abrirCobertura(registro) {
+  const c = registro || {};
+  state.crm.coverageEditor = {
+    id: c.id || "",
+    coveringSeller: c.covering_seller || "",
+    coveredSeller: c.covered_seller || "",
+    startDate: c.start_date || dateInDays(0),
+    endDate: c.end_date || "",
+    reason: c.reason || "",
+  };
+  requestRender();
+}
+
+function fecharCobertura() {
+  state.crm.coverageEditor = null;
+  requestRender();
+}
+
+async function salvarCobertura() {
+  const c = state.crm.coverageEditor;
+  if (!c) return;
+  try {
+    const r = await api("/api/crm/coverages/save", { method: "POST", body: JSON.stringify(c) });
+    addMessage("success", r.message || "Cobertura salva.");
+    state.crm.coverageEditor = null;
+    await loadCoverages();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function encerrarCobertura(id) {
+  if (!window.confirm("Encerrar esta cobertura? O vendedor deixa de enxergar a carteira.")) return;
+  try {
+    const r = await api("/api/crm/coverages/delete", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", r.message || "Cobertura encerrada.");
+    await loadCoverages();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+/** Chips do vendedor: só aparecem quando existe cobertura ativa. */
+function coberturaChips() {
+  const c = state.crm.coverages;
+  if (!c || c.canManage || !(c.mine || []).length) return "";
+  const atual = state.crm.coverageOf;
+  const chip = (nome, rotulo, sub) => `
+    <button class="btn btn-sm ${(atual || "") === nome ? "btn-primary" : "btn-ghost"}"
+      type="button" onclick="trocarCarteira('${jsAttr(nome)}')" style="text-align:left">
+      ${escapeHtml(rotulo)}${sub ? `<div class="text-small" style="opacity:.75">${escapeHtml(sub)}</div>` : ""}
+    </button>`;
+  return `
+    <div class="form-card" style="padding:12px 14px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <span class="text-small" style="color:var(--muted);margin-right:4px">Carteira:</span>
+        ${chip("", "Minha carteira", "")}
+        ${c.mine.map((cv) => chip(cv.covered_seller, cv.covered_seller,
+            cv.end_date ? `cobertura até ${shortDate(cv.end_date)}` : "cobertura sem prazo")).join("")}
+      </div>
+      ${atual ? `<div class="text-small" style="margin-top:8px;color:#7a5c00;background:#fff8e6;
+                   border:1px solid #f0d68a;border-radius:8px;padding:8px 10px">
+        Você está vendo a carteira de <strong>${escapeHtml(atual)}</strong>. Os contatos que
+        registrar aqui ficam no histórico do cliente e aparecem para o gerente como cobertura.
+      </div>` : ""}
+    </div>`;
+}
+
+/** Painel do gerente: quem cobre quem, com prazo. */
+function coberturaGestaoCard() {
+  const c = state.crm.coverages;
+  if (!c || !c.canManage) return "";
+  const linhas = c.all || [];
+  const hoje = dateInDays(0);
+  const vigente = (l) => l.start_date <= hoje && (!l.end_date || l.end_date >= hoje);
+  return `
+    <div class="form-card">
+      <div class="section-title">
+        <div><h3>Cobertura de carteira</h3>
+        <div class="text-small">Férias e ausências: autorize um vendedor a enxergar a carteira de outro, com prazo.</div></div>
+        <button class="btn btn-primary btn-sm" type="button" onclick="abrirCobertura()">+ Autorizar</button>
+      </div>
+      ${linhas.length ? `
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Quem cobre</th><th>Carteira coberta</th><th>Período</th><th>Motivo</th><th style="text-align:right">Ações</th></tr></thead>
+            <tbody>
+              ${linhas.map((l) => `
+                <tr style="${vigente(l) ? "" : "opacity:.55"}">
+                  <td><strong>${escapeHtml(l.covering_seller)}</strong></td>
+                  <td>${escapeHtml(l.covered_seller)}</td>
+                  <td class="text-small">${escapeHtml(shortDate(l.start_date) || "")} →
+                      ${escapeHtml(l.end_date ? shortDate(l.end_date) : "sem prazo")}
+                      ${vigente(l) ? '<span class="soft-badge" style="margin-left:6px">vigente</span>' : ""}</td>
+                  <td class="text-small">${escapeHtml(l.reason || "-")}</td>
+                  <td style="text-align:right;white-space:nowrap">
+                    <button class="btn btn-ghost btn-sm" type="button" onclick='abrirCobertura(${JSON.stringify(l).replace(/'/g, "&#39;")})'>Editar</button>
+                    <button class="btn btn-ghost btn-sm" type="button" onclick="encerrarCobertura(${Number(l.id)})">Encerrar</button>
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>` : '<div class="text-small" style="color:var(--muted)">Nenhuma cobertura ativa.</div>'}
+    </div>`;
+}
+
+function coberturaModal() {
+  const c = state.crm.coverageEditor;
+  if (!c) return "";
+  const vendedores = (state.crm.coverages?.sellers || []).map((v) => v.personName || v.person_name || v);
+  const opcoes = (valor) => vendedores.map((v) =>
+    `<option value="${escapeHtml(v)}" ${valor === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("");
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharCobertura()">
+      <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>🤝 Autorizar cobertura</h3>
+          <div class="text-small">Quem cobre passa a enxergar a carteira do colega no período.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharCobertura()">Fechar</button>
+        </div>
+        <div class="two-column-form" style="margin-top:10px">
+          <div class="field"><label>Quem cobre</label>
+            <select onchange="state.crm.coverageEditor.coveringSeller=this.value">
+              <option value="">Selecione…</option>${opcoes(c.coveringSeller)}
+            </select></div>
+          <div class="field"><label>Carteira coberta</label>
+            <select onchange="state.crm.coverageEditor.coveredSeller=this.value">
+              <option value="">Selecione…</option>${opcoes(c.coveredSeller)}
+            </select></div>
+          <div class="field"><label>Início</label>
+            <input type="date" value="${escapeHtml(c.startDate)}" onchange="state.crm.coverageEditor.startDate=this.value" /></div>
+          <div class="field"><label>Fim <span style="color:var(--muted);font-weight:400">(vazio = sem prazo)</span></label>
+            <input type="date" value="${escapeHtml(c.endDate || "")}" onchange="state.crm.coverageEditor.endDate=this.value" /></div>
+          <div class="field field-span-2"><label>Motivo</label>
+            <input value="${escapeHtml(c.reason || "")}" placeholder="Ex: férias de 01/09 a 20/09"
+              oninput="state.crm.coverageEditor.reason=this.value" /></div>
+        </div>
+        <div class="text-small" style="color:var(--muted)">
+          Sem data final a cobertura não expira sozinha — prefira sempre definir o fim.
+        </div>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" type="button" onclick="salvarCobertura()">Salvar cobertura</button>
+          <button class="btn btn-ghost" type="button" onclick="fecharCobertura()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function crmClientsView() {
   if (!state.crm.summary) return `<div class="loader panel">Carregando clientes CRM...</div>`;
   const rows = filteredCrmClients();
+  const blocoCobertura = coberturaChips() + coberturaGestaoCard();
 
   if (roleIsSeller()) {
     const urgent = rows.filter((r) => r.statusCode === "INATIVO" || r.statusCode === "PRE_INATIVO");
@@ -9200,6 +9540,7 @@ function crmClientsView() {
 
     return `
       <div class="stack">
+        ${blocoCobertura}
         ${sellerFilterBar()}
         ${isLoading ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">⏳ Atualizando carteira…</div>` : ""}
         ${activeSellerFilterCount() > 0 ? `
@@ -9406,6 +9747,7 @@ function crmClientsView() {
 
   return `
     <div class="stack">
+      ${blocoCobertura}
       <!-- Toggle de visualização -->
       <div class="form-card" style="padding:10px 16px">
         <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -9460,7 +9802,16 @@ function crmClientsView() {
                       </div>
                     </td>
                   </tr>
-                `).join("") || '<tr><td colspan="13">Nenhum cliente encontrado com os filtros selecionados.</td></tr>'}
+                `).join("") || `<tr><td colspan="13">
+                    Nenhum cliente encontrado com os filtros selecionados.
+                    ${roleIsSeller() ? `
+                      <div style="margin-top:8px">
+                        <button class="btn btn-secondary btn-sm" type="button"
+                          onclick="abrirApoio('${jsAttr(state.crm.crmClientFilters?.search || "")}')">
+                          🤝 Atender cliente de outra carteira pelo código
+                        </button>
+                      </div>` : ""}
+                  </td></tr>`}
               </tbody>
             </table>
           </div>
@@ -9488,6 +9839,10 @@ function clientDrawerView() {
         </div>
         <div class="client-drawer-actions">
           <button class="btn btn-primary" ${client.clientKey ? "" : "disabled"} onclick="prefillInteractionFromAgenda('${escapeHtml(client.clientKey || "")}')">Registrar contato</button>
+          ${detail && detail.isOwnClient === false && roleIsSeller() ? `
+            <span class="soft-badge" style="background:#e0f2f1;color:#00695c;align-self:center">
+              🤝 cliente de outra carteira — o registro entra como apoio
+            </span>` : ""}
           <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"} onclick="openContactUpdateModal('${escapeHtml(client.clientKey || "")}')">Atualizar contato</button>
           <button class="btn btn-secondary" ${client.clientKey ? "" : "disabled"}
             onclick="openReceptiveModal('${escapeHtml(client.clientKey || "")}')"
@@ -10288,7 +10643,8 @@ async function submitCrmModalAction() {
   }
 }
 
-async function openCrmClient(clientKey, switchToClientsTab = true, renderAfterLoad = true) {
+async function openCrmClient(clientKey, switchToClientsTab = true, renderAfterLoad = true,
+                             { outside = false } = {}) {
   if (!clientKey) return;
   state.crm.selectedClientKey = clientKey;
   state.ui.crmClientDetailTab = "historico";
@@ -10305,7 +10661,9 @@ async function openCrmClient(clientKey, switchToClientsTab = true, renderAfterLo
 
   try {
     // 1. Carrega só o summary — abre o drawer imediatamente
-    state.crm.selectedClient = await api(`/api/crm/client/summary?${buildQuery()}&clientKey=${encodeURIComponent(clientKey)}`);
+    state.crm.selectedClient = await api(
+      `/api/crm/client/summary?${buildQuery()}&clientKey=${encodeURIComponent(clientKey)}`
+      + (outside ? "&outside=1" : ""));
     state.ui.clientDrawerError = "";
   } catch (error) {
     state.crm.selectedClient = null;
@@ -10402,6 +10760,10 @@ async function submitCrmInteraction() {
       method: "POST",
       body: JSON.stringify({
         ...form,
+        // Cliente de outra carteira: o servidor confirma e grava como APOIO,
+        // fora da meta de ligações. Marcar aqui evita depender da tela.
+        initiative: form.initiative
+          || (state.crm.selectedClient?.isOwnClient === false ? "APOIO" : "ATIVO"),
         clientKey: form.clientCode || form.clientKey,
         occurredAt: form.occurredAt ? form.occurredAt.replace("T", " ") : localDateTimeString(),
         followupDueAt: form.followupDueAt ? form.followupDueAt.replace("T", " ") : "",
@@ -12458,6 +12820,8 @@ function dashboardView() {
       ${assignTaskModal()}
       ${scheduleContactModal()}
       ${conciliacaoModal()}
+      ${apoioModal()}
+      ${coberturaModal()}
       ${receptiveModal()}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
       ${assistantFab()}

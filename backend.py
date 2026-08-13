@@ -545,6 +545,11 @@ CRM_CONTACT_TYPES = [
 CRM_RECEPTIVE_TYPES = ["LIGACAO_RECEBIDA", "MENSAGEM_RECEBIDA", "ANOTACAO"]
 INITIATIVE_ACTIVE = "ATIVO"
 INITIATIVE_RECEPTIVE = "RECEPTIVO"
+# APOIO: vendedor atendendo cliente de OUTRA carteira (férias, almoço, ausência).
+# Fica fora da meta de ligações de propósito. Se contasse, bastaria atender a
+# carteira alheia para bater meta sem prospectar ninguém — e a meta do MEC mede
+# iniciativa, não volume de atendimento.
+INITIATIVE_SUPPORT = "APOIO"
 
 CRM_CONTACT_RESULTS = [
     ("FALOU_CLIENTE", "Falou com o cliente", 0, 0),
@@ -2113,6 +2118,23 @@ def init_db() -> None:
                 UNIQUE(company_id, city_name, valid_from, source),
                 FOREIGN KEY (company_id) REFERENCES companies(id)
             );
+
+            CREATE TABLE IF NOT EXISTS portfolio_coverage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                covering_seller TEXT NOT NULL,   -- quem cobre
+                covered_seller TEXT NOT NULL,    -- carteira coberta
+                unit_name TEXT,
+                start_date TEXT NOT NULL,
+                end_date TEXT,
+                reason TEXT,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_coverage_lookup
+                ON portfolio_coverage(company_id, covering_seller, start_date);
 
             CREATE TABLE IF NOT EXISTS client_name_aliases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4134,6 +4156,8 @@ def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | Non
         # Busca por item: aceita código do fabricante ou interno
         "itemCode": normalize_whitespace(query.get("itemCode", [None])[0]),
         "search": normalize_whitespace(query.get("search", [None])[0]),
+        # Carteira coberta que o vendedor pediu para enxergar (cobertura de férias)
+        "coverage_of": normalize_whitespace(query.get("coverageOf", [None])[0]),
     }
 
 
@@ -6983,6 +7007,8 @@ TASK_ORIGINS = [
      "hint": "Ação combinada durante uma visita gerencial."},
     {"id": "LIVRE", "label": "Direcionamento", "icon": "🎯", "color": "#6a1b9a", "bg": "#f3e5f5",
      "hint": "Tarefa de gestão, com ou sem cliente vinculado."},
+    {"id": "APOIO", "label": "Atendido por outro", "icon": "🤝", "color": "#00695c", "bg": "#e0f2f1",
+     "hint": "Outro vendedor atendeu este cliente da sua carteira — retome o contato."},
 ]
 TASK_ORIGIN_IDS = {o["id"] for o in TASK_ORIGINS}
 
@@ -7065,7 +7091,7 @@ def contact_history(
         condicoes.append("i.result_code = ?")
         params.append(resultado)
     iniciativa = normalize_upper(filtros.get("initiative"))
-    if iniciativa in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE}:
+    if iniciativa in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE, INITIATIVE_SUPPORT}:
         condicoes.append("i.initiative = ?")
         params.append(iniciativa)
     busca = normalize_whitespace(filtros.get("search"))
@@ -7100,6 +7126,7 @@ def contact_history(
             COUNT(*) AS registros,
             SUM(CASE WHEN i.initiative = 'ATIVO' THEN 1 ELSE 0 END) AS ativos,
             SUM(CASE WHEN i.initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptivos,
+            SUM(CASE WHEN i.initiative = 'APOIO' THEN 1 ELSE 0 END) AS apoios,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.contact_type_code = 'LIGACAO'
                      THEN 1 ELSE 0 END) AS ligacoes,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.result_code = 'FALOU_CLIENTE'
@@ -7120,6 +7147,7 @@ def contact_history(
             COUNT(*) AS registros,
             SUM(CASE WHEN i.initiative = 'ATIVO' THEN 1 ELSE 0 END) AS ativos,
             SUM(CASE WHEN i.initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptivos,
+            SUM(CASE WHEN i.initiative = 'APOIO' THEN 1 ELSE 0 END) AS apoios,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.contact_type_code = 'LIGACAO'
                      THEN 1 ELSE 0 END) AS ligacoes,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.result_code = 'FALOU_CLIENTE'
@@ -8614,6 +8642,19 @@ def crm_scoped_filters_for_user(
     """Filtros do CRM. Igual ao dashboard, exceto que NUNCA consolida:
     o perfil "unidade + consolidado" fica restrito às unidades vinculadas aqui."""
     scoped = scoped_filters_for_user(conn, company_id, user, filters)
+
+    # Cobertura de carteira: o vendedor pode pedir a carteira de um colega
+    # DESDE QUE o gerente tenha autorizado e a autorização esteja vigente.
+    # Sem isso o escopo "proprio" travaria o nome dele e a cobertura seria
+    # apenas decorativa.
+    pedido = normalize_whitespace(filters.get("coverage_of"))
+    if pedido and data_scope_for_user(conn, user) == "proprio":
+        if seller_can_see_portfolio(conn, company_id, user, pedido):
+            scoped["seller_name"] = pedido
+            scoped["coverage_of"] = pedido
+        else:
+            scoped["seller_name"] = seller_identity_for_user(user)
+
     allowed = crm_allowed_units_for_user(conn, user)
     if allowed is None:
         return scoped
@@ -9954,12 +9995,23 @@ def count_crm_clients(
 
 def get_crm_client_summary(
     conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None], client_key: str,
-    seller_name: str | None = None,
+    seller_name: str | None = None, allow_outside: bool = False,
 ) -> dict[str, Any] | None:
     base_summary = next(
         (row for row in list_crm_clients(conn, company_id, filters, attach_context=False) if row["clientKey"] == client_key),
         None,
     )
+    if not base_summary and allow_outside:
+        # Atendimento de apoio: o vendedor chegou pelo CÓDIGO EXATO, informado
+        # pelo cliente na linha. A ficha é completa — histórico e vendas — para
+        # ele conseguir negociar com o mesmo contexto de quem é dono.
+        livres = dict(filters)
+        livres["seller_name"] = ""
+        livres["unit_name"] = ""
+        livres["allowed_units"] = None
+        base_summary = next(
+            (row for row in list_crm_clients(conn, company_id, livres, attach_context=False)
+             if row["clientKey"] == client_key), None)
     if not base_summary:
         return None
     # A ficha traz os scripts prontos, já com o nome do cliente preenchido
@@ -10158,10 +10210,22 @@ def get_crm_client_tasks(
 
 
 def get_crm_client_360(
-    conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None], client_key: str
+    conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None], client_key: str,
+    allow_outside: bool = False,
 ) -> dict[str, Any] | None:
     summaries = {row["clientKey"]: row for row in list_crm_clients(conn, company_id, filters)}
     summary = summaries.get(client_key)
+    if not summary and allow_outside:
+        # Atendimento de apoio: o vendedor chegou pelo CÓDIGO EXATO, informado
+        # pelo próprio cliente na linha. Aqui a ficha é completa, incluindo
+        # histórico e vendas — decisão do Felipe: quem atende precisa negociar
+        # com o mesmo contexto de quem é dono.
+        livres = dict(filters)
+        livres["seller_name"] = ""
+        livres["unit_name"] = ""
+        livres["allowed_units"] = None
+        summary = {row["clientKey"]: row for row in list_crm_clients(
+            conn, company_id, livres)}.get(client_key)
     if not summary:
         return None
     detail_name = summary.get("summaryClientName") or summary["clientName"]
@@ -10419,6 +10483,173 @@ def save_crm_client_contact(
     }
 
 
+def active_coverages_for_seller(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, quando: str = ""
+) -> list[dict[str, Any]]:
+    """Carteiras que este vendedor está autorizado a cobrir hoje.
+
+    A cobertura é nominal e tem prazo: o gerente diz quem cobre quem e até
+    quando. Sem prazo, "cobertura de férias" viraria acesso permanente à
+    carteira do colega — que é exatamente o que não queremos.
+    """
+    alvo = person_key(seller_name)
+    if not alvo:
+        return []
+    hoje = quando or today_in_brazil().isoformat()
+    linhas = []
+    for r in conn.execute(
+        "SELECT * FROM portfolio_coverage WHERE company_id = ? "
+        "AND date(start_date) <= date(?) "
+        "AND (end_date IS NULL OR end_date = '' OR date(end_date) >= date(?))",
+        (company_id, hoje, hoje),
+    ).fetchall():
+        if person_key(r["covering_seller"]) == alvo:
+            linhas.append(dict(r))
+    return linhas
+
+
+def seller_can_see_portfolio(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, seller_name: str
+) -> bool:
+    """O usuário pode abrir a carteira deste vendedor?"""
+    if data_scope_for_user(conn, user) != "proprio":
+        return True
+    alvo = person_key(seller_name)
+    if alvo == person_key(seller_identity_for_user(user)):
+        return True
+    return any(person_key(c["covered_seller"]) == alvo
+               for c in active_coverages_for_seller(
+                   conn, company_id, seller_identity_for_user(user)))
+
+
+def save_coverage(
+    conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    cobre = normalize_whitespace(payload.get("coveringSeller"))
+    coberto = normalize_whitespace(payload.get("coveredSeller"))
+    if not cobre or not coberto:
+        raise ValueError("Informe quem cobre e qual carteira será coberta.")
+    if person_key(cobre) == person_key(coberto):
+        raise ValueError("O vendedor não precisa de autorização para a própria carteira.")
+    inicio = normalize_whitespace(payload.get("startDate")) or today_in_brazil().isoformat()
+    fim = normalize_whitespace(payload.get("endDate")) or None
+    if fim and fim < inicio:
+        raise ValueError("A data final não pode ser anterior à inicial.")
+    registro_id = payload.get("id")
+    if registro_id:
+        conn.execute(
+            "UPDATE portfolio_coverage SET covering_seller=?, covered_seller=?, start_date=?, "
+            "end_date=?, reason=? WHERE company_id = ? AND id = ?",
+            (cobre, coberto, inicio, fim, normalize_whitespace(payload.get("reason")) or None,
+             company_id, int(registro_id)),
+        )
+    else:
+        conn.execute(
+            """
+            INSERT INTO portfolio_coverage
+                (company_id, covering_seller, covered_seller, unit_name, start_date, end_date,
+                 reason, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?)
+            """,
+            (company_id, cobre, coberto, normalize_unit(payload.get("unitName")) or None,
+             inicio, fim, normalize_whitespace(payload.get("reason")) or None, user_id, now_iso()),
+        )
+    audit_log(conn, company_id, user_id, "salvar", "portfolio_coverage",
+              f"{cobre} cobre {coberto}", {"inicio": inicio, "fim": fim})
+    conn.commit()
+    prazo = f"até {fim}" if fim else "sem prazo definido"
+    return {"message": f"{cobre} passa a enxergar a carteira de {coberto} ({prazo})."}
+
+
+def delete_coverage(
+    conn: sqlite3.Connection, company_id: int, user_id: int, registro_id: Any
+) -> dict[str, Any]:
+    conn.execute("DELETE FROM portfolio_coverage WHERE company_id = ? AND id = ?",
+                 (company_id, int(registro_id)))
+    audit_log(conn, company_id, user_id, "excluir", "portfolio_coverage", str(registro_id), {})
+    conn.commit()
+    return {"message": "Cobertura encerrada."}
+
+
+def list_coverages(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[dict[str, Any]]:
+    permitidas = crm_allowed_units_for_user(conn, user)
+    linhas = [dict(r) for r in conn.execute(
+        "SELECT * FROM portfolio_coverage WHERE company_id = ? ORDER BY start_date DESC",
+        (company_id,),
+    ).fetchall()]
+    if permitidas is None:
+        return linhas
+    return [l for l in linhas if not l.get("unit_name") or l["unit_name"] in permitidas]
+
+
+def client_is_outside_own_portfolio(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, client_key: str
+) -> bool:
+    """O cliente pertence a outro vendedor?"""
+    if data_scope_for_user(conn, user) != "proprio":
+        return False
+    dono = conn.execute(
+        "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS vendedor "
+        "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (company_id, client_key),
+    ).fetchone()
+    if not dono or not normalize_whitespace(dono["vendedor"]):
+        return False
+    return person_key(dono["vendedor"]) != person_key(seller_identity_for_user(user))
+
+
+def support_client_view(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, codigo: str
+) -> dict[str, Any] | None:
+    """Ficha REDUZIDA de um cliente de outra carteira, por código exato.
+
+    Duas escolhas de desenho, ambas deliberadas:
+
+    1. Só código EXATO. Aceitar nome ou trecho deixaria qualquer vendedor varrer
+       a carteira do colega em minutos. Pelo código, ele só chega em quem já
+       está falando com ele — é o cliente que informa o código.
+    2. Sem valores. Vai o necessário para ATENDER (telefone, contato, endereço,
+       última compra, retornos em aberto, histórico de contatos). Não vai
+       faturamento, média, classe nem margem: isso é resultado do colega e
+       alimenta comparação e comissão.
+    """
+    code = normalize_whitespace(codigo)
+    if not code:
+        return None
+    perfil = conn.execute(
+        "SELECT client_code, client_name, trade_name, document_number, phone, updated_phone, "
+        "       primary_contact_name, contact_notes, address_line, address_number, neighborhood, "
+        "       city_name, state_name, postal_code, last_sale_at, "
+        "       COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS owner_name "
+        "FROM crm_client_profiles WHERE company_id = ? AND TRIM(client_code) = ?",
+        (company_id, code),
+    ).fetchone()
+    if not perfil:
+        return None
+
+    dados = dict(perfil)
+    dados["isOwnClient"] = not client_is_outside_own_portfolio(conn, company_id, user, code)
+    dados["interactions"] = [dict(r) for r in conn.execute(
+        "SELECT i.occurred_at, i.seller_name, i.notes, i.initiative, "
+        "       t.label AS type_label, r.label AS result_label "
+        "FROM crm_interactions i "
+        "LEFT JOIN crm_contact_types t ON t.code = i.contact_type_code "
+        "LEFT JOIN crm_contact_results r ON r.code = i.result_code "
+        "WHERE i.company_id = ? AND i.client_key = ? "
+        "ORDER BY i.occurred_at DESC LIMIT 10",
+        (company_id, code),
+    ).fetchall()]
+    dados["openTasks"] = [dict(r) for r in conn.execute(
+        "SELECT title, due_at, seller_name FROM crm_tasks "
+        "WHERE company_id = ? AND client_key = ? AND status IN ('ABERTA','ATRASADA','REAGENDADA') "
+        "ORDER BY due_at LIMIT 5",
+        (company_id, code),
+    ).fetchall()]
+    return dados
+
+
 def create_crm_interaction(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -10440,7 +10671,11 @@ def create_crm_interaction(
     # histórico e na ficha, mas fica fora da meta de ligações ativas — senão
     # bastaria anotar o que chegou sozinho para "bater" a meta sem prospectar.
     iniciativa = (normalize_upper(payload.get("initiative")) or INITIATIVE_ACTIVE)
-    if iniciativa not in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE}:
+    if iniciativa not in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE, INITIATIVE_SUPPORT}:
+        iniciativa = INITIATIVE_ACTIVE
+    if iniciativa == INITIATIVE_SUPPORT and not client_is_outside_own_portfolio(
+            conn, company_id, user, client_key):
+        # Cliente é da carteira dele: apoio não se aplica, é atendimento normal.
         iniciativa = INITIATIVE_ACTIVE
     if contact_type_code in CRM_RECEPTIVE_TYPES:
         iniciativa = INITIATIVE_RECEPTIVE
@@ -10530,6 +10765,31 @@ def create_crm_interaction(
         """,
         (now_iso(), company_id, client_key, normalize_upper(seller_name)),
     )
+
+    # Atendimento de apoio: o DONO precisa saber que alguém falou com o cliente
+    # dele, senão o atendimento morre ali e o cliente fica sem continuidade.
+    # A tarefa é o canal que ele já usa todo dia — não inventa notificação nova.
+    if iniciativa == INITIATIVE_SUPPORT:
+        dono = conn.execute(
+            "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS vendedor "
+            "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+            (company_id, client_key),
+        ).fetchone()
+        nome_dono = normalize_whitespace(dono["vendedor"]) if dono else ""
+        if nome_dono:
+            conn.execute(
+                """
+                INSERT INTO crm_tasks
+                    (company_id, client_key, client_name, seller_name, title, description,
+                     due_at, status, origin, priority, created_by_name, created_at)
+                VALUES (?,?,?,?,?,?,?, 'ABERTA', 'APOIO', 'ALTA', ?, ?)
+                """,
+                (company_id, client_key, client_name, nome_dono,
+                 f"Cliente atendido por {seller_name}",
+                 f"{seller_name} atendeu este cliente da sua carteira em "
+                 f"{occurred_at[:10]}. Observação: {notes}",
+                 today_in_brazil().isoformat(), seller_name, now_iso()),
+            )
 
     task_id = None
     if result["generates_followup"] and followup_due_at:
@@ -15960,9 +16220,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Informe clientKey"}))
                     return
+                fora = query.get("outside", ["0"])[0] in {"1", "true", "sim"}
                 with closing(get_connection()) as conn:
                     filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
-                    data = get_crm_client_360(conn, user["company_id"], filters, client_key)
+                    data = get_crm_client_360(conn, user["company_id"], filters, client_key,
+                                              allow_outside=fora)
+                    if data:
+                        dono = conn.execute(
+                            "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) v "
+                            "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+                            (user["company_id"], client_key),
+                        ).fetchone()
+                        data["ownerName"] = normalize_whitespace(dono["v"]) if dono else ""
+                        data["isOwnClient"] = not client_is_outside_own_portfolio(
+                            conn, user["company_id"], user, client_key)
                 if not data:
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Cliente nao encontrado"}))
@@ -15986,8 +16257,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     data = get_crm_client_summary(
                         conn, user["company_id"], filters, client_key,
                         seller_name=user["full_name"] or user["username"],
+                        allow_outside=query.get("outside", ["0"])[0] in {"1", "true", "sim"},
                     )
                     if data:
+                        data["isOwnClient"] = not client_is_outside_own_portfolio(
+                            conn, user["company_id"], user, client_key)
                         # Gestão pode cobrar contato de qualquer cliente da ficha.
                         # A lista de vendedores acompanha para o caso de o cliente
                         # não ter dono definido.
@@ -16169,6 +16443,40 @@ class AppHandler(BaseHTTPRequestHandler):
                     dados = contact_history(conn, user["company_id"], user, filtros)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
+                return
+            if path == "/api/crm/coverages":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    escopo = data_scope_for_user(conn, user)
+                    if escopo == "proprio":
+                        itens = active_coverages_for_seller(
+                            conn, user["company_id"], seller_identity_for_user(user))
+                        payload = {"mine": itens, "canManage": False}
+                    else:
+                        payload = {"all": list_coverages(conn, user["company_id"], user),
+                                   "canManage": True,
+                                   "sellers": sellers_available_for_assignment(
+                                       conn, user["company_id"], user)}
+                self._set_headers(200)
+                self.wfile.write(json_dumps(payload))
+                return
+            if path == "/api/crm/client/support":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    achado = support_client_view(
+                        conn, user["company_id"], user,
+                        parse_qs(parsed.query).get("code", [""])[0])
+                if not achado:
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps(
+                        {"error": "Nenhum cliente com este código no cadastro."}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"client": achado}))
                 return
             if path == "/api/crm/clients/by-code":
                 user = self._require_auth()
@@ -17351,6 +17659,30 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn.commit()
                     self._set_headers(200)
                     self.wfile.write(json_dumps({"message": "Usuário excluído."}))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in {"/api/crm/coverages/save", "/api/crm/coverages/delete"}:
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if data_scope_for_user(conn, user) == "proprio":
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps(
+                                {"error": "Só a gestão define cobertura de carteira."}))
+                            return
+                        if path.endswith("/delete"):
+                            res = delete_coverage(conn, user["company_id"], user["id"],
+                                                  payload.get("id"))
+                        else:
+                            res = save_coverage(conn, user["company_id"], user["id"], payload)
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(res))
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(400)
