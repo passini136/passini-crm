@@ -8840,25 +8840,40 @@ def crm_base_client_rows(
     # Regra: o faturamento fica com um único código — o que tem movimento no mês
     # corrente; sem movimento em nenhum, fica com o de compra mais recente.
     revenue_owner_by_name: dict[str, str] = {}
-    _candidates_by_name: dict[str, list[tuple[float, str, str]]] = defaultdict(list)
+    _candidates_by_name: dict[str, list[tuple[float, str, str, str]]] = defaultdict(list)
     for row in aggregate_rows:
         code = normalize_whitespace(row["client_code"])
         if not code:
             continue
+        # NOME FANTASIA NÃO ENTRA AQUI.
+        #
+        # Ele entrava, e criava duplicata falsa: fantasia costuma ser curta e
+        # repetida ("RAFAEL", "AUTO CENTER", "OFICINA"), então dois clientes sem
+        # nenhuma relação caíam na mesma chave e um era marcado como cópia do
+        # outro. Caso real: RAFAEL MOSCARELLI (Pelotas) apontando para RAFAEL
+        # SPANIOL E CIA (Matriz). O faturamento vem pela RAZÃO SOCIAL, então a
+        # fantasia não ajudaria nem se fosse confiável.
         for key in {
             normalize_client_key(row["client_name"]),
             normalize_client_key(row["summary_client_name"]),
-            normalize_client_key(row["trade_name"]),
         }:
             if key:
                 _candidates_by_name[key].append((
                     float(row["current_revenue"] or 0.0),
                     normalize_whitespace(row["last_purchase_at"]) or "",
                     code,
+                    only_digits(row["document_number"]),
                 ))
     for name_key, candidates in _candidates_by_name.items():
         if len(candidates) < 2:
             revenue_owner_by_name[name_key] = candidates[0][2]
+            continue
+        # Segunda trava: documentos diferentes são clientes diferentes, por mais
+        # parecido que o nome seja. Homônimo existe — duas empresas do mesmo dono,
+        # matriz e filial, pessoa física e jurídica com o mesmo nome. Sem isso, o
+        # faturamento de uma seria creditado à outra.
+        documentos = {c[3] for c in candidates if c[3]}
+        if len(documentos) > 1:
             continue
         # Maior receita no mês corrente; empate resolve pela compra mais recente
         candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
@@ -8872,11 +8887,12 @@ def crm_base_client_rows(
         # fantasia. DEDUPLICAR é essencial: quando dois desses campos normalizam
         # para a mesma chave (o caso comum — razão social igual em ambos), o loop
         # abaixo somava o MESMO faturamento duas ou três vezes, dobrando a média.
+        # Também sem fantasia, pela mesma razão: o faturamento é indexado pela
+        # razão social, e casar por fantasia trazia receita de outro cliente.
         candidate_keys = list(dict.fromkeys(
             key for key in (
                 normalize_client_key(row["client_name"]),
                 normalize_client_key(row["summary_client_name"]),
-                normalize_client_key(row["trade_name"]),
             ) if key
         ))
         merged_revenues = [0.0, 0.0, 0.0]
