@@ -1626,6 +1626,16 @@ function applyProspectSearch() {
   loadProspects();
 }
 
+/** Escolher o vendedor traz a unidade dele junto — unidade errada tira o
+ *  prospect da vista da equipe que deveria trabalhá-lo. */
+function escolherVendedorProspect(nome) {
+  if (!state.prospectEditor) return;
+  state.prospectEditor.sellerName = nome;
+  const unidade = (state.prospects?.sellerUnits || {})[nome];
+  if (unidade) state.prospectEditor.unitName = unidade;
+  requestRender();
+}
+
 function novoProspect() {
   const p = state.prospects || {};
   state.prospectEditor = {
@@ -1650,6 +1660,10 @@ async function salvarProspect() {
   const p = state.prospectEditor;
   if (!p) return;
   if (!p.companyName.trim()) { addMessage("error", "Informe o nome da oficina."); return; }
+  if (!String(p.sellerName || "").trim()) {
+    addMessage("error", "Escolha o vendedor responsável — é ele que trabalha este prospect.");
+    return;
+  }
   p.saving = true; requestRender();
   try {
     const r = await api("/api/prospects/save", { method: "POST", body: JSON.stringify(p) });
@@ -2299,15 +2313,23 @@ function prospectEditorModal() {
 
         ${d.canManage ? `
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-            <div class="field"><label>Vendedor responsável</label>
-              <select onchange="state.prospectEditor.sellerName=this.value">
+            <div class="field">
+              <label>Vendedor responsável <span style="color:var(--bad)">*</span></label>
+              <select onchange="escolherVendedorProspect(this.value)">
                 <option value="">Selecione…</option>
                 ${(d.sellers || []).map((s) => `<option value="${escapeHtml(s)}" ${p.sellerName === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
-              </select></div>
+              </select>
+              <div class="text-small" style="color:var(--muted);margin-top:4px">
+                Define a unidade e é por ele que a equipe enxerga este prospect.
+              </div></div>
             <div class="field"><label>Unidade</label>
               <select onchange="state.prospectEditor.unitName=this.value">
+                <option value="">—</option>
                 ${(d.units || []).map((u) => `<option value="${escapeHtml(u)}" ${p.unitName === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
-              </select></div>
+              </select>
+              ${p.sellerName && p.unitName ? `<div class="text-small" style="color:var(--muted);margin-top:4px">
+                Preenchida pelo cadastro de ${escapeHtml(p.sellerName)}.</div>` : ""}
+            </div>
           </div>` : ""}
 
         <div class="subtle-card padded-card" style="margin-top:8px">
@@ -2353,7 +2375,13 @@ function prospectEditorModal() {
             <input value="${escapeHtml(p.origin)}" oninput="state.prospectEditor.origin=this.value"
               placeholder="Indicação, rua, lista, internet" /></div>
           <div class="field"><label>Observações</label>
-            <input value="${escapeHtml(p.notes)}" oninput="state.prospectEditor.notes=this.value" /></div>
+            <input value="${escapeHtml(p.notes)}" oninput="state.prospectEditor.notes=this.value"
+              placeholder="O que a oficina disse na ligação" />
+            ${!d.canManage && !p.id ? `
+              <div class="text-small" style="color:var(--muted);margin-top:4px">
+                Preenchendo aqui, o sistema já registra a <strong>ligação de prospecção</strong>
+                no seu nome — não precisa lançar o contato de novo.
+              </div>` : ""}</div>
         </div>
 
         <div class="actions" style="margin-top:14px">

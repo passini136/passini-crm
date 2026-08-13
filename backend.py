@@ -8396,9 +8396,13 @@ def save_prospect(
 
     escopo = data_scope_for_user(conn, user)
     if escopo == "proprio":
+        # Vendedor cadastrando: é dele, sem pergunta.
         vendedor = seller_identity_for_user(user)
     else:
-        vendedor = normalize_whitespace(payload.get("sellerName")) or meeting_person_identity(user)
+        # Gestor cadastrando: TEM de escolher o vendedor. Antes caía no nome do
+        # próprio gestor, e o prospect nascia numa carteira que ninguém trabalha
+        # — some da fila do vendedor e vira cadastro morto.
+        vendedor = normalize_whitespace(payload.get("sellerName"))
 
     # Quem é o dono do prospect: primeiro o que foi escolhido na tela, depois o
     # TERRITÓRIO (bairro/cidade) e só então a unidade do vendedor. O território
@@ -8418,6 +8422,10 @@ def save_prospect(
 
     documento = normalize_whitespace(payload.get("documentNumber"))
     digitos = only_digits(documento)
+
+    if not vendedor:
+        raise ValueError("Escolha o vendedor responsável — é ele que trabalha este prospect "
+                         "e é por ele que a unidade é definida.")
 
     prospect_id = payload.get("id")
     campos = (
@@ -8476,6 +8484,27 @@ def save_prospect(
         novo_id = int(cursor.lastrowid)
 
     _refresh_prospect_status(conn, company_id, novo_id)
+
+    # Cadastro com observação preenchida É o registro da ligação de prospecção.
+    # O vendedor acabou de falar com a oficina — obrigá-lo a registrar o contato
+    # de novo, em outra tela, é retrabalho e faz o esforço não aparecer no
+    # placar. Só vale para quem cadastrou a própria prospecção: gestor
+    # cadastrando pelo vendedor não gera ligação no nome dele.
+    observacao = normalize_whitespace(payload.get("notes"))
+    if (escopo == "proprio" and observacao
+            and payload.get("registerContact") is not False):
+        try:
+            create_crm_interaction(conn, company_id, user, {
+                "clientKey": prospect_client_key(novo_id),
+                "clientName": nome,
+                "contactTypeCode": "LIGACAO",
+                "resultCode": "FALOU_CLIENTE",
+                "notes": observacao,
+                "unitName": unidade,
+            })
+        except Exception as exc:   # registro é acessório: nunca derruba o cadastro
+            print(f"[prospects] contato não registrado para {nome}: {exc}", flush=True)
+
     audit_log(conn, company_id, user["id"], "salvar", "prospects", str(novo_id), {"nome": nome})
     conn.commit()
 
@@ -16058,6 +16087,14 @@ class AppHandler(BaseHTTPRequestHandler):
                         "sellers": ([s["sellerName"] for s in
                                      sellers_available_for_assignment(conn, user["company_id"], user)]
                                     if escopo != "proprio" else []),
+                        # Vendedor → unidade: escolher o vendedor no formulário
+                        # já define a unidade, sem o gestor ter que lembrar qual
+                        # é. Unidade errada tira o prospect da vista da equipe
+                        # que deveria trabalhá-lo.
+                        "sellerUnits": ({s["sellerName"]: s.get("baseUnit") or s.get("unitName") or ""
+                                         for s in sellers_available_for_assignment(
+                                             conn, user["company_id"], user)}
+                                        if escopo != "proprio" else {}),
                         "myName": seller_identity_for_user(user) if escopo == "proprio" else meeting_person_identity(user),
                     }
                 self._set_headers(200)
