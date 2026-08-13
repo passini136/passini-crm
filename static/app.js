@@ -9607,8 +9607,15 @@ function coberturaModal() {
 function resumoCarteiraVendedor() {
   const ps = state.crm.portfolioSummary;
   if (!ps || ps.error) return "";
+  const linhas = ps.sellers || [];
+  // Para o vendedor o servidor já devolve UMA linha — a dele. Casar por nome
+  // aqui só criaria um segundo lugar para o vínculo falhar, que é o defeito
+  // que já custou caro nas atas e no feedback. Só quando vier mais de uma
+  // linha é que o nome decide.
   const eu = meuNomeDeVendas();
-  const linha = (ps.sellers || []).find((s) => personKeyJs(s.sellerName) === personKeyJs(eu));
+  const linha = linhas.length === 1
+    ? linhas[0]
+    : linhas.find((s) => personKeyJs(s.sellerName) === personKeyJs(eu));
   if (!linha || !linha.total) return "";
 
   const share = (n) => `${((Number(n || 0) / linha.total) * 100).toFixed(1)}%`;
