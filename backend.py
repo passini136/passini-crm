@@ -16200,6 +16200,16 @@ class AppHandler(BaseHTTPRequestHandler):
                             competence=req_competence, unit_filter=req_unit,
                             person_type_filter=req_person_type,
                         )
+                        # Vendedor recebe SÓ a própria linha. O cálculo é por
+                        # equipe inteira, e devolver tudo entregaria a carteira
+                        # e a inadimplência de contato dos colegas para quem só
+                        # deveria ver a si mesmo.
+                        if data_scope_for_user(conn, user) == "proprio":
+                            eu = person_key(seller_identity_for_user(user))
+                            minha = [l for l in data.get("sellers", [])
+                                     if person_key(l.get("sellerName")) == eu]
+                            data["sellers"] = minha
+                            data["totals"] = minha[0] if minha else {}
                     self._set_headers(200)
                     self.wfile.write(json_dumps(data))
                 except Exception as _e:

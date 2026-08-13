@@ -566,12 +566,15 @@ async function bootstrap() {
       requestRender();
     });
     await Promise.all(loads);
+    // O resumo da carteira vale para os dois perfis: o vendedor vê a própria
+    // linha (o servidor recorta), o gestor vê a equipe.
+    loadPortfolioSummary();
+    loadCoverages();
     if (state.user.role !== "Vendedor") {
       // Cargas pesadas em background — nenhuma bloqueia a UI
       loadAdmin();
       if (placarEnabled()) loadTeamScore();
       loadTeamActivity();
-      loadPortfolioSummary();
     }
   }
   requestRender();
@@ -1359,11 +1362,12 @@ async function handleLogin(event) {
     const loginLoads = [loadOptions(), loadDashboard(), loadCrmOptions(), loadCrmData()];
     if (result.user.role === "Vendedor" && placarEnabled()) loginLoads.push(loadSellerScore());
     await Promise.all(loginLoads);
+    loadPortfolioSummary();
+    loadCoverages();
     if (state.user.role !== "Vendedor") {
       loadAdmin();
       if (placarEnabled()) loadTeamScore();
       loadTeamActivity();
-      loadPortfolioSummary();
     }
     addMessage("success", "Login realizado com sucesso.");
   } catch (error) {
