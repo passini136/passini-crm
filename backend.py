@@ -8649,20 +8649,13 @@ def crm_base_client_scope_query(
     if city_name:
         where_clauses.append("COALESCE(p.city_name, s.summary_city_name) = ?")
         filter_params.append(city_name)
-    if unit_name:
-        where_clauses.append(
-            """
-            EXISTS (
-                SELECT 1
-                FROM city_mappings cm
-                WHERE cm.company_id = ?
-                  AND cm.principal_unit = ?
-                  AND cm.city_name = COALESCE(p.city_name, s.summary_city_name)
-                    AND (cm.valid_to IS NULL OR cm.valid_to = '')
-            )
-            """
-        )
-        filter_params.extend([company_id, unit_name])
+    # O filtro de UNIDADE não entra mais aqui. Ele existia como um EXISTS sobre
+    # city_mappings, ou seja, só conhecia a cidade — e desde que a unidade passou
+    # a vir do vendedor (e do bairro, quando não há vendedor), esse filtro
+    # devolvia zero para a Zona Norte: nenhuma CIDADE aponta para ela, o vínculo
+    # é pelo vendedor e pelo bairro. Agora a filtragem acontece em Python, logo
+    # depois de a unidade ser resolvida, usando exatamente a mesma regra que a
+    # tela exibe. Ver unit_for_client_row().
     scope_query = f"""
         WITH current_summary AS (
             SELECT
@@ -8730,6 +8723,7 @@ def crm_base_client_rows(
     city_unit_map = build_city_unit_map(conn, company_id, c0)
     seller_unit_map = build_seller_unit_map(conn, company_id, c0)
     territory_map = build_territory_map(conn, company_id, c0)
+    unit_filter = normalize_unit(filters.get("unit_name"))
 
     # Agrega fact_sales_detail por cliente no SQL — evita iterar milhares de linhas no Python
     detail_rows = conn.execute(
@@ -8886,6 +8880,8 @@ def crm_base_client_rows(
         resolved_unit_name = unit_for_client_row(
             row["assigned_seller"], row["city_name"], row["neighborhood"],
             seller_unit_map, territory_map, city_unit_map)
+        if unit_filter and normalize_unit(resolved_unit_name) != unit_filter:
+            continue
         priorities: list[str] = []
         if status_code == "INATIVO":
             priorities.append("REATIVACAO_INATIVO")
@@ -9622,9 +9618,13 @@ def list_crm_clients(
                       "eligibleCount": len(visible_rows)})
     if limit is not None:
         visible_rows = visible_rows[:limit]
-    attach_engagement_markers(conn, company_id, visible_rows)
+    # Os sinais de relacionamento NÃO são calculados aqui. Eles montam um IN com
+    # as chaves recebidas e esta função devolve a carteira inteira — depois que a
+    # base passou de 100 mil clientes, virou um IN de 100 mil parâmetros por
+    # consulta e a tela levava minutos. Quem chama aplica em cima da PÁGINA.
     if not attach_context:
         return visible_rows
+    attach_engagement_markers(conn, company_id, visible_rows)
     return crm_attach_context(conn, company_id, visible_rows)
 
 
@@ -9647,6 +9647,12 @@ def attach_engagement_markers(
         return
     chaves = [normalize_client_key(r.get("clientKey")) for r in rows if r.get("clientKey")]
     if not chaves:
+        return
+    # Lote pequeno por segurança: SQLite tem teto de parâmetros por consulta e,
+    # mesmo onde não estoura, um IN enorme fica lento.
+    if len(chaves) > 400:
+        for inicio in range(0, len(rows), 400):
+            attach_engagement_markers(conn, company_id, rows[inicio : inicio + 400])
         return
     marcadores = ",".join("?" for _ in chaves)
     limite = (today_in_brazil() - timedelta(days=ENGAGEMENT_RECENT_DAYS)).isoformat()
@@ -9865,6 +9871,7 @@ def query_crm_clients_page(
     safe_page = min(max(int(page or 1), 1), total_pages)
     offset = (safe_page - 1) * safe_page_size
     visible_rows = filtered_rows[offset : offset + safe_page_size]
+    attach_engagement_markers(conn, company_id, visible_rows)
     rows = crm_attach_context(conn, company_id, visible_rows)
     # Só nos clientes da página visível — não faz sentido carregar o detalhe de quem não aparece.
     if item_details:
