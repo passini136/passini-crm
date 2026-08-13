@@ -6363,7 +6363,7 @@ def search_clients_for_visit(
     sql = """
         SELECT client_code, client_name, trade_name, city_name, neighborhood,
                address_line, address_number, postal_code, phone, updated_phone,
-               COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name
+               NULLIF(TRIM(internal_seller_name), '') AS seller_name
         FROM crm_client_profiles
         WHERE company_id = ?
           AND (UPPER(client_code) LIKE ? OR UPPER(client_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?)
@@ -6775,7 +6775,7 @@ def list_visits(
     if data_scope_for_user(conn, user) == "proprio":
         # O vendedor vê as visitas dos clientes dele e aquelas em que participou.
         sql += " AND (UPPER(seller_name) = ? OR client_key IN (SELECT client_code FROM crm_client_profiles "
-        sql += "     WHERE company_id = ? AND UPPER(COALESCE(NULLIF(internal_seller_name,''), external_seller_name)) = ?))"
+        sql += "     WHERE company_id = ? AND UPPER(TRIM(COALESCE(internal_seller_name,''))) = ?))"
         eu = normalize_upper(seller_identity_for_user(user))
         params.extend([eu, company_id, eu])
     else:
@@ -8683,9 +8683,7 @@ def crm_base_client_scope_query(
     base_params: list[Any] = [company_id, current_competence, company_id, company_id, current_competence, company_id]
     filter_params: list[Any] = []
     if seller_name:
-        where_clauses.append(
-            "UPPER(COALESCE(NULLIF(p.internal_seller_name, ''), NULLIF(p.external_seller_name, ''), s.summary_seller_name)) = ?"
-        )
+        where_clauses.append("UPPER(TRIM(COALESCE(p.internal_seller_name, ''))) = ?")
         filter_params.append(seller_name)
     if city_name:
         where_clauses.append("COALESCE(p.city_name, s.summary_city_name) = ?")
@@ -8733,7 +8731,14 @@ def crm_base_client_scope_query(
             p.credit_limit,
             p.economic_group,
             p.neighborhood,
-            COALESCE(NULLIF(p.internal_seller_name, ''), NULLIF(p.external_seller_name, ''), s.summary_seller_name) AS assigned_seller,
+            -- CARTEIRA = vendedor INTERNO do cadastro. Só ele.
+            --
+            -- Aqui havia uma cascata interno → externo → quem faturou, e por
+            -- isso a mesma vendedora aparecia com 177 clientes na lista e 132
+            -- no painel. Vendedor externo e quem emitiu a nota não definem
+            -- carteira: representante atende cliente de vários vendedores, e o
+            -- faturamento de um mês não transfere a propriedade do cliente.
+            NULLIF(TRIM(p.internal_seller_name), '') AS assigned_seller,
             COALESCE(s.current_revenue, 0) AS current_revenue,
             COALESCE(s.last_purchase_at, p.last_sale_at) AS last_purchase_at
         FROM base_clients base
@@ -10607,7 +10612,7 @@ def client_is_outside_own_portfolio(
     if data_scope_for_user(conn, user) != "proprio":
         return False
     dono = conn.execute(
-        "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS vendedor "
+        "SELECT NULLIF(TRIM(internal_seller_name), '') AS vendedor "
         "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
         (company_id, client_key),
     ).fetchone()
@@ -10638,7 +10643,7 @@ def support_client_view(
         "SELECT client_code, client_name, trade_name, document_number, phone, updated_phone, "
         "       primary_contact_name, contact_notes, address_line, address_number, neighborhood, "
         "       city_name, state_name, postal_code, last_sale_at, "
-        "       COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS owner_name "
+        "       NULLIF(TRIM(internal_seller_name), '') AS owner_name "
         "FROM crm_client_profiles WHERE company_id = ? AND TRIM(client_code) = ?",
         (company_id, code),
     ).fetchone()
@@ -10787,7 +10792,7 @@ def create_crm_interaction(
     # A tarefa é o canal que ele já usa todo dia — não inventa notificação nova.
     if iniciativa == INITIATIVE_SUPPORT:
         dono = conn.execute(
-            "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS vendedor "
+            "SELECT NULLIF(TRIM(internal_seller_name), '') AS vendedor "
             "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
             (company_id, client_key),
         ).fetchone()
@@ -11293,7 +11298,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         _key = normalize_client_key(_o["client_name"])
         if not _key:
             continue
-        _owner = normalize_whitespace(_o["internal_seller_name"]) or normalize_whitespace(_o["external_seller_name"])
+        # Só o vendedor interno define dono, como no resto do sistema.
+        _owner = normalize_whitespace(_o["internal_seller_name"])
         if _owner:
             client_owner_map[_key] = _owner
 
@@ -14788,7 +14794,7 @@ def client_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, dic
 
 CLIENT_LOOKUP_COLUMNS = (
     "client_code, client_name, trade_name, city_name, document_number, "
-    "COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name"
+    "NULLIF(TRIM(internal_seller_name), '') AS seller_name"
 )
 
 
@@ -14894,7 +14900,7 @@ def compute_unassigned_clients(
     owned: set[str] = set()
     for row in conn.execute(
         "SELECT client_name FROM crm_client_profiles WHERE company_id = ? "
-        "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' OR TRIM(COALESCE(external_seller_name,'')) <> '')",
+        "AND TRIM(COALESCE(internal_seller_name,'')) <> ''",
         (company_id,),
     ).fetchall():
         key = normalize_client_key(row["client_name"])
@@ -14941,8 +14947,7 @@ def compute_unassigned_clients(
         normalize_whitespace(r["client_code"])
         for r in conn.execute(
             "SELECT client_code FROM crm_client_profiles WHERE company_id = ? "
-            "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' "
-            "  OR TRIM(COALESCE(external_seller_name,'')) <> '')",
+            "AND TRIM(COALESCE(internal_seller_name,'')) <> ''",
             (company_id,),
         ).fetchall()
     }
@@ -15249,17 +15254,6 @@ def compute_portfolio_summary_by_seller(
             WHERE company_id = ?
             GROUP BY client_code
         ),
-        -- Vendedor da última competência faturada. Entra na cascata abaixo como
-        -- terceira opção, para este painel usar EXATAMENTE a mesma definição de
-        -- dono que a Lista de Clientes. Antes o painel olhava só o vendedor
-        -- interno e a lista olhava interno → externo → quem faturou: a mesma
-        -- vendedora aparecia com 132 clientes aqui e 177 lá.
-        last_summary AS (
-            SELECT client_code, seller_name,
-                ROW_NUMBER() OVER (PARTITION BY client_code ORDER BY competence DESC) AS rn
-            FROM crm_client_summary
-            WHERE company_id = ?
-        ),
         seller_units AS (
             SELECT person_name, base_unit,
                 ROW_NUMBER() OVER (PARTITION BY company_id, person_name ORDER BY valid_from DESC) AS rn
@@ -15267,10 +15261,7 @@ def compute_portfolio_summary_by_seller(
             WHERE company_id = ?
         )
         SELECT
-            COALESCE(NULLIF(TRIM(p.internal_seller_name), ''),
-                     NULLIF(TRIM(p.external_seller_name), ''),
-                     NULLIF(TRIM(ls.seller_name), ''),
-                     'Sem Vendedor') AS seller,
+            COALESCE(NULLIF(TRIM(p.internal_seller_name), ''), 'Sem Vendedor') AS seller,
             COALESCE(su.base_unit, '') AS seller_unit,
             COALESCE(lp.latest_purchase_at, p.last_sale_at) AS effective_last_sale,
             COALESCE(cs.net_value, 0) AS current_revenue,
@@ -15288,17 +15279,12 @@ def compute_portfolio_summary_by_seller(
             ON cs_prev.company_id = p.company_id
             AND cs_prev.client_code = p.client_code
             AND cs_prev.competence = ?
-        LEFT JOIN last_summary ls
-            ON ls.client_code = p.client_code AND ls.rn = 1
         LEFT JOIN seller_units su
-            ON su.person_name = COALESCE(NULLIF(TRIM(p.internal_seller_name), ''),
-                                         NULLIF(TRIM(p.external_seller_name), ''),
-                                         NULLIF(TRIM(ls.seller_name), ''),
-                                         'Sem Vendedor')
+            ON su.person_name = COALESCE(NULLIF(TRIM(p.internal_seller_name), ''), 'Sem Vendedor')
             AND su.rn = 1
         WHERE p.company_id = ?
         """,
-        (company_id, company_id, company_id, competence, prev_competence, company_id),
+        (company_id, company_id, competence, prev_competence, company_id),
     ).fetchall()
 
     by_seller: dict[str, dict[str, Any]] = {}
@@ -16262,7 +16248,7 @@ class AppHandler(BaseHTTPRequestHandler):
                                               allow_outside=fora)
                     if data:
                         dono = conn.execute(
-                            "SELECT COALESCE(NULLIF(internal_seller_name,''), external_seller_name) v "
+                            "SELECT NULLIF(TRIM(internal_seller_name), '') v "
                             "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
                             (user["company_id"], client_key),
                         ).fetchone()
