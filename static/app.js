@@ -3038,7 +3038,10 @@ async function refreshCurrentTab() {
     promises.push(loadTeamActivity(), loadCrmData());
   }
   if (tab === "crm-clientes") {
-    promises.push(loadCrmClients({ renderAfterLoad: true, reason: "reload" }), loadPortfolioSummary());
+    // O resumo e as coberturas valem para os dois perfis: o vendedor vê os
+    // próprios números e as carteiras que está cobrindo; o gestor vê a equipe.
+    promises.push(loadCrmClients({ renderAfterLoad: true, reason: "reload" }),
+                  loadPortfolioSummary(), loadCoverages());
   }
   if (tab === "crm-tarefas" || tab === "crm-interacao") {
     promises.push(loadCrmData());
@@ -9590,6 +9593,66 @@ function coberturaModal() {
     </div>`;
 }
 
+/** Resumo da carteira do vendedor, com os mesmos números do painel do gerente.
+ *
+ * Reaproveita /api/crm/portfolio-summary de propósito, em vez de recontar no
+ * navegador: se a régua de ativo, pré-inativo e queda for calculada em dois
+ * lugares, os dois divergem no primeiro ajuste — e a conversa de feedback vira
+ * discussão sobre qual tela está certa.
+ */
+function resumoCarteiraVendedor() {
+  const ps = state.crm.portfolioSummary;
+  if (!ps || ps.error) return "";
+  const eu = meuNomeDeVendas();
+  const linha = (ps.sellers || []).find((s) => personKeyJs(s.sellerName) === personKeyJs(eu));
+  if (!linha || !linha.total) return "";
+
+  const share = (n) => `${((Number(n || 0) / linha.total) * 100).toFixed(1)}%`;
+  const bloco = (rotulo, valor, cor, detalhe) => `
+    <div style="flex:1;min-width:104px">
+      <div class="text-small" style="color:var(--muted)">${rotulo}</div>
+      <div style="font-size:19px;font-weight:800;${cor ? `color:${cor}` : ""}">${number(valor || 0)}</div>
+      ${detalhe ? `<div class="text-small" style="color:var(--muted)">${detalhe}</div>` : ""}
+    </div>`;
+
+  return `
+    <div class="form-card" style="padding:14px 18px">
+      <div class="section-title" style="margin-bottom:10px">
+        <div>
+          <h3 style="font-size:15px">Minha carteira em números</h3>
+          <div class="text-small">Competência ${escapeHtml(ps.competence || "—")} · mesma régua do painel do gerente</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:14px;flex-wrap:wrap">
+        ${bloco("Carteira", linha.total, "", "clientes no seu nome")}
+        ${bloco("Compraram no mês", linha.comVendaMes, "var(--good)", share(linha.comVendaMes))}
+        ${bloco("Mês anterior", linha.comVendaMesAnterior, "", "para comparar")}
+        ${bloco("Ativos", linha.ativos, "var(--good)", share(linha.ativos))}
+        ${bloco("Pré-inativos", linha.preInativos, "#e0a800", share(linha.preInativos))}
+        ${bloco("Inativos", linha.inativos, "var(--bad)", share(linha.inativos))}
+        ${bloco("Queda >30%", linha.queda30, "var(--bad)", "vs mês anterior")}
+        ${bloco("Queda >20%", linha.queda20, "#e0a800", "vs mês anterior")}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:10px;line-height:1.6">
+        Pré-inativo é quem está entre 30 e 60 dias sem comprar — ainda dá para reverter com
+        uma ligação. Passou de 60, vira inativo e a conversa é outra.
+      </div>
+    </div>`;
+}
+
+/** Nome do vendedor logado como aparece no faturamento. */
+function meuNomeDeVendas() {
+  return state.assistant?.myName || state.user?.linkedPersonName || state.user?.fullName || "";
+}
+
+/** Mesma normalização de nome do servidor: sem acento, sem sufixo, sem pontuação. */
+function personKeyJs(nome) {
+  return String(nome || "")
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .toUpperCase().replace(/\([^)]*\)/g, " ")
+    .replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+}
+
 /** Saída para o vendedor quando a busca na própria carteira não achou nada.
  *
  * O caso real: ele atende um cliente de outro vendedor e procura pelo nome.
@@ -9647,6 +9710,7 @@ function crmClientsView() {
     return `
       <div class="stack">
         ${blocoCobertura}
+        ${resumoCarteiraVendedor()}
         ${sellerFilterBar()}
         ${isLoading ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">⏳ Atualizando carteira…</div>` : ""}
         ${activeSellerFilterCount() > 0 ? `
