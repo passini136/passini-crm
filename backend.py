@@ -2555,9 +2555,22 @@ def get_company_id(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT id FROM companies WHERE name = ?", (DEFAULT_COMPANY,)).fetchone()["id"]
 
 
-def current_role_and_unit(conn: sqlite3.Connection, company_id: int, person_name: str, competence: str | None = None) -> tuple[str | None, str | None]:
+def competence_window(competence: str | None = None) -> tuple[str, str]:
+    """Primeiro e último dia da competência, para checar vigência de pessoa.
+
+    A pergunta certa é "trabalhou em ALGUM momento deste mês?", não "já
+    trabalhava no dia 1º". Comparar só com o primeiro dia escondia o mês
+    inteiro de quem foi cadastrado no meio dele — o vendedor novo não aparecia
+    para o gerente, ficava sem unidade na carteira e sumia das listas de
+    equipe justamente nas primeiras semanas, quando mais precisa aparecer.
+    """
     competence = competence or date.today().strftime("%Y-%m")
-    target = first_day_of_competence(competence).isoformat()
+    return (first_day_of_competence(competence).isoformat(),
+            last_day_of_competence(competence).isoformat())
+
+
+def current_role_and_unit(conn: sqlite3.Connection, company_id: int, person_name: str, competence: str | None = None) -> tuple[str | None, str | None]:
+    inicio, fim = competence_window(competence)
     row = conn.execute(
         """
         SELECT role_classification, base_unit
@@ -2567,7 +2580,7 @@ def current_role_and_unit(conn: sqlite3.Connection, company_id: int, person_name
         ORDER BY date(valid_from) DESC
         LIMIT 1
         """,
-        (company_id, person_name, target, target),
+        (company_id, person_name, fim, inicio),
     ).fetchone()
     if row:
         return row["role_classification"], row["base_unit"]
@@ -2961,8 +2974,7 @@ def build_seller_unit_map(
     escreve "CLEBER ALVES OLIVEIRA (VENDAS)" e o cadastro de pessoas às vezes
     escreve só "CLEBER ALVES OLIVEIRA".
     """
-    competence = competence or date.today().strftime("%Y-%m")
-    alvo = first_day_of_competence(competence).isoformat()
+    inicio, fim = competence_window(competence)
     mapa: dict[str, str] = {}
     for row in conn.execute(
         """
@@ -2972,7 +2984,7 @@ def build_seller_unit_map(
           AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
         ORDER BY date(valid_from) DESC
         """,
-        (company_id, alvo, alvo),
+        (company_id, fim, inicio),
     ).fetchall():
         for chave in (person_key(row["person_name"]), short_person_key(row["person_name"])):
             if chave and chave not in mapa:
@@ -4573,7 +4585,12 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
     e treinamento alcançam a equipe inteira, não só quem emite pedido.
     """
     competence = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
-    comp_day = first_day_of_competence(competence).isoformat()
+    # A vigência é comparada com HOJE (ou o fim da competência, se ela já
+    # fechou), não com o primeiro dia do mês. Comparar com o dia 1º escondia
+    # quem entrou no meio do mês: um vendedor cadastrado hoje só apareceria
+    # para o gerente no mês que vem — justamente quando ele mais precisa
+    # aparecer, que é na primeira semana.
+    inicio, fim = competence_window(competence)
     allowed = crm_allowed_units_for_user(conn, user)
     rows = conn.execute(
         """
@@ -4584,7 +4601,7 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
           AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
         ORDER BY person_name
         """,
-        (company_id, comp_day, comp_day),
+        (company_id, fim, inicio),
     ).fetchall()
     vistos: set[str] = set()
     pessoas: list[dict[str, Any]] = []
@@ -7094,6 +7111,24 @@ def contact_history(
     if iniciativa in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE, INITIATIVE_SUPPORT}:
         condicoes.append("i.initiative = ?")
         params.append(iniciativa)
+    carteira = normalize_whitespace(filtros.get("portfolio"))
+    if carteira == "__SEM_VENDEDOR__":
+        condicoes.append(
+            "COALESCE(TRIM((SELECT internal_seller_name FROM crm_client_profiles p2 "
+            " WHERE p2.company_id = i.company_id AND p2.client_code = i.client_key)), '') = ''")
+    elif carteira == "__CRUZADOS__":
+        # Só os contatos em cliente de outra carteira — o recorte que o gestor
+        # abre quando quer entender quem está atendendo o quê.
+        condicoes.append(
+            "UPPER(TRIM(COALESCE((SELECT internal_seller_name FROM crm_client_profiles p2 "
+            " WHERE p2.company_id = i.company_id AND p2.client_code = i.client_key), ''))) "
+            "NOT IN ('', UPPER(TRIM(i.seller_name)))")
+    elif carteira:
+        condicoes.append(
+            "UPPER(TRIM(COALESCE((SELECT internal_seller_name FROM crm_client_profiles p2 "
+            " WHERE p2.company_id = i.company_id AND p2.client_code = i.client_key), ''))) = ?")
+        params.append(normalize_upper(carteira))
+
     busca = normalize_whitespace(filtros.get("search"))
     if busca:
         condicoes.append("(UPPER(i.client_name) LIKE ? OR i.client_key LIKE ?)")
@@ -7102,21 +7137,36 @@ def contact_history(
     onde = " AND ".join(condicoes)
     limite = min(int(filtros.get("limit") or 300), 1000)
 
+    # A coluna CARTEIRA é o vendedor do CADASTRO do cliente — diferente do
+    # vendedor que fez o contato. É o que revela atendimento cruzado: quem ligou
+    # para cliente de outra carteira, seja cobertura de férias, apoio ou
+    # invasão. Sem isso o gestor só enxerga quem ligou, nunca de quem era.
     itens = [dict(r) for r in conn.execute(
         f"""
         SELECT i.id, i.client_key, i.client_name, i.seller_name, i.unit_name,
                i.contact_type_code, i.result_code, i.occurred_at, i.notes,
                i.next_action, i.followup_due_at, i.initiative, i.offer_title,
-               t.label AS type_label, r.label AS result_label
+               t.label AS type_label, r.label AS result_label,
+               NULLIF(TRIM(COALESCE(p.internal_seller_name, '')), '') AS portfolio_seller
         FROM crm_interactions i
         LEFT JOIN crm_contact_types t ON t.code = i.contact_type_code
         LEFT JOIN crm_contact_results r ON r.code = i.result_code
+        LEFT JOIN crm_client_profiles p
+               ON p.company_id = i.company_id AND p.client_code = i.client_key
         WHERE {onde}
         ORDER BY i.occurred_at DESC, i.id DESC
         LIMIT ?
         """,
         (*params, limite),
     ).fetchall()]
+    for item in itens:
+        dono = normalize_whitespace(item.get("portfolio_seller"))
+        item["portfolioSeller"] = dono or "Sem vendedor"
+        # Contato cruzado: quem ligou não é o dono da carteira. Prospect (P-*)
+        # fica de fora — ele ainda não tem carteira, por definição.
+        item["crossPortfolio"] = bool(
+            dono and not str(item.get("client_key") or "").startswith(PROSPECT_KEY_PREFIX)
+            and person_key(dono) != person_key(item.get("seller_name")))
 
     # ── KPIs por vendedor ─────────────────────────────────────────────────
     # Sem o LIMIT: o indicador tem de refletir o período inteiro, não a página.
@@ -7194,6 +7244,9 @@ def contact_history(
         "totals": enriquece(dict(agregado) if agregado else {}),
         "sellers": [enriquece(l) for l in por_vendedor],
         "sellerOptions": sorted({l["seller_name"] for l in por_vendedor if l["seller_name"]}),
+        "portfolioOptions": sorted({i["portfolioSeller"] for i in itens
+                                    if i["portfolioSeller"] != "Sem vendedor"}),
+        "crossCount": sum(1 for i in itens if i["crossPortfolio"]),
         "contactTypes": [dict(r) for r in conn.execute(
             "SELECT code, label FROM crm_contact_types WHERE is_active = 1 ORDER BY code").fetchall()],
         "contactResults": [dict(r) for r in conn.execute(
@@ -8266,6 +8319,72 @@ def list_prospects(
                 dias = (today_in_brazil() - dt.date()).days
         p["daysSinceContact"] = dias
     return linhas
+
+
+def inactive_clients_for_unit(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    busca: str = "", limite: int = 200,
+) -> dict[str, Any]:
+    """Clientes INATIVOS da unidade, para o vendedor buscar reativação.
+
+    Diferente da carteira, aqui não importa de quem é o cliente — com dono ou
+    sem, se está inativo, é oportunidade parada. Um vendedor que quer crescer
+    tem onde procurar sem depender de o gerente redistribuir carteira.
+
+    A unidade sai da mesma cascata do resto do sistema (vendedor → território →
+    cidade), então o vendedor vê a praça dele, não a empresa inteira.
+    """
+    filtros = build_filters_from_query({})
+    escopo = data_scope_for_user(conn, user)
+    unidade_alvo = ""
+    if escopo == "proprio":
+        unidade_alvo = seller_unit_name(conn, company_id, seller_identity_for_user(user))
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas:
+            unidade_alvo = permitidas[0]
+
+    linhas = crm_base_client_rows_cached(conn, company_id, filtros)
+    termo = normalize_upper(strip_accents(busca))
+    eu = person_key(seller_identity_for_user(user))
+
+    achados: list[dict[str, Any]] = []
+    for linha in linhas:
+        if linha.get("statusCode") != "INATIVO":
+            continue
+        if unidade_alvo and normalize_unit(linha.get("unitName")) != normalize_unit(unidade_alvo):
+            continue
+        if termo:
+            alvo = normalize_upper(strip_accents(
+                f"{linha.get('clientName')} {linha.get('cityName')} {linha.get('clientKey')}"))
+            if termo not in alvo:
+                continue
+        dono = normalize_whitespace(linha.get("assignedSeller"))
+        achados.append({
+            "clientKey": linha.get("clientKey"),
+            "clientName": linha.get("clientName"),
+            "cityName": linha.get("cityName"),
+            "neighborhood": linha.get("neighborhood") or "",
+            "phone": linha.get("phone") or "",
+            "unitName": linha.get("unitName"),
+            "classCode": linha.get("classCode"),
+            "daysWithoutPurchase": linha.get("daysWithoutPurchase"),
+            "lastPurchaseAt": linha.get("lastPurchaseAt"),
+            "assignedSeller": dono or "Sem vendedor",
+            "isMine": bool(dono) and person_key(dono) == eu,
+            "averageRevenue": linha.get("averageRevenue"),
+        })
+
+    # Quem já foi bom cliente vale mais que quem nunca comprou: ordena pela
+    # média histórica e, empatando, por quem parou há menos tempo (mais fácil
+    # de trazer de volta).
+    achados.sort(key=lambda c: (-(c["averageRevenue"] or 0), c["daysWithoutPurchase"] or 9999))
+    return {
+        "items": achados[:limite],
+        "total": len(achados),
+        "unitName": unidade_alvo or "todas",
+        "withoutSeller": sum(1 for c in achados if c["assignedSeller"] == "Sem vendedor"),
+    }
 
 
 def save_prospect(
@@ -16506,9 +16625,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 filtros = {k: query.get(k, [""])[0] for k in
-                           ("start", "end", "seller", "type", "result", "initiative", "search", "limit")}
+                           ("start", "end", "seller", "type", "result", "initiative",
+                            "search", "portfolio", "limit")}
                 with closing(get_connection()) as conn:
                     dados = contact_history(conn, user["company_id"], user, filtros)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
+            if path == "/api/prospects/inactive":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = inactive_clients_for_unit(
+                        conn, user["company_id"], user,
+                        normalize_whitespace(query.get("q", [""])[0]))
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return

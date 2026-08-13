@@ -5,7 +5,9 @@ const state = {
   admin: null,
   territories: null,   // mapa de bairro/cidade por unidade (Administração → Territórios)
   contacts: null,      // histórico de registros de contato
-  contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "", search: "", limit: "300" },
+  inactives: null,     // clientes inativos da unidade, para reativação
+  contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
+                    search: "", portfolio: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
@@ -70,10 +72,13 @@ const state = {
       prospects: false,
       territories: false,
       contacts: false,
+      inactives: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
     bulkCityUnit: "",      // unidade escolhida para o lote
+    inactivesOpen: false,  // painel de inativos da unidade na Prospecção
+    inactiveSearch: "",
     territoryCity: "",     // filtro de cidade na tela de territórios
     territoryDraft: null,  // linha em edição/criação no mapa de territórios
     personResults: null,   // resultados da busca de pessoa a vincular
@@ -1973,6 +1978,109 @@ function blocoConfiguracaoUnidade() {
     </div>`;
 }
 
+// ─── Reativação: inativos da unidade ───────────────────────────────────────
+//
+// Prospecção não é só oficina nova. Cliente que já comprou e parou é a
+// oportunidade mais barata que existe: o cadastro está pronto, alguém já
+// confiou na Passini uma vez e a objeção costuma ter nome. Aqui o vendedor
+// acha esses clientes na unidade dele, tenham dono ou não.
+
+async function loadInativos() {
+  if (state.ui.loading.inactives) return;
+  setLoading("inactives", true);
+  try {
+    const q = (state.ui.inactiveSearch || "").trim();
+    state.inactives = await api(`/api/prospects/inactive${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+  } catch (error) {
+    addMessage("error", error.message);
+    state.inactives = { items: [], total: 0 };
+  } finally {
+    setLoading("inactives", false);
+  }
+  requestRender();
+}
+
+function toggleInativos() {
+  state.ui.inactivesOpen = !state.ui.inactivesOpen;
+  if (state.ui.inactivesOpen && !state.inactives) void loadInativos();
+  else requestRender();
+}
+
+function blocoInativosDaUnidade() {
+  const aberto = state.ui.inactivesOpen;
+  const d = state.inactives;
+  const carregando = Boolean(state.ui.loading.inactives);
+
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div>
+          <h3>♻️ Reativar inativos da unidade</h3>
+          <div class="text-small">Clientes que já compraram e pararam — com ou sem vendedor.
+            Cadastro pronto e objeção conhecida: é a prospecção mais barata que existe.</div>
+        </div>
+        <button class="btn ${aberto ? "btn-ghost" : "btn-primary"} btn-sm" type="button" onclick="toggleInativos()">
+          ${aberto ? "Fechar" : "Buscar inativos"}
+        </button>
+      </div>
+
+      ${aberto ? `
+        <div style="display:flex;gap:8px;margin:10px 0">
+          <input style="flex:1" placeholder="Filtrar por nome, cidade ou código"
+            value="${escapeHtml(state.ui.inactiveSearch || "")}"
+            oninput="state.ui.inactiveSearch=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();loadInativos();}" />
+          <button class="btn btn-secondary btn-sm" type="button" onclick="loadInativos()">
+            ${carregando ? "Buscando…" : "Filtrar"}</button>
+        </div>
+
+        ${carregando && !d ? '<div class="loader">Carregando…</div>' : ""}
+
+        ${d ? `
+          <div class="text-small" style="color:var(--muted);margin-bottom:8px">
+            ${number(d.total)} inativo(s) em <strong>${escapeHtml(d.unitName || "todas")}</strong>
+            · ${number(d.withoutSeller)} sem vendedor
+            ${d.total > (d.items || []).length ? ` · mostrando os ${number(d.items.length)} de maior potencial` : ""}
+          </div>
+          <div class="table-wrap">
+            <table class="table-sticky-actions">
+              <thead><tr>
+                <th>Cliente</th><th>Cidade</th><th>Classe</th>
+                <th style="text-align:right">Média/mês</th><th style="text-align:right">Dias parado</th>
+                <th>Carteira</th><th style="text-align:right">Ações</th>
+              </tr></thead>
+              <tbody>
+                ${(d.items || []).length ? d.items.map((c) => `
+                  <tr>
+                    <td><strong>${escapeHtml(c.clientName)}</strong>
+                        <div class="text-small" style="color:var(--muted)">${escapeHtml(c.clientKey)}${c.phone ? ` · ${escapeHtml(c.phone)}` : ""}</div></td>
+                    <td class="text-small">${escapeHtml([c.cityName, c.neighborhood].filter(Boolean).join(" · ") || "-")}</td>
+                    <td class="text-small">${escapeHtml(c.classCode || "-")}</td>
+                    <td style="text-align:right">${currency(c.averageRevenue || 0)}</td>
+                    <td style="text-align:right;color:var(--bad);font-weight:700">${number(c.daysWithoutPurchase || 0)}</td>
+                    <td class="text-small">
+                      ${c.isMine ? '<span class="soft-badge">sua carteira</span>'
+                        : (c.assignedSeller === "Sem vendedor"
+                            ? '<span style="color:var(--good);font-weight:700">sem vendedor</span>'
+                            : escapeHtml(c.assignedSeller))}
+                    </td>
+                    <td style="text-align:right;white-space:nowrap">
+                      <button class="btn btn-primary btn-sm" type="button"
+                        onclick="openCrmClient('${jsAttr(c.clientKey)}', false, true, { outside: true })">Abrir ficha</button>
+                    </td>
+                  </tr>`).join("")
+                  : '<tr><td colspan="7" class="text-small">Nenhum cliente inativo com esse filtro.</td></tr>'}
+              </tbody>
+            </table>
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
+            Ordenado pela média histórica: quem já comprou mais vale mais o telefonema.
+            Cliente <strong>sem vendedor</strong> é o alvo mais direto — ninguém responde por ele hoje.
+          </div>` : ""}
+      ` : ""}
+    </div>`;
+}
+
 function prospeccaoView() {
   if (!state.prospects) { loadProspects(); return `<div class="loader panel">Carregando prospecção…</div>`; }
   if (state.prospects.error) return `<div class="message error">${escapeHtml(state.prospects.error)}</div>`;
@@ -1998,6 +2106,8 @@ function prospeccaoView() {
       ${metasAtividadeModal()}
 
       ${blocoConfiguracaoUnidade()}
+
+      ${blocoInativosDaUnidade()}
 
       ${fase.isDeployment ? `
         <div class="panel" style="padding:14px 18px;border-left:4px solid #f4c25f">
@@ -4425,6 +4535,15 @@ function contatosView() {
               <option value="">Todos</option>
               ${(d.sellerOptions || []).map((v) => `<option value="${escapeHtml(v)}" ${f.seller === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
             </select></div>` : ""}
+          ${gerente ? `
+          <div class="field"><label>Carteira do cliente</label>
+            <select onchange="setContactFilter('portfolio', this.value)">
+              <option value="">Todas</option>
+              <option value="__CRUZADOS__" ${f.portfolio === "__CRUZADOS__" ? "selected" : ""}>
+                ⚠ Só contatos em carteira de outro${d.crossCount ? ` (${d.crossCount})` : ""}</option>
+              <option value="__SEM_VENDEDOR__" ${f.portfolio === "__SEM_VENDEDOR__" ? "selected" : ""}>Sem vendedor</option>
+              ${(d.portfolioOptions || []).map((v) => `<option value="${escapeHtml(v)}" ${f.portfolio === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+            </select></div>` : ""}
           <div class="field"><label>Tipo</label>
             <select onchange="setContactFilter('type', this.value)">
               <option value="">Todos</option>
@@ -4497,7 +4616,7 @@ function contatosView() {
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th>Quando</th><th>Cliente</th>${gerente ? "<th>Vendedor</th>" : ""}
+              <th>Quando</th><th>Cliente</th>${gerente ? "<th>Vendedor</th><th>Carteira</th>" : ""}
               <th>Tipo</th><th>Resultado</th><th>Observação</th><th>Retorno</th>
             </tr></thead>
             <tbody>
@@ -4508,13 +4627,20 @@ function contatosView() {
                     <button class="btn btn-ghost btn-sm" type="button" style="padding:0;text-align:left"
                       onclick="openCrmClient('${jsAttr(i.client_key)}')">${escapeHtml(i.client_name || i.client_key)}</button>
                   </td>
-                  ${gerente ? `<td class="text-small">${escapeHtml(i.seller_name || "-")}</td>` : ""}
+                  ${gerente ? `
+                    <td class="text-small">${escapeHtml(i.seller_name || "-")}</td>
+                    <td class="text-small">
+                      ${i.portfolioSeller === "Sem vendedor"
+                        ? '<span style="color:var(--muted)">Sem vendedor</span>'
+                        : escapeHtml(i.portfolioSeller)}
+                      ${i.crossPortfolio ? '<div style="color:#b06000;font-weight:700">⚠ outra carteira</div>' : ""}
+                    </td>` : ""}
                   <td class="text-small">${escapeHtml(i.type_label || i.contact_type_code)} ${badgeIniciativa(i.initiative)}</td>
                   <td class="text-small">${escapeHtml(i.result_label || i.result_code)}</td>
                   <td class="text-small" style="max-width:340px">${escapeHtml((i.notes || "").slice(0, 160))}${(i.notes || "").length > 160 ? "…" : ""}</td>
                   <td class="text-small">${escapeHtml(i.followup_due_at ? shortDate(i.followup_due_at) : "-")}</td>
                 </tr>`).join("")
-                : `<tr><td colspan="${gerente ? 7 : 6}" class="text-small">Nenhum registro no período.</td></tr>`}
+                : `<tr><td colspan="${gerente ? 8 : 6}" class="text-small">Nenhum registro no período.</td></tr>`}
             </tbody>
           </table>
         </div>
@@ -12902,6 +13028,10 @@ function dashboardView() {
   const filtersLoading = Boolean(state.ui.loading.filters);
   const dis = filtersLoading ? "disabled" : "";
   const isCrmTab = state.activeTab.startsWith("crm-") || state.activeTab === "meu-placar" || state.activeTab === "placar-equipe";
+  // Telas com período próprio não devem mostrar o seletor de competência: dois
+  // filtros de tempo na mesma tela, um deles sem efeito, só geram dúvida sobre
+  // qual está valendo. Contatos filtra por data de/até dentro da própria tela.
+  const TELAS_SEM_COMPETENCIA = ["contatos", "reunioes", "visitas", "prospeccao", "administracao", "acessos"];
   // O vendedor não escolhe unidade nem vendedor (o escopo já força os dele),
   // mas precisa trocar de mês para acompanhar o próprio histórico.
   const sellerFilterBar = sellerRole && !isCrmTab ? `
@@ -12915,7 +13045,7 @@ function dashboardView() {
       </div>
     </div>
   ` : "";
-  const filterBar = sellerRole || isCrmTab ? sellerFilterBar : `
+  const filterBar = TELAS_SEM_COMPETENCIA.includes(state.activeTab) ? "" : (sellerRole || isCrmTab ? sellerFilterBar : `
     <div class="form-card" style="padding:12px 18px">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="font-size:12px;font-weight:700;color:var(--muted);white-space:nowrap">COMPETÊNCIA</span>
@@ -12938,7 +13068,7 @@ function dashboardView() {
         <button class="btn btn-ghost btn-sm" onclick="resetFilters()" ${dis}>Limpar</button>
       </div>
     </div>
-  `;
+  `);
 
   // Score resumido no sidebar para vendedor
   const sidebarScore = placarEnabled() && roleIsSeller() && state.sellerScore ? `
