@@ -9216,9 +9216,11 @@ function sellerClientCard(item) {
         <span style="color:${hasPurchase ? "var(--good)" : "#e67e22"}">${hasPurchase ? "✅ Comprou" : "○ Sem compra"}</span>
       </div>
       <div class="actions" style="gap:6px">
-        <button class="btn btn-secondary btn-sm" onclick="openCrmClient('${escapeHtml(item.clientKey)}', false)">Ficha</button>
-        <button class="btn btn-primary btn-sm" onclick="prefillInteractionFromAgenda('${escapeHtml(item.clientKey)}')">Registrar</button>
-        <button class="btn btn-ghost btn-sm" onclick="openContactUpdateModal('${escapeHtml(item.clientKey)}')">Atualizar</button>
+        <!-- Só Ficha. Registrar e Atualizar saíram do card de propósito: o
+             registro tem de ser feito COM a ficha aberta, olhando histórico,
+             última compra e o que oferecer. Registrar direto da lista convida
+             ao "falei com o cliente" sem contexto nenhum. -->
+        <button class="btn btn-primary btn-sm" onclick="openCrmClient('${escapeHtml(item.clientKey)}', false)">Abrir ficha</button>
       </div>
     </div>
   `;
@@ -12865,7 +12867,7 @@ function dashboardView() {
   return `
     <div class="shell">
       <div class="app-shell ${state.ui.sidebarCollapsed ? 'shell-collapsed' : ''}">
-        <nav class="sidebar ${state.ui.sidebarCollapsed ? 'sidebar-collapsed' : ''}">
+        <nav class="sidebar ${state.ui.sidebarCollapsed ? 'sidebar-collapsed' : ''}" data-keep-scroll="sidebar">
           <div>
             <div class="brand-pill ${state.ui.sidebarCollapsed ? 'brand-collapsed' : ''}">
               ${!state.ui.sidebarCollapsed ? '<span class="dot"></span>' : ''}
@@ -12942,9 +12944,12 @@ function render() {
   // elementos novos. Em telas longas dentro de modal (ata de reunião, por
   // exemplo) qualquer clique que atualize o estado jogava a pessoa de volta
   // ao topo. Qualquer elemento com data-keep-scroll tem a posição restaurada.
+  // Guarda TODA posição, inclusive zero: o menu lateral precisa disso. Ao
+  // clicar num item lá embaixo, a tela trocava e o menu voltava ao topo,
+  // escondendo justamente o item recém-escolhido.
   const posicoes = new Map();
   document.querySelectorAll("[data-keep-scroll]").forEach((el) => {
-    if (el.scrollTop > 0) posicoes.set(el.getAttribute("data-keep-scroll"), el.scrollTop);
+    posicoes.set(el.getAttribute("data-keep-scroll"), el.scrollTop);
   });
   const drawerEl = document.querySelector(".client-drawer");
   const drawerScroll = drawerEl ? drawerEl.scrollTop : 0;
@@ -12957,7 +12962,7 @@ function render() {
   }
   posicoes.forEach((topo, chave) => {
     const el = document.querySelector(`[data-keep-scroll="${chave}"]`);
-    if (el) el.scrollTop = topo;
+    if (el && topo > 0) el.scrollTop = topo;
   });
 }
 
