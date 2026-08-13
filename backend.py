@@ -7818,7 +7818,7 @@ def assistant_payload(
     # atrasada precisa mais de um empurrão concreto que de uma frase.
     situacionais = [d for d in dicas if d["trigger"]]
 
-    tour_key = f"tour-{papel.lower()}"
+    tour_key = f"tour-{papel.lower()}-{getattr(conteudo, 'TOUR_VERSION', 'v1')}"
     visto = conn.execute(
         "SELECT completed_at, skipped FROM user_onboarding WHERE user_id = ? AND tour_key = ?",
         (user["id"], tour_key),

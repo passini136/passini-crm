@@ -25,7 +25,7 @@ TOUR_VENDEDOR = [
         "body": "Este sistema existe para uma coisa: te mostrar quem contatar hoje e por quê. "
                 "Ele não substitui o seu jeito de vender — organiza o que você já faz para "
                 "nenhuma oportunidade se perder no caminho.",
-        "hint": "São 6 telas. Leva 2 minutos.",
+        "hint": "São 8 telas. Leva 3 minutos.",
     },
     {
         "tab": "crm-agenda",
@@ -33,17 +33,19 @@ TOUR_VENDEDOR = [
         "title": "Missão do Dia — comece sempre por aqui",
         "body": "Todo dia o sistema monta sua fila: 5 contatos prioritários, com 2 clientes "
                 "Bronze/Prata, 2 Ouro/Diamante e 1 de prospecção. Cada card já diz o motivo do "
-                "contato e o que oferecer.",
+                "contato e o que oferecer. Quem você contatou sai da fila e só volta depois que "
+                "a carteira inteira girar — assim você não fica orbitando os mesmos nomes.",
         "hint": "Regra do MEC: abra o CRM, faça a primeira tarefa da fila, registre e marque o próximo passo.",
     },
     {
         "tab": "crm-clientes",
         "icon": "👥",
-        "title": "Carteira — seus clientes e a situação de cada um",
-        "body": "Aqui estão todos os seus clientes separados por situação: quem está ativo, quem "
-                "está espaçando os pedidos e quem parou de comprar. Dá para filtrar por classe, "
-                "por queda e até buscar quem comprou uma peça específica.",
-        "hint": "Clique em Ficha para ver o histórico, os itens que o cliente costuma levar e o que oferecer.",
+        "title": "Carteira — e a coluna de sinais",
+        "body": "Seus clientes separados por situação: ativo, espaçando pedidos, parado. Na coluna "
+                "Sinais, quatro marcas contam a história de cada um num relance — bolinha verde é "
+                "contato ativo nos últimos 30 dias, cinza é contato antigo, losango é visita, seta "
+                "é retorno pendente e círculo vermelho vazio é cliente que nunca foi tocado.",
+        "hint": "Passe o mouse em cada marca para ver a data. Os vermelhos são onde há dinheiro parado.",
     },
     {
         "tab": "crm-interacao",
@@ -55,30 +57,51 @@ TOUR_VENDEDOR = [
         "hint": "Contato sem registro não conta. E é o registro que faz o cliente sair da sua fila.",
     },
     {
+        "tab": "crm-clientes",
+        "icon": "📌",
+        "title": "Registro receptivo — quando o cliente procura você",
+        "body": "Ligação que você recebeu, WhatsApp que chegou, informação que vale guardar: na "
+                "ficha do cliente, o botão Registro receptivo grava isso no histórico. Ele NÃO "
+                "conta na sua meta de ligações, e é proposital — a meta mede o que você foi "
+                "buscar, não o que chegou sozinho.",
+        "hint": "Use sem medo: o histórico completo do cliente vale mais do que um número inflado.",
+    },
+    {
+        "tab": "contatos",
+        "icon": "📇",
+        "title": "Contatos — seu histórico e seu ritmo",
+        "body": "Tudo que você registrou, com filtro de período, tipo e resultado. No topo, quatro "
+                "números: ligações ativas contra o esperado ATÉ HOJE (não contra os 60 do mês "
+                "fechado), quanto você conseguiu falar de fato, quanto virou orçamento ou pedido "
+                "e com quantos clientes diferentes você falou.",
+        "hint": "Muita ligação com pouca conversa é sinal de horário errado, não de falta de esforço.",
+    },
+    {
         "tab": "crm-tarefas",
         "icon": "✅",
         "title": "Tarefas — nada fica só na memória",
         "body": "Todo retorno que você marca vira tarefa com data. Aqui também chegam as cobranças "
-                "do gerente e as ações combinadas nas visitas. Você filtra por situação, período e "
-                "vê o histórico do que já concluiu.",
+                "do gerente, as ações combinadas nas visitas e o aviso quando um colega atendeu um "
+                "cliente da sua carteira.",
         "hint": "Comece o dia resolvendo o que está atrasado, antes de pegar a fila nova.",
     },
     {
-        "tab": "biblioteca",
-        "icon": "🎯",
+        "tab": "prospeccao",
+        "icon": "🌱",
         "title": "Prospecção — o quinto contato do dia",
-        "body": "Um cliente novo por dia. A Passini tem um modelo próprio: quatro perguntas que "
-                "revelam o potencial da oficina e três gatilhos de fechamento. Está tudo na "
-                "Biblioteca, na aba Prospecção, com o roteiro completo da primeira ligação.",
+        "body": "Uma oficina nova por dia. Cadastre a oficina aqui mesmo, sem esperar o cadastro do "
+                "Alfa: quatro perguntas revelam o potencial e três gatilhos fecham. Quando ela "
+                "vira cliente, o histórico da prospecção vai junto para a ficha.",
         "hint": "Sem um dos 3 gatilhos no fim, a prospecção não conta como válida no funil.",
     },
     {
         "tab": "biblioteca",
         "icon": "📚",
-        "title": "Biblioteca e Meu Placar",
-        "body": "Na Biblioteca você encontra mensagens prontas de WhatsApp, abordagens de ligação e "
-                "como responder objeções. No Meu Placar acompanha seus pontos e a premiação do mês.",
-        "hint": "Não sabe como abordar? Copie um script da Biblioteca e adapte.",
+        "title": "Biblioteca, Visitas e Meu Placar",
+        "body": "Na Biblioteca estão mensagens de WhatsApp, abordagens e respostas a objeções. Em "
+                "Visitas você pede ao gerente para visitar um cliente — precisa de ligação "
+                "registrada antes. No Meu Placar acompanha pontos e premiação.",
+        "hint": "Atendeu cliente de outro vendedor? Busque pelo código na Carteira: dá para ver a ficha e registrar.",
     },
 ]
 
@@ -89,7 +112,7 @@ TOUR_GERENTE = [
         "title": "Bem-vindo ao CRM da Passini",
         "body": "Como gerente, você tem duas frentes aqui: acompanhar o resultado da unidade e "
                 "desenvolver a equipe. O sistema te dá os números e o método — a condução é sua.",
-        "hint": "São 7 telas. Leva 3 minutos.",
+        "hint": "São 9 telas. Leva 4 minutos.",
     },
     {
         "tab": "executivo",
@@ -109,6 +132,16 @@ TOUR_GERENTE = [
         "hint": "Compare cada vendedor com a média da unidade antes de tirar conclusão.",
     },
     {
+        "tab": "contatos",
+        "icon": "📇",
+        "title": "Contatos — produtividade por vendedor",
+        "body": "O histórico de todos os registros da equipe, com quatro indicadores por vendedor: "
+                "ligações no ritmo da meta, taxa de conversa efetiva, conversão em orçamento ou "
+                "pedido e quantos clientes distintos ele tocou. Esse último denuncia quem liga "
+                "sempre para os mesmos.",
+        "hint": "Ligação alta com conversa baixa é problema de lista ou horário. Cobre a causa, não o número.",
+    },
+    {
         "tab": "crm-agenda",
         "icon": "📣",
         "title": "Missão do Dia e cobrança de contato",
@@ -116,6 +149,15 @@ TOUR_GERENTE = [
                 "qualquer cliente, o botão Cobrar contato cria a tarefa para o vendedor "
                 "responsável — com motivo e prazo.",
         "hint": "Cobrança com motivo escrito funciona. 'Liga nesse cliente' não.",
+    },
+    {
+        "tab": "crm-clientes",
+        "icon": "🤝",
+        "title": "Cobertura de carteira — férias e ausências",
+        "body": "Na Carteira você autoriza um vendedor a enxergar a carteira de outro, com data de "
+                "início e fim. Para ele, aparecem dois botões no topo: a carteira dele e a que "
+                "está cobrindo — nunca misturadas. Fora do período, o acesso fecha sozinho.",
+        "hint": "Sempre defina a data final. Sem prazo, a cobertura não expira.",
     },
     {
         "tab": "visitas",
@@ -153,7 +195,7 @@ TOUR_DIRETOR = [
         "body": "Você enxerga a empresa inteira: todas as unidades, todas as equipes e todos os "
                 "registros. Este roteiro mostra onde estão as respostas que a diretoria costuma "
                 "procurar.",
-        "hint": "São 6 telas. Leva 3 minutos.",
+        "hint": "São 8 telas. Leva 4 minutos.",
     },
     {
         "tab": "executivo",
@@ -169,8 +211,28 @@ TOUR_DIRETOR = [
         "icon": "🏢",
         "title": "Unidades — comparação justa entre praças",
         "body": "Cada unidade contra a própria meta, com margem, desconto e devolução lado a lado. "
-                "É onde se vê se o problema é de mercado ou de execução.",
+                "Unidade em implantação aparece marcada e fica isenta de meta até a competência "
+                "que você definir — assim ela não polui a comparação nem pinta tudo de vermelho.",
         "hint": "Desconto alto com meta batida costuma esconder margem sendo queimada.",
+    },
+    {
+        "tab": "administracao",
+        "icon": "🗺️",
+        "title": "Territórios — de quem é cada bairro",
+        "body": "Porto Alegre tem duas unidades, então a cidade sozinha não diz mais de quem é o "
+                "cliente. Em Administração → Territórios você define a divisão por bairro. Isso "
+                "decide a prospecção, o roteiro de visita e o território na ficha — o faturamento "
+                "continua contando para a unidade do vendedor que vendeu.",
+        "hint": "O painel 'bairros sem dono' mostra onde há cliente e ninguém responde pelo território.",
+    },
+    {
+        "tab": "contatos",
+        "icon": "📇",
+        "title": "Contatos — a execução comercial da empresa",
+        "body": "Todos os registros, de todas as unidades, com os indicadores por vendedor. É onde "
+                "se vê se a rotina do MEC está acontecendo de verdade ou se o número de vendas "
+                "está vindo de outra coisa.",
+        "hint": "Compare a taxa de conversa efetiva entre unidades: costuma revelar diferença de método.",
     },
     {
         "tab": "feedback",
@@ -185,21 +247,29 @@ TOUR_DIRETOR = [
         "tab": "acessos",
         "icon": "🔑",
         "title": "Usuários e Perfis — quem vê o quê",
-        "body": "Cada perfil define as telas e o alcance dos dados. Vendedor vê só a carteira dele; "
-                "gerente vê a unidade; diretoria vê tudo. O campo Pessoa vinculada é o que liga a "
-                "conta ao nome do cadastro — sem ele, presença em reunião e feedback não chegam.",
-        "hint": "Duas contas apontando para a mesma pessoa fazem o sistema não notificar ninguém.",
+        "body": "Cada perfil define as telas e o alcance dos dados. O campo Pessoa vinculada liga a "
+                "conta ao nome do cadastro e vale para TODOS os perfis — é por ele que o gerente "
+                "recebe ciência de ata e feedback. A busca é obrigatória: digitar à mão quebra o "
+                "vínculo em silêncio.",
+        "hint": "Vendedor precisa também da unidade, que é gravada no cadastro de pessoas.",
     },
     {
         "tab": "importacoes",
         "icon": "📥",
         "title": "Importações — de onde vêm os números",
-        "body": "Faturamento, custo, cadastro de clientes e devoluções em garantia entram por aqui, "
-                "com auditoria por competência. Linhas repetidas são reconhecidas e ignoradas — "
-                "reimportar o mesmo arquivo não duplica nada.",
-        "hint": "Devolução em garantia é append-only: nunca é apagada por uma reimportação.",
+        "body": "Faturamento, custo, cadastro de clientes e devoluções entram por aqui. Atenção ao "
+                "cadastro de clientes: o Alfa exporta em DOIS arquivos e a importação substitui a "
+                "base inteira. Mandar um só apaga o outro — os dois têm de estar na pasta juntos.",
+        "hint": "Depois de importar, confira a cobertura: abaixo de 85% o sistema avisa que faltou arquivo.",
     },
 ]
+
+# Versão do roteiro. Entra na chave que marca "já vi o tutorial", então subir
+# este número faz o tour aparecer UMA vez para quem já tinha visto o anterior.
+# Suba quando a mudança for grande o bastante para valer a interrupção — foi o
+# caso da v2, que acrescentou Contatos, sinais na carteira, registro receptivo,
+# rodízio da fila, territórios e cobertura de carteira.
+TOUR_VERSION = "v2"
 
 TOURS = {
     "VENDEDOR": TOUR_VENDEDOR,
@@ -226,6 +296,111 @@ FAQ_CATEGORIES = [
 ]
 
 FAQ_SEED = [
+    # ── Telas e regras criadas depois da primeira versão ────────────────
+    {
+        "category": "dia-a-dia",
+        "question": "Contatei o cliente e ele sumiu da Missão do Dia. Está certo?",
+        "answer": "Está. Quem você contatou entra em descanso e só volta depois que a carteira "
+                  "prioritária girar inteira — a janela é calculada pelo tamanho da sua carteira "
+                  "no ritmo de 5 contatos por dia. É o que impede a fila de ficar orbitando os "
+                  "mesmos nomes. Quando todos já rodaram, o ciclo recomeça pelos mais antigos e "
+                  "a tela avisa.",
+        "keywords": "sumiu da fila cliente saiu missao do dia nao aparece mais contatado descanso rodizio",
+        "roles": "",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "O cliente me ligou. Como registro sem inflar minha meta?",
+        "answer": "Na ficha do cliente, use o botão Registro receptivo. Ele grava ligação "
+                  "recebida, mensagem recebida ou anotação no histórico, mas fica FORA da meta de "
+                  "ligações ativas. A meta mede o que você foi buscar; o que chega sozinho conta "
+                  "como histórico, não como esforço de prospecção.",
+        "keywords": "cliente ligou recebi ligacao whatsapp mensagem anotacao registro receptivo nao conta meta",
+        "roles": "",
+    },
+    {
+        "category": "clientes",
+        "question": "O que significam as bolinhas na coluna Sinais da carteira?",
+        "answer": "São quatro marcas: bolinha verde = contato ativo nos últimos 30 dias; bolinha "
+                  "cinza = último contato ativo mais antigo que isso; losango = visita registrada; "
+                  "seta = retorno pendente. Círculo vermelho vazio é o mais importante: cliente que "
+                  "nunca recebeu nenhum registro nem visita. Passe o mouse para ver a data.",
+        "keywords": "bolinha sinal marca coluna sinais circulo vermelho losango seta o que significa",
+        "roles": "",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "Preciso atender um cliente que não é da minha carteira. Como faço?",
+        "answer": "Na Carteira, busque pelo CÓDIGO do cliente — o próprio cliente informa. A ficha "
+                  "abre completa, com histórico e vendas, e você registra o atendimento "
+                  "normalmente. O registro entra como apoio: não conta na sua meta de ligações, "
+                  "mas fica no histórico, o gerente enxerga e o vendedor responsável recebe uma "
+                  "tarefa para retomar o contato.",
+        "keywords": "cliente de outro vendedor nao e da minha carteira atender colega ferias apoio codigo",
+        "roles": "VENDEDOR",
+    },
+    {
+        "category": "dia-a-dia",
+        "question": "Apareceram dois botões de carteira no topo da tela. O que é isso?",
+        "answer": "É cobertura: o gerente autorizou você a enxergar a carteira de um colega por um "
+                  "período, normalmente férias. Um botão mostra a sua carteira e o outro a que você "
+                  "está cobrindo — nunca as duas juntas. Terminado o prazo, o acesso fecha sozinho "
+                  "e os botões somem.",
+        "keywords": "dois botoes carteira cobertura ferias carteira do colega apareceu outro nome",
+        "roles": "VENDEDOR",
+    },
+    {
+        "category": "gestao",
+        "question": "Como libero um vendedor para cobrir a carteira de outro nas férias?",
+        "answer": "Na Carteira, no painel Cobertura de carteira, clique em Autorizar: escolha quem "
+                  "cobre, qual carteira e o período. Sempre defina a data final — sem prazo a "
+                  "cobertura não expira sozinha. O vendedor passa a ver a carteira do colega em uma "
+                  "aba separada, sem misturar com a dele.",
+        "keywords": "ferias cobertura liberar carteira outro vendedor autorizar substituto ausencia",
+        "roles": "GERENTE DIRETOR",
+    },
+    {
+        "category": "numeros",
+        "question": "O que é 'ligações no ritmo' na tela Contatos?",
+        "answer": "É a comparação com o esperado ATÉ HOJE, não com a meta fechada do mês. O piso do "
+                  "MEC é 60 ligações no mês; no dia 6 de um mês de 22 dias úteis, o esperado é 16, "
+                  "não 60. Cobrar o número cheio no começo do mês marcaria todo mundo como "
+                  "irregular e o painel perderia a credibilidade.",
+        "keywords": "ligacoes no ritmo meta 60 esperado ate hoje barra colorida contatos indicador",
+        "roles": "",
+    },
+    {
+        "category": "numeros",
+        "question": "Um vendedor tem muita ligação e pouca conversa. O que isso indica?",
+        "answer": "A taxa de conversa efetiva separa esforço de resultado. Volume alto com conversa "
+                  "baixa costuma ser lista ruim, telefone desatualizado ou horário errado — não "
+                  "falta de trabalho. Antes de cobrar mais ligação, olhe a qualidade da lista e o "
+                  "horário em que ele liga.",
+        "keywords": "conversa efetiva taxa baixa muita ligacao pouco resultado nao atende qualidade",
+        "roles": "GERENTE DIRETOR",
+    },
+    {
+        "category": "clientes",
+        "question": "O cliente aparece no faturamento mas não na carteira, e diz 'sem cadastro'.",
+        "answer": "O nome do relatório de vendas não casou com o cadastro. O sistema tenta três "
+                  "caminhos: nome exato, documento embutido no nome e razão social sem o sufixo "
+                  "(LTDA, ME, EPP). Falhando os três, use o botão Conciliar na tela Sem Vendedor e "
+                  "informe o código do cliente. Se muitos clientes estiverem assim, o provável é "
+                  "que falte um dos dois arquivos do cadastro na última importação.",
+        "keywords": "sem cadastro nao achei o cliente conciliar codigo nome diferente faturamento carteira",
+        "roles": "GERENTE DIRETOR",
+    },
+    {
+        "category": "numeros",
+        "question": "De qual unidade é um cliente?",
+        "answer": "Vale a unidade do VENDEDOR que atende — é a mesma regra do faturamento, para a "
+                  "venda e a carteira não contarem em lugares diferentes. Quando o cliente não tem "
+                  "vendedor, vale o território: primeiro o bairro, depois a cidade. Cidade "
+                  "compartilhada entre duas unidades fica sem mapa de propósito, e aí quem manda é "
+                  "quem já atende.",
+        "keywords": "unidade do cliente porque esta em outra unidade zona norte zona sul territorio bairro",
+        "roles": "",
+    },
     # ── Primeiros passos ────────────────────────────────────────────────
     {
         "category": "primeiros-passos",
@@ -258,10 +433,11 @@ FAQ_SEED = [
     {
         "category": "dia-a-dia",
         "question": "Registrei o contato mas o cliente continua na minha fila. Por quê?",
-        "answer": "O cliente sai da fila assim que a interação é salva. Se continuar aparecendo, "
-                  "confira se você clicou em Salvar no formulário e se o contato foi registrado no "
-                  "cliente certo. Registro salvo também conclui automaticamente as tarefas abertas "
-                  "daquele cliente.",
+        "answer": "O cliente sai da fila assim que a interação é salva e só volta depois que a "
+                  "carteira girar. Se continuar aparecendo, confira três coisas: se você clicou em "
+                  "Salvar, se registrou no cliente certo e se não usou o Registro receptivo — o "
+                  "receptivo grava o histórico mas não tira o cliente da fila, porque quem procurou "
+                  "foi ele, não você.",
         "keywords": "cliente não sai da fila top 5 continua aparecendo registrei mas não sumiu",
         "roles": "VENDEDOR",
     },
