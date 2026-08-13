@@ -15249,6 +15249,17 @@ def compute_portfolio_summary_by_seller(
             WHERE company_id = ?
             GROUP BY client_code
         ),
+        -- Vendedor da última competência faturada. Entra na cascata abaixo como
+        -- terceira opção, para este painel usar EXATAMENTE a mesma definição de
+        -- dono que a Lista de Clientes. Antes o painel olhava só o vendedor
+        -- interno e a lista olhava interno → externo → quem faturou: a mesma
+        -- vendedora aparecia com 132 clientes aqui e 177 lá.
+        last_summary AS (
+            SELECT client_code, seller_name,
+                ROW_NUMBER() OVER (PARTITION BY client_code ORDER BY competence DESC) AS rn
+            FROM crm_client_summary
+            WHERE company_id = ?
+        ),
         seller_units AS (
             SELECT person_name, base_unit,
                 ROW_NUMBER() OVER (PARTITION BY company_id, person_name ORDER BY valid_from DESC) AS rn
@@ -15256,7 +15267,10 @@ def compute_portfolio_summary_by_seller(
             WHERE company_id = ?
         )
         SELECT
-            COALESCE(NULLIF(TRIM(p.internal_seller_name), ''), 'Sem Vendedor') AS seller,
+            COALESCE(NULLIF(TRIM(p.internal_seller_name), ''),
+                     NULLIF(TRIM(p.external_seller_name), ''),
+                     NULLIF(TRIM(ls.seller_name), ''),
+                     'Sem Vendedor') AS seller,
             COALESCE(su.base_unit, '') AS seller_unit,
             COALESCE(lp.latest_purchase_at, p.last_sale_at) AS effective_last_sale,
             COALESCE(cs.net_value, 0) AS current_revenue,
@@ -15274,12 +15288,17 @@ def compute_portfolio_summary_by_seller(
             ON cs_prev.company_id = p.company_id
             AND cs_prev.client_code = p.client_code
             AND cs_prev.competence = ?
+        LEFT JOIN last_summary ls
+            ON ls.client_code = p.client_code AND ls.rn = 1
         LEFT JOIN seller_units su
-            ON su.person_name = COALESCE(NULLIF(TRIM(p.internal_seller_name), ''), 'Sem Vendedor')
+            ON su.person_name = COALESCE(NULLIF(TRIM(p.internal_seller_name), ''),
+                                         NULLIF(TRIM(p.external_seller_name), ''),
+                                         NULLIF(TRIM(ls.seller_name), ''),
+                                         'Sem Vendedor')
             AND su.rn = 1
         WHERE p.company_id = ?
         """,
-        (company_id, company_id, competence, prev_competence, company_id),
+        (company_id, company_id, company_id, competence, prev_competence, company_id),
     ).fetchall()
 
     by_seller: dict[str, dict[str, Any]] = {}
