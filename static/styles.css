@@ -1771,6 +1771,71 @@ tbody tr:hover {
 .as-fab:hover { transform: translateY(-2px) scale(1.04); box-shadow: 0 16px 34px rgba(42, 26, 110, 0.5); }
 .as-fab svg { width: 44px; height: 44px; }
 
+/* ── Presença do assistente ─────────────────────────────────────────────
+   O avatar cobria conteúdo do CRM em telas cheias. Em vez de um liga/desliga,
+   três níveis: normal, discreto e oculto. */
+
+.as-fab-discreto {
+  width: 40px; height: 40px; right: 14px; bottom: 14px;
+  opacity: 0.35; box-shadow: 0 4px 12px rgba(42, 26, 110, 0.25);
+}
+.as-fab-discreto:hover { opacity: 1; }
+.as-fab-discreto svg { width: 30px; height: 30px; }
+
+/* Engrenagem de presença: só aparece ao passar o mouse, para não virar mais
+   um elemento competindo por atenção. */
+.as-fab-gear {
+  position: absolute; top: -6px; left: -6px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: #fff; color: #4327a8; border: 1px solid rgba(42, 26, 110, 0.25);
+  font-size: 13px; font-weight: 800; line-height: 20px; text-align: center;
+  opacity: 0; transition: opacity 0.15s;
+}
+.as-fab:hover .as-fab-gear { opacity: 1; }
+
+.as-menu {
+  position: fixed; right: 22px; bottom: 96px; z-index: 71;
+  width: 250px; background: #fff; border-radius: 12px;
+  border: 1px solid rgba(15, 40, 60, 0.12);
+  box-shadow: 0 16px 40px rgba(15, 40, 60, 0.22);
+  overflow: hidden;
+}
+.as-menu-title {
+  padding: 10px 14px; font-size: 12px; font-weight: 800;
+  color: #5b6b76; background: #f5f7f9; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.as-menu-item {
+  display: block; width: 100%; text-align: left; border: none; background: #fff;
+  padding: 10px 14px; cursor: pointer; border-top: 1px solid rgba(15, 40, 60, 0.07);
+}
+.as-menu-item:hover { background: #f5f9ff; }
+.as-menu-item strong { display: block; font-size: 13px; color: #0f2844; }
+.as-menu-item span { font-size: 11px; color: #6b7a85; }
+.as-menu-item.ativo { background: #eef4ff; box-shadow: inset 3px 0 0 #4327a8; }
+
+/* Oculto: aba fina na borda. Não some do sistema, só sai da frente. */
+.as-tab-oculto {
+  position: fixed; right: 0; bottom: 90px; z-index: 70;
+  width: 26px; height: 44px; padding: 0;
+  border: 1px solid rgba(42, 26, 110, 0.25); border-right: none;
+  border-radius: 10px 0 0 10px; cursor: pointer;
+  background: rgba(255, 255, 255, 0.9); color: #4327a8;
+  font-size: 14px; opacity: 0.5; transition: opacity 0.15s, width 0.15s;
+}
+.as-tab-oculto:hover { opacity: 1; width: 32px; }
+.as-tab-badge {
+  position: absolute; top: -4px; left: -6px;
+  min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+  background: #e74c3c; color: #fff; font-size: 10px; font-weight: 800; line-height: 16px;
+}
+
+.as-bubble-close {
+  position: absolute; top: 4px; right: 6px;
+  border: none; background: transparent; cursor: pointer;
+  color: #9aa7b1; font-size: 16px; line-height: 1; padding: 2px 4px;
+}
+.as-bubble-close:hover { color: #0f2844; }
+
 /* Selo com o número de novidades: dica situacional ou dúvida esperando resposta. */
 .as-fab-badge {
   position: absolute; top: -2px; right: -2px;
@@ -1784,6 +1849,7 @@ tbody tr:hover {
 .as-bubble {
   position: fixed; right: 96px; bottom: 34px; z-index: 70;
   max-width: 260px; background: #fff; color: #16123a;
+  padding-right: 22px;   /* espaço do × de dispensar */
   border: 1px solid var(--line); border-radius: 14px 14px 2px 14px;
   padding: 10px 14px; font-size: 13px; line-height: 1.45;
   box-shadow: 0 12px 30px rgba(9, 23, 34, 0.16);

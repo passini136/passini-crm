@@ -81,6 +81,7 @@ const state = {
     personQuery: "",
     assistantOpen: false,
     assistantBubble: true,   // balão de chamada, some no primeiro clique
+    assistantMenuOpen: false, // menu de presença do assistente (normal/discreto/oculto)
     assistantTab: "dicas",
     assistantAnswer: null,
     assistantSearching: false,
@@ -2241,19 +2242,94 @@ function prospectEditorModal() {
     </div>`;
 }
 
+// ─── Presença do assistente ────────────────────────────────────────────────
+//
+// Três níveis, porque "sempre visível" e "desligado" são extremos ruins: o
+// primeiro atrapalha a leitura da tela, o segundo faz a pessoa esquecer que o
+// recurso existe. O nível intermediário resolve o incômodo sem esconder a
+// ferramenta. A escolha fica gravada no navegador, por usuário.
+
+const ASSISTANT_MODES = ["normal", "discreto", "oculto"];
+
+function assistantMode() {
+  const salvo = safeStorageGet(assistantModeKey());
+  return ASSISTANT_MODES.includes(salvo) ? salvo : "normal";
+}
+
+function assistantModeKey() {
+  return `passini.assistant.mode.${state.user?.username || "anon"}`;
+}
+
+function setAssistantMode(modo) {
+  safeStorageSet(assistantModeKey(), modo);
+  if (modo !== "normal") state.ui.assistantBubble = false;
+  if (modo === "oculto") state.ui.assistantOpen = false;
+  state.ui.assistantMenuOpen = false;
+  requestRender();
+}
+
+function toggleAssistantMenu(event) {
+  if (event) { event.preventDefault(); event.stopPropagation(); }
+  state.ui.assistantMenuOpen = !state.ui.assistantMenuOpen;
+  requestRender();
+}
+
+/** localStorage pode estar bloqueado (aba anônima, política do navegador).
+ *  Falhar aqui não pode derrubar a tela — o padrão volta a ser "normal". */
+function safeStorageGet(chave) {
+  try { return window.localStorage.getItem(chave); } catch (e) { return null; }
+}
+
+function safeStorageSet(chave, valor) {
+  try { window.localStorage.setItem(chave, valor); } catch (e) { /* sem persistência */ }
+}
+
 function assistantFab() {
   if (!state.user) return "";
   const a = state.assistant;
   const novidades = a ? (a.situationTips || []).length + (a.pendingQuestions || []).length : 0;
+  const modo = assistantMode();
+
+  // Oculto: sobra uma aba fina na borda. Some da tela sem sumir do sistema —
+  // desligar de vez faria a pessoa nunca mais achar o assistente.
+  if (modo === "oculto") {
+    return `
+      <button class="as-tab-oculto" onclick="setAssistantMode('normal')"
+        title="Mostrar o assistente novamente">
+        💡${novidades ? `<span class="as-tab-badge">${novidades}</span>` : ""}
+      </button>
+      ${state.ui.assistantOpen ? assistantPanel() : ""}`;
+  }
+
+  const menu = state.ui.assistantMenuOpen ? `
+    <div class="as-menu">
+      <div class="as-menu-title">Assistente</div>
+      ${[["normal", "Normal", "Balão de dica e selo de novidades"],
+         ["discreto", "Discreto", "Menor e translúcido, sem balão"],
+         ["oculto", "Ocultar", "Vira uma aba fina na lateral"]].map(([id, rotulo, ajuda]) => `
+        <button class="as-menu-item ${modo === id ? "ativo" : ""}" onclick="setAssistantMode('${id}')">
+          <strong>${rotulo}</strong>
+          <span>${escapeHtml(ajuda)}</span>
+        </button>`).join("")}
+    </div>` : "";
+
   return `
-    ${state.ui.assistantBubble && !state.ui.assistantOpen && a?.messageOfDay ? `
-      <div class="as-bubble" onclick="toggleAssistant()">
-        <strong>${escapeHtml(a.messageOfDay.title)}</strong><br />
-        <span style="color:var(--muted)">Clique para ver a dica de hoje</span>
+    ${state.ui.assistantBubble && !state.ui.assistantOpen && modo === "normal" && a?.messageOfDay ? `
+      <div class="as-bubble">
+        <button class="as-bubble-close" onclick="event.stopPropagation();state.ui.assistantBubble=false;requestRender()"
+          title="Dispensar" aria-label="Dispensar">×</button>
+        <div onclick="toggleAssistant()" style="cursor:pointer">
+          <strong>${escapeHtml(a.messageOfDay.title)}</strong><br />
+          <span style="color:var(--muted)">Clique para ver a dica de hoje</span>
+        </div>
       </div>` : ""}
-    <button class="as-fab" onclick="toggleAssistant()" title="Assistente Passini" aria-label="Abrir assistente">
-      ${assistantAvatar(44, true)}
-      ${novidades ? `<span class="as-fab-badge">${novidades}</span>` : ""}
+    ${menu}
+    <button class="as-fab ${modo === "discreto" ? "as-fab-discreto" : ""}"
+      onclick="toggleAssistant()" oncontextmenu="toggleAssistantMenu(event)"
+      title="Assistente Passini — clique direito para ocultar" aria-label="Abrir assistente">
+      ${assistantAvatar(modo === "discreto" ? 30 : 44, true)}
+      ${novidades && modo === "normal" ? `<span class="as-fab-badge">${novidades}</span>` : ""}
+      <span class="as-fab-gear" onclick="toggleAssistantMenu(event)" title="Como o assistente aparece">⋯</span>
     </button>
     ${state.ui.assistantOpen ? assistantPanel() : ""}`;
 }
