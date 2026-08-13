@@ -552,9 +552,8 @@ button {
 }
 
 /* Coluna de ações grudada na direita.
-   Com o menu lateral aberto a tabela passa a rolar na horizontal e a última
-   coluna simplesmente saía da tela — o botão existia mas era inalcançável sem
-   fechar o menu. */
+   Com o menu lateral aberto a tabela rola na horizontal e a última coluna saía
+   da tela — o botão existia, mas era inalcançável sem fechar o menu. */
 .table-sticky-actions th:last-child,
 .table-sticky-actions td:last-child {
   position: sticky;

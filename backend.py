@@ -2595,15 +2595,44 @@ def seed_territory_mappings(conn: sqlite3.Connection, company_id: int) -> None:
                        TERRITORIO_COMPARTILHADO, vigencia, None, "semente_2026_09",
                        "Sem mapa de propósito: a unidade vem do vendedor que atende", agora))
 
-    conn.executemany(
+    # ORDEM IMPORTA. A antecipação de vigência roda ANTES do INSERT: senão o
+    # INSERT não veria conflito (a chave única inclui a vigência), criaria uma
+    # segunda linha para o mesmo bairro e o mapa passaria a ter duas respostas.
+    movidas = conn.execute(
         """
-        INSERT OR IGNORE INTO territory_mappings
-            (company_id, city_name, neighborhood, unit_name, valid_from, valid_to,
-             source, notes, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
+        UPDATE territory_mappings SET valid_from = ?
+        WHERE company_id = ? AND source = 'semente_2026_09' AND valid_from <> ?
+          AND NOT EXISTS (
+              SELECT 1 FROM territory_mappings t2
+              WHERE t2.company_id = territory_mappings.company_id
+                AND t2.city_name = territory_mappings.city_name
+                AND t2.neighborhood = territory_mappings.neighborhood
+                AND t2.valid_from = ?)
         """,
-        linhas,
-    )
+        (vigencia, company_id, vigencia, vigencia),
+    ).rowcount
+    if movidas:
+        print(f"[territorio] {movidas} território(s) passaram a valer desde {vigencia}")
+
+    # Insere só o que não existe em NENHUMA vigência: linha já ajustada à mão
+    # na tela de Territórios não pode ser sombreada por uma cópia da semente.
+    novos = 0
+    for linha in linhas:
+        cursor = conn.execute(
+            """
+            INSERT INTO territory_mappings
+                (company_id, city_name, neighborhood, unit_name, valid_from, valid_to,
+                 source, notes, created_at)
+            SELECT ?,?,?,?,?,?,?,?,?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM territory_mappings
+                WHERE company_id = ? AND city_name = ? AND neighborhood = ?)
+            """,
+            (*linha, linha[0], linha[1], linha[2]),
+        )
+        novos += cursor.rowcount
+    if novos:
+        print(f"[territorio] {novos} território(s) carregado(s)")
     conn.commit()
 
 
@@ -2899,6 +2928,94 @@ def resolve_city_unit(conn: sqlite3.Connection, company_id: int, city_name: str 
     if row:
         return normalize_unit(row["principal_unit"])
     return None
+
+
+def build_seller_unit_map(
+    conn: sqlite3.Connection, company_id: int, competence: str | None = None
+) -> dict[str, str]:
+    """Vendedor → unidade base, na vigência da competência. Uma query só.
+
+    Indexado pela chave normalizada do nome, porque o cadastro de clientes
+    escreve "CLEBER ALVES OLIVEIRA (VENDAS)" e o cadastro de pessoas às vezes
+    escreve só "CLEBER ALVES OLIVEIRA".
+    """
+    competence = competence or date.today().strftime("%Y-%m")
+    alvo = first_day_of_competence(competence).isoformat()
+    mapa: dict[str, str] = {}
+    for row in conn.execute(
+        """
+        SELECT person_name, base_unit FROM people_records
+        WHERE company_id = ? AND base_unit IS NOT NULL AND TRIM(base_unit) <> ''
+          AND date(valid_from) <= date(?)
+          AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
+        ORDER BY date(valid_from) DESC
+        """,
+        (company_id, alvo, alvo),
+    ).fetchall():
+        for chave in (person_key(row["person_name"]), short_person_key(row["person_name"])):
+            if chave and chave not in mapa:
+                mapa[chave] = normalize_unit(row["base_unit"])
+    return mapa
+
+
+def build_territory_map(
+    conn: sqlite3.Connection, company_id: int, competence: str | None = None
+) -> dict[tuple[str, str], str]:
+    """(cidade, bairro) → unidade, em um dict, para não consultar linha a linha."""
+    competence = competence or date.today().strftime("%Y-%m")
+    alvo = first_day_of_competence(competence).isoformat()
+    mapa: dict[tuple[str, str], str] = {}
+    for row in conn.execute(
+        """
+        SELECT city_name, neighborhood, unit_name FROM territory_mappings
+        WHERE company_id = ? AND date(valid_from) <= date(?)
+          AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
+        ORDER BY date(valid_from) DESC
+        """,
+        (company_id, alvo, alvo),
+    ).fetchall():
+        chave = (normalize_upper(strip_accents(row["city_name"])),
+                 normalize_upper(strip_accents(row["neighborhood"])))
+        if chave not in mapa:
+            mapa[chave] = normalize_unit(row["unit_name"])
+    return mapa
+
+
+def unit_for_client_row(
+    seller_name: str | None, city_name: str | None, neighborhood: str | None,
+    seller_units: dict[str, str], territory: dict[tuple[str, str], str],
+    city_units: dict[str, str | None],
+) -> str | None:
+    """Unidade dona do cliente na carteira, em cascata.
+
+      1. UNIDADE DO VENDEDOR que atende. É a regra combinada — a venda conta
+         para a unidade de quem vendeu, então a carteira tem de mostrar o mesmo.
+         Antes a unidade vinha só da cidade: um vendedor da Zona Norte com
+         cliente em Canoas aparecia como Matriz, e a carteira dele sumia da
+         unidade nova.
+      2. Sem vendedor, vale o TERRITÓRIO: bairro, depois cidade inteira. É o que
+         faz o cliente de um bairro da Zona Norte, ainda sem dono, aparecer na
+         carteira da Zona Norte esperando alguém assumir.
+      3. Por último, o mapa antigo de cidades, que segue valendo no interior.
+    """
+    vendedor = normalize_whitespace(seller_name)
+    if vendedor:
+        unidade = (seller_units.get(person_key(vendedor))
+                   or seller_units.get(short_person_key(vendedor)))
+        if unidade:
+            return unidade
+
+    cidade = normalize_upper(strip_accents(city_name))
+    bairro = normalize_upper(strip_accents(neighborhood))
+    if cidade:
+        for chave in ([(cidade, bairro)] if bairro else []) + [(cidade, TERRITORIO_CIDADE_INTEIRA)]:
+            unidade = territory.get(chave)
+            if unidade and unidade != TERRITORIO_COMPARTILHADO:
+                return unidade
+            if unidade == TERRITORIO_COMPARTILHADO:
+                break  # cidade compartilhada e sem vendedor: cai no mapa antigo
+
+    return city_units.get(normalize_upper(city_name))
 
 
 def build_city_unit_map(conn: sqlite3.Connection, company_id: int, competence: str | None = None) -> dict[str, str | None]:
@@ -8577,8 +8694,10 @@ def crm_base_client_rows(
 
     aggregate_rows = conn.execute(scope_query, params).fetchall()
 
-    # Precarrega mapeamento cidade→unidade em uma única query (evita N+1)
+    # Precarrega os três mapas de unidade em uma query cada (evita N+1)
     city_unit_map = build_city_unit_map(conn, company_id, c0)
+    seller_unit_map = build_seller_unit_map(conn, company_id, c0)
+    territory_map = build_territory_map(conn, company_id, c0)
 
     # Agrega fact_sales_detail por cliente no SQL — evita iterar milhares de linhas no Python
     detail_rows = conn.execute(
@@ -8732,7 +8851,9 @@ def crm_base_client_rows(
         class_code = crm_class_from_average(average_revenue)
         drop_pct = safe_div(current_revenue - average_revenue, average_revenue) if average_revenue else 0.0
         has_mix_opportunity = current_revenue > 0 and merged_current_sku_count <= 2
-        resolved_unit_name = city_unit_map.get(normalize_upper(row["city_name"]))
+        resolved_unit_name = unit_for_client_row(
+            row["assigned_seller"], row["city_name"], row["neighborhood"],
+            seller_unit_map, territory_map, city_unit_map)
         priorities: list[str] = []
         if status_code == "INATIVO":
             priorities.append("REATIVACAO_INATIVO")
@@ -14228,14 +14349,57 @@ def sellers_available_for_assignment(
     return result
 
 
+def build_document_client_map(
+    conn: sqlite3.Connection, company_id: int
+) -> tuple[dict[str, str], dict[str, set[str]]]:
+    """CNPJ/CPF → código do cliente, e raiz de CNPJ → códigos.
+
+    O relatório de faturamento às vezes escreve o cliente com o documento
+    grudado no nome — "54.719.029 ISMAEL GREGORY", "ROGERIO GAUGER 01860545050".
+    O casamento por nome falha nesses casos, e o cliente aparecia como "sem
+    cadastro" mesmo estando cadastrado. O documento resolve sozinho boa parte
+    deles, sem ninguém precisar conciliar à mão.
+    """
+    exatos: dict[str, str] = {}
+    por_raiz: dict[str, set[str]] = defaultdict(set)
+    for row in conn.execute(
+        "SELECT client_code, document_number FROM crm_client_profiles "
+        "WHERE company_id = ? AND document_number IS NOT NULL AND TRIM(document_number) <> ''",
+        (company_id,),
+    ).fetchall():
+        digitos = only_digits(row["document_number"])
+        codigo = normalize_whitespace(row["client_code"])
+        if not digitos or not codigo:
+            continue
+        exatos.setdefault(digitos, codigo)
+        if len(digitos) == 14:
+            por_raiz[digitos[:8]].add(codigo)
+    return exatos, por_raiz
+
+
+def client_code_from_name_digits(
+    nome: str, exatos: dict[str, str], por_raiz: dict[str, set[str]]
+) -> str | None:
+    """Código do cliente a partir do documento embutido no nome do faturamento.
+
+    A raiz de 8 dígitos só vale quando aponta para UM cliente: filiais dividem a
+    mesma raiz, e chutar entre elas seria pior que não resolver.
+    """
+    digitos = only_digits(nome)
+    if len(digitos) in (11, 14):
+        return exatos.get(digitos)
+    if len(digitos) == 8:
+        candidatos = por_raiz.get(digitos) or set()
+        return next(iter(candidatos)) if len(candidatos) == 1 else None
+    return None
+
+
 def client_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, dict[str, str]]:
     """Nome do faturamento → cliente do cadastro, conciliado à mão.
 
-    O relatório do Alfa às vezes escreve o cliente de um jeito que não casa com
-    o cadastro — "54.719.029 ISMAEL GREGORY" no faturamento e "ISMAEL GREGORY"
-    no cadastro. A normalização não resolve porque o CNPJ está grudado no nome.
-    Sem o vínculo, o cliente aparece como "sem cadastro" e o gerente não
-    consegue nem abrir a ficha para atribuir um vendedor.
+    Usado SÓ para dar código a quem ficou sem. O casamento automático por nome
+    continua sendo a regra: este mapa entra depois dele e apenas preenche as
+    lacunas, nunca substitui nem remove nada da lista.
     """
     return {
         r["sales_name_key"]: {"clientCode": r["client_code"], "clientName": r["client_name"]}
@@ -14246,22 +14410,33 @@ def client_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, dic
     }
 
 
+def find_client_by_code(
+    conn: sqlite3.Connection, company_id: int, codigo: str
+) -> dict[str, Any] | None:
+    """Cliente pelo código do Alfa — é o dado que o gerente tem em mãos."""
+    code = normalize_whitespace(codigo)
+    if not code:
+        return None
+    row = conn.execute(
+        "SELECT client_code, client_name, trade_name, city_name, document_number, "
+        "       COALESCE(NULLIF(internal_seller_name,''), external_seller_name) AS seller_name "
+        "FROM crm_client_profiles WHERE company_id = ? AND TRIM(client_code) = ?",
+        (company_id, code),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def save_client_alias(
     conn: sqlite3.Connection, company_id: int, user_id: int, payload: dict[str, Any]
 ) -> dict[str, Any]:
     nome_faturamento = normalize_whitespace(payload.get("salesName"))
     codigo = normalize_whitespace(payload.get("clientCode"))
     if not nome_faturamento or not codigo:
-        raise ValueError("Informe o nome do faturamento e o cliente do cadastro.")
-    cliente = conn.execute(
-        "SELECT client_code, client_name, internal_seller_name, external_seller_name "
-        "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
-        (company_id, codigo),
-    ).fetchone()
+        raise ValueError("Informe o nome do faturamento e o código do cliente.")
+    cliente = find_client_by_code(conn, company_id, codigo)
     if not cliente:
         raise ValueError(f"Cliente {codigo} não existe no cadastro.")
 
-    chave = normalize_client_key(nome_faturamento)
     conn.execute(
         """
         INSERT INTO client_name_aliases
@@ -14274,38 +14449,16 @@ def save_client_alias(
                       created_by_user_id = excluded.created_by_user_id,
                       created_at = excluded.created_at
         """,
-        (company_id, chave, nome_faturamento, cliente["client_code"], cliente["client_name"],
-         user_id, now_iso()),
+        (company_id, normalize_client_key(nome_faturamento), nome_faturamento,
+         cliente["client_code"], cliente["client_name"], user_id, now_iso()),
     )
     audit_log(conn, company_id, user_id, "conciliar", "client_name_aliases",
               nome_faturamento, {"clientCode": cliente["client_code"]})
     conn.commit()
     invalidate_crm_cache(company_id)
-
-    vendedor = normalize_whitespace(cliente["internal_seller_name"]) \
-        or normalize_whitespace(cliente["external_seller_name"])
-    return {
-        "message": f"{nome_faturamento} conciliado com {cliente['client_name']} ({cliente['client_code']}).",
-        "clientCode": cliente["client_code"],
-        "clientName": cliente["client_name"],
-        "sellerName": vendedor,
-        # Conciliar não atribui vendedor: se o cadastro já tem um, o cliente
-        # sai da lista sozinho; se não tem, continua aqui — que é o correto,
-        # porque a pendência real (falta de dono) segue de pé.
-        "stillUnassigned": not vendedor,
-    }
-
-
-def delete_client_alias(
-    conn: sqlite3.Connection, company_id: int, user_id: int, sales_name: str
-) -> dict[str, Any]:
-    chave = normalize_client_key(sales_name)
-    conn.execute("DELETE FROM client_name_aliases WHERE company_id = ? AND sales_name_key = ?",
-                 (company_id, chave))
-    audit_log(conn, company_id, user_id, "desfazer_conciliacao", "client_name_aliases", sales_name, {})
-    conn.commit()
-    invalidate_crm_cache(company_id)
-    return {"message": "Conciliação desfeita."}
+    return {"message": f"{nome_faturamento} conciliado com {cliente['client_name']} "
+                       f"({cliente['client_code']}).",
+            "clientCode": cliente["client_code"], "clientName": cliente["client_name"]}
 
 
 def compute_unassigned_clients(
@@ -14331,17 +14484,6 @@ def compute_unassigned_clients(
         key = normalize_client_key(row["client_name"])
         if key:
             owned.add(key)
-    # Nome do faturamento conciliado com um cliente que JÁ tem vendedor também
-    # sai da lista — era só o nome que não casava.
-    for chave, destino in client_alias_map(conn, company_id).items():
-        dono = conn.execute(
-            "SELECT 1 FROM crm_client_profiles WHERE company_id = ? AND client_code = ? "
-            "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' "
-            "  OR TRIM(COALESCE(external_seller_name,'')) <> '')",
-            (company_id, destino["clientCode"]),
-        ).fetchone()
-        if dono:
-            owned.add(chave)
 
     # Código do cliente por nome — a ficha é aberta pelo código, mas esta lista
     # nasce do faturamento, que só tem o nome. Cliente sem cadastro fica sem
@@ -14356,10 +14498,26 @@ def compute_unassigned_clients(
         if key and code and key not in code_by_name:
             code_by_name[key] = code
 
-    # Conciliações feitas à mão têm prioridade sobre o casamento por nome.
+    # Segunda tentativa automática: documento embutido no nome do faturamento.
+    docs_exatos, docs_raiz = build_document_client_map(conn, company_id)
+
+    # Conciliação manual só PREENCHE lacuna: entra depois do casamento por nome
+    # e nunca sobrescreve um código que já foi encontrado sozinho.
     aliases = client_alias_map(conn, company_id)
     for chave, destino in aliases.items():
-        code_by_name[chave] = destino["clientCode"]
+        code_by_name.setdefault(chave, destino["clientCode"])
+
+    # Dono do cliente por CÓDIGO — usado para tirar da lista quem só não casava
+    # pelo nome mas tem vendedor no cadastro.
+    dono_por_codigo = {
+        normalize_whitespace(r["client_code"])
+        for r in conn.execute(
+            "SELECT client_code FROM crm_client_profiles WHERE company_id = ? "
+            "AND (TRIM(COALESCE(internal_seller_name,'')) <> '' "
+            "  OR TRIM(COALESCE(external_seller_name,'')) <> '')",
+            (company_id,),
+        ).fetchall()
+    }
 
     allowed_units = crm_allowed_units_for_user(conn, user)
     city_unit = build_city_unit_map(conn, company_id, latest)
@@ -14406,6 +14564,14 @@ def compute_unassigned_clients(
     for r in rows:
         key = normalize_client_key(r["client_name"])
         if not key or key in owned:
+            continue
+        if key not in code_by_name:
+            achado = client_code_from_name_digits(r["client_name"], docs_exatos, docs_raiz)
+            if achado:
+                code_by_name[key] = achado
+        # Casou por documento (ou por conciliação) com um cliente que tem
+        # vendedor: a pendência era só o nome, então sai da lista.
+        if code_by_name.get(key) in dono_por_codigo:
             continue
         unit = city_unit.get(normalize_upper(r["city_name"]))
         if allowed_units and unit not in allowed_units:
@@ -15350,9 +15516,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
-                    # Gestão em geral, não só quem cuida de visita: a mesma busca
-                    # serve para conciliar cliente na tela Sem Vendedor.
-                    if data_scope_for_user(conn, user) == "proprio":
+                    if not user_can_manage_visits(conn, user):
                         self._set_headers(403)
                         self.wfile.write(json_dumps({"error": "Busca disponível para a gestão."}))
                         return
@@ -15850,6 +16014,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     dados = contact_history(conn, user["company_id"], user, filtros)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
+                return
+            if path == "/api/crm/clients/by-code":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    if data_scope_for_user(conn, user) == "proprio":
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Consulta da gestão."}))
+                        return
+                    achado = find_client_by_code(
+                        conn, user["company_id"],
+                        parse_qs(parsed.query).get("code", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"client": achado}))
                 return
             if path == "/api/admin/territories":
                 user = self._require_auth()
@@ -17018,7 +17197,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
                 return
-            if path in {"/api/crm/clients/alias", "/api/crm/clients/alias/delete"}:
+            if path == "/api/crm/clients/alias":
                 user = self._require_auth()
                 if not user:
                     return
@@ -17029,11 +17208,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             self._set_headers(403)
                             self.wfile.write(json_dumps({"error": "Conciliação é da gestão."}))
                             return
-                        if path.endswith("/delete"):
-                            res = delete_client_alias(conn, user["company_id"], user["id"],
-                                                      payload.get("salesName"))
-                        else:
-                            res = save_client_alias(conn, user["company_id"], user["id"], payload)
+                        res = save_client_alias(conn, user["company_id"], user["id"], payload)
                     self._set_headers(200)
                     self.wfile.write(json_dumps(res))
                 except Exception as exc:

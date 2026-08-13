@@ -214,8 +214,8 @@ const state = {
     copyFallback: null,  // modal de copia manual (HTTP sem clipboard API)
     assignTask: null,      // modal de cobrar contato (gestao)
     scheduleContact: null, // modal de agendar contato (vendedor, para si mesmo)
+    reconcile: null,       // modal de conciliação por código (só "sem cadastro")
     receptive: null,       // modal de registro receptivo (não conta na meta)
-    reconcile: null,       // modal de conciliação de cliente sem cadastro
     unassignedFilters: { minMonths: 2, window: 6 },
     autoImport: null,
     editingVacationId: null,
@@ -5346,13 +5346,16 @@ async function loadUnassignedClients() {
   requestRender();
 }
 
-// ─── Conciliação de cliente sem cadastro ───────────────────────────────────
+// ─── Conciliação por código do cliente ─────────────────────────────────────
+//
+// Só para as linhas marcadas "sem cadastro". O casamento automático por nome
+// continua sendo a regra e não é tocado — aqui o gerente resolve à mão o que
+// sobrou, informando o código do Alfa, que é o dado que ele tem em mãos.
 
 function abrirConciliacao(nomeFaturamento) {
-  state.crm.reconcile = { salesName: nomeFaturamento, term: nomeFaturamento,
-                          results: null, searching: false, saving: false };
+  state.crm.reconcile = { salesName: nomeFaturamento, code: "", found: null,
+                          searching: false, saving: false, notFound: false };
   requestRender();
-  void buscarClienteConciliacao();
 }
 
 function fecharConciliacao() {
@@ -5360,37 +5363,36 @@ function fecharConciliacao() {
   requestRender();
 }
 
-async function buscarClienteConciliacao() {
+async function buscarClientePorCodigo() {
   const r = state.crm.reconcile;
   if (!r) return;
-  const termo = (r.term || "").trim();
-  if (termo.length < 2) { addMessage("warn", "Digite ao menos 2 letras."); return; }
-  r.searching = true; requestRender();
+  const codigo = (r.code || "").trim();
+  if (!codigo) { addMessage("warn", "Informe o código do cliente."); return; }
+  r.searching = true; r.found = null; r.notFound = false; requestRender();
   try {
-    const resposta = await api(`/api/crm/clients/search?q=${encodeURIComponent(termo)}`);
-    if (state.crm.reconcile) state.crm.reconcile.results = resposta.clients || [];
+    const resposta = await api(`/api/crm/clients/by-code?code=${encodeURIComponent(codigo)}`);
+    if (state.crm.reconcile) {
+      state.crm.reconcile.found = resposta.client || null;
+      state.crm.reconcile.notFound = !resposta.client;
+    }
   } catch (error) {
     addMessage("error", error.message);
-    if (state.crm.reconcile) state.crm.reconcile.results = [];
   } finally {
     if (state.crm.reconcile) state.crm.reconcile.searching = false;
     requestRender();
   }
 }
 
-async function confirmarConciliacao(clientCode) {
+async function confirmarConciliacao() {
   const r = state.crm.reconcile;
-  if (!r || r.saving) return;
+  if (!r || !r.found || r.saving) return;
   r.saving = true; requestRender();
   try {
     const resposta = await api("/api/crm/clients/alias", {
       method: "POST",
-      body: JSON.stringify({ salesName: r.salesName, clientCode }),
+      body: JSON.stringify({ salesName: r.salesName, clientCode: r.found.client_code }),
     });
     addMessage("success", resposta.message || "Cliente conciliado.");
-    if (resposta.stillUnassigned) {
-      addMessage("warn", "O cadastro deste cliente ainda está sem vendedor — ele segue na lista até você atribuir um.");
-    }
     state.crm.reconcile = null;
     await loadUnassignedClients();
   } catch (error) {
@@ -5403,9 +5405,10 @@ async function confirmarConciliacao(clientCode) {
 function conciliacaoModal() {
   const r = state.crm.reconcile;
   if (!r) return "";
+  const c = r.found;
   return `
     <div class="client-drawer-overlay open modal-dim" onclick="fecharConciliacao()">
-      <div class="panel modal-panel" style="max-width:640px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
+      <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
             <h3>🔗 Conciliar cliente</h3>
@@ -5415,36 +5418,41 @@ function conciliacaoModal() {
         </div>
 
         <div class="text-small" style="color:var(--muted);margin:10px 0">
-          Este nome não casa com nenhum cliente do cadastro — normalmente porque o relatório
-          traz o CNPJ grudado no nome. Busque o cliente correto para ligar os dois.
+          Este nome não casou com nenhum cliente do cadastro. Informe o código do cliente
+          no Alfa para ligar os dois.
         </div>
 
         <div style="display:flex;gap:8px">
-          <input style="flex:1" value="${escapeHtml(r.term || "")}"
-            placeholder="Buscar por código, nome ou nome fantasia"
-            oninput="state.crm.reconcile.term=this.value"
-            onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClienteConciliacao();}" />
-          <button class="btn btn-secondary" type="button" onclick="buscarClienteConciliacao()">
+          <input style="flex:1" value="${escapeHtml(r.code || "")}"
+            placeholder="Código do cliente — ex: 70123"
+            oninput="state.crm.reconcile.code=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClientePorCodigo();}" />
+          <button class="btn btn-secondary" type="button" onclick="buscarClientePorCodigo()">
             ${r.searching ? "Buscando…" : "Buscar"}</button>
         </div>
 
-        ${r.results ? `
-          <div style="border:1px solid var(--line);border-radius:8px;max-height:320px;overflow:auto;margin-top:10px">
-            ${r.results.length ? r.results.map((c) => `
-              <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
-                          padding:10px 12px;border-bottom:1px solid var(--line)">
-                <div>
-                  <div style="font-weight:700;font-size:13px">${escapeHtml(c.client_name)}</div>
-                  <div class="text-small" style="color:var(--muted)">
-                    cód. ${escapeHtml(c.client_code)}${c.city_name ? ` · ${escapeHtml(c.city_name)}` : ""}
-                    ${c.seller_name ? ` · vendedor: ${escapeHtml(c.seller_name)}` : " · sem vendedor no cadastro"}
-                  </div>
-                </div>
-                <button class="btn btn-primary btn-sm" type="button" ${r.saving ? "disabled" : ""}
-                  onclick="confirmarConciliacao('${jsAttr(c.client_code)}')">Vincular</button>
-              </div>`).join("")
-              : '<div class="text-small" style="padding:12px;color:var(--muted)">Nenhum cliente encontrado. Tente pelo CNPJ ou por parte do nome.</div>'}
+        ${c ? `
+          <div style="margin-top:12px;background:#f5f9ff;border:1px solid var(--accent);
+                      border-radius:10px;padding:12px">
+            <div style="font-weight:700;font-size:14px">${escapeHtml(c.client_name)}</div>
+            <div class="text-small" style="color:var(--muted)">
+              cód. ${escapeHtml(c.client_code)}${c.city_name ? ` · ${escapeHtml(c.city_name)}` : ""}
+              ${c.document_number ? ` · ${escapeHtml(c.document_number)}` : ""}
+            </div>
+            <div class="text-small" style="margin-top:4px">
+              ${c.seller_name
+                ? `Vendedor no cadastro: <strong>${escapeHtml(c.seller_name)}</strong>`
+                : '<span style="color:var(--bad)">Sem vendedor no cadastro</span> — segue nesta lista até você atribuir um.'}
+            </div>
+          </div>
+          <div class="actions" style="margin-top:14px">
+            <button class="btn btn-primary" ${r.saving ? "disabled" : ""} onclick="confirmarConciliacao()">
+              ${r.saving ? "Vinculando…" : "Vincular este cliente"}</button>
+            <button class="btn btn-ghost" onclick="fecharConciliacao()">Cancelar</button>
           </div>` : ""}
+
+        ${r.notFound ? `<div class="text-small" style="margin-top:12px;color:var(--bad)">
+          Nenhum cliente com este código no cadastro. Confira no Alfa.</div>` : ""}
       </div>
     </div>
   `;
@@ -5523,7 +5531,7 @@ function semVendedorView() {
                       ${i.clientKey
                         ? `<button class="btn btn-ghost btn-sm" type="button" onclick="openCrmClient('${escapeHtml(i.clientKey)}', false)">Ficha</button>`
                         : `<button class="btn btn-secondary btn-sm" type="button"
-                             title="O nome do faturamento não casa com o cadastro. Busque o cliente e faça o vínculo."
+                             title="Sem cadastro: o nome do faturamento não casa com nenhum cliente. Informe o código para ligar os dois."
                              onclick="abrirConciliacao('${jsAttr(i.clientName)}')">🔗 Conciliar</button>`}
                     </td>
                   </tr>`).join("")}
@@ -12386,8 +12394,8 @@ function dashboardView() {
       ${copyFallbackModal()}
       ${assignTaskModal()}
       ${scheduleContactModal()}
-      ${receptiveModal()}
       ${conciliacaoModal()}
+      ${receptiveModal()}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
       ${assistantFab()}
       ${helpEditorModal()}

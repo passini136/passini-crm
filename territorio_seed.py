@@ -14,7 +14,18 @@ Nomes são comparados sem acento e em maiúsculas, então a grafia do cadastro
 do Alfa não precisa bater exatamente.
 """
 
-TERRITORIO_VIGENCIA = "2026-09-01"
+# Vigência do MAPA DE TERRITÓRIO — não confundir com a vigência de resultado.
+#
+# Felipe definiu setembro/2026 para a nova divisão, para agosto fechar inteiro
+# na estrutura atual. Essa decisão vale para o FATURAMENTO, que continua
+# contando pela unidade do vendedor e não é tocado por este mapa.
+#
+# O território decide outra coisa: de quem é o cliente AINDA SEM VENDEDOR na
+# carteira, para onde vai o prospect e como se agrupa o roteiro de visita.
+# Segurar isso até setembro deixaria os vendedores da Zona Norte sem enxergar
+# os clientes do bairro deles justamente nas semanas de montagem da carteira,
+# antes da inauguração em 24/08. Por isso vale desde agosto.
+TERRITORIO_VIGENCIA = "2026-08-01"
 
 # Cidades atendidas por uma unidade só. Regra de cidade inteira, sem bairro.
 CIDADES_EXCLUSIVAS = {
