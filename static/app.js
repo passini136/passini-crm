@@ -1988,6 +1988,7 @@ function blocoConfiguracaoUnidade() {
 async function loadInativos() {
   if (state.ui.loading.inactives) return;
   setLoading("inactives", true);
+  requestRender();   // sem isto o "Buscando…" só apareceria depois da resposta
   try {
     const q = (state.ui.inactiveSearch || "").trim();
     state.inactives = await api(`/api/prospects/inactive${q ? `?q=${encodeURIComponent(q)}` : ""}`);
@@ -2002,8 +2003,8 @@ async function loadInativos() {
 
 function toggleInativos() {
   state.ui.inactivesOpen = !state.ui.inactivesOpen;
+  requestRender();                       // abre o painel na hora
   if (state.ui.inactivesOpen && !state.inactives) void loadInativos();
-  else requestRender();
 }
 
 function blocoInativosDaUnidade() {
@@ -2019,8 +2020,9 @@ function blocoInativosDaUnidade() {
           <div class="text-small">Clientes que já compraram e pararam — com ou sem vendedor.
             Cadastro pronto e objeção conhecida: é a prospecção mais barata que existe.</div>
         </div>
-        <button class="btn ${aberto ? "btn-ghost" : "btn-primary"} btn-sm" type="button" onclick="toggleInativos()">
-          ${aberto ? "Fechar" : "Buscar inativos"}
+        <button class="btn ${aberto ? "btn-ghost" : "btn-primary"} btn-sm" type="button"
+          ${carregando ? "disabled" : ""} onclick="toggleInativos()">
+          ${carregando && !aberto ? "⏳ Buscando…" : (aberto ? "Fechar" : "Buscar inativos")}
         </button>
       </div>
 
@@ -2030,13 +2032,19 @@ function blocoInativosDaUnidade() {
             value="${escapeHtml(state.ui.inactiveSearch || "")}"
             oninput="state.ui.inactiveSearch=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();loadInativos();}" />
-          <button class="btn btn-secondary btn-sm" type="button" onclick="loadInativos()">
-            ${carregando ? "Buscando…" : "Filtrar"}</button>
+          <button class="btn btn-secondary btn-sm" type="button"
+            ${carregando ? "disabled" : ""} onclick="loadInativos()">
+            ${carregando ? "⏳ Buscando…" : "Filtrar"}</button>
         </div>
 
-        ${carregando && !d ? '<div class="loader">Carregando…</div>' : ""}
+        ${carregando ? `
+          <div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
+            ⏳ Buscando inativos da unidade… a varredura passa pela carteira inteira e pode
+            levar alguns segundos.
+          </div>` : ""}
 
         ${d ? `
+          <div style="${carregando ? "opacity:.45;pointer-events:none" : ""}">
           <div class="text-small" style="color:var(--muted);margin-bottom:8px">
             ${number(d.total)} inativo(s) em <strong>${escapeHtml(d.unitName || "todas")}</strong>
             · ${number(d.withoutSeller)} sem vendedor
@@ -2076,6 +2084,7 @@ function blocoInativosDaUnidade() {
           <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
             Ordenado pela média histórica: quem já comprou mais vale mais o telefonema.
             Cliente <strong>sem vendedor</strong> é o alvo mais direto — ninguém responde por ele hoje.
+          </div>
           </div>` : ""}
       ` : ""}
     </div>`;
