@@ -41,8 +41,54 @@ ultima = conn.execute(
 ).fetchone()["u"]
 print(f"CADASTRO DE CLIENTES NO CRM: {total_cadastro} cliente(s), "
       f"{com_documento} com CNPJ/CPF · última atualização {ultima}")
-print("(Se este número for muito menor que o do Alfa, o problema é a importação"
-      " do cadastro, não o casamento.)\n")
+
+# ── A importação do cadastro trouxe tudo? ────────────────────────────────
+# O código do Alfa é sequencial: se o maior código do cadastro for MENOR que os
+# códigos que aparecem no Alfa, a exportação veio truncada e nenhuma regra de
+# casamento vai resolver — o cliente simplesmente não está no banco.
+faixa = conn.execute(
+    "SELECT MIN(CAST(client_code AS INTEGER)) mn, MAX(CAST(client_code AS INTEGER)) mx "
+    "FROM crm_client_profiles WHERE company_id = ? AND client_code GLOB '[0-9]*'",
+    (company_id,),
+).fetchone()
+print(f"  Faixa de códigos: {faixa['mn']} a {faixa['mx']}")
+
+ultimo_import = conn.execute(
+    "SELECT MAX(source_import_id) i FROM crm_client_profiles WHERE company_id = ?",
+    (company_id,),
+).fetchone()["i"]
+if ultimo_import:
+    linha = conn.execute(
+        "SELECT imported_at, notes FROM imports WHERE id = ?", (ultimo_import,)
+    ).fetchone()
+    if linha:
+        print(f"  Última importação de cadastro: {linha['imported_at']} · {linha['notes'] or ''}")
+    carregados = conn.execute(
+        "SELECT COUNT(*) n FROM crm_client_profiles WHERE company_id = ? AND source_import_id = ?",
+        (company_id, ultimo_import),
+    ).fetchone()["n"]
+    print(f"  Clientes tocados nessa importação: {carregados}")
+
+# Quantos clientes do faturamento não existem no cadastro, de forma alguma
+sem_cadastro = conn.execute(
+    """
+    SELECT COUNT(*) n FROM (
+        SELECT DISTINCT f.client_name FROM fact_sales_detail f
+        WHERE f.company_id = ?
+          AND NOT EXISTS (SELECT 1 FROM crm_client_profiles p
+                          WHERE p.company_id = f.company_id
+                            AND UPPER(TRIM(p.client_name)) = UPPER(TRIM(f.client_name)))
+    )
+    """,
+    (company_id,),
+).fetchone()["n"]
+faturados = conn.execute(
+    "SELECT COUNT(DISTINCT client_name) n FROM fact_sales_detail WHERE company_id = ?",
+    (company_id,),
+).fetchone()["n"]
+print(f"  Clientes no faturamento: {faturados} · sem nome igual no cadastro: {sem_cadastro}")
+print("\n  >> Se o MAIOR código acima for menor que os códigos novos do Alfa, ou se")
+print("     'sem nome igual' for muito alto, a exportação do cadastro veio incompleta.\n")
 
 # ── Mapas usados pelo sistema ────────────────────────────────────────────
 por_nome: dict[str, str] = {}
@@ -79,16 +125,23 @@ def investiga(nome: str) -> str:
         return f"OK pela razão social sem sufixo -> {next(iter(candidatos))}"
     if len(candidatos) > 1:
         return f"AMBÍGUO: {len(candidatos)} clientes com a mesma razão social {sorted(candidatos)}"
-    parecidos = [
-        r["client_name"] for r in conn.execute(
-            "SELECT client_name FROM crm_client_profiles WHERE company_id = ? "
-            "AND UPPER(client_name) LIKE ? LIMIT 3",
-            (company_id, f"%{chave_empresa.split(' ')[0]}%" if chave_empresa else "%"),
-        ).fetchall()
-    ]
+    # "Parecido" só vale se o TOKEN MAIS DISTINTIVO bater. Procurar pela
+    # primeira palavra devolvia toda oficina mecânica do banco para qualquer
+    # "MECANICA X LTDA" — ruído que faz parecer que existe candidato quando não
+    # existe. O token mais longo é o que carrega o nome próprio.
+    tokens = sorted((t for t in chave_empresa.split() if len(t) >= 5), key=len, reverse=True)
+    parecidos: list[str] = []
+    if tokens:
+        parecidos = [
+            r["client_name"] for r in conn.execute(
+                "SELECT client_name FROM crm_client_profiles WHERE company_id = ? "
+                "AND UPPER(client_name) LIKE ? LIMIT 3",
+                (company_id, f"%{tokens[0]}%"),
+            ).fetchall()
+        ]
     if parecidos:
-        return f"SEM CASAMENTO · parecidos no cadastro: {parecidos}"
-    return "SEM CASAMENTO · nenhum nome parecido no cadastro (provável falta na importação)"
+        return f"SEM CASAMENTO · parecidos ({tokens[0]}): {parecidos}"
+    return "SEM CASAMENTO · NÃO EXISTE no cadastro do CRM (falta na importação)"
 
 
 if termo:
