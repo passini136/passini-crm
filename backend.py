@@ -149,9 +149,9 @@ AUTO_IMPORT_FOLDERS = [
     # CRM separado em duas pastas — cada base importa de forma independente
     {"folder": "crm/clientes", "scope": "crm_clients",
      "label": "CRM · Cadastro de Clientes",
-     "hint": "Base do Alfa, sem competência. Coloque TODAS as exportações juntas (a base vem "
-             "dividida em 2 arquivos) — elas são importadas como uma só e substituem a base "
-             "anterior. Atualizar 1x ao dia."},
+     "hint": "Base do Alfa, sem competência. A base vem dividida em DOIS arquivos e a "
+             "importação SUBSTITUI a base inteira: mandar um arquivo só apaga o outro. "
+             "Coloque os dois juntos na pasta antes de importar. Atualizar 1x ao dia."},
     {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
      "label": "CRM · Faturamento Consolidado",
      "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
@@ -4066,6 +4066,38 @@ def import_package(
                     "Verifique se todas as exportações do Alfa estavam na pasta."
                 )
                 _msg += " ⚠ possível exportação incompleta"
+
+        # Cobertura sobre o faturamento. É o alarme que faltava: comparar com a
+        # importação anterior não adianta quando a base SEMPRE veio pela metade —
+        # foi o que aconteceu aqui, com 57% dos clientes faturados fora do
+        # cadastro e nenhum aviso. Comparar com o faturamento é absoluto: cliente
+        # que compra tem de existir no cadastro.
+        nomes_cadastro = {
+            normalize_client_key(r["client_name"])
+            for r in conn.execute(
+                "SELECT client_name FROM crm_client_profiles WHERE company_id = ?", (company_id,)
+            ).fetchall()
+        }
+        nomes_faturados = {
+            normalize_client_key(r["client_name"])
+            for r in conn.execute(
+                "SELECT DISTINCT client_name FROM fact_sales_detail WHERE company_id = ?",
+                (company_id,),
+            ).fetchall()
+        }
+        if nomes_faturados:
+            fora = len(nomes_faturados - nomes_cadastro)
+            cobertura = 100 * (1 - fora / len(nomes_faturados))
+            result["coveragePct"] = round(cobertura, 1)
+            result["clientsMissingFromRegistry"] = fora
+            _msg += f" · cobertura do faturamento: {cobertura:.1f}%"
+            if cobertura < 85:
+                result["warning"] = (
+                    f"ATENÇÃO: {fora} cliente(s) que compraram não estão no cadastro "
+                    f"({cobertura:.1f}% de cobertura). A base do Alfa vem em DOIS arquivos — "
+                    "confirme que os dois estavam na pasta antes da importação."
+                )
+                _msg += " ⚠ cadastro incompleto"
         result["message"] = _msg
     return result
 
