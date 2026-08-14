@@ -1050,6 +1050,10 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if "contact_name" not in interaction_columns:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_name TEXT")
     if "origin" not in interaction_columns:
+        _precisa_backfill_origem = True
+    else:
+        _precisa_backfill_origem = False
+    if "origin" not in interaction_columns:
         # De onde nasceu o contato: de uma TAREFA (retorno que o vendedor
         # agendou, cobrança do gestor, ação de visita) ou da rotina da carteira
         # e da Missão do Dia. Sem isso o gestor não distingue quem só cumpre
@@ -1096,6 +1100,38 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE crm_tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'FOLLOWUP'")
     if "priority" not in task_columns:
         conn.execute("ALTER TABLE crm_tasks ADD COLUMN priority TEXT NOT NULL DEFAULT 'NORMAL'")
+
+    # Roda AQUI, e não junto da criação da coluna: o backfill lê
+    # crm_tasks.origin, que só existe depois da migração logo acima.
+    if _precisa_backfill_origem:
+        # Registros anteriores à coluna ficariam fora de qualquer filtro de
+        # origem — e o filtro nasceria devolvendo zero para todo o histórico.
+        #
+        # O registro de contato SEMPRE conclui as tarefas abertas do cliente no
+        # mesmo instante. Então, tarefa concluída a menos de 5 minutos do
+        # registro é a tarefa que originou aquele contato. É inferência, não
+        # certeza — mas erra pouco, e o que sobra vira "carteira/missão", que é
+        # o que de fato acontece quando não havia tarefa nenhuma.
+        conn.execute(
+            """
+            UPDATE crm_interactions SET origin = (
+                SELECT COALESCE(t.origin, 'FOLLOWUP') FROM crm_tasks t
+                WHERE t.company_id = crm_interactions.company_id
+                  AND t.client_key = crm_interactions.client_key
+                  AND UPPER(t.seller_name) = UPPER(crm_interactions.seller_name)
+                  AND t.status = 'CONCLUIDA' AND t.completed_at IS NOT NULL
+                  AND ABS(julianday(REPLACE(t.completed_at,'T',' '))
+                          - julianday(REPLACE(crm_interactions.created_at,'T',' '))) < 0.0035
+                LIMIT 1)
+            WHERE origin IS NULL
+            """
+        )
+        _restantes = conn.execute(
+            "UPDATE crm_interactions SET origin = 'ESPONTANEO' WHERE origin IS NULL"
+        ).rowcount
+        print(f"[contatos] origem preenchida no histórico · {_restantes} classificado(s) "
+              "como carteira/missão do dia")
+
     if "created_by_name" not in task_columns:
         conn.execute("ALTER TABLE crm_tasks ADD COLUMN created_by_name TEXT")
     if "created_by_user_id" not in task_columns:
@@ -7398,7 +7434,10 @@ def contact_history(
         "contactResults": [dict(r) for r in conn.execute(
             "SELECT code, label FROM crm_contact_results WHERE is_active = 1 ORDER BY code").fetchall()],
         "receptiveTypes": CRM_RECEPTIVE_TYPES,
-        "origins": CONTACT_ORIGINS,
+        # O seletor já tem o atalho "Carteira / Missão do Dia" no topo, então a
+        # lista detalhada traz só as origens de TAREFA — repetir a mesma opção
+        # duas vezes fazia parecer que uma delas era outra coisa.
+        "origins": [o for o in CONTACT_ORIGINS if o["id"] != "ESPONTANEO"],
         "callGoalMonth": CALL_GOAL_MONTH,
         "isManagerView": escopo != "proprio",
     }
