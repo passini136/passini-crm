@@ -551,6 +551,19 @@ INITIATIVE_RECEPTIVE = "RECEPTIVO"
 # iniciativa, não volume de atendimento.
 INITIATIVE_SUPPORT = "APOIO"
 
+# Origem do contato. A ordem da lista é a de prioridade quando o cliente tem
+# mais de uma tarefa aberta: cobrança do gestor pesa mais que retorno próprio.
+CONTACT_ORIGINS = [
+    {"id": "COBRANCA",   "label": "Cobrança do gestor", "icon": "📣"},
+    {"id": "VISITA",     "label": "Ação de visita",     "icon": "🗺️"},
+    {"id": "FOLLOWUP",   "label": "Retorno agendado",   "icon": "🔁"},
+    {"id": "LIVRE",      "label": "Direcionamento",     "icon": "🎯"},
+    {"id": "APOIO",      "label": "Apoio a outro",      "icon": "🤝"},
+    {"id": "ESPONTANEO", "label": "Carteira / Missão do Dia", "icon": "📋"},
+]
+CONTACT_ORIGIN_LABELS = {o["id"]: o["label"] for o in CONTACT_ORIGINS}
+CONTACT_ORIGIN_PRIORITY = [o["id"] for o in CONTACT_ORIGINS]
+
 CRM_CONTACT_RESULTS = [
     ("FALOU_CLIENTE", "Falou com o cliente", 0, 0),
     ("NAO_ATENDEU", "Nao atendeu", 1, 1),
@@ -1036,6 +1049,13 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_phone TEXT")
     if "contact_name" not in interaction_columns:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_name TEXT")
+    if "origin" not in interaction_columns:
+        # De onde nasceu o contato: de uma TAREFA (retorno que o vendedor
+        # agendou, cobrança do gestor, ação de visita) ou da rotina da carteira
+        # e da Missão do Dia. Sem isso o gestor não distingue quem só cumpre
+        # agenda de quem trabalha a carteira por conta própria — e são
+        # comportamentos bem diferentes.
+        conn.execute("ALTER TABLE crm_interactions ADD COLUMN origin TEXT")
     if "initiative" not in interaction_columns:
         # ATIVO = o vendedor procurou o cliente. É o que conta na meta.
         # RECEPTIVO = o cliente procurou, ou é uma anotação sobre ele. Registra
@@ -7220,6 +7240,15 @@ def contact_history(
     if iniciativa in {INITIATIVE_ACTIVE, INITIATIVE_RECEPTIVE, INITIATIVE_SUPPORT}:
         condicoes.append("i.initiative = ?")
         params.append(iniciativa)
+    origem = normalize_upper(filtros.get("origin"))
+    if origem == "__TAREFA__":
+        condicoes.append("i.origin IN ('COBRANCA','VISITA','FOLLOWUP','LIVRE')")
+    elif origem == "__SEM_TAREFA__":
+        condicoes.append("COALESCE(i.origin,'') = 'ESPONTANEO'")
+    elif origem:
+        condicoes.append("i.origin = ?")
+        params.append(origem)
+
     carteira = normalize_whitespace(filtros.get("portfolio"))
     if carteira == "__SEM_VENDEDOR__":
         condicoes.append(
@@ -7256,6 +7285,7 @@ def contact_history(
         SELECT i.id, i.client_key, i.client_name, i.seller_name, i.unit_name,
                i.contact_type_code, i.result_code, i.occurred_at, i.notes,
                i.next_action, i.followup_due_at, i.initiative, i.offer_title,
+               COALESCE(i.origin, '') AS origin,
                t.label AS type_label, r.label AS result_label,
                NULLIF(TRIM(COALESCE(p.internal_seller_name, '')), '') AS portfolio_seller
         FROM crm_interactions i
@@ -7270,6 +7300,9 @@ def contact_history(
         (*params, limite),
     ).fetchall()]
     for item in itens:
+        item["originLabel"] = CONTACT_ORIGIN_LABELS.get(
+            item.get("origin"), "Não informado")
+        item["fromTask"] = item.get("origin") in {"COBRANCA", "VISITA", "FOLLOWUP", "LIVRE"}
         dono = normalize_whitespace(item.get("portfolio_seller"))
         item["portfolioSeller"] = dono or "Sem vendedor"
         # Contato cruzado: quem ligou não é o dono da carteira. Prospect (P-*)
@@ -7287,6 +7320,9 @@ def contact_history(
             SUM(CASE WHEN i.initiative = 'ATIVO' THEN 1 ELSE 0 END) AS ativos,
             SUM(CASE WHEN i.initiative = 'RECEPTIVO' THEN 1 ELSE 0 END) AS receptivos,
             SUM(CASE WHEN i.initiative = 'APOIO' THEN 1 ELSE 0 END) AS apoios,
+            SUM(CASE WHEN i.origin IN ('COBRANCA','VISITA','FOLLOWUP','LIVRE')
+                     THEN 1 ELSE 0 END) AS deTarefa,
+            SUM(CASE WHEN COALESCE(i.origin,'') = 'ESPONTANEO' THEN 1 ELSE 0 END) AS espontaneos,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.contact_type_code = 'LIGACAO'
                      THEN 1 ELSE 0 END) AS ligacoes,
             SUM(CASE WHEN i.initiative = 'ATIVO' AND i.result_code = 'FALOU_CLIENTE'
@@ -7362,6 +7398,7 @@ def contact_history(
         "contactResults": [dict(r) for r in conn.execute(
             "SELECT code, label FROM crm_contact_results WHERE is_active = 1 ORDER BY code").fetchall()],
         "receptiveTypes": CRM_RECEPTIVE_TYPES,
+        "origins": CONTACT_ORIGINS,
         "callGoalMonth": CALL_GOAL_MONTH,
         "isManagerView": escopo != "proprio",
     }
@@ -11406,6 +11443,25 @@ def create_crm_interaction(
             _refresh_prospect_status(conn, company_id, int(client_key[len(PROSPECT_KEY_PREFIX):]))
         except (ValueError, sqlite3.Error) as exc:
             print(f"[prospects] status não atualizado para {client_key}: {exc}", flush=True)
+
+    # ORIGEM: lida ANTES de fechar as tarefas, senão não sobra o que ler. Se
+    # havia tarefa aberta para este cliente, o contato nasceu dela; se não,
+    # nasceu da rotina da carteira ou da fila da Missão do Dia.
+    abertas = [normalize_upper(r["origin"]) for r in conn.execute(
+        """
+        SELECT COALESCE(origin, 'FOLLOWUP') AS origin FROM crm_tasks
+        WHERE company_id = ? AND client_key = ? AND UPPER(seller_name) = ?
+          AND status IN ('ABERTA', 'ATRASADA', 'REAGENDADA')
+        """,
+        (company_id, client_key, normalize_upper(seller_name)),
+    ).fetchall()]
+    if iniciativa == INITIATIVE_SUPPORT:
+        origem = "APOIO"
+    elif abertas:
+        origem = next((o for o in CONTACT_ORIGIN_PRIORITY if o in abertas), "FOLLOWUP")
+    else:
+        origem = "ESPONTANEO"
+    conn.execute("UPDATE crm_interactions SET origin = ? WHERE id = ?", (origem, interaction_id))
 
     # Registrar o contato encerra as tarefas abertas daquele cliente para aquele
     # vendedor. Sem isso o retorno continuava aparecendo em "Retornos de hoje"
@@ -17161,7 +17217,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 filtros = {k: query.get(k, [""])[0] for k in
                            ("start", "end", "seller", "type", "result", "initiative",
-                            "search", "portfolio", "limit", "export")}
+                            "search", "portfolio", "origin", "limit", "export")}
                 with closing(get_connection()) as conn:
                     dados = contact_history(conn, user["company_id"], user, filtros)
                 self._set_headers(200)

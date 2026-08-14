@@ -9,7 +9,7 @@ const state = {
   leads: null,         // base fria de empresas que ainda não são clientes
   leadFilters: { city: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
   contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
-                    search: "", portfolio: "", limit: "300" },
+                    search: "", portfolio: "", origin: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
@@ -919,6 +919,7 @@ async function exportContatosXLSX() {
       i.client_name || i.client_key,
       ...(gerente ? [i.seller_name || "", i.portfolioSeller || "", i.crossPortfolio ? "Sim" : "Não"] : []),
       i.type_label || i.contact_type_code,
+      i.originLabel || "",
       i.initiative === "RECEPTIVO" ? "Receptivo" : (i.initiative === "APOIO" ? "Apoio" : "Ativo"),
       i.result_label || i.result_code,
       i.notes || "",
@@ -928,7 +929,7 @@ async function exportContatosXLSX() {
     await baixarPlanilha("contatos", "Contatos",
       ["Quando", "Cliente",
        ...(gerente ? ["Vendedor do contato", "Carteira", "Contato cruzado"] : []),
-       "Tipo", "Iniciativa", "Resultado", "Observação", "Retorno"], linhas);
+       "Tipo", "Origem", "Iniciativa", "Resultado", "Observação", "Retorno"], linhas);
     addMessage("success", `Planilha exportada — ${linhas.length} registro(s).`);
   } catch (e) {
     addMessage("error", "Erro ao exportar: " + (e.message || e));
@@ -4965,6 +4966,15 @@ function contatosView() {
               <option value="">Todos</option>
               ${(d.contactResults || []).map((c) => `<option value="${escapeHtml(c.code)}" ${f.result === c.code ? "selected" : ""}>${escapeHtml(c.label)}</option>`).join("")}
             </select></div>
+          <div class="field"><label>Origem do contato</label>
+            <select onchange="setContactFilter('origin', this.value)">
+              <option value="">Todas as origens</option>
+              <option value="__TAREFA__" ${f.origin === "__TAREFA__" ? "selected" : ""}>
+                📌 Veio de tarefa agendada${t.deTarefa ? ` (${number(t.deTarefa)})` : ""}</option>
+              <option value="__SEM_TAREFA__" ${f.origin === "__SEM_TAREFA__" ? "selected" : ""}>
+                📋 Carteira / Missão do Dia${t.espontaneos ? ` (${number(t.espontaneos)})` : ""}</option>
+              ${(d.origins || []).map((o) => `<option value="${escapeHtml(o.id)}" ${f.origin === o.id ? "selected" : ""}>${o.icon} ${escapeHtml(o.label)}</option>`).join("")}
+            </select></div>
           <div class="field"><label>Iniciativa</label>
             <select onchange="setContactFilter('initiative', this.value)">
               <option value="">Ativo e receptivo</option>
@@ -4986,6 +4996,8 @@ function contatosView() {
                   `${number(t.converteu || 0)} registros`, "")}
         ${kpiCard("Clientes distintos", number(t.clientes || 0),
                   `${number(t.receptivos || 0)} registro(s) receptivo(s)`, "")}
+        ${kpiCard("Vieram de tarefa", number(t.deTarefa || 0),
+                  `${number(t.espontaneos || 0)} da carteira/missão`, "")}
       </div>
 
       ${gerente && (d.sellers || []).length ? `
@@ -5047,7 +5059,10 @@ function contatosView() {
                         : escapeHtml(i.portfolioSeller)}
                       ${i.crossPortfolio ? '<div style="color:#b06000;font-weight:700">⚠ outra carteira</div>' : ""}
                     </td>` : ""}
-                  <td class="text-small">${escapeHtml(i.type_label || i.contact_type_code)} ${badgeIniciativa(i.initiative)}</td>
+                  <td class="text-small">${escapeHtml(i.type_label || i.contact_type_code)} ${badgeIniciativa(i.initiative)}
+                    <div style="color:${i.fromTask ? "#1a5276" : "var(--muted)"};font-size:11px">
+                      ${i.fromTask ? "📌 " : ""}${escapeHtml(i.originLabel || "")}</div>
+                  </td>
                   <td class="text-small">${escapeHtml(i.result_label || i.result_code)}</td>
                   <td class="text-small" style="max-width:340px">${escapeHtml((i.notes || "").slice(0, 160))}${(i.notes || "").length > 160 ? "…" : ""}</td>
                   <td class="text-small">${escapeHtml(i.followup_due_at ? shortDate(i.followup_due_at) : "-")}</td>
