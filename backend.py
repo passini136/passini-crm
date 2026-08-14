@@ -2152,6 +2152,10 @@ def init_db() -> None:
                 claimed_by TEXT,
                 claimed_at TEXT,
                 discard_reason TEXT,
+                -- Código do cliente quando o lead já é da casa. Guardar o
+                -- vínculo (em vez de só esconder a linha) é o que permite
+                -- abrir a ficha e não perguntar de novo no mês seguinte.
+                client_code TEXT,
                 created_at TEXT NOT NULL,
                 UNIQUE(company_id, cnpj),
                 FOREIGN KEY (company_id) REFERENCES companies(id)
@@ -4224,6 +4228,12 @@ def import_package(
                     "confirme que os dois estavam na pasta antes da importação."
                 )
                 _msg += " ⚠ cadastro incompleto"
+        # Cadastro novo pode conter empresas que estavam na base fria. Revarrer
+        # aqui evita o vendedor ligar para quem virou cliente semana passada.
+        _leads_marcados = mark_leads_already_clients(conn, company_id)
+        if _leads_marcados:
+            result["leadsMarkedAsClients"] = _leads_marcados
+            _msg += f" · {_leads_marcados} lead(s) da base de prospecção viraram clientes"
         result["message"] = _msg
     return result
 
@@ -8486,6 +8496,62 @@ def import_prospect_leads(conn: sqlite3.Connection, company_id: int, conteudo: b
                        f"{marcados} já são clientes e saíram da fila."}
 
 
+def mark_lead_as_client(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    lead_id: Any, client_code: str = "",
+) -> dict[str, Any]:
+    """Marca o lead como cliente da casa e guarda de qual código ele é.
+
+    Duas formas de chegar lá: o CNPJ bate com o cadastro (o sistema acha
+    sozinho) ou a pessoa informa o código. Guardar o vínculo importa mais do que
+    esconder a linha — na próxima carga da base o mesmo CNPJ voltaria e alguém
+    perderia a ligação de novo descobrindo a mesma coisa.
+    """
+    lead = conn.execute(
+        "SELECT * FROM prospect_leads WHERE company_id = ? AND id = ?",
+        (company_id, int(lead_id))).fetchone()
+    if not lead:
+        raise ValueError("Lead não encontrado.")
+
+    codigo = normalize_whitespace(client_code)
+    cliente = find_client_by_code(conn, company_id, codigo) if codigo else None
+    if not cliente:
+        # Sem código informado: procura pelo CNPJ, que é o vínculo confiável.
+        linha = conn.execute(
+            """
+            SELECT client_code, client_name,
+                   COALESCE(NULLIF(TRIM(internal_seller_name),''),'') AS vendedor
+            FROM crm_client_profiles
+            WHERE company_id = ?
+              AND REPLACE(REPLACE(REPLACE(COALESCE(document_number,''),'.',''),'/',''),'-','') = ?
+            LIMIT 1
+            """,
+            (company_id, lead["cnpj"]),
+        ).fetchone()
+        cliente = dict(linha) if linha else None
+    if codigo and not cliente:
+        raise ValueError(f"Não existe cliente com o código {codigo} no cadastro.")
+
+    conn.execute(
+        "UPDATE prospect_leads SET status = 'CLIENTE', client_code = ?, claimed_by = ?, "
+        "claimed_at = ? WHERE company_id = ? AND id = ?",
+        ((cliente or {}).get("client_code"), seller_identity_for_user(user), now_iso(),
+         company_id, int(lead_id)))
+    audit_log(conn, company_id, user["id"], "marcar_cliente", "prospect_leads", str(lead_id),
+              {"clientCode": (cliente or {}).get("client_code") or "sem código"})
+    conn.commit()
+
+    if cliente:
+        dono = normalize_whitespace(cliente.get("vendedor")) or "sem vendedor no cadastro"
+        return {"message": f"{lead['razao_social']} já é cliente: código "
+                           f"{cliente['client_code']} · {dono}.",
+                "clientCode": cliente["client_code"], "sellerName": cliente.get("vendedor") or ""}
+    return {"message": f"{lead['razao_social']} marcado como já cadastrado. "
+                       "Sem CNPJ correspondente no cadastro — informe o código depois, "
+                       "se quiser abrir a ficha por aqui.",
+            "clientCode": ""}
+
+
 def mark_leads_already_clients(conn: sqlite3.Connection, company_id: int) -> int:
     """Lead cujo CNPJ já está no cadastro do Alfa deixa de ser lead.
 
@@ -8495,7 +8561,14 @@ def mark_leads_already_clients(conn: sqlite3.Connection, company_id: int) -> int
     """
     return conn.execute(
         """
-        UPDATE prospect_leads SET status = 'CLIENTE'
+        UPDATE prospect_leads SET
+            status = 'CLIENTE',
+            client_code = (
+                SELECT p.client_code FROM crm_client_profiles p
+                WHERE p.company_id = prospect_leads.company_id
+                  AND REPLACE(REPLACE(REPLACE(COALESCE(p.document_number,''),'.',''),'/',''),'-','')
+                      = prospect_leads.cnpj
+                LIMIT 1)
         WHERE company_id = ? AND status = 'NOVO' AND cnpj IN (
             SELECT REPLACE(REPLACE(REPLACE(COALESCE(document_number,''),'.',''),'/',''),'-','')
             FROM crm_client_profiles WHERE company_id = ?
@@ -17871,7 +17944,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path in {"/api/prospects/leads/claim", "/api/prospects/leads/discard",
-                        "/api/prospects/leads/restore"}:
+                        "/api/prospects/leads/restore", "/api/prospects/leads/client"}:
                 user = self._require_auth()
                 if not user:
                     return
@@ -17882,6 +17955,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             res = claim_prospect_lead(conn, user["company_id"], user,
                                                       payload.get("id"),
                                                       payload.get("sellerName") or "")
+                        elif path.endswith("/client"):
+                            res = mark_lead_as_client(conn, user["company_id"], user,
+                                                      payload.get("id"),
+                                                      payload.get("clientCode") or "")
                         elif path.endswith("/restore"):
                             res = restore_prospect_lead(conn, user["company_id"], user,
                                                         payload.get("id"))

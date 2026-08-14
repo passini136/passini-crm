@@ -2161,6 +2161,38 @@ async function descartarLead(id, nome) {
   }
 }
 
+/** "Já é cliente": tenta achar o cadastro pelo CNPJ e guarda o vínculo.
+ *  Esconder a linha resolveria hoje; guardar o código resolve para sempre. */
+async function marcarLeadCliente(id, nome) {
+  try {
+    const r = await api("/api/prospects/leads/client", {
+      method: "POST", body: JSON.stringify({ id }),
+    });
+    addMessage("success", r.message);
+    if (r.clientCode && window.confirm(`${r.message}\n\nAbrir a ficha deste cliente?`)) {
+      await openCrmClient(r.clientCode, true, true, { outside: true });
+    }
+    await loadLeads();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+/** Quando o CNPJ não bate, o gestor informa o código na mão. */
+async function vincularLeadPorCodigo(id, nome) {
+  const codigo = window.prompt(`Qual o código de "${nome}" no cadastro do Alfa?`);
+  if (!codigo) return;
+  try {
+    const r = await api("/api/prospects/leads/client", {
+      method: "POST", body: JSON.stringify({ id, clientCode: codigo.trim() }),
+    });
+    addMessage("success", r.message);
+    await loadLeads();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
 async function restaurarLead(id) {
   try {
     const r = await api("/api/prospects/leads/restore", { method: "POST", body: JSON.stringify({ id }) });
@@ -2279,13 +2311,23 @@ function blocoBaseDeLeads() {
                       <td class="text-small">${escapeHtml(l.porte || "-")}<div style="color:var(--muted)">${escapeHtml(l.faixa_faturamento || "")}</div></td>
                       <td>${chanceLead(l.chance_contato)}</td>
                       <td style="text-align:right;white-space:nowrap">
-                        ${l.status === "DESCARTADO" ? `
+                        ${l.status === "CLIENTE" ? (l.client_code ? `
+                          <button class="btn btn-ghost btn-sm" type="button"
+                            onclick="openCrmClient('${jsAttr(l.client_code)}', true, true, { outside: true })">
+                            Ficha ${escapeHtml(l.client_code)}</button>`
+                          : `<button class="btn btn-ghost btn-sm" type="button"
+                            onclick="vincularLeadPorCodigo(${Number(l.id)}, '${jsAttr(l.razao_social)}')">
+                            Informar código</button>`)
+                        : l.status === "DESCARTADO" ? `
                           <button class="btn btn-ghost btn-sm" type="button"
                             onclick="restaurarLead(${Number(l.id)})">Devolver à base</button>`
                         : l.status !== "NOVO" ? `<span class="text-small" style="color:var(--muted)">${escapeHtml(l.claimed_by || l.status)}</span>`
                         : `
                           <button class="btn btn-primary btn-sm" type="button"
                             onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>
+                          <button class="btn btn-secondary btn-sm" type="button"
+                            title="Esta empresa já é cliente da Passini — o sistema busca o código pelo CNPJ"
+                            onclick="marcarLeadCliente(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Já é cliente</button>
                           ${d.canManage ? `<button class="btn btn-ghost btn-sm" type="button"
                             title="Tira da base de todos os vendedores"
                             onclick="descartarLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Descartar</button>` : ""}`}
@@ -2296,6 +2338,8 @@ function blocoBaseDeLeads() {
               </table>
             </div>
             <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
+              Achou uma empresa que já compra da Passini? <strong>Já é cliente</strong> tira da fila
+              e guarda o vínculo pelo CNPJ — na próxima carga da base ela não volta.<br>
               A ordem prioriza quem tem telefone confiável — ligação que não completa é tempo
               perdido antes da abordagem. <strong>Assumir</strong> cria o prospect no seu nome com
               os dados já preenchidos; <strong>Descartar</strong> tira da fila sem apagar o registro.
