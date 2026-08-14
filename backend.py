@@ -1024,6 +1024,13 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
                 ON crm_interactions(company_id, client_key);
         """
     )
+    # Colunas acrescentadas depois que a tabela já existia em produção.
+    # CREATE TABLE IF NOT EXISTS não altera tabela existente — sem este ALTER,
+    # o servidor sobe e só quebra na hora do clique, com "no such column".
+    lead_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospect_leads)").fetchall()}
+    if lead_columns and "client_code" not in lead_columns:
+        conn.execute("ALTER TABLE prospect_leads ADD COLUMN client_code TEXT")
+
     interaction_columns = {row["name"] for row in conn.execute("PRAGMA table_info(crm_interactions)").fetchall()}
     if "contact_phone" not in interaction_columns:
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN contact_phone TEXT")
