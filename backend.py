@@ -3126,6 +3126,55 @@ def projection_metrics(realized_value: float, elapsed_days: int, total_days: int
     return projected, pace_pct
 
 
+# Faixas de meta usadas no ritmo diário. 105% existe só para o vendedor: é a
+# faixa de premiação, e saber quanto falta por dia para chegar lá é o que
+# transforma a meta em decisão do dia seguinte.
+PACE_TARGETS_DEFAULT = (100, 95, 90)
+PACE_TARGETS_SELLER = (105, 100, 95, 90)
+
+
+def daily_pace(
+    revenue_net: float, revenue_goal: float, elapsed_days: int, total_days: int,
+    targets: tuple[int, ...] = PACE_TARGETS_DEFAULT,
+) -> dict[str, Any]:
+    """Média diária vendida e a média necessária para fechar em cada faixa.
+
+    A conta que a equipe faz de cabeça, e erra: dividir o que falta pelos dias
+    ÚTEIS que restam, não pelos dias corridos. No fim do mês a diferença entre
+    os dois é o que separa "dá tempo" de "não deu".
+
+    Sem meta, devolve só o realizado — número inventado seria pior que nenhum.
+    """
+    elapsed_days = max(int(elapsed_days or 0), 0)
+    total_days = max(int(total_days or 0), 0)
+    restantes = max(total_days - elapsed_days, 0)
+    realizado_dia = safe_div(revenue_net, elapsed_days) if elapsed_days else 0.0
+
+    faixas: list[dict[str, Any]] = []
+    for alvo in targets:
+        meta_alvo = revenue_goal * alvo / 100
+        falta = meta_alvo - revenue_net
+        faixas.append({
+            "pct": alvo,
+            "targetValue": round(meta_alvo, 2),
+            "missing": round(max(falta, 0.0), 2),
+            "reached": falta <= 0,
+            # Sem dia útil restante não existe média a perseguir: o mês acabou.
+            "dailyNeeded": round(safe_div(falta, restantes), 2) if restantes and falta > 0 else 0.0,
+            # Quanto a mais por dia que o ritmo atual — é o esforço extra real.
+            "deltaVsActual": round(safe_div(falta, restantes) - realizado_dia, 2)
+                             if restantes and falta > 0 else 0.0,
+        })
+
+    return {
+        "dailyActual": round(realizado_dia, 2),
+        "elapsedDays": elapsed_days,
+        "remainingDays": restantes,
+        "hasGoal": revenue_goal > 0,
+        "targets": faixas if revenue_goal > 0 else [],
+    }
+
+
 def dashboard_metric_projection(realized_value: float, elapsed_days: int, total_days: int) -> tuple[float, float]:
     if elapsed_days <= 0 or total_days <= 0:
         return 0.0, 0.0
@@ -12066,6 +12115,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "missingGoal": revenue_goal <= 0,
                 "inDeployment": normalize_unit(base_unit) in unidades_implantacao,
                 "metaDiaria": round(daily_goal_value, 2),
+                "pace": daily_pace(revenue_net, revenue_goal, seller_elapsed_days,
+                                   seller_total_days, PACE_TARGETS_SELLER),
                 "sellerWorkingDays": seller_total_days,
                 "sellerElapsedWorkingDays": seller_elapsed_days,
                 "vacationDays": summary_calendar["totalWorkingDays"] - seller_total_days,
@@ -12109,6 +12160,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "projectedRevenue": projected_revenue,
                 "dailyRevenueActual": round(daily_revenue_actual, 2),
                 "dailyGoal": round(daily_goal_value, 2),
+                "pace": daily_pace(revenue_net, revenue_goal,
+                                   unit_calendar["elapsedWorkingDays"],
+                                   unit_calendar["totalWorkingDays"]),
                 "returnsValue": round(returns_value, 2),
                 "warrantyReturnsValue": round(warranty_value, 2),
                 "returnsTotalValue": round(returns_total, 2),
@@ -12431,6 +12485,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "projectedGoalAttainmentPct": round(safe_div(projection_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
             "dailyRevenueActual": daily_revenue_actual,
             "dailyGoal": daily_goal,
+            "pace": daily_pace(summary_revenue, summary_goal,
+                               summary_calendar["elapsedWorkingDays"],
+                               summary_calendar["totalWorkingDays"]),
             "revenuePfPct": revenue_pf_pct,
             "revenuePjPct": revenue_pj_pct,
             "ticketAverage": summary_ticket_average,

@@ -3327,6 +3327,19 @@ function sellerRows(rows) {
     .join("");
 }
 
+/** Célula compacta de ritmo para as tabelas: realizado/dia → necessário/dia. */
+function celulaRitmo(pace, alvo = 100) {
+  if (!pace) return "-";
+  const t = (pace.targets || []).find((x) => x.pct === alvo);
+  if (!pace.hasGoal) return `<span class="text-small" style="color:var(--muted)">sem meta</span>`;
+  if (!t) return "-";
+  if (t.reached) return `<span style="color:var(--good);font-weight:700">✓ ${alvo}%</span>`;
+  if (!pace.remainingDays) return `<span class="text-small" style="color:var(--muted)">mês encerrado</span>`;
+  const pior = t.dailyNeeded > pace.dailyActual * 1.2;
+  return `<strong style="color:${pior ? "var(--bad)" : "var(--text)"}">${currency(t.dailyNeeded)}</strong>
+    <div class="text-small" style="color:var(--muted)">atual ${currency(pace.dailyActual)}</div>`;
+}
+
 function unitRows(rows) {
   return rows
     .map(
@@ -3344,6 +3357,7 @@ function unitRows(rows) {
         <td>${number(row.qtySold || 0)}</td>
         <td>${currency(row.ticketPerPiece || 0)}</td>
         <td>${currency(row.metaDiaria)}</td>
+        <td>${celulaRitmo(row.pace, 100)}</td>
       </tr>
     `
     )
@@ -3557,6 +3571,7 @@ function vendedoresViewTableOnly() {
                   <th>% Meta</th>
                   <th>% Meta Proj.</th>
                   <th>Meta diária</th>
+                  <th title="Quanto precisa vender por dia útil restante para fechar em 100%">R$/dia p/ 100%</th>
                   <th>Ticket</th>
                   <th>Peças</th>
                   <th>Ticket/peça</th>
@@ -3582,6 +3597,7 @@ function vendedoresViewTableOnly() {
                   <td>${pct(row.goalAttainmentPct)}</td>
                   <td>${pct(row.projectedGoalAttainmentPct || 0)}</td>
                   <td>${currency(row.metaDiaria)}</td>
+                  <td>${celulaRitmo(row.pace, 100)}</td>
                   <td>${currency(row.ticketAverage)}</td>
                   <td>${number(row.qtySold || 0)}</td>
                   <td>${currency(row.ticketPerPiece || 0)}</td>
@@ -11458,7 +11474,7 @@ function unitsView() {
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th></tr>
+            <tr><th>Unidade</th><th>Líquido</th><th>Meta</th><th>% Meta</th><th>% Proj.</th><th>Dev. comercial</th><th>% Dev.</th><th>Dev. garantia</th><th>Margem</th><th>Qtd. Peças</th><th>Ticket/Peça</th><th>Meta diária</th><th title="Quanto precisa vender por dia útil restante para fechar em 100%">R$/dia p/ 100%</th></tr>
           </thead>
           <tbody>${unitRows(applyTableSort(state.dashboard.unitPerformance || [], "unidades"))}</tbody>
         </table>
@@ -13103,6 +13119,61 @@ function loadingBanner() {
   return `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">⏳ Atualizando dados…</div>`;
 }
 
+/** Ritmo diário: o que está sendo vendido por dia e o que falta por dia útil.
+ *
+ * A conta que todo mundo faz de cabeça e erra, porque divide pelos dias
+ * corridos. Aqui é por dia ÚTIL restante — no fim do mês, a diferença entre os
+ * dois é o que separa "dá tempo" de "não deu".
+ */
+function blocoRitmoDiario(pace, titulo) {
+  if (!pace) return "";
+  if (!pace.hasGoal) {
+    return `
+      <div class="form-card" style="padding:12px 18px">
+        <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em">RITMO DIÁRIO</div>
+        <div style="margin-top:6px">Média vendida por dia útil: <strong>${currency(pace.dailyActual)}</strong>
+          <span class="text-small" style="color:var(--muted)"> · ${number(pace.elapsedDays)} de
+          ${number(pace.elapsedDays + pace.remainingDays)} dias úteis</span></div>
+        <div class="text-small" style="color:var(--muted);margin-top:4px">
+          Sem meta definida nesta competência, não há quanto perseguir por dia.
+        </div>
+      </div>`;
+  }
+
+  const fim = pace.remainingDays <= 0;
+  return `
+    <div class="form-card" style="padding:14px 18px">
+      <div class="section-title" style="margin-bottom:8px">
+        <div>
+          <h3 style="font-size:15px">${escapeHtml(titulo)}</h3>
+          <div class="text-small">Média atual <strong>${currency(pace.dailyActual)}</strong>/dia útil ·
+            ${number(pace.elapsedDays)} dia(s) corrido(s), <strong>${number(pace.remainingDays)}</strong> restante(s)</div>
+        </div>
+      </div>
+      ${fim ? `<div class="text-small" style="color:var(--muted)">Mês encerrado — não há dias úteis restantes.</div>` : `
+        <div style="display:flex;gap:12px;flex-wrap:wrap">
+          ${pace.targets.map((t) => {
+            const cor = t.pct >= 105 ? "#6a1b9a" : t.pct >= 100 ? "var(--accent)" : t.pct >= 95 ? "#b06000" : "var(--muted)";
+            return `
+            <div style="flex:1;min-width:150px;background:#fff;border:1px solid var(--line);
+                        border-left:3px solid ${cor};border-radius:0 10px 10px 0;padding:10px 12px">
+              <div class="text-small" style="color:var(--muted)">Para fechar em <strong>${t.pct}%</strong></div>
+              ${t.reached
+                ? `<div style="font-size:18px;font-weight:800;color:var(--good)">✓ atingido</div>
+                   <div class="text-small" style="color:var(--muted)">meta ${currency(t.targetValue)}</div>`
+                : `<div style="font-size:19px;font-weight:800;color:${cor}">${currency(t.dailyNeeded)}<span
+                       style="font-size:12px;font-weight:500;color:var(--muted)">/dia</span></div>
+                   <div class="text-small" style="color:var(--muted)">faltam ${currency(t.missing)}</div>
+                   <div class="text-small" style="color:${t.deltaVsActual > 0 ? "var(--bad)" : "var(--good)"}">
+                     ${t.deltaVsActual > 0 ? `+${currency(t.deltaVsActual)}/dia vs ritmo atual`
+                                           : `${currency(Math.abs(t.deltaVsActual))}/dia abaixo do ritmo atual`}
+                   </div>`}
+            </div>`;
+          }).join("")}
+        </div>`}
+    </div>`;
+}
+
 function executivoView() {
   if (!state.dashboard) return `<div class="loader panel">Carregando dashboard…</div>`;
   // Gerente vê o MESMO Executivo de diretor e admin — os dados já vêm recortados
@@ -13127,6 +13198,17 @@ function executivoView() {
         ${kpiCard("Dias úteis", `${number(s.workingDaysElapsed)}/${number(s.workingDaysTotal)}`, "Meta diária", currency(s.dailyRevenueTarget))}
       </div>
       ${farolLegend(s.paceExpectedPct)}
+      ${(() => {
+        // O vendedor vê o ritmo DELE, que inclui a faixa de 105% — a faixa de
+        // premiação. O consolidado e a unidade param em 100%.
+        if (!roleIsSeller()) return blocoRitmoDiario(s.pace, "Ritmo diário — quanto precisa vender por dia");
+        const eu = (state.dashboard.sellerRanking || [])
+          .find((r) => personKeyJs(r.sellerName) === personKeyJs(meuNomeDeVendas()));
+        const minha = (state.dashboard.sellerRanking || []).length === 1
+          ? state.dashboard.sellerRanking[0] : eu;
+        return blocoRitmoDiario((minha && minha.pace) || s.pace,
+                                "Meu ritmo diário — quanto preciso vender por dia");
+      })()}
       ${(Number(s.ownClients || 0) + Number(s.otherClients || 0)) > 0 ? `
         <div class="form-card" style="padding:12px 18px">
           <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
