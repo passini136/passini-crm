@@ -866,10 +866,17 @@ async function exportCrmClientsXLSX() {
     if (filters.search) query.set("search", filters.search);
     if (filters.itemCode) query.set("itemCode", filters.itemCode);
     query.set("page", "1");
-    query.set("pageSize", "9999");
+    query.set("pageSize", "20000");
+    // export=1 libera o teto de 100 linhas da tela. Sem isso a planilha saía
+    // com a primeira página apenas — 100 clientes de 190, sem nenhum aviso.
+    query.set("export", "1");
     const data = await api(`/api/crm/clients?${query.toString()}`);
     const rows = data.rows || [];
     if (!rows.length) { addMessage("warn", "Nenhum cliente encontrado para exportar."); return; }
+    if (data.total > rows.length) {
+      addMessage("warn", `A planilha traz ${rows.length} de ${data.total} clientes — o limite de `
+        + `exportação foi atingido. Estreite o filtro para levar o resto.`);
+    }
 
     if (!window.XLSX) {
       await new Promise((resolve, reject) => {

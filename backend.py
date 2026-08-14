@@ -10097,12 +10097,21 @@ def filter_crm_client_rows(
     return filtered
 
 
+# Teto de linhas por página na tela. Existe porque cada linha visível recebe
+# oferta sugerida, perguntas e scripts — caro de montar. A EXPORTAÇÃO não passa
+# por esse teto: ela não precisa desse enriquecimento e o usuário espera a
+# planilha com tudo que a tela contou.
+CRM_PAGE_MAX = 100
+CRM_EXPORT_MAX = 20000
+
+
 def query_crm_clients_page(
     conn: sqlite3.Connection,
     company_id: int,
     filters: dict[str, str | None],
     page: int,
     page_size: int,
+    export: bool = False,
 ) -> dict[str, Any]:
     all_rows = list_crm_clients(conn, company_id, filters, attach_context=False)
     item_details = item_purchase_details(conn, company_id, filters.get("itemCode"))
@@ -10110,13 +10119,16 @@ def query_crm_clients_page(
     filtered_rows = filter_crm_client_rows(all_rows, filters, item_buyers)
     filtered_rows = sort_by_search_relevance(filtered_rows, filters.get("search") or "")
     total = len(filtered_rows)
-    safe_page_size = min(max(int(page_size or 50), 1), 100)
+    teto = CRM_EXPORT_MAX if export else CRM_PAGE_MAX
+    safe_page_size = min(max(int(page_size or 50), 1), teto)
     total_pages = max(math.ceil(total / safe_page_size), 1) if total else 1
     safe_page = min(max(int(page or 1), 1), total_pages)
     offset = (safe_page - 1) * safe_page_size
     visible_rows = filtered_rows[offset : offset + safe_page_size]
     attach_engagement_markers(conn, company_id, visible_rows)
-    rows = crm_attach_context(conn, company_id, visible_rows)
+    # Exportação pula o enriquecimento: oferta e script não vão para a planilha
+    # e montar isso para milhares de linhas levaria minutos.
+    rows = visible_rows if export else crm_attach_context(conn, company_id, visible_rows)
     # Só nos clientes da página visível — não faz sentido carregar o detalhe de quem não aparece.
     if item_details:
         for row in rows:
@@ -16414,12 +16426,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 with closing(get_connection()) as conn:
                     filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    exportando = query.get("export", ["0"])[0] in {"1", "true", "sim"}
                     clients = query_crm_clients_page(
                         conn,
                         user["company_id"],
                         filters,
                         parse_int(query.get("page", [1])[0]) or 1,
                         parse_int(query.get("pageSize", [50])[0]) or 50,
+                        export=exportando,
                     )
                 print(
                     "[CRM CLIENTS DEBUG]",
