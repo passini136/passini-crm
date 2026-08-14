@@ -7,7 +7,7 @@ const state = {
   contacts: null,      // histórico de registros de contato
   inactives: null,     // clientes inativos da unidade, para reativação
   leads: null,         // base fria de empresas que ainda não são clientes
-  leadFilters: { city: "", segment: "", search: "", withPhone: false },
+  leadFilters: { city: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
   contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
                     search: "", portfolio: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
@@ -2102,6 +2102,7 @@ async function loadLeads() {
     if (f.segment) q.set("segment", f.segment);
     if (f.search) q.set("q", f.search);
     if (f.withPhone) q.set("withPhone", "1");
+    if (f.status) q.set("status", f.status);
     state.leads = await api(`/api/prospects/leads?${q.toString()}`);
   } catch (error) {
     addMessage("error", error.message);
@@ -2124,8 +2125,19 @@ function setLeadFilter(campo, valor) {
 }
 
 async function assumirLead(id, nome) {
+  // Gestor precisa dizer para QUEM vai o lead — ele não trabalha a oficina.
+  let vendedor = "";
+  if (state.leads?.canManage) {
+    vendedor = state.leadFilters.assignTo || "";
+    if (!vendedor) {
+      addMessage("error", "Escolha primeiro, no alto da lista, para qual vendedor os leads vão.");
+      return;
+    }
+  }
   try {
-    const r = await api("/api/prospects/leads/claim", { method: "POST", body: JSON.stringify({ id }) });
+    const r = await api("/api/prospects/leads/claim", {
+      method: "POST", body: JSON.stringify({ id, sellerName: vendedor }),
+    });
     addMessage("success", r.message || "Lead assumido.");
     await Promise.all([loadLeads(), loadProspects(true)]);
   } catch (error) {
@@ -2134,11 +2146,25 @@ async function assumirLead(id, nome) {
 }
 
 async function descartarLead(id, nome) {
-  const motivo = window.prompt(`Por que descartar "${nome}"?\n(telefone errado, fechou, não é público-alvo…)`);
+  const motivo = window.prompt(
+    `Descartar "${nome}" tira a empresa da base de TODOS os vendedores.\n\n`
+    + `Motivo (telefone errado, empresa fechada, fora do público-alvo):`);
   if (motivo === null) return;
   try {
-    await api("/api/prospects/leads/discard", { method: "POST", body: JSON.stringify({ id, reason: motivo }) });
-    addMessage("success", "Lead descartado.");
+    const r = await api("/api/prospects/leads/discard", {
+      method: "POST", body: JSON.stringify({ id, reason: motivo }),
+    });
+    addMessage("success", r.message || "Lead descartado.");
+    await loadLeads();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function restaurarLead(id) {
+  try {
+    const r = await api("/api/prospects/leads/restore", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", r.message || "Lead devolvido à base.");
     await loadLeads();
   } catch (error) {
     addMessage("error", error.message);
@@ -2196,6 +2222,23 @@ function blocoBaseDeLeads() {
                 onchange="setLeadFilter('withPhone', this.checked)" />
               <span>Só com telefone</span>
             </label></div>
+          ${d?.canManage ? `
+            <div class="field"><label>Situação</label>
+              <select onchange="setLeadFilter('status', this.value)">
+                <option value="">Disponíveis</option>
+                <option value="DESCARTADO" ${f.status === "DESCARTADO" ? "selected" : ""}>Descartados</option>
+                <option value="ADOTADO" ${f.status === "ADOTADO" ? "selected" : ""}>Já assumidos</option>
+                <option value="CLIENTE" ${f.status === "CLIENTE" ? "selected" : ""}>Viraram clientes</option>
+              </select></div>
+            <div class="field">
+              <label>Enviar leads para <span style="color:var(--bad)">*</span></label>
+              <select onchange="state.leadFilters.assignTo=this.value;requestRender()">
+                <option value="">Selecione o vendedor…</option>
+                ${(d.sellers || []).map((v) => `<option value="${escapeHtml(v)}" ${f.assignTo === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+              </select>
+              <div class="text-small" style="color:var(--muted);margin-top:4px">
+                Você não trabalha a oficina — o lead precisa de dono.
+              </div></div>` : ""}
         </div>
 
         ${carregando ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
@@ -2203,9 +2246,13 @@ function blocoBaseDeLeads() {
 
         ${d?.blocked ? `<div class="message error">${escapeHtml(d.blocked)}</div>` : ""}
 
-        ${d && !d.cities?.length ? `
+        ${d && !d.unrestricted && !d.cities?.length && !d.blocked ? `
           <div class="message">Sua unidade ainda não tem cidades mapeadas. Fale com o gestor —
             o mapa fica em Administração → Territórios.</div>` : ""}
+        ${d?.unrestricted ? `
+          <div class="text-small" style="color:var(--muted);margin-top:4px">
+            Seu perfil enxerga o estado inteiro. Vendedor e gerente veem só as cidades da unidade deles.
+          </div>` : ""}
 
         ${d && d.items ? `
           <div style="${carregando ? "opacity:.45;pointer-events:none" : ""}">
@@ -2232,10 +2279,16 @@ function blocoBaseDeLeads() {
                       <td class="text-small">${escapeHtml(l.porte || "-")}<div style="color:var(--muted)">${escapeHtml(l.faixa_faturamento || "")}</div></td>
                       <td>${chanceLead(l.chance_contato)}</td>
                       <td style="text-align:right;white-space:nowrap">
-                        <button class="btn btn-primary btn-sm" type="button"
-                          onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>
-                        <button class="btn btn-ghost btn-sm" type="button"
-                          onclick="descartarLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Descartar</button>
+                        ${l.status === "DESCARTADO" ? `
+                          <button class="btn btn-ghost btn-sm" type="button"
+                            onclick="restaurarLead(${Number(l.id)})">Devolver à base</button>`
+                        : l.status !== "NOVO" ? `<span class="text-small" style="color:var(--muted)">${escapeHtml(l.claimed_by || l.status)}</span>`
+                        : `
+                          <button class="btn btn-primary btn-sm" type="button"
+                            onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>
+                          ${d.canManage ? `<button class="btn btn-ghost btn-sm" type="button"
+                            title="Tira da base de todos os vendedores"
+                            onclick="descartarLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Descartar</button>` : ""}`}
                       </td>
                     </tr>`).join("")
                     : '<tr><td colspan="7" class="text-small">Nenhuma empresa com esse filtro.</td></tr>'}

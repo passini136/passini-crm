@@ -8507,19 +8507,26 @@ def mark_leads_already_clients(conn: sqlite3.Connection, company_id: int) -> int
 
 def lead_cities_for_user(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
-) -> list[str]:
+) -> list[str] | None:
     """Cidades que a unidade do usuário atende — o recorte da base fria.
 
-    Sai do mesmo mapa de território do resto do sistema, mais as cidades onde a
-    unidade já fatura. Sem isso, dois vendedores de praças diferentes ligariam
-    para a mesma oficina.
+    Três respostas diferentes, e a distinção importa:
+      None  = sem restrição (diretoria e administração enxergam o estado todo)
+      []    = restrito, mas a unidade não tem cidade mapeada → não pode ver nada
+      lista = as cidades da unidade
+
+    A primeira versão devolvia [] nos dois casos e o código tratava lista vazia
+    como "sem filtro": um vendedor de unidade sem mapa via os 63 mil leads do RS
+    inteiro. Exatamente o contrário do combinado.
     """
     escopo = data_scope_for_user(conn, user)
     if escopo == "proprio":
         unidades = [seller_unit_name(conn, company_id, seller_identity_for_user(user))]
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
-        unidades = list(permitidas) if permitidas else []
+        if permitidas is None:
+            return None                      # diretoria/administração: sem recorte
+        unidades = list(permitidas)
     unidades = [normalize_unit(u) for u in unidades if u]
     if not unidades:
         return []
@@ -8545,17 +8552,28 @@ def search_prospect_leads(
 ) -> dict[str, Any]:
     """Busca na base fria, restrita às cidades da unidade."""
     cidades = lead_cities_for_user(conn, company_id, user)
-    condicoes = ["l.company_id = ?", "l.status = 'NOVO'"]
-    params: list[Any] = [company_id]
+    sem_restricao = cidades is None
+    status_filtro = normalize_upper(filtros.get("status")) or "NOVO"
+    condicoes = ["l.company_id = ?", "l.status = ?"]
+    params: list[Any] = [company_id, status_filtro]
+
+    # Restrito e sem cidade mapeada: não devolve nada. Silenciar aqui seria
+    # entregar a base inteira para quem deveria ver só a praça dele.
+    if not sem_restricao and not cidades:
+        return {"items": [], "total": 0, "cities": [], "segments": LEAD_SEGMENTS,
+                "unrestricted": False,
+                "blocked": "Sua unidade ainda não tem cidades mapeadas. "
+                           "O mapa fica em Administração → Territórios."}
 
     cidade = normalize_upper(strip_accents(filtros.get("city")))
     if cidade:
-        if cidades and cidade not in cidades:
+        if not sem_restricao and cidade not in cidades:
             return {"items": [], "total": 0, "cities": cidades, "segments": LEAD_SEGMENTS,
+                    "unrestricted": False,
                     "blocked": f"{cidade} não é atendida pela sua unidade."}
         condicoes.append("UPPER(l.cidade) = ?")
         params.append(cidade)
-    elif cidades:
+    elif not sem_restricao:
         marcadores = ",".join("?" for _ in cidades)
         condicoes.append(f"UPPER(l.cidade) IN ({marcadores})")
         params.extend(cidades)
@@ -8586,12 +8604,25 @@ def search_prospect_leads(
     linhas.sort(key=lambda l: (LEAD_CHANCE_RANK.get(normalize_upper(l.get("chance_contato")), 9),
                                0 if normalize_whitespace(l.get("telefone")) else 1,
                                l.get("razao_social") or ""))
-    return {"items": linhas[:limite], "total": total, "cities": cidades,
+    # Lista de cidades do seletor: as da unidade ou, sem restrição, as que
+    # realmente têm lead disponível (ordenadas por volume, não alfabeticamente —
+    # ninguém procura "Ajuricaba" antes de "Porto Alegre").
+    if sem_restricao:
+        opcoes = [r["cidade"] for r in conn.execute(
+            "SELECT cidade, COUNT(*) c FROM prospect_leads "
+            "WHERE company_id = ? AND status = 'NOVO' AND TRIM(COALESCE(cidade,'')) <> '' "
+            "GROUP BY cidade ORDER BY c DESC LIMIT 120", (company_id,)).fetchall()]
+    else:
+        opcoes = cidades
+
+    return {"items": linhas[:limite], "total": total, "cities": opcoes,
+            "unrestricted": sem_restricao, "status": status_filtro,
             "segments": LEAD_SEGMENTS, "limited": total > limite}
 
 
 def claim_prospect_lead(
-    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, lead_id: Any
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, lead_id: Any,
+    payload_seller: str = "",
 ) -> dict[str, Any]:
     """O vendedor assume o lead: ele vira prospect no funil, no nome dele."""
     lead = conn.execute(
@@ -8601,6 +8632,12 @@ def claim_prospect_lead(
         raise ValueError("Lead não encontrado.")
     if lead["status"] != "NOVO":
         raise ValueError(f"Este lead já está como {lead['status'].lower()}.")
+
+    escopo = data_scope_for_user(conn, user)
+    destino = normalize_whitespace(payload_seller)
+    if escopo != "proprio" and not destino:
+        raise ValueError("Escolha para qual vendedor este lead vai — é ele que vai trabalhar "
+                         "a oficina, e é por ele que a unidade é definida.")
 
     res = save_prospect(conn, company_id, user, {
         "companyName": lead["razao_social"],
@@ -8612,15 +8649,15 @@ def claim_prospect_lead(
         "neighborhood": lead["bairro"] or "",
         "addressLine": lead["logradouro"] or "",
         "origin": "Base de leads",
-        "sellerName": (seller_identity_for_user(user)
-                       if data_scope_for_user(conn, user) == "proprio" else ""),
+        "sellerName": seller_identity_for_user(user) if escopo == "proprio" else destino,
     })
+    dono = seller_identity_for_user(user) if escopo == "proprio" else destino
     conn.execute(
         "UPDATE prospect_leads SET status = 'ADOTADO', prospect_id = ?, claimed_by = ?, "
         "claimed_at = ? WHERE id = ?",
-        (res.get("prospectId"), seller_identity_for_user(user), now_iso(), lead["id"]))
+        (res.get("prospectId"), dono, now_iso(), lead["id"]))
     conn.commit()
-    return {"message": f"{lead['razao_social']} entrou na sua prospecção.",
+    return {"message": f"{lead['razao_social']} entrou na prospecção de {dono}.",
             "prospectId": res.get("prospectId"), **res}
 
 
@@ -8628,14 +8665,45 @@ def discard_prospect_lead(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     lead_id: Any, motivo: str = "",
 ) -> dict[str, Any]:
-    """Tira o lead da fila sem apagá-lo — telefone errado, fechou, não é público."""
-    conn.execute(
+    """Tira o lead da fila — telefone errado, empresa fechada, fora do público.
+
+    O descarte vale PARA TODOS: a base é compartilhada e um telefone errado é
+    errado para qualquer vendedor. Por isso é ação de gestão, com motivo
+    obrigatório e autor registrado — e é reversível. Se cada vendedor pudesse
+    descartar o que não quer trabalhar, a base sumiria para a equipe inteira em
+    uma semana.
+    """
+    if data_scope_for_user(conn, user) == "proprio":
+        raise ValueError("O descarte tira a empresa da base de todos os vendedores. "
+                         "Peça ao gerente, explicando o motivo.")
+    razao = normalize_whitespace(motivo)
+    if len(razao) < 4:
+        raise ValueError("Escreva o motivo do descarte — é o que permite revisar depois.")
+    cur = conn.execute(
         "UPDATE prospect_leads SET status = 'DESCARTADO', discard_reason = ?, "
-        "claimed_by = ?, claimed_at = ? WHERE company_id = ? AND id = ?",
-        (normalize_whitespace(motivo) or "sem motivo informado",
-         seller_identity_for_user(user), now_iso(), company_id, int(lead_id)))
+        "claimed_by = ?, claimed_at = ? WHERE company_id = ? AND id = ? AND status = 'NOVO'",
+        (razao, seller_identity_for_user(user), now_iso(), company_id, int(lead_id)))
+    if not cur.rowcount:
+        raise ValueError("Este lead já saiu da fila.")
+    audit_log(conn, company_id, user["id"], "descartar", "prospect_leads", str(lead_id),
+              {"motivo": razao})
     conn.commit()
-    return {"message": "Lead descartado."}
+    return {"message": "Lead descartado da base — vale para todos os vendedores."}
+
+
+def restore_prospect_lead(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, lead_id: Any
+) -> dict[str, Any]:
+    """Devolve à fila um lead descartado por engano."""
+    if data_scope_for_user(conn, user) == "proprio":
+        raise ValueError("Só a gestão devolve lead à base.")
+    conn.execute(
+        "UPDATE prospect_leads SET status = 'NOVO', discard_reason = NULL "
+        "WHERE company_id = ? AND id = ? AND status = 'DESCARTADO'",
+        (company_id, int(lead_id)))
+    audit_log(conn, company_id, user["id"], "restaurar", "prospect_leads", str(lead_id), {})
+    conn.commit()
+    return {"message": "Lead devolvido à base."}
 
 
 def prospect_leads_summary(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
@@ -17029,10 +17097,16 @@ class AppHandler(BaseHTTPRequestHandler):
                         "city": query.get("city", [""])[0],
                         "segment": query.get("segment", [""])[0],
                         "search": query.get("q", [""])[0],
+                        "status": query.get("status", [""])[0],
                         "withPhone": query.get("withPhone", ["0"])[0] in {"1", "true"},
                         "limit": query.get("limit", ["100"])[0],
                     })
                     dados["summary"] = prospect_leads_summary(conn, user["company_id"])
+                    escopo_lead = data_scope_for_user(conn, user)
+                    dados["canManage"] = escopo_lead != "proprio"
+                    dados["sellers"] = ([s["sellerName"] for s in
+                                         sellers_available_for_assignment(conn, user["company_id"], user)]
+                                        if escopo_lead != "proprio" else [])
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
@@ -17796,7 +17870,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
-            if path in {"/api/prospects/leads/claim", "/api/prospects/leads/discard"}:
+            if path in {"/api/prospects/leads/claim", "/api/prospects/leads/discard",
+                        "/api/prospects/leads/restore"}:
                 user = self._require_auth()
                 if not user:
                     return
@@ -17805,7 +17880,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     with closing(get_connection()) as conn:
                         if path.endswith("/claim"):
                             res = claim_prospect_lead(conn, user["company_id"], user,
-                                                      payload.get("id"))
+                                                      payload.get("id"),
+                                                      payload.get("sellerName") or "")
+                        elif path.endswith("/restore"):
+                            res = restore_prospect_lead(conn, user["company_id"], user,
+                                                        payload.get("id"))
                         else:
                             res = discard_prospect_lead(conn, user["company_id"], user,
                                                         payload.get("id"), payload.get("reason"))
