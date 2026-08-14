@@ -6,6 +6,8 @@ const state = {
   territories: null,   // mapa de bairro/cidade por unidade (Administração → Territórios)
   contacts: null,      // histórico de registros de contato
   inactives: null,     // clientes inativos da unidade, para reativação
+  leads: null,         // base fria de empresas que ainda não são clientes
+  leadFilters: { city: "", segment: "", search: "", withPhone: false },
   contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
                     search: "", portfolio: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
@@ -73,10 +75,12 @@ const state = {
       territories: false,
       contacts: false,
       inactives: false,
+      leads: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
     bulkCityUnit: "",      // unidade escolhida para o lote
+    leadsOpen: false,      // painel da base fria de leads
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
     inactiveSearch: "",
     territoryCity: "",     // filtro de cidade na tela de territórios
@@ -2080,6 +2084,174 @@ function blocoConfiguracaoUnidade() {
     </div>`;
 }
 
+// ─── Base fria: empresas que ainda não são clientes ────────────────────────
+//
+// 70 mil CNPJs do RS, filtrados pelas cidades que a unidade atende. É prospecção
+// de verdade: quem está aqui nunca comprou da Passini. O lead só vira prospect
+// quando alguém o assume — assim o funil continua medindo trabalho real, não
+// tamanho de lista.
+
+async function loadLeads() {
+  if (state.ui.loading.leads) return;
+  setLoading("leads", true);
+  requestRender();
+  try {
+    const f = state.leadFilters;
+    const q = new URLSearchParams();
+    if (f.city) q.set("city", f.city);
+    if (f.segment) q.set("segment", f.segment);
+    if (f.search) q.set("q", f.search);
+    if (f.withPhone) q.set("withPhone", "1");
+    state.leads = await api(`/api/prospects/leads?${q.toString()}`);
+  } catch (error) {
+    addMessage("error", error.message);
+    state.leads = { items: [], total: 0 };
+  } finally {
+    setLoading("leads", false);
+  }
+  requestRender();
+}
+
+function toggleLeads() {
+  state.ui.leadsOpen = !state.ui.leadsOpen;
+  requestRender();
+  if (state.ui.leadsOpen && !state.leads) void loadLeads();
+}
+
+function setLeadFilter(campo, valor) {
+  state.leadFilters[campo] = valor;
+  void loadLeads();
+}
+
+async function assumirLead(id, nome) {
+  try {
+    const r = await api("/api/prospects/leads/claim", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", r.message || "Lead assumido.");
+    await Promise.all([loadLeads(), loadProspects(true)]);
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function descartarLead(id, nome) {
+  const motivo = window.prompt(`Por que descartar "${nome}"?\n(telefone errado, fechou, não é público-alvo…)`);
+  if (motivo === null) return;
+  try {
+    await api("/api/prospects/leads/discard", { method: "POST", body: JSON.stringify({ id, reason: motivo }) });
+    addMessage("success", "Lead descartado.");
+    await loadLeads();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+/** Cor da chance de contato: é a probabilidade de o telefone funcionar. */
+function chanceLead(valor) {
+  const v = String(valor || "").toUpperCase();
+  const cor = v.includes("MUITO ALTA") || v === "ALTA" ? "var(--good)"
+    : v.includes("MUITO BAIXA") || v === "BAIXA" ? "var(--bad)" : "#b06000";
+  return `<span style="color:${cor};font-weight:700;font-size:11px">${escapeHtml(valor || "—")}</span>`;
+}
+
+function blocoBaseDeLeads() {
+  const aberto = state.ui.leadsOpen;
+  const d = state.leads;
+  const f = state.leadFilters;
+  const carregando = Boolean(state.ui.loading.leads);
+  const resumo = d?.summary || {};
+
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div>
+          <h3>🧭 Base de empresas para prospectar</h3>
+          <div class="text-small">Empresas do RS que ainda não são clientes da Passini,
+            nas cidades que a sua unidade atende. Assuma o lead e ele entra na sua prospecção.</div>
+        </div>
+        <button class="btn ${aberto ? "btn-ghost" : "btn-primary"} btn-sm" type="button"
+          ${carregando ? "disabled" : ""} onclick="toggleLeads()">
+          ${carregando && !aberto ? "⏳ Buscando…" : (aberto ? "Fechar" : "Abrir base")}
+        </button>
+      </div>
+
+      ${aberto ? `
+        <div class="two-column-form" style="margin-top:10px">
+          <div class="field"><label>Cidade</label>
+            <select onchange="setLeadFilter('city', this.value)">
+              <option value="">Todas as cidades da unidade</option>
+              ${(d?.cities || []).map((c) => `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Segmento</label>
+            <select onchange="setLeadFilter('segment', this.value)">
+              <option value="">Todos</option>
+              ${(d?.segments || []).map((sg) => `<option value="${escapeHtml(sg.id)}" ${f.segment === sg.id ? "selected" : ""}>${sg.icon} ${escapeHtml(sg.label)}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Buscar</label>
+            <input value="${escapeHtml(f.search || "")}" placeholder="Nome ou CNPJ"
+              oninput="state.leadFilters.search=this.value"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();loadLeads();}" /></div>
+          <div class="field" style="align-self:end">
+            <label class="check-row" style="font-weight:500">
+              <input type="checkbox" ${f.withPhone ? "checked" : ""}
+                onchange="setLeadFilter('withPhone', this.checked)" />
+              <span>Só com telefone</span>
+            </label></div>
+        </div>
+
+        ${carregando ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
+          ⏳ Buscando na base…</div>` : ""}
+
+        ${d?.blocked ? `<div class="message error">${escapeHtml(d.blocked)}</div>` : ""}
+
+        ${d && !d.cities?.length ? `
+          <div class="message">Sua unidade ainda não tem cidades mapeadas. Fale com o gestor —
+            o mapa fica em Administração → Territórios.</div>` : ""}
+
+        ${d && d.items ? `
+          <div style="${carregando ? "opacity:.45;pointer-events:none" : ""}">
+            <div class="text-small" style="color:var(--muted);margin:8px 0">
+              ${number(d.total)} empresa(s) disponível(is)
+              ${d.limited ? ` · mostrando as ${number(d.items.length)} de melhor contato` : ""}
+              ${resumo.ADOTADO ? ` · ${number(resumo.ADOTADO)} já assumida(s)` : ""}
+            </div>
+            <div class="table-wrap">
+              <table class="table-sticky-actions">
+                <thead><tr>
+                  <th>Empresa</th><th>Segmento</th><th>Cidade</th><th>Telefone</th>
+                  <th>Porte</th><th>Contato</th><th style="text-align:right">Ações</th>
+                </tr></thead>
+                <tbody>
+                  ${d.items.length ? d.items.map((l) => `
+                    <tr>
+                      <td><strong>${escapeHtml(l.razao_social)}</strong>
+                        ${l.nome_fantasia ? `<div class="text-small">${escapeHtml(l.nome_fantasia)}</div>` : ""}
+                        <div class="text-small" style="color:var(--muted)">${escapeHtml(l.cnpj)}</div></td>
+                      <td class="text-small">${escapeHtml((d.segments || []).find((sg) => sg.id === l.segmento)?.label || l.segmento || "-")}</td>
+                      <td class="text-small">${escapeHtml(l.cidade || "-")}${l.bairro ? `<div style="color:var(--muted)">${escapeHtml(l.bairro)}</div>` : ""}</td>
+                      <td class="text-small">${l.telefone ? escapeHtml(l.telefone) : '<span style="color:var(--muted)">sem telefone</span>'}</td>
+                      <td class="text-small">${escapeHtml(l.porte || "-")}<div style="color:var(--muted)">${escapeHtml(l.faixa_faturamento || "")}</div></td>
+                      <td>${chanceLead(l.chance_contato)}</td>
+                      <td style="text-align:right;white-space:nowrap">
+                        <button class="btn btn-primary btn-sm" type="button"
+                          onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>
+                        <button class="btn btn-ghost btn-sm" type="button"
+                          onclick="descartarLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Descartar</button>
+                      </td>
+                    </tr>`).join("")
+                    : '<tr><td colspan="7" class="text-small">Nenhuma empresa com esse filtro.</td></tr>'}
+                </tbody>
+              </table>
+            </div>
+            <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
+              A ordem prioriza quem tem telefone confiável — ligação que não completa é tempo
+              perdido antes da abordagem. <strong>Assumir</strong> cria o prospect no seu nome com
+              os dados já preenchidos; <strong>Descartar</strong> tira da fila sem apagar o registro.
+            </div>
+          </div>` : ""}
+      ` : ""}
+    </div>`;
+}
+
 // ─── Reativação: inativos da unidade ───────────────────────────────────────
 //
 // Prospecção não é só oficina nova. Cliente que já comprou e parou é a
@@ -2218,6 +2390,7 @@ function prospeccaoView() {
 
       ${blocoConfiguracaoUnidade()}
 
+      ${blocoBaseDeLeads()}
       ${blocoInativosDaUnidade()}
 
       ${fase.isDeployment ? `

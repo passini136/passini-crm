@@ -2119,6 +2119,49 @@ def init_db() -> None:
                 FOREIGN KEY (company_id) REFERENCES companies(id)
             );
 
+            -- Base fria de prospecção: empresas do RS que ainda NÃO são
+            -- clientes. Fica separada de `prospects` de propósito: aqui são
+            -- dezenas de milhares de nomes que ninguém trabalhou, e misturar
+            -- isso com o funil real faria todo indicador de prospecção perder
+            -- sentido. O lead vira prospect no momento em que um vendedor o
+            -- assume.
+            CREATE TABLE IF NOT EXISTS prospect_leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                cnpj TEXT NOT NULL,
+                razao_social TEXT NOT NULL,
+                nome_fantasia TEXT,
+                segmento TEXT,
+                atividade TEXT,
+                cidade TEXT,
+                bairro TEXT,
+                logradouro TEXT,
+                cep TEXT,
+                telefone TEXT,
+                email TEXT,
+                porte TEXT,
+                faixa_faturamento TEXT,
+                chance_contato TEXT,
+                data_abertura TEXT,
+                socios TEXT,
+                cnae TEXT,
+                -- Situação do lead nesta base: NOVO, ADOTADO (virou prospect),
+                -- CLIENTE (já existe no cadastro) ou DESCARTADO.
+                status TEXT NOT NULL DEFAULT 'NOVO',
+                prospect_id INTEGER,
+                claimed_by TEXT,
+                claimed_at TEXT,
+                discard_reason TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, cnpj),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_leads_cidade
+                ON prospect_leads(company_id, cidade, status);
+            CREATE INDEX IF NOT EXISTS idx_leads_segmento
+                ON prospect_leads(company_id, segmento, status);
+
             CREATE TABLE IF NOT EXISTS portfolio_coverage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -8320,6 +8363,237 @@ def list_prospects(
                 dias = (today_in_brazil() - dt.date()).days
         p["daysSinceContact"] = dias
     return linhas
+
+
+# ─── Base fria de leads ─────────────────────────────────────────────────────
+
+LEAD_SEGMENTS = [
+    {"id": "OFICINA",    "label": "Oficina mecânica",   "icon": "🔧"},
+    {"id": "VAREJO",     "label": "Varejo de peças",    "icon": "🏪"},
+    {"id": "ATACADO",    "label": "Atacado de peças",   "icon": "📦"},
+    {"id": "TRANSPORTE", "label": "Transportadora",     "icon": "🚚"},
+    {"id": "OUTRO",      "label": "Outro",              "icon": "•"},
+]
+
+# Ordem de prioridade da "chance de contato" que a base traz. Vira número para
+# ordenar: quem tem telefone confiável vem primeiro, porque ligação que não
+# completa é tempo perdido antes mesmo da abordagem.
+LEAD_CHANCE_RANK = {
+    "MUITO ALTA": 0, "ALTA": 1, "REGULAR-ALTA": 2, "REGULAR": 3,
+    "REGULAR-BAIXA": 4, "BAIXA": 5, "MUITO BAIXA": 6,
+}
+
+
+def import_prospect_leads(conn: sqlite3.Connection, company_id: int, conteudo: bytes) -> dict[str, Any]:
+    """Carrega a base fria a partir do CSV enxuto.
+
+    Reimportar é seguro: o CNPJ é único e a linha existente é ATUALIZADA sem
+    perder o que já aconteceu com ela (adotado, descartado, virou cliente).
+    """
+    linhas = parse_csv_bytes(conteudo)
+    novos = atualizados = 0
+    for linha in linhas:
+        cnpj = only_digits(linha.get("cnpj"))
+        razao = normalize_whitespace(linha.get("razao_social"))
+        if len(cnpj) != 14 or not razao:
+            continue
+        existente = conn.execute(
+            "SELECT id FROM prospect_leads WHERE company_id = ? AND cnpj = ?",
+            (company_id, cnpj)).fetchone()
+        campos = (
+            razao, normalize_whitespace(linha.get("nome_fantasia")),
+            normalize_upper(linha.get("segmento")) or "OUTRO",
+            normalize_whitespace(linha.get("atividade")),
+            normalize_upper(linha.get("cidade")), normalize_upper(linha.get("bairro")),
+            normalize_whitespace(linha.get("logradouro")), only_digits(linha.get("cep")),
+            only_digits(linha.get("telefone")), normalize_whitespace(linha.get("email")),
+            normalize_whitespace(linha.get("porte")),
+            normalize_whitespace(linha.get("faixa_faturamento")),
+            normalize_upper(linha.get("chance_contato")),
+            normalize_whitespace(linha.get("data_abertura")),
+            normalize_whitespace(linha.get("socios")), normalize_whitespace(linha.get("cnae")),
+        )
+        if existente:
+            conn.execute(
+                """UPDATE prospect_leads SET razao_social=?, nome_fantasia=?, segmento=?,
+                   atividade=?, cidade=?, bairro=?, logradouro=?, cep=?, telefone=?, email=?,
+                   porte=?, faixa_faturamento=?, chance_contato=?, data_abertura=?, socios=?,
+                   cnae=? WHERE id=?""",
+                (*campos, existente["id"]))
+            atualizados += 1
+        else:
+            conn.execute(
+                """INSERT INTO prospect_leads
+                   (company_id, cnpj, razao_social, nome_fantasia, segmento, atividade, cidade,
+                    bairro, logradouro, cep, telefone, email, porte, faixa_faturamento,
+                    chance_contato, data_abertura, socios, cnae, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (company_id, cnpj, *campos, now_iso()))
+            novos += 1
+    conn.commit()
+    marcados = mark_leads_already_clients(conn, company_id)
+    return {"imported": novos, "updated": atualizados, "alreadyClients": marcados,
+            "message": f"{novos} lead(s) novo(s), {atualizados} atualizado(s). "
+                       f"{marcados} já são clientes e saíram da fila."}
+
+
+def mark_leads_already_clients(conn: sqlite3.Connection, company_id: int) -> int:
+    """Lead cujo CNPJ já está no cadastro do Alfa deixa de ser lead.
+
+    A base foi montada com o que não tinha código Passini na época; o cadastro
+    anda. Sem esta varredura, o vendedor ligaria para quem já é cliente — e
+    poucas coisas queimam mais a credibilidade do sistema.
+    """
+    return conn.execute(
+        """
+        UPDATE prospect_leads SET status = 'CLIENTE'
+        WHERE company_id = ? AND status = 'NOVO' AND cnpj IN (
+            SELECT REPLACE(REPLACE(REPLACE(COALESCE(document_number,''),'.',''),'/',''),'-','')
+            FROM crm_client_profiles WHERE company_id = ?
+        )
+        """,
+        (company_id, company_id),
+    ).rowcount
+
+
+def lead_cities_for_user(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[str]:
+    """Cidades que a unidade do usuário atende — o recorte da base fria.
+
+    Sai do mesmo mapa de território do resto do sistema, mais as cidades onde a
+    unidade já fatura. Sem isso, dois vendedores de praças diferentes ligariam
+    para a mesma oficina.
+    """
+    escopo = data_scope_for_user(conn, user)
+    if escopo == "proprio":
+        unidades = [seller_unit_name(conn, company_id, seller_identity_for_user(user))]
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        unidades = list(permitidas) if permitidas else []
+    unidades = [normalize_unit(u) for u in unidades if u]
+    if not unidades:
+        return []
+
+    cidades: set[str] = set()
+    for r in conn.execute(
+        "SELECT city_name, principal_unit FROM city_mappings WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        if normalize_unit(r["principal_unit"]) in unidades:
+            cidades.add(normalize_upper(strip_accents(r["city_name"])))
+    for r in conn.execute(
+        "SELECT DISTINCT city_name, unit_name FROM territory_mappings WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        if normalize_unit(r["unit_name"]) in unidades:
+            cidades.add(normalize_upper(strip_accents(r["city_name"])))
+    return sorted(cidades)
+
+
+def search_prospect_leads(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, filtros: dict[str, Any]
+) -> dict[str, Any]:
+    """Busca na base fria, restrita às cidades da unidade."""
+    cidades = lead_cities_for_user(conn, company_id, user)
+    condicoes = ["l.company_id = ?", "l.status = 'NOVO'"]
+    params: list[Any] = [company_id]
+
+    cidade = normalize_upper(strip_accents(filtros.get("city")))
+    if cidade:
+        if cidades and cidade not in cidades:
+            return {"items": [], "total": 0, "cities": cidades, "segments": LEAD_SEGMENTS,
+                    "blocked": f"{cidade} não é atendida pela sua unidade."}
+        condicoes.append("UPPER(l.cidade) = ?")
+        params.append(cidade)
+    elif cidades:
+        marcadores = ",".join("?" for _ in cidades)
+        condicoes.append(f"UPPER(l.cidade) IN ({marcadores})")
+        params.extend(cidades)
+
+    segmento = normalize_upper(filtros.get("segment"))
+    if segmento:
+        condicoes.append("l.segmento = ?")
+        params.append(segmento)
+    if filtros.get("withPhone"):
+        condicoes.append("TRIM(COALESCE(l.telefone,'')) <> ''")
+    busca = normalize_whitespace(filtros.get("search"))
+    if busca:
+        condicoes.append("(UPPER(l.razao_social) LIKE ? OR UPPER(COALESCE(l.nome_fantasia,'')) LIKE ? "
+                         "OR l.cnpj LIKE ?)")
+        alvo = f"%{normalize_upper(busca)}%"
+        params.extend([alvo, alvo, f"%{only_digits(busca)}%"])
+
+    onde = " AND ".join(condicoes)
+    total = conn.execute(f"SELECT COUNT(*) c FROM prospect_leads l WHERE {onde}",
+                         params).fetchone()["c"]
+    limite = min(int(filtros.get("limit") or 100), 500)
+    linhas = [dict(r) for r in conn.execute(
+        f"SELECT * FROM prospect_leads l WHERE {onde} ORDER BY l.razao_social LIMIT ?",
+        (*params, limite * 3),
+    ).fetchall()]
+    # Ordena por chance de contato em Python: a coluna é texto e a ordem certa
+    # não é a alfabética ("Alta" viria antes de "Muito Alta").
+    linhas.sort(key=lambda l: (LEAD_CHANCE_RANK.get(normalize_upper(l.get("chance_contato")), 9),
+                               0 if normalize_whitespace(l.get("telefone")) else 1,
+                               l.get("razao_social") or ""))
+    return {"items": linhas[:limite], "total": total, "cities": cidades,
+            "segments": LEAD_SEGMENTS, "limited": total > limite}
+
+
+def claim_prospect_lead(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, lead_id: Any
+) -> dict[str, Any]:
+    """O vendedor assume o lead: ele vira prospect no funil, no nome dele."""
+    lead = conn.execute(
+        "SELECT * FROM prospect_leads WHERE company_id = ? AND id = ?",
+        (company_id, int(lead_id))).fetchone()
+    if not lead:
+        raise ValueError("Lead não encontrado.")
+    if lead["status"] != "NOVO":
+        raise ValueError(f"Este lead já está como {lead['status'].lower()}.")
+
+    res = save_prospect(conn, company_id, user, {
+        "companyName": lead["razao_social"],
+        "tradeName": lead["nome_fantasia"] or "",
+        "documentNumber": lead["cnpj"],
+        "phone": lead["telefone"] or "",
+        "email": lead["email"] or "",
+        "cityName": lead["cidade"] or "",
+        "neighborhood": lead["bairro"] or "",
+        "addressLine": lead["logradouro"] or "",
+        "origin": "Base de leads",
+        "sellerName": (seller_identity_for_user(user)
+                       if data_scope_for_user(conn, user) == "proprio" else ""),
+    })
+    conn.execute(
+        "UPDATE prospect_leads SET status = 'ADOTADO', prospect_id = ?, claimed_by = ?, "
+        "claimed_at = ? WHERE id = ?",
+        (res.get("prospectId"), seller_identity_for_user(user), now_iso(), lead["id"]))
+    conn.commit()
+    return {"message": f"{lead['razao_social']} entrou na sua prospecção.",
+            "prospectId": res.get("prospectId"), **res}
+
+
+def discard_prospect_lead(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    lead_id: Any, motivo: str = "",
+) -> dict[str, Any]:
+    """Tira o lead da fila sem apagá-lo — telefone errado, fechou, não é público."""
+    conn.execute(
+        "UPDATE prospect_leads SET status = 'DESCARTADO', discard_reason = ?, "
+        "claimed_by = ?, claimed_at = ? WHERE company_id = ? AND id = ?",
+        (normalize_whitespace(motivo) or "sem motivo informado",
+         seller_identity_for_user(user), now_iso(), company_id, int(lead_id)))
+    conn.commit()
+    return {"message": "Lead descartado."}
+
+
+def prospect_leads_summary(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
+    linhas = conn.execute(
+        "SELECT status, COUNT(*) c FROM prospect_leads WHERE company_id = ? GROUP BY status",
+        (company_id,)).fetchall()
+    return {r["status"]: r["c"] for r in linhas}
 
 
 def inactive_clients_for_unit(
@@ -16688,6 +16962,23 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
+            if path == "/api/prospects/leads":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = search_prospect_leads(conn, user["company_id"], user, {
+                        "city": query.get("city", [""])[0],
+                        "segment": query.get("segment", [""])[0],
+                        "search": query.get("q", [""])[0],
+                        "withPhone": query.get("withPhone", ["0"])[0] in {"1", "true"},
+                        "limit": query.get("limit", ["100"])[0],
+                    })
+                    dados["summary"] = prospect_leads_summary(conn, user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
             if path == "/api/prospects/inactive":
                 user = self._require_auth()
                 if not user:
@@ -17447,6 +17738,26 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, **resultado}))
+                return
+            if path in {"/api/prospects/leads/claim", "/api/prospects/leads/discard"}:
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path.endswith("/claim"):
+                            res = claim_prospect_lead(conn, user["company_id"], user,
+                                                      payload.get("id"))
+                        else:
+                            res = discard_prospect_lead(conn, user["company_id"], user,
+                                                        payload.get("id"), payload.get("reason"))
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps(res))
+                except Exception as exc:
+                    traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
                 return
             if path in ("/api/prospects/save", "/api/prospects/delete", "/api/prospects/lost",
                         "/api/prospects/link", "/api/prospects/reconcile",
