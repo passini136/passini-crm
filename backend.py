@@ -12451,16 +12451,14 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
 
     detail_totals["ownClients"] = len(_own_clients)
     detail_totals["otherClients"] = len(_other_clients)
-    detail_totals["ownRevenue"] = round(_own_revenue, 2)
-    detail_totals["otherRevenue"] = round(_other_revenue, 2)
     detail_totals["pjClients"] = len(_pj_clients)
     detail_totals["pfClients"] = len(_pf_clients)
-    detail_totals["pjRevenue"] = round(_pj_revenue, 2)
-    detail_totals["pfRevenue"] = round(_pf_revenue, 2)
-    detail_totals["ticketAveragePj"] = round(safe_div(_pj_revenue, len(_pj_clients)), 2)
-    detail_totals["ticketAveragePf"] = round(safe_div(_pf_revenue, len(_pf_clients)), 2)
-    detail_totals["ticketAverageOwn"] = round(safe_div(_own_revenue, len(_own_clients)), 2)
-    detail_totals["ticketAverageOther"] = round(safe_div(_other_revenue, len(_other_clients)), 2)
+    # Guarda os valores CRUS do detalhado, para o diagnóstico poder comparar.
+    detail_totals["ownRevenueRaw"] = round(_own_revenue, 2)
+    detail_totals["otherRevenueRaw"] = round(_other_revenue, 2)
+    detail_totals["pjRevenueRaw"] = round(_pj_revenue, 2)
+    detail_totals["pfRevenueRaw"] = round(_pf_revenue, 2)
+    detail_totals["detailRevenueRaw"] = round(_own_revenue + _other_revenue, 2)
 
     official_totals_vendor = aggregate_official_summary_rows(vendor_summary_rows)
     official_totals_unit = aggregate_official_summary_rows(unit_summary_rows)
@@ -12532,6 +12530,30 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     summary_returns = max(summary_returns_total - summary_warranty, 0.0)
     summary_revenue_with_warranty = summary_revenue
     summary_revenue = summary_revenue + summary_warranty
+
+    # ── As quebras respeitam o total oficial ──────────────────────────────────
+    #
+    # Carteira x fora e PJ x PF saem do relatório DETALHADO; o faturamento do
+    # painel sai do resumo oficial. Quando as duas bases divergem — e divergem,
+    # por reimportação, item sem cliente, devolução tratada diferente — os
+    # cartões mostravam parte maior que o todo: "de carteira R$ 3,1 mi" com
+    # total de R$ 2,0 mi. Número que se contradiz na mesma tela destrói a
+    # confiança no painel inteiro.
+    #
+    # A quebra é uma PROPORÇÃO, não uma segunda contagem. Aplicamos a proporção
+    # do detalhado sobre o total oficial: as partes sempre somam o todo, e a
+    # divergência entre as fontes fica registrada para o diagnóstico.
+    _detalhe_total = detail_totals.get("detailRevenueRaw") or 0.0
+    _fator = safe_div(summary_revenue, _detalhe_total) if _detalhe_total else 0.0
+    for _bruto, _final in (("ownRevenueRaw", "ownRevenue"), ("otherRevenueRaw", "otherRevenue"),
+                           ("pjRevenueRaw", "pjRevenue"), ("pfRevenueRaw", "pfRevenue")):
+        detail_totals[_final] = round((detail_totals.get(_bruto) or 0.0) * _fator, 2)
+    detail_totals["ticketAveragePj"] = round(safe_div(detail_totals["pjRevenue"], _pj_clients and len(_pj_clients)), 2)
+    detail_totals["ticketAveragePf"] = round(safe_div(detail_totals["pfRevenue"], _pf_clients and len(_pf_clients)), 2)
+    detail_totals["ticketAverageOwn"] = round(safe_div(detail_totals["ownRevenue"], _own_clients and len(_own_clients)), 2)
+    detail_totals["ticketAverageOther"] = round(safe_div(detail_totals["otherRevenue"], _other_clients and len(_other_clients)), 2)
+    detail_totals["sourceRatio"] = round(_fator, 4)
+    detail_totals["sourceGapPct"] = round(abs(1 - _fator) * 100, 1) if _fator else None
 
     elapsed_days_current = summary_calendar["elapsedWorkingDays"]
     total_days_current = summary_calendar["totalWorkingDays"]
@@ -12705,6 +12727,10 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "otherRevenue": detail_totals["otherRevenue"],
             "ticketAverageOwn": detail_totals["ticketAverageOwn"],
             "ticketAverageOther": detail_totals["ticketAverageOther"],
+            # Divergência entre o detalhado e o oficial. Acima de 5% é sinal de
+            # problema de importação, não de arredondamento.
+            "detailSourceGapPct": detail_totals.get("sourceGapPct"),
+            "detailRevenueRaw": detail_totals.get("detailRevenueRaw"),
             # Quebra por tipo de pessoa
             "pjClients": detail_totals["pjClients"],
             "pfClients": detail_totals["pfClients"],

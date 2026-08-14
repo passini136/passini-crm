@@ -13326,7 +13326,14 @@ function executivoView() {
           <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">
             <div>
               <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em">CLIENTES ATENDIDOS</div>
-              <div class="text-small" style="color:var(--muted)">Carteira = cliente com vendedor definido no cadastro CRM.</div>
+              <div class="text-small" style="color:var(--muted)">Carteira = cliente com vendedor definido no cadastro CRM.
+                Os valores são a proporção do relatório detalhado aplicada ao faturamento oficial.</div>
+              ${Number(s.detailSourceGapPct || 0) > 5 ? `
+                <div class="text-small" style="margin-top:4px;color:#7a5c00;background:#fff8e6;
+                     border:1px solid #f0d68a;border-radius:6px;padding:4px 8px;display:inline-block">
+                  ⚠ Relatório detalhado difere ${pct(s.detailSourceGapPct)} do oficial — rode
+                  <strong>diag_faturamento.py</strong> para achar a causa.
+                </div>` : ""}
             </div>
             <div style="display:flex;gap:18px;flex-wrap:wrap">
               <div><span class="text-small" style="color:var(--muted)">Total</span><br>
