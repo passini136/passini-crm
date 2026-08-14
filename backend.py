@@ -7135,7 +7135,8 @@ def contact_history(
         params.extend([f"%{normalize_upper(busca)}%", f"%{busca}%"])
 
     onde = " AND ".join(condicoes)
-    limite = min(int(filtros.get("limit") or 300), 1000)
+    exportando = str(filtros.get("export") or "") in {"1", "true", "sim"}
+    limite = min(int(filtros.get("limit") or 300), CRM_EXPORT_MAX if exportando else 1000)
 
     # A coluna CARTEIRA é o vendedor do CADASTRO do cliente — diferente do
     # vendedor que fez o contato. É o que revela atendimento cruzado: quem ligou
@@ -15082,7 +15083,7 @@ def save_client_alias(
 
 def compute_unassigned_clients(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
-    min_months: int = 2, months_window: int = 6, limit: int = 200,
+    min_months: int = 2, months_window: int = 6, limit: int = 200, export: bool = False,
 ) -> dict[str, Any]:
     """Clientes que compram com recorrência mas não têm vendedor no cadastro CRM.
 
@@ -15228,7 +15229,10 @@ def compute_unassigned_clients(
         })
 
     return {
-        "items": items[:limit],
+        # A tela mostra os 200 de maior peso; a exportação leva tudo. Cortar a
+        # planilha no mesmo ponto da tela era o defeito que aparecia sem aviso
+        # na carteira: o gestor levava lista parcial achando que era o total.
+        "items": items[:(CRM_EXPORT_MAX if export else limit)],
         "total": len(items),
         "totalRevenue": round(total_revenue, 2),
         "criteria": {
@@ -16038,6 +16042,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         data = compute_unassigned_clients(
                             conn, user["company_id"], user,
                             min_months=min_months, months_window=window,
+                            export=query.get("export", ["0"])[0] in {"1", "true", "sim"},
                         )
                     self._set_headers(200)
                     self.wfile.write(json_dumps(data))
@@ -16677,7 +16682,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 query = parse_qs(parsed.query)
                 filtros = {k: query.get(k, [""])[0] for k in
                            ("start", "end", "seller", "type", "result", "initiative",
-                            "search", "portfolio", "limit")}
+                            "search", "portfolio", "limit", "export")}
                 with closing(get_connection()) as conn:
                     dados = contact_history(conn, user["company_id"], user, filtros)
                 self._set_headers(200)

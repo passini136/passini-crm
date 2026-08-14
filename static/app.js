@@ -850,6 +850,87 @@ function tendenciaCliente(atual, media) {
   return "Estável";
 }
 
+/** Carrega a biblioteca de planilha sob demanda (é pesada, não vem no boot). */
+async function garantirXLSX() {
+  if (window.XLSX) return;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+
+/** Gera e baixa uma planilha simples a partir de cabeçalhos + linhas. */
+async function baixarPlanilha(nomeArquivo, aba, headers, linhas) {
+  await garantirXLSX();
+  const ws = XLSX.utils.aoa_to_sheet([headers, ...linhas]);
+  ws["!cols"] = headers.map((h) => ({ wch: Math.min(Math.max(String(h).length + 4, 12), 46) }));
+  ws["!autofilter"] = { ref: XLSX.utils.encode_range({
+    s: { r: 0, c: 0 }, e: { r: linhas.length, c: headers.length - 1 } }) };
+  ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, aba);
+  XLSX.writeFile(wb, `${nomeArquivo}_${new Date().toISOString().slice(0, 10)}.xlsx`);
+}
+
+/** Exporta a lista Sem Vendedor inteira — a tela mostra só os 200 maiores. */
+async function exportUnassignedXLSX() {
+  try {
+    addMessage("info", "Gerando planilha…");
+    const c = state.crm.unassigned?.criteria || {};
+    const q = new URLSearchParams({ export: "1" });
+    if (c.minMonths) q.set("minMonths", String(c.minMonths));
+    if (c.monthsWindow) q.set("window", String(c.monthsWindow));
+    const data = await api(`/api/crm/unassigned?${q.toString()}`);
+    const linhas = (data.items || []).map((i) => [
+      i.clientName, i.cityName || "", i.unitName || "", i.months,
+      Number(i.revenue || 0), Number(i.avgMonthly || 0),
+      (i.lastPurchaseAt || "").slice(0, 10),
+      i.clientKey || "sem cadastro",
+      (i.sellers || []).map((s) => `${s.sellerName} (${s.months}m)`).join(" · "),
+    ]);
+    if (!linhas.length) { addMessage("warn", "Nada para exportar."); return; }
+    await baixarPlanilha("clientes_sem_vendedor", "Sem vendedor",
+      ["Cliente", "Cidade", "Unidade", "Meses com compra", "Faturamento", "Média/mês",
+       "Última compra", "Código no CRM", "Quem atendeu"], linhas);
+    addMessage("success", `Planilha exportada — ${linhas.length} de ${number(data.total)} cliente(s).`);
+  } catch (e) {
+    addMessage("error", "Erro ao exportar: " + (e.message || e));
+  }
+}
+
+/** Exporta o histórico de contatos do período filtrado. */
+async function exportContatosXLSX() {
+  try {
+    addMessage("info", "Gerando planilha…");
+    const f = state.contactFilters;
+    const q = new URLSearchParams({ export: "1", limit: "20000" });
+    Object.entries(f).forEach(([k, v]) => { if (v && k !== "limit") q.set(k, v); });
+    const data = await api(`/api/crm/contacts?${q.toString()}`);
+    const gerente = Boolean(data.isManagerView);
+    const linhas = (data.items || []).map((i) => [
+      (i.occurred_at || "").replace("T", " ").slice(0, 16),
+      i.client_name || i.client_key,
+      ...(gerente ? [i.seller_name || "", i.portfolioSeller || "", i.crossPortfolio ? "Sim" : "Não"] : []),
+      i.type_label || i.contact_type_code,
+      i.initiative === "RECEPTIVO" ? "Receptivo" : (i.initiative === "APOIO" ? "Apoio" : "Ativo"),
+      i.result_label || i.result_code,
+      i.notes || "",
+      (i.followup_due_at || "").slice(0, 10),
+    ]);
+    if (!linhas.length) { addMessage("warn", "Nenhum registro no período."); return; }
+    await baixarPlanilha("contatos", "Contatos",
+      ["Quando", "Cliente",
+       ...(gerente ? ["Vendedor do contato", "Carteira", "Contato cruzado"] : []),
+       "Tipo", "Iniciativa", "Resultado", "Observação", "Retorno"], linhas);
+    addMessage("success", `Planilha exportada — ${linhas.length} registro(s).`);
+  } catch (e) {
+    addMessage("error", "Erro ao exportar: " + (e.message || e));
+  }
+}
+
 async function exportCrmClientsXLSX() {
   try {
     addMessage("info", "Gerando planilha…");
@@ -4656,6 +4737,7 @@ function contatosView() {
         <div class="section-title">
           <div><h3>Registros</h3>
           <div class="text-small">${number((d.items || []).length)} registro(s)${d.truncated ? " — mostrando os mais recentes, refine o período" : ""}.</div></div>
+          <button class="btn btn-ghost btn-sm" type="button" onclick="exportContatosXLSX()">↓ Exportar</button>
         </div>
         <div class="table-wrap">
           <table>
@@ -5809,6 +5891,7 @@ function semVendedorView() {
             </select>
           </div>
           <button class="btn btn-ghost btn-sm" onclick="loadUnassignedClients()">↻ Atualizar</button>
+          <button class="btn btn-ghost btn-sm" onclick="exportUnassignedXLSX()">↓ Exportar</button>
         </div>
         <div class="text-small" style="color:var(--muted);margin-top:8px">
           Clientes que compram com frequência mas não têm vendedor no cadastro do CRM.
