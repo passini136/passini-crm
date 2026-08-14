@@ -17024,11 +17024,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Informe clientKey"}))
                     return
-                fora = query.get("outside", ["0"])[0] in {"1", "true", "sim"}
                 with closing(get_connection()) as conn:
                     filters = scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
                     data = get_crm_client_360(conn, user["company_id"], filters, client_key,
-                                              allow_outside=fora)
+                                              allow_outside=True)
                     if data:
                         dono = conn.execute(
                             "SELECT NULLIF(TRIM(internal_seller_name), '') v "
@@ -17058,10 +17057,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 with closing(get_connection()) as conn:
                     filters = crm_scoped_filters_for_user(conn, user["company_id"], user, build_filters_from_query(query))
+                    # A ficha é sempre aberta por CÓDIGO EXATO, num clique
+                    # deliberado — nunca por varredura. Por isso a busca não
+                    # depende mais do parâmetro "outside": exigir que cada botão
+                    # lembrasse de mandá-lo fazia a ficha falhar em silêncio
+                    # (inativos da unidade, cliente sem dono, cliente cuja
+                    # unidade resolvida difere da do vendedor). Quem é dono
+                    # continua marcado em isOwnClient, e o registro de contato
+                    # em cliente alheio segue entrando como apoio.
                     data = get_crm_client_summary(
                         conn, user["company_id"], filters, client_key,
                         seller_name=user["full_name"] or user["username"],
-                        allow_outside=query.get("outside", ["0"])[0] in {"1", "true", "sim"},
+                        allow_outside=True,
                     )
                     if data:
                         data["isOwnClient"] = not client_is_outside_own_portfolio(
