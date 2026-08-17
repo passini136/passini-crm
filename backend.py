@@ -4372,6 +4372,8 @@ def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | Non
         # Busca por item: aceita código do fabricante ou interno
         "itemCode": normalize_whitespace(query.get("itemCode", [None])[0]),
         "search": normalize_whitespace(query.get("search", [None])[0]),
+        # Recorte por limite de crédito: com, sem, ou já acima do limite no mês
+        "creditLimit": normalize_upper(query.get("creditLimit", [None])[0]),
         # Carteira coberta que o vendedor pediu para enxergar (cobertura de férias)
         "coverage_of": normalize_whitespace(query.get("coverageOf", [None])[0]),
     }
@@ -9717,6 +9719,13 @@ def crm_base_client_rows(
                 "documentNumber": row["document_number"],
                 "personType": person_type,
                 "creditLimit": float(row["credit_limit"] or 0.0),
+                # Saldo PREVISTO: limite menos o que o cliente comprou no mês.
+                # Não é o saldo real — parcela de mês anterior ainda em aberto
+                # não entra aqui. Serve para o vendedor saber, antes de ligar,
+                # se ainda cabe pedido no limite. O nome carrega o aviso.
+                "predictedBalance": round(
+                    float(row["credit_limit"] or 0.0) - current_revenue, 2),
+                "hasCreditLimit": float(row["credit_limit"] or 0.0) > 0,
                 "economicGroup": row["economic_group"],
                 "assignedSeller": row["assigned_seller"],
                 "unitName": resolved_unit_name,
@@ -10646,6 +10655,7 @@ def filter_crm_client_rows(
     growth_filter = normalize_upper(filters.get("growth"))
     class_filter = normalize_upper(filters.get("classCode"))
     person_type_filter = normalize_upper(filters.get("personType"))
+    credit_filter = normalize_upper(filters.get("creditLimit"))
     search_filter = normalize_whitespace(filters.get("search"))
     filtered: list[dict[str, Any]] = []
     for row in rows:
@@ -10669,6 +10679,13 @@ def filter_crm_client_rows(
         if class_filter and class_filter != "SEM_CLASSE" and class_code != class_filter:
             continue
         if person_type_filter and normalize_upper(row.get("personType")) != person_type_filter:
+            continue
+        if credit_filter == "COM_LIMITE" and not row.get("hasCreditLimit"):
+            continue
+        if credit_filter == "SEM_LIMITE" and row.get("hasCreditLimit"):
+            continue
+        if credit_filter == "LIMITE_ESTOURADO" and not (
+                row.get("hasCreditLimit") and float(row.get("predictedBalance") or 0) < 0):
             continue
         if search_filter and not crm_matches_search(row, search_filter):
             continue

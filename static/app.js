@@ -172,6 +172,7 @@ const state = {
       growth: "",
       classCode: "",
       personType: "",
+      creditLimit: "",   // COM_LIMITE | SEM_LIMITE | LIMITE_ESTOURADO
       search: "",
       itemCode: "",     // busca por peça comprada (código fabricante ou interno)
       unit: "",
@@ -734,6 +735,7 @@ async function loadCrmClients({ renderAfterLoad = true, reason = "reload", pageA
   if (filters.personType) query.set("personType", filters.personType);
   if (filters.search) query.set("search", filters.search);
   if (filters.itemCode) query.set("itemCode", filters.itemCode);
+  if (filters.creditLimit) query.set("creditLimit", filters.creditLimit);
   // Vendedor vê toda a carteira de uma vez (sem paginação) para agrupar por status
   const isSeller = roleIsSeller();
   query.set("page", isSeller ? "1" : String(state.crm.pagination.page || 1));
@@ -797,6 +799,7 @@ async function clearCrmClientFilters() {
     growth: "",
     classCode: "",
     personType: "",
+    creditLimit: "",
     search: "",
     itemCode: "",
     unit: "",
@@ -951,6 +954,7 @@ async function exportCrmClientsXLSX() {
     if (filters.personType) query.set("personType", filters.personType);
     if (filters.search) query.set("search", filters.search);
     if (filters.itemCode) query.set("itemCode", filters.itemCode);
+    if (filters.creditLimit) query.set("creditLimit", filters.creditLimit);
     query.set("page", "1");
     query.set("pageSize", "20000");
     // export=1 libera o teto de 100 linhas da tela. Sem isso a planilha saía
@@ -997,6 +1001,9 @@ async function exportCrmClientsXLSX() {
       `${competenceLabel(meses[2])} · ${shortMoneyHeader(totalM3)}`,
       `Trimestre · ${shortMoneyHeader(totalTri)}`,
       "Média trim. (R$)", "Tendência",
+      // Saldo previsto = limite − compra do mês. NÃO é o saldo real: parcela de
+      // mês anterior ainda em aberto não entra. O nome da coluna carrega o aviso.
+      "Limite de crédito", "Saldo previsto (limite − mês)",
       "Última compra", "Dias sem compra", "Último contato", "Motivo principal",
     ];
 
@@ -1023,6 +1030,8 @@ async function exportCrmClientsXLSX() {
           Number((m1 + m2 + m3).toFixed(2)),
           Number(r.averageRevenue || 0),
           tendenciaCliente(r.currentRevenue, r.averageRevenue),
+          Number(r.creditLimit || 0),
+          Number(r.predictedBalance || 0),
           r.lastPurchaseAt ? r.lastPurchaseAt.slice(0, 10) : "",
           r.daysWithoutPurchase != null ? Number(r.daysWithoutPurchase) : "",
           r.lastInteractionAt ? String(r.lastInteractionAt).slice(0, 10) : "",
@@ -9582,6 +9591,15 @@ function crmFilterToolbar() {
           </select>
         </div>
         <div class="field">
+          <label>Limite de crédito</label>
+          <select onchange="updateCrmClientFilter('creditLimit', this.value)">
+            <option value="">Todos</option>
+            <option value="COM_LIMITE" ${filters.creditLimit === "COM_LIMITE" ? "selected" : ""}>Com limite cadastrado</option>
+            <option value="SEM_LIMITE" ${filters.creditLimit === "SEM_LIMITE" ? "selected" : ""}>Sem limite</option>
+            <option value="LIMITE_ESTOURADO" ${filters.creditLimit === "LIMITE_ESTOURADO" ? "selected" : ""}>Passou do limite no mês</option>
+          </select>
+        </div>
+        <div class="field">
           <label>Por página</label>
           <select onchange="setCrmClientPageSize(this.value)">
             <option value="25" ${pagination.pageSize === 25 ? "selected" : ""}>25</option>
@@ -9682,6 +9700,8 @@ const SELLER_FILTER_CHIPS = [
   { group: "classCode",  value: "OURO",        label: "Ouro",         icon: "🥇" },
   { group: "classCode",  value: "PRATA",       label: "Prata",        icon: "🥈" },
   { group: "classCode",  value: "BRONZE",      label: "Bronze",       icon: "🥉" },
+  { group: "creditLimit", value: "COM_LIMITE",       label: "Com limite",       icon: "💳" },
+  { group: "creditLimit", value: "LIMITE_ESTOURADO", label: "Passou do limite", icon: "⚠" },
   { group: "personType", value: "PJ",          label: "PJ",           icon: "🏢" },
   { group: "personType", value: "PF",          label: "PF",           icon: "👤" },
 ];
@@ -9694,7 +9714,7 @@ function toggleSellerChip(group, value) {
 
 function activeSellerFilterCount() {
   const f = state.crm.crmClientFilters || {};
-  return ["purchaseMonth", "status", "classCode", "personType", "itemCode"]
+  return ["purchaseMonth", "status", "classCode", "personType", "itemCode", "creditLimit"]
     .filter((k) => f[k]).length;
 }
 
@@ -9804,6 +9824,15 @@ function sellerClientCard(item) {
         <span>📞 ${escapeHtml(item.phone || "Sem tel.")}</span>
         <span style="color:${hasPurchase ? "var(--good)" : "#e67e22"}">${hasPurchase ? "✅ Comprou" : "○ Sem compra"}</span>
       </div>
+      ${Number(item.creditLimit || 0) > 0 ? `
+        <div class="text-small" style="display:flex;justify-content:space-between;gap:8px;
+             background:#f5f7f9;border-radius:6px;padding:5px 8px;margin:6px 0">
+          <span style="color:var(--muted)">💳 Limite ${currency(item.creditLimit)}</span>
+          <span style="font-weight:700;color:${Number(item.predictedBalance) < 0 ? "var(--bad)" : "var(--good)"}"
+            title="Limite menos as compras do mês. Não considera parcelas de meses anteriores em aberto.">
+            saldo previsto ${currency(item.predictedBalance)}
+          </span>
+        </div>` : ""}
       <div class="actions" style="gap:6px">
         <!-- Só Ficha. Registrar e Atualizar saíram do card de propósito: o
              registro tem de ser feito COM a ficha aberta, olhando histórico,
@@ -10660,6 +10689,14 @@ function clientDrawerView() {
               <div class="crm-mini-grid crm-detail-grid">
                 <div><span>Última compra</span><strong>${escapeHtml(client.lastPurchaseAt ? client.lastPurchaseAt.slice(0, 10) : "-")}</strong></div>
                 <div><span>Dias sem compra</span><strong>${number(client.daysWithoutPurchase || 0)}</strong></div>
+                ${Number(client.creditLimit || profile.credit_limit || 0) > 0 ? `
+                  <div><span>Limite de crédito</span><strong>${currency(client.creditLimit || profile.credit_limit)}</strong></div>
+                  <div><span>Saldo previsto</span>
+                    <strong style="color:${Number(client.predictedBalance) < 0 ? "var(--bad)" : "var(--good)"}">
+                      ${currency(client.predictedBalance)}</strong>
+                    <div class="text-small" style="color:var(--muted)">
+                      limite − compras do mês · não inclui parcelas anteriores em aberto</div>
+                  </div>` : ""}
                 <div><span>Faturamento mês atual</span><strong>${currency(client.currentRevenue)}</strong></div>
                 <div><span>Média dos 3 meses anteriores</span><strong>${currency(client.averageRevenue)}</strong></div>
                 <div><span>Crescimento ou queda</span><strong>${pct((client.growthPct || 0) * 100)}</strong></div>
