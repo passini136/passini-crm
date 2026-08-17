@@ -3590,6 +3590,34 @@ async function refreshCurrentTab() {
   addMessage("success", "Dados atualizados.");
 }
 
+/** "Dados até 15/08" ao lado do título — presente em todas as telas.
+ *
+ * É a pergunta que precede qualquer número: alguém olha o painel no dia 15 e
+ * conclui que a equipe vendeu pouco, quando o faturamento só entrou até o dia
+ * 12. Fica em cinza, discreto, e só ganha cor quando o atraso passa de dois
+ * dias úteis — aí deixa de ser informação e vira alerta.
+ */
+function selo_dados_ate() {
+  const f = state.options.dataFreshness;
+  if (!f || !f.salesThrough) return "";
+  const detalhe = [
+    `Faturamento até ${shortDate(f.salesThrough)}`,
+    f.registryThrough ? `Cadastro de clientes até ${shortDate(f.registryThrough)}` : "",
+    f.warrantyThrough ? `Devoluções em garantia até ${shortDate(f.warrantyThrough)}` : "",
+    f.lastImportAt ? `Última importação em ${shortDate(f.lastImportAt)}` : "",
+  ].filter(Boolean).join(" · ");
+  const cor = f.stale ? "#b06000" : "var(--muted)";
+  const fundo = f.stale ? "#fff8e6" : "rgba(15,40,60,0.05)";
+  const borda = f.stale ? "#f0d68a" : "transparent";
+  return `<span title="${escapeHtml(detalhe)}"
+    style="font-size:11px;font-weight:700;color:${cor};background:${fundo};
+           border:1px solid ${borda};border-radius:20px;padding:3px 10px;
+           margin-left:8px;vertical-align:middle;white-space:nowrap;letter-spacing:0.01em">
+    ${f.stale ? "⚠ " : ""}dados até ${escapeHtml(shortDate(f.salesThrough))}${
+      f.stale ? ` · ${number(f.businessDaysBehind)} dia(s) útil(eis) atrás` : ""}
+  </span>`;
+}
+
 function topbarActions() {
   const dropdownItems = [
     !roleIsSeller() ? '<button class="dropdown-item" onclick="toggleActionsMenu(); bootstrapSample()">Carregar exemplo</button>' : "",
@@ -13610,7 +13638,7 @@ function dashboardView() {
         <div class="main">
           <div class="topbar">
             <div>
-              <h2>${escapeHtml(title)}</h2>
+              <h2>${escapeHtml(title)} ${selo_dados_ate()}</h2>
               <p>${escapeHtml(description)}</p>
             </div>
             ${topbarActions()}

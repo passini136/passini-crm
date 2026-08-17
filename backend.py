@@ -4318,6 +4318,45 @@ def query_competences(conn: sqlite3.Connection, company_id: int) -> list[str]:
     return [row["competence"] for row in rows]
 
 
+def data_freshness(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
+    """Até quando os dados vão — a pergunta que precede qualquer número.
+
+    Sem isso, alguém olha o painel no dia 15 e conclui que a equipe vendeu
+    pouco, quando na verdade o faturamento só entrou até o dia 12. A data que
+    importa é a da ÚLTIMA VENDA carregada, não a do último import: importar um
+    arquivo velho não torna o dado novo.
+    """
+    def _max(sql: str) -> str:
+        try:
+            return normalize_whitespace(
+                conn.execute(sql, (company_id,)).fetchone()[0])[:10]
+        except sqlite3.Error:
+            return ""
+
+    venda = _max("SELECT MAX(issue_date) FROM fact_sales_detail WHERE company_id = ?")
+    cadastro = _max("SELECT MAX(updated_at) FROM crm_client_profiles WHERE company_id = ?")
+    garantia = _max("SELECT MAX(return_date) FROM fact_warranty_returns WHERE company_id = ?")
+    importado = _max("SELECT MAX(imported_at) FROM imports WHERE company_id = ?")
+
+    hoje = today_in_brazil()
+    atraso = None
+    if venda:
+        dt = parse_datetime_flexible(venda)
+        if dt:
+            # Conta em dias ÚTEIS: fim de semana sem faturamento é normal e não
+            # deve pintar o painel de vermelho na segunda de manhã.
+            atraso = sum(1 for d in daterange(dt.date(), hoje)
+                         if d > dt.date() and d.weekday() < 5)
+    return {
+        "salesThrough": venda,
+        "registryThrough": cadastro,
+        "warrantyThrough": garantia,
+        "lastImportAt": importado,
+        "businessDaysBehind": atraso,
+        "stale": bool(atraso is not None and atraso >= 2),
+    }
+
+
 def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | None]:
     return {
         "competence_start": query.get("competenceStart", [None])[0],
@@ -16484,7 +16523,11 @@ class AppHandler(BaseHTTPRequestHandler):
                             seller_unit_map[pname] = normalize_whitespace(r["base_unit"])
                     sellers_with_units = [{"name": s, "unit": seller_unit_map.get(s)} for s in sellers]
                     self._set_headers(200)
-                    self.wfile.write(json_dumps({"competences": competences, "units": units, "sellers": sellers, "sellersWithUnits": sellers_with_units, "cities": cities}))
+                    self.wfile.write(json_dumps({
+                        "competences": competences, "units": units, "sellers": sellers,
+                        "sellersWithUnits": sellers_with_units, "cities": cities,
+                        "dataFreshness": data_freshness(conn, company_id),
+                    }))
                 return
             if path == "/api/dashboard":
                 user = self._require_auth()
