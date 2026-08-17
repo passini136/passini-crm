@@ -211,23 +211,27 @@ UNIT_NORMALIZATION = {
 # Módulos (telas) disponíveis para montar perfis de acesso.
 # A ordem aqui define a ordem de exibição na tela de perfis.
 # ─────────────────────────────────────────────────────────────────────────────
+# Grupos por INTENÇÃO, ordenados pela frequência de uso — o diário em cima.
+# Os IDs nunca mudam: são eles que os perfis de acesso guardam. Reagrupar é
+# mexer só no rótulo do grupo, sem migração e sem quebrar permissão de ninguém.
 ACCESS_MODULES: list[dict[str, str]] = [
-    # CRM
-    {"id": "crm-agenda",     "label": "Missão do Dia",      "group": "CRM"},
-    {"id": "crm-clientes",   "label": "Carteira",           "group": "CRM"},
-    {"id": "crm-tarefas",    "label": "Tarefas",            "group": "CRM"},
-    {"id": "crm-interacao",  "label": "Registrar interação","group": "CRM"},
-    {"id": "meu-placar",     "label": "Meu Placar",         "group": "CRM"},
-    {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "CRM"},
-    {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "CRM"},
-    {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "CRM"},
-    {"id": "visitas",        "label": "Visitas",            "group": "CRM"},
-    {"id": "prospeccao",     "label": "Prospecção",         "group": "CRM"},
-    {"id": "contatos",       "label": "Contatos",           "group": "CRM"},
-    # Desenvolvimento
-    {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Desenvolvimento"},
-    {"id": "feedback",       "label": "Feedback e PDI",      "group": "Desenvolvimento"},
-    # Resultados
+    # Meu Dia — o ciclo diário do MEC, na ordem do dia
+    {"id": "crm-agenda",     "label": "Missão do Dia",      "group": "Meu Dia"},
+    {"id": "crm-tarefas",    "label": "Tarefas",            "group": "Meu Dia"},
+    {"id": "crm-clientes",   "label": "Carteira",           "group": "Meu Dia"},
+    {"id": "contatos",       "label": "Contatos",           "group": "Meu Dia"},
+    {"id": "crm-interacao",  "label": "Registrar interação","group": "Meu Dia"},
+    # Crescer — expandir e recuperar a base
+    {"id": "prospeccao",     "label": "Prospecção",         "group": "Crescer"},
+    {"id": "visitas",        "label": "Visitas",            "group": "Crescer"},
+    {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "Crescer"},
+    # Equipe — motivação e desenvolvimento
+    {"id": "meu-placar",     "label": "Meu Placar",         "group": "Equipe"},
+    {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "Equipe"},
+    {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "Equipe"},
+    {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
+    {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
+    # Resultados — o diário visível, o ocasional recolhido em Análises
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
     {"id": "unidades",       "label": "Unidades",           "group": "Resultados"},

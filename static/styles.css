@@ -261,6 +261,15 @@ button {
   flex-direction: column;
 }
 
+.sidebar-subtoggle {
+  width: 100%; display: flex; justify-content: space-between; align-items: center;
+  border: none; background: transparent; cursor: pointer;
+  padding: 6px 12px; margin-top: 2px;
+  font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: 0.02em;
+  border-radius: 8px;
+}
+.sidebar-subtoggle:hover { background: rgba(15, 40, 60, 0.06); color: var(--text); }
+
 .brand-pill {
   width: 100%;
   justify-content: flex-start;

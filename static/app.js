@@ -80,6 +80,7 @@ const state = {
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
     bulkCityUnit: "",      // unidade escolhida para o lote
+    analysisOpen: false,   // subgrupo Análises do menu aberto
     leadsOpen: false,      // painel da base fria de leads
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
     inactiveSearch: "",
@@ -13248,12 +13249,27 @@ function topbarTitle() {
   return map[state.activeTab] || { title: "Dashboard", description: "Visão geral." };
 }
 
+/** Subgrupo recolhível: consultas ocasionais que não merecem o primeiro nível.
+ *  Abre sozinho quando a tela ativa está dentro dele — ninguém fica preso. */
+function sidebarSubGroup(title, tabs) {
+  if (!tabs.length) return "";
+  if (state.ui.sidebarCollapsed) return sidebarTabGroup("", tabs);
+  const contémAtiva = tabs.some((t) => t.id === state.activeTab);
+  const aberto = state.ui.analysisOpen || contémAtiva;
+  return `
+    <button class="sidebar-subtoggle" onclick="state.ui.analysisOpen=!state.ui.analysisOpen;requestRender()">
+      <span>${aberto ? "▾" : "▸"} ${escapeHtml(title)}</span>
+      <span class="text-small" style="color:var(--muted)">${tabs.length}</span>
+    </button>
+    ${aberto ? sidebarTabGroup("", tabs) : ""}`;
+}
+
 function sidebarTabGroup(title, tabs) {
   if (!tabs.length) return "";
   const collapsed = state.ui.sidebarCollapsed;
   return `
     <div class="nav-section">
-      ${!collapsed ? `<div class="nav-section-label">${escapeHtml(title)}</div>` : ""}
+      ${!collapsed && title ? `<div class="nav-section-label">${escapeHtml(title)}</div>` : ""}
       ${tabs.map((tab) => `
         <button class="tab-button ${state.activeTab === tab.id ? "active" : ""} ${collapsed ? "tab-collapsed" : ""}"
           onclick="switchTab('${tab.id}')" title="${escapeHtml(tab.title)}">
@@ -13550,24 +13566,30 @@ function dashboardView() {
   const allowed = allowedTabsForUser(state.user);
   const { title, description } = topbarTitle();
 
-  const crmTabs = [
+  // Grupos por INTENÇÃO, na ordem de frequência de uso — o diário no topo.
+  // "Meu Dia" é o ciclo do MEC na ordem em que o dia acontece: abrir a fila,
+  // resolver o atrasado, trabalhar a carteira, conferir o que registrou.
+  const meuDiaTabs = [
     { id: "crm-agenda",    title: "Missão do Dia",    desc: "5 contatos prioritários", icon: "📅" },
-    { id: "meu-placar",    title: "Meu Placar",       desc: "Pontos e premiação",       icon: "⭐" },
-    { id: "placar-equipe", title: "Placar Equipe",    desc: "Ranking e alertas",        icon: "🏆" },
-    { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
-    { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
-    { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
-    { id: "prospeccao",    title: "Prospecção",       desc: "Oficinas novas",           icon: "🌱" },
+    { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "contatos",      title: "Contatos",         desc: "Histórico e produtividade", icon: "📇" },
+  ].filter((t) => allowed.includes(t.id));
+
+  const crescerTabs = [
+    { id: "prospeccao",    title: "Prospecção",       desc: "Oficinas novas",           icon: "🌱" },
     { id: "visitas",       title: "Visitas",          desc: "Roteiro e resultado",      icon: "🗺️",
       // Só o gestor tem o que responder. Para o vendedor, pedido pendente é
       // espera, não pendência — contador vermelho ali só geraria ansiedade.
       badge: state.visits?.canManage
         ? (state.visits?.requests || []).filter((r) => r.status === "PENDENTE").length : 0 },
+    { id: "sem-vendedor",  title: "Sem Vendedor",     desc: "Clientes no limpo",        icon: "🔍" },
   ].filter((t) => allowed.includes(t.id));
 
-  const devTabs = [
+  const equipeTabs = [
+    { id: "meu-placar",    title: "Meu Placar",       desc: "Pontos e premiação",       icon: "⭐" },
+    { id: "placar-equipe", title: "Placar Equipe",    desc: "Ranking e alertas",        icon: "🏆" },
+    { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
       badge: state.meetings?.pendingCount || 0 },
     { id: "feedback", title: "Feedback",  desc: "Avaliação e PDI",      icon: "🎯",
@@ -13578,6 +13600,11 @@ function dashboardView() {
     { id: "executivo",  title: "Executivo",  desc: "Panorama e KPIs",          icon: "📊" },
     { id: "vendedores", title: "Vendedores", desc: "Ranking e score",           icon: "👤" },
     { id: "unidades",   title: "Unidades",   desc: "Comparativo",               icon: "🏢" },
+  ].filter((t) => allowed.includes(t.id));
+
+  // Consultas ocasionais recolhidas: no mesmo nível do Executivo elas puxavam
+  // o menu para baixo sem merecer o espaço — são abertas algumas vezes por mês.
+  const analiseTabs = [
     { id: "clientes",   title: "Clientes",   desc: "Carteira ativa",            icon: "🧑" },
     { id: "cidades",    title: "Cidades",    desc: "Cobertura geográfica",      icon: "🌍" },
     { id: "descontos",  title: "Descontos",  desc: "Política de desconto",      icon: "🏷" },
@@ -13663,9 +13690,11 @@ function dashboardView() {
             <button class="sidebar-toggle" onclick="toggleSidebar()" title="${state.ui.sidebarCollapsed ? 'Expandir menu' : 'Recolher menu'}">
               ${state.ui.sidebarCollapsed ? '▶' : '◀'}
             </button>
-            ${sidebarTabGroup("CRM", crmTabs)}
-            ${sidebarTabGroup("Desenvolvimento", devTabs)}
+            ${sidebarTabGroup("Meu Dia", meuDiaTabs)}
+            ${sidebarTabGroup("Crescer", crescerTabs)}
+            ${sidebarTabGroup("Equipe", equipeTabs)}
             ${sidebarTabGroup("Resultados", resultTabs)}
+            ${sidebarSubGroup("Análises", analiseTabs)}
             ${sidebarTabGroup("Operações", opsTabs)}
           </div>
           <div class="sidebar-footer">
