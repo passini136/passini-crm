@@ -6253,6 +6253,7 @@ function semVendedorView() {
                 ${items.map((i) => `
                   <tr>
                     <td><strong>${escapeHtml(i.clientName)}</strong>
+                      ${i.clientKey ? `<div class="text-small" style="color:var(--muted)">cód. ${escapeHtml(i.clientKey)}</div>` : ""}
                       ${i.aliasOf ? `<div class="text-small" style="color:var(--muted)">conciliado com ${escapeHtml(i.aliasOf)}</div>` : ""}
                     </td>
                     <td class="text-small">${escapeHtml(i.cityName || "-")}</td>
