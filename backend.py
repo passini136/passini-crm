@@ -1261,6 +1261,11 @@ def get_connection() -> sqlite3.Connection:
     # PRAGMAs seguros por conexão (sem escrita no DB)
     conn.execute("PRAGMA cache_size=-16000")   # 16 MB page cache por conexão
     conn.execute("PRAGMA temp_store=MEMORY")
+    # sem_acento em TODA conexão: o SQLite não conhece acento, e mais de uma
+    # busca depende disso. Registrar em um lugar só evita "no such function".
+    conn.create_function(
+        "sem_acento", 1,
+        lambda v: normalize_upper(strip_accents(v)) if v is not None else None)
     return conn
 
 
@@ -15670,12 +15675,22 @@ def find_client_by_code(
         return None
     tentativas = [code, code.lstrip("0"), only_digits(code)]
     for alvo in [t for t in dict.fromkeys(tentativas) if t]:
-        row = conn.execute(
-            f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
-            "WHERE company_id = ? AND (TRIM(client_code) = ? "
-            "   OR CAST(TRIM(client_code) AS INTEGER) = CAST(? AS INTEGER))",
-            (company_id, alvo, alvo),
-        ).fetchone()
+        # A comparação numérica só vale se o alvo for número: no SQLite, CAST de
+        # texto vira 0, e aí dois códigos não numéricos casariam um com o outro.
+        if alvo.isdigit():
+            row = conn.execute(
+                f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
+                "WHERE company_id = ? AND (TRIM(client_code) = ? "
+                "   OR (TRIM(client_code) GLOB '[0-9]*' "
+                "       AND CAST(TRIM(client_code) AS INTEGER) = CAST(? AS INTEGER)))",
+                (company_id, alvo, alvo),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
+                "WHERE company_id = ? AND TRIM(client_code) = ?",
+                (company_id, alvo),
+            ).fetchone()
         if row:
             return dict(row)
     return None
@@ -15689,10 +15704,13 @@ def search_clients_by_name(
     if len(texto) < 3:
         return []
     chave = company_match_key(texto)
+    # sem_acento nos DOIS lados: o cadastro tem acento, o que a pessoa digita
+    # nem sempre. Comparar só um lado sem acento nunca casaria "JOSÉ".
     alvo = f"%{normalize_upper(strip_accents(texto))}%"
     linhas = [dict(r) for r in conn.execute(
         f"SELECT {CLIENT_LOOKUP_COLUMNS} FROM crm_client_profiles "
-        "WHERE company_id = ? AND (UPPER(client_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?) "
+        "WHERE company_id = ? AND (sem_acento(client_name) LIKE ? "
+        "                       OR sem_acento(COALESCE(trade_name,'')) LIKE ?) "
         "ORDER BY client_name LIMIT ?",
         (company_id, alvo, alvo, limite),
     ).fetchall()]
@@ -17432,17 +17450,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 user = self._require_auth()
                 if not user:
                     return
+                consulta = parse_qs(parsed.query)
+                # Tudo dentro do with: a consulta precisa da conexão ABERTA.
                 with closing(get_connection()) as conn:
                     if data_scope_for_user(conn, user) == "proprio":
                         self._set_headers(403)
                         self.wfile.write(json_dumps({"error": "Consulta da gestão."}))
                         return
-                consulta = parse_qs(parsed.query)
-                achado = find_client_by_code(
-                    conn, user["company_id"], consulta.get("code", [""])[0])
-                candidatos = ([] if achado else
-                              search_clients_by_name(conn, user["company_id"],
-                                                     consulta.get("name", [""])[0]))
+                    achado = find_client_by_code(
+                        conn, user["company_id"], consulta.get("code", [""])[0])
+                    candidatos = ([] if achado else
+                                  search_clients_by_name(conn, user["company_id"],
+                                                         consulta.get("name", [""])[0]))
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado,
                                              "candidates": [dict(c) for c in candidatos]}))
