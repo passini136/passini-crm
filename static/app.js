@@ -2566,6 +2566,11 @@ function prospeccaoView() {
               ${s.icon} ${escapeHtml(s.label)} (${number(fun.byStatus?.[s.id] || 0)})
             </button>`).join("")}
         </div>
+        <div class="text-small" style="color:var(--muted);margin-top:2px">
+          A lista mostra o que ainda é trabalho de prospecção. Quem ganhou vendedor no
+          cadastro virou carteira e quem foi dado como perdido saem daqui — clique no
+          selo correspondente para revê-los.
+        </div>
       </div>
 
       <div class="table-card">
@@ -2614,7 +2619,16 @@ function prospectCard(p, podeGerir) {
           ${p.clientCode ? `
             <div class="text-small" style="color:var(--good);font-weight:600;margin-top:3px">
               ✓ Virou cliente ${escapeHtml(p.clientCode)}${p.firstPurchaseAt ? ` · 1ª compra em ${shortDate(p.firstPurchaseAt)}` : " · ainda sem compra"}
-            </div>` : ""}
+            </div>
+            ${p.portfolioSeller ? `
+              <div class="text-small" style="color:var(--muted);margin-top:2px">
+                👥 Já é carteira de <strong>${escapeHtml(p.portfolioSeller)}</strong> — saiu da fila de prospecção
+              </div>`
+            : `
+              <div class="text-small" style="color:#b06000;margin-top:2px">
+                ⚠ Cadastrado no Alfa, mas <strong>ainda sem vendedor</strong> no cadastro —
+                segue em prospecção até alguém assumir
+              </div>`}` : ""}
           ${p.lostReason ? `<div class="text-small" style="color:var(--bad)">Perdido: ${escapeHtml(p.lostReason)}</div>` : ""}
         </div>
         <div style="text-align:right;min-width:130px">

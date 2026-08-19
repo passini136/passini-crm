@@ -8487,6 +8487,10 @@ def prospect_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "convertedAt": row["converted_at"] or "",
         "firstPurchaseAt": row["first_purchase_at"] or "",
         "lostReason": row["lost_reason"] or "",
+        # Vendedor do CADASTRO de clientes. Tendo dono lá, a oficina virou
+        # carteira e sai da prospecção — o trabalho passa a ser outro.
+        "portfolioSeller": (row["carteira_vendedor"]
+                            if "carteira_vendedor" in row.keys() else "") or "",
         "createdAt": row["created_at"],
         # Qualificado = as 4 respostas + um gatilho, como manda o modelo Passini.
         "isQualified": bool(row["q_service_type"] and row["q_cars_week"]
@@ -8497,39 +8501,56 @@ def prospect_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 def list_prospects(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     status: str = "", search: str = "", seller: str = "", limit: int = 500,
+    incluir_encerrados: bool = False,
 ) -> list[dict[str, Any]]:
-    sql = "SELECT * FROM prospects WHERE company_id = ?"
+    """Oficinas em prospecção.
+
+    A lista mostra só o que ainda é TRABALHO DE PROSPECÇÃO. Sai daqui quem
+    ganhou vendedor no cadastro de clientes (virou carteira, e o vendedor já
+    encontra a oficina lá) e quem foi dado como perdido (some para todos). Os
+    dois seguem alcançáveis clicando no selo de status correspondente — o
+    histórico não se perde, apenas deixa de ocupar a fila do dia.
+    """
+    sql = ("SELECT p.*, NULLIF(TRIM(COALESCE(c.internal_seller_name, '')), '') AS carteira_vendedor "
+           "FROM prospects p "
+           "LEFT JOIN crm_client_profiles c "
+           "  ON c.company_id = p.company_id AND TRIM(c.client_code) = TRIM(p.client_code) "
+           "WHERE p.company_id = ?")
     params: list[Any] = [company_id]
 
     if data_scope_for_user(conn, user) == "proprio":
-        sql += " AND UPPER(seller_name) = ?"
+        sql += " AND UPPER(p.seller_name) = ?"
         params.append(normalize_upper(seller_identity_for_user(user)))
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
         if permitidas is not None:
             if permitidas:
                 marcadores = ",".join("?" for _ in permitidas)
-                sql += f" AND unit_name IN ({marcadores})"
+                sql += f" AND p.unit_name IN ({marcadores})"
                 params.extend(permitidas)
             else:
                 sql += " AND 1 = 0"
         if seller:
-            sql += " AND UPPER(seller_name) = ?"
+            sql += " AND UPPER(p.seller_name) = ?"
             params.append(normalize_upper(seller))
 
     if status in PROSPECT_STATUS_IDS:
-        sql += " AND status = ?"
+        sql += " AND p.status = ?"
         params.append(status)
+    elif not incluir_encerrados:
+        # Sem filtro de status: a lista é a fila de trabalho.
+        sql += (" AND p.status <> 'PERDIDO'"
+                " AND TRIM(COALESCE(c.internal_seller_name, '')) = ''")
     termo = normalize_whitespace(search)
     if termo:
         alvo = f"%{termo.upper()}%"
-        sql += (" AND (UPPER(company_name) LIKE ? OR UPPER(COALESCE(trade_name,'')) LIKE ?"
-                " OR UPPER(COALESCE(contact_name,'')) LIKE ? OR COALESCE(document_digits,'') LIKE ?"
-                " OR UPPER(COALESCE(city_name,'')) LIKE ?)")
+        sql += (" AND (UPPER(p.company_name) LIKE ? OR UPPER(COALESCE(p.trade_name,'')) LIKE ?"
+                " OR UPPER(COALESCE(p.contact_name,'')) LIKE ? OR COALESCE(p.document_digits,'') LIKE ?"
+                " OR UPPER(COALESCE(p.city_name,'')) LIKE ?)")
         params.extend([alvo, alvo, alvo, f"%{only_digits(termo)}%" if only_digits(termo) else "%%", alvo])
 
-    sql += """ ORDER BY CASE status WHEN 'QUALIFICADO' THEN 0 WHEN 'EM_CONTATO' THEN 1
-               WHEN 'NOVO' THEN 2 WHEN 'CADASTRADO' THEN 3 ELSE 4 END, company_name LIMIT ?"""
+    sql += """ ORDER BY CASE p.status WHEN 'QUALIFICADO' THEN 0 WHEN 'EM_CONTATO' THEN 1
+               WHEN 'NOVO' THEN 2 WHEN 'CADASTRADO' THEN 3 ELSE 4 END, p.company_name LIMIT ?"""
     params.append(int(limit))
 
     linhas = [prospect_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -8783,6 +8804,13 @@ def search_prospect_leads(
         marcadores = ",".join("?" for _ in cidades)
         condicoes.append(f"UPPER(l.cidade) IN ({marcadores})")
         params.extend(cidades)
+
+    # Empresa dada como PERDIDA some da base fria também. Sem isto, ela
+    # voltaria para a fila de outro vendedor, que refaria a ligação já feita —
+    # e a oficina receberia a mesma abordagem duas vezes.
+    condicoes.append(
+        "NOT EXISTS (SELECT 1 FROM prospects pp WHERE pp.company_id = l.company_id "
+        "            AND pp.status = 'PERDIDO' AND pp.document_digits = l.cnpj)")
 
     segmento = normalize_upper(filtros.get("segment"))
     if segmento:
@@ -9270,7 +9298,9 @@ def delete_prospect(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 def prospect_funnel(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 ) -> dict[str, Any]:
-    linhas = list_prospects(conn, company_id, user, limit=5000)
+    # incluir_encerrados: o funil mede o histórico inteiro. Fosse a mesma lista
+    # da tela, "Cadastrado" e "Perdido" apareceriam como zero.
+    linhas = list_prospects(conn, company_id, user, limit=5000, incluir_encerrados=True)
     por_status = {s["id"]: 0 for s in PROSPECT_STATUSES}
     for p in linhas:
         por_status[p["status"]] = por_status.get(p["status"], 0) + 1
@@ -9280,7 +9310,8 @@ def prospect_funnel(
         "total": total,
         "byStatus": por_status,
         "conversionPct": round(safe_div(convertidos, total) * 100, 1) if total else 0.0,
-        "withoutContact": sum(1 for p in linhas if not p["contactCount"]),
+        "withoutContact": sum(1 for p in linhas if not p["contactCount"]
+                              and p["status"] not in ("CADASTRADO", "PERDIDO")),
         "stale": sum(1 for p in linhas
                      if p["status"] in ("NOVO", "EM_CONTATO", "QUALIFICADO")
                      and (p["daysSinceContact"] is None or p["daysSinceContact"] >= 7)),
