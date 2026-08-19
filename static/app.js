@@ -82,6 +82,7 @@ const state = {
     bulkCityUnit: "",      // unidade escolhida para o lote
     analysisOpen: false,   // subgrupo Análises do menu aberto
     leadsOpen: false,      // painel da base fria de leads
+    refreshing: {},        // botões de atualizar que estão rodando agora
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
     inactiveSearch: "",
     territoryCity: "",     // filtro de cidade na tela de territórios
@@ -519,6 +520,7 @@ async function loadTeamScore() {
     state.teamScore = { error: err.message, sellers: [], summary: {} };
   }
   requestRender();
+  return state.teamScore;
 }
 
 async function loadTeamActivity() {
@@ -550,6 +552,7 @@ async function loadPortfolioSummary() {
     state.crm.portfolioSummary = { error: err.message, sellers: [], totals: {} };
   }
   requestRender();
+  return state.crm.portfolioSummary;
 }
 
 async function bootstrap() {
@@ -1205,6 +1208,7 @@ async function loadAutoImportStatus() {
     state.autoImport = { error: e.message, logs: [], folders: [] };
   }
   requestRender();
+  return state.autoImport;
 }
 
 async function runAutoImportNow() {
@@ -3561,6 +3565,41 @@ function cityRows(rows) {
     .join("");
 }
 
+/** Executa uma atualização mostrando que ela está rodando.
+ *
+ *  Botão que recarrega em silêncio parece quebrado: a pessoa clica, nada muda
+ *  na tela (porque os dados vieram iguais) e ela clica de novo. Aqui o rótulo
+ *  vira "Atualizando…", o botão trava contra o clique duplo e, no fim, sai um
+ *  aviso dizendo que terminou — mesmo quando nada mudou.
+ */
+async function atualizarCom(chave, fn, mensagem) {
+  if (state.ui.refreshing[chave]) return;
+  state.ui.refreshing[chave] = true;
+  requestRender();
+  try {
+    // As cargas não lançam exceção: guardam o erro no estado e o devolvem.
+    // Sem olhar o retorno, uma falha viraria "Dados atualizados." em verde.
+    const r = await fn();
+    if (r && r.error) addMessage("error", r.error);
+    else addMessage("success", mensagem || "Dados atualizados.");
+  } catch (e) {
+    addMessage("error", e.message || "Não foi possível atualizar agora.");
+  } finally {
+    delete state.ui.refreshing[chave];
+    requestRender();
+  }
+}
+
+/** Botão padrão de atualizar. `chamada` é o código que recarrega a tela. */
+function botaoAtualizar(chave, chamada, opcoes = {}) {
+  const rodando = Boolean(state.ui.refreshing[chave]);
+  const msg = opcoes.mensagem ? `, '${jsAttr(opcoes.mensagem)}'` : "";
+  return `<button class="btn ${opcoes.classe || "btn-ghost btn-sm"}" ${rodando ? "disabled" : ""}
+    title="Atualizar os dados desta tela"
+    onclick="atualizarCom('${chave}', () => ${chamada}${msg})">
+    ${rodando ? '<span class="girando">↻</span> Atualizando…' : "↻ Atualizar"}</button>`;
+}
+
 async function refreshCurrentTab() {
   const tab = state.activeTab;
   const promises = [];
@@ -3597,7 +3636,6 @@ async function refreshCurrentTab() {
     promises.push(loadDashboard(), loadCrmData());
   }
   await Promise.all(promises);
-  addMessage("success", "Dados atualizados.");
 }
 
 /** "Dados até 15/08" ao lado do título — presente em todas as telas.
@@ -3642,7 +3680,7 @@ function topbarActions() {
           ${dropdownItems}
         </div>
       </div>
-      <button class="btn btn-ghost btn-sm" onclick="refreshCurrentTab()" title="Atualizar dados da tela atual">↻ Atualizar</button>
+      ${botaoAtualizar("telaAtual", "refreshCurrentTab()")}
       <button class="btn btn-ghost btn-sm" onclick="logout()" style="color:var(--bad);border-color:var(--bad);white-space:nowrap">Sair →</button>
     </div>
   `;
@@ -6022,6 +6060,7 @@ async function loadUnassignedClients() {
     state.crm.unassigned = { error: e.message, items: [], total: 0 };
   }
   requestRender();
+  return state.crm.unassigned;   // o helper lê o erro daqui para avisar
 }
 
 // ─── Conciliação por código do cliente ─────────────────────────────────────
@@ -6229,7 +6268,7 @@ function semVendedorView() {
               ${[3,6,12].map((v) => `<option value="${v}" ${String(f.window) === String(v) ? "selected" : ""}>últimos ${v} meses</option>`).join("")}
             </select>
           </div>
-          <button class="btn btn-ghost btn-sm" onclick="loadUnassignedClients()">↻ Atualizar</button>
+          ${botaoAtualizar("semVendedor", "loadUnassignedClients()", { mensagem: "Lista de clientes sem vendedor atualizada." })}
           <button class="btn btn-ghost btn-sm" onclick="exportUnassignedXLSX()">↓ Exportar</button>
         </div>
         <div class="text-small" style="color:var(--muted);margin-top:8px">
@@ -8297,6 +8336,7 @@ async function loadVisitSuggestions(silencioso) {
     state.ui.loading.visitRoute = false;
     requestRender();
   }
+  return state.visitRoute;
 }
 
 function setVisitCity(cidade) {
@@ -8826,7 +8866,7 @@ function visitasView() {
               <input type="checkbox" ${f.relationship ? "checked" : ""} onchange="toggleVisitRelationship()" />
               <span>Incluir visitas de relacionamento no caminho</span>
             </label>
-            <button class="btn btn-ghost btn-sm" onclick="loadVisitSuggestions()">Atualizar</button>
+            ${botaoAtualizar("visitas", "loadVisitSuggestions()", { mensagem: "Sugestões de visita atualizadas." })}
             <span style="flex:1"></span>
             <button class="btn btn-secondary btn-sm" onclick="imprimirRoteiro()">🖨️ Imprimir / PDF</button>
             <button class="btn btn-secondary btn-sm" onclick="copiarRoteiroWhatsapp()">💬 Copiar p/ WhatsApp</button>
@@ -10471,7 +10511,7 @@ function crmClientsView() {
         <div class="table-card">
           <div class="section-title">
             <div><h3>Resumo por Vendedor</h3><div class="text-small">Competência ${escapeHtml(ps.competence || "—")} · mês anterior ${escapeHtml(ps.prevCompetence || "—")}</div></div>
-            <button class="btn btn-ghost btn-sm" onclick="loadPortfolioSummary(); addMessage('success','Atualizado.')">↻ Atualizar</button>
+            ${botaoAtualizar("resumoCarteira", "loadPortfolioSummary()", { mensagem: "Resumo por vendedor atualizado." })}
           </div>
           <div class="table-wrap">
             <table>
@@ -11911,7 +11951,7 @@ function autoImportPanel() {
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn btn-primary btn-sm" id="btn-auto-import-run" onclick="runAutoImportNow()">▶ Importar agora</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadAutoImportStatus(); addMessage('success','Status atualizado.')">↻ Atualizar</button>
+          ${botaoAtualizar("statusImport", "loadAutoImportStatus()", { mensagem: "Status da importação atualizado." })}
         </div>
       </div>
       ${!ai ? `<div class="message">Carregando status… <button class="btn btn-ghost btn-sm" onclick="loadAutoImportStatus()">Carregar</button></div>` : `
@@ -12953,7 +12993,7 @@ function placardaEquipeView() {
       <div class="table-card">
         <div class="section-title">
           <div><h3>Visão por Unidade</h3><div class="text-small">Clique em uma unidade para filtrar o ranking abaixo.</div></div>
-          <button class="btn btn-ghost btn-sm" onclick="loadTeamScore(); addMessage('success','Placar atualizado.')">↻ Atualizar</button>
+          ${botaoAtualizar("placar", "loadTeamScore()", { mensagem: "Placar atualizado." })}
         </div>
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:4px 0">
           ${unitSummaryCards() || '<div class="text-small" style="color:var(--muted)">Nenhuma unidade com dados neste mês.</div>'}

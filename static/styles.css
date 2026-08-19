@@ -261,6 +261,10 @@ button {
   flex-direction: column;
 }
 
+/* Gira enquanto a atualização roda — sinal de que algo está acontecendo. */
+@keyframes girar { to { transform: rotate(360deg); } }
+.girando { display: inline-block; animation: girar 0.9s linear infinite; }
+
 .sidebar-subtoggle {
   width: 100%; display: flex; justify-content: space-between; align-items: center;
   border: none; background: transparent; cursor: pointer;
