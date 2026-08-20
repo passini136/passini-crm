@@ -5159,7 +5159,7 @@ def list_meetings(
         params.append(date_to)
     termo = normalize_whitespace(search)
     if termo:
-        alvo = f"%{termo.upper()}%"
+        alvo = f"%{normalize_upper(strip_accents(termo))}%"
         sql += (
             " AND (UPPER(m.title) LIKE ? OR UPPER(COALESCE(m.topic,'')) LIKE ?"
             "   OR UPPER(COALESCE(m.summary,'')) LIKE ? OR UPPER(COALESCE(m.agenda,'')) LIKE ?"
@@ -7687,9 +7687,9 @@ def list_crm_tasks(
         params.append(origin)
     termo = normalize_whitespace(search)
     if termo:
-        alvo = f"%{termo.upper()}%"
-        sql += (" AND (UPPER(title) LIKE ? OR UPPER(COALESCE(client_name,'')) LIKE ?"
-                " OR UPPER(COALESCE(description,'')) LIKE ?)")
+        alvo = f"%{normalize_upper(strip_accents(termo))}%"
+        sql += (" AND (sem_acento(title) LIKE ? OR sem_acento(COALESCE(client_name,'')) LIKE ?"
+                " OR sem_acento(COALESCE(description,'')) LIKE ?)")
         params.extend([alvo, alvo, alvo])
 
     sql += (" ORDER BY CASE status WHEN 'ATRASADA' THEN 0 WHEN 'ABERTA' THEN 1"
@@ -8675,11 +8675,18 @@ def list_prospects(
                 " AND TRIM(COALESCE(c.internal_seller_name, '')) = ''")
     termo = normalize_whitespace(search)
     if termo:
-        alvo = f"%{termo.upper()}%"
-        sql += (" AND (UPPER(p.company_name) LIKE ? OR UPPER(COALESCE(p.trade_name,'')) LIKE ?"
-                " OR UPPER(COALESCE(p.contact_name,'')) LIKE ? OR COALESCE(p.document_digits,'') LIKE ?"
-                " OR UPPER(COALESCE(p.city_name,'')) LIKE ?)")
-        params.extend([alvo, alvo, alvo, f"%{only_digits(termo)}%" if only_digits(termo) else "%%", alvo])
+        alvo = f"%{normalize_upper(strip_accents(termo))}%"
+        partes = ["sem_acento(p.company_name) LIKE ?",
+                  "sem_acento(COALESCE(p.trade_name,'')) LIKE ?",
+                  "sem_acento(COALESCE(p.contact_name,'')) LIKE ?",
+                  "sem_acento(COALESCE(p.city_name,'')) LIKE ?"]
+        params.extend([alvo, alvo, alvo, alvo])
+        digitos = only_digits(termo)
+        # Idem: sem dígitos no termo, a condição de documento casaria com tudo.
+        if digitos:
+            partes.append("COALESCE(p.document_digits,'') LIKE ?")
+            params.append(f"%{digitos}%")
+        sql += " AND (" + " OR ".join(partes) + ")"
 
     sql += """ ORDER BY CASE p.status WHEN 'QUALIFICADO' THEN 0 WHEN 'EM_CONTATO' THEN 1
                WHEN 'NOVO' THEN 2 WHEN 'CADASTRADO' THEN 3 ELSE 4 END, p.company_name LIMIT ?"""
@@ -8952,10 +8959,18 @@ def search_prospect_leads(
         condicoes.append("TRIM(COALESCE(l.telefone,'')) <> ''")
     busca = normalize_whitespace(filtros.get("search"))
     if busca:
-        condicoes.append("(UPPER(l.razao_social) LIKE ? OR UPPER(COALESCE(l.nome_fantasia,'')) LIKE ? "
-                         "OR l.cnpj LIKE ?)")
-        alvo = f"%{normalize_upper(busca)}%"
-        params.extend([alvo, alvo, f"%{only_digits(busca)}%"])
+        # sem_acento nos dois lados: o cadastro tem acento, quem digita nem sempre.
+        alvo = f"%{normalize_upper(strip_accents(busca))}%"
+        partes = ["sem_acento(l.razao_social) LIKE ?",
+                  "sem_acento(COALESCE(l.nome_fantasia,'')) LIKE ?"]
+        params.extend([alvo, alvo])
+        digitos = only_digits(busca)
+        # Só procura por CNPJ se o termo TIVER dígitos. Sem esta guarda a
+        # condição virava LIKE '%%', que casa com tudo e anula a busca.
+        if digitos:
+            partes.append("l.cnpj LIKE ?")
+            params.append(f"%{digitos}%")
+        condicoes.append("(" + " OR ".join(partes) + ")")
 
     onde = " AND ".join(condicoes)
     total = conn.execute(f"SELECT COUNT(*) c FROM prospect_leads l WHERE {onde}",

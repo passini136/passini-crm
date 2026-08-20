@@ -2313,9 +2313,16 @@ function blocoBaseDeLeads() {
               ${(d?.segments || []).map((sg) => `<option value="${escapeHtml(sg.id)}" ${f.segment === sg.id ? "selected" : ""}>${sg.icon} ${escapeHtml(sg.label)}</option>`).join("")}
             </select></div>
           <div class="field"><label>Buscar</label>
-            <input value="${escapeHtml(f.search || "")}" placeholder="Nome ou CNPJ"
-              oninput="state.leadFilters.search=this.value"
-              onkeydown="if(event.key==='Enter'){event.preventDefault();loadLeads();}" /></div>
+            <div style="display:flex;gap:8px">
+              <input style="flex:1" value="${escapeHtml(f.search || "")}" placeholder="Nome ou CNPJ"
+                oninput="state.leadFilters.search=this.value"
+                onkeydown="if(event.key==='Enter'){event.preventDefault();loadLeads();}" />
+              <button class="btn btn-secondary btn-sm" type="button"
+                ${carregando ? "disabled" : ""} onclick="loadLeads()">
+                ${carregando ? "⏳" : "Buscar"}</button>
+              ${f.search ? `<button class="btn btn-ghost btn-sm" type="button"
+                onclick="state.leadFilters.search='';loadLeads()">Limpar</button>` : ""}
+            </div></div>
           <div class="field" style="align-self:end">
             <label class="check-row" style="font-weight:500">
               <input type="checkbox" ${f.withPhone ? "checked" : ""}
