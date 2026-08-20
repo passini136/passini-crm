@@ -720,7 +720,7 @@ def parse_datetime_pt(value: str | None) -> datetime | None:
     text = normalize_whitespace(value)
     if not text:
         return None
-    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
         try:
             return datetime.strptime(text, fmt)
         except ValueError:
@@ -807,7 +807,8 @@ def parse_datetime_flexible(value: str | None) -> datetime | None:
     if not text:
         return None
     normalized = text.replace("T", " ")
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y %H:%M:%S", "%d/%m/%Y"):
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                "%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y"):
         try:
             return datetime.strptime(normalized, fmt)
         except ValueError:
@@ -1046,7 +1047,8 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     # CREATE TABLE IF NOT EXISTS não altera tabela existente — sem este ALTER,
     # o servidor sobe e só quebra na hora do clique, com "no such column".
     sales_columns = {row["name"] for row in conn.execute("PRAGMA table_info(fact_sales_detail)").fetchall()}
-    if sales_columns and "brand_name" not in sales_columns:
+    _rehash_faturamento = bool(sales_columns) and "brand_name" not in sales_columns
+    if _rehash_faturamento:
         # A coluna "Marca" sempre veio no arquivo do Alfa, mas não era gravada.
         # Fica NULL nas linhas antigas: só reimportar o mês traz a marca dele.
         conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN brand_name TEXT")
@@ -1054,6 +1056,11 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sales_brand "
             "ON fact_sales_detail(company_id, competence, brand_name)")
+
+    if _rehash_faturamento:
+        # Roda uma vez só, junto da criação da coluna: quem ainda não tinha
+        # brand_name é exatamente quem tem a identidade no formato antigo.
+        rehash_sales_detail(conn)
 
     lead_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospect_leads)").fetchall()}
     if lead_columns and "client_code" not in lead_columns:
@@ -3568,10 +3575,73 @@ def decode_text_content(content: bytes) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+def rehash_sales_detail(conn: sqlite3.Connection) -> int:
+    """Recalcula a identidade das linhas de faturamento sem a hora.
+
+    Necessário uma única vez. As linhas antigas foram gravadas com a hora cheia
+    na assinatura; o mesmo relatório do Alfa sai ora com segundos, ora sem, e
+    então a MESMA venda entraria de novo numa reimportação — dobrando o mês.
+    Recalculando aqui, a linha antiga passa a ter a mesma identidade que o
+    importador vai gerar, e a reimportação é reconhecida como repetição.
+
+    Só mexe em row_hash e no formato de issue_date. Não apaga, não soma, não
+    altera nenhum valor de venda.
+    """
+    linhas = conn.execute(
+        "SELECT id, company_id, competence, seller_name, client_name, city_name, "
+        "       gtin_value, manufacturer_sku, issue_date, quantity, gross_value, "
+        "       discount_value, freight_value, return_quantity, return_value, "
+        "       net_value, sale_share "
+        "FROM fact_sales_detail ORDER BY id"
+    ).fetchall()
+    if not linhas:
+        return 0
+
+    ocorrencia: Counter = Counter()
+    atualizacoes = []
+    for r in linhas:
+        dia = normalize_whitespace(r["issue_date"])[:10]
+        payload = {
+            "seller": r["seller_name"],
+            "client": r["client_name"],
+            "city": r["city_name"] or "",
+            "gtin": r["gtin_value"] or "",
+            "manufacturer": r["manufacturer_sku"] or "",
+            "issue_date": dia,
+            "quantity": float(r["quantity"] or 0),
+            "gross": float(r["gross_value"] or 0),
+            "discount": float(r["discount_value"] or 0),
+            "freight": float(r["freight_value"] or 0),
+            "qty_return": float(r["return_quantity"] or 0),
+            "value_return": float(r["return_value"] or 0),
+            "net": float(r["net_value"] or 0),
+            "sale_share": float(r["sale_share"] or 0),
+        }
+        sig = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        # A contagem é por (empresa, competência) porque é aí que vale o UNIQUE.
+        chave = (r["company_id"], r["competence"], sig)
+        ocorrencia[chave] += 1
+        atualizacoes.append((hash_text(f"{sig}#{ocorrencia[chave]}"), dia or None, r["id"]))
+
+    conn.executemany(
+        "UPDATE fact_sales_detail SET row_hash = ?, issue_date = ? WHERE id = ?",
+        atualizacoes)
+    print(f"[faturamento] identidade de {len(atualizacoes)} linha(s) recalculada sem a hora "
+          f"— reimportar não vai duplicar", flush=True)
+    return len(atualizacoes)
+
+
 def parse_csv_bytes(content: bytes) -> list[dict[str, str]]:
     text = decode_text_content(content)
     reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=";")
     return [dict(row) for row in reader]
+
+
+def parse_csv_header(content: bytes) -> list[str]:
+    """Só o cabeçalho. Ler 40 MB inteiros para descobrir o tipo é desperdício."""
+    text = decode_text_content(content[:8192])
+    primeira = text.splitlines()[0] if text.splitlines() else ""
+    return [c.strip().strip('"') for c in primeira.split(";")]
 
 
 def file_hash(content: bytes) -> str:
@@ -3588,6 +3658,9 @@ def detect_file_type(filename: str) -> str | None:
     stem_lower = Path(filename).stem.lower()
     aliases = {
         "01fat": "faturamento_detalhado",
+        "fat detalhado": "faturamento_detalhado",
+        "fat_detalhado": "faturamento_detalhado",
+        "faturamento detalhado": "faturamento_detalhado",
         "02unidade": "custo_unidade",
         "03vendedor": "custo_vendedor",
         "030-relatoriofaturamento detalhado": "faturamento_detalhado",
@@ -3625,17 +3698,44 @@ def detect_file_type(filename: str) -> str | None:
     return None
 
 
+# Assinatura de colunas de cada relatório do Alfa. Basta o conjunto mínimo
+# aparecer no cabeçalho — colunas a mais não atrapalham.
+FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
+    ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "DATA EMISSAO", "LIQUIDO"}),
+    ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "MARCA", "FABRICANTE", "LIQUIDO"}),
+]
+
+
+def detect_file_type_by_header(content: bytes | None) -> str | None:
+    """Tipo do arquivo pelo cabeçalho, quando o nome não diz."""
+    if not content:
+        return None
+    try:
+        cabecalho = parse_csv_header(content)
+    except Exception:
+        return None
+    if not cabecalho:
+        return None
+    colunas = {normalize_upper(strip_accents(c)) for c in cabecalho if c}
+    for tipo, assinatura in FILE_HEADER_SIGNATURES:
+        if assinatura <= colunas:
+            return tipo
+    return None
+
+
 def normalize_upload_entries(files_payload: dict[str, bytes] | list[dict[str, Any]]) -> list[dict[str, Any]]:
     if isinstance(files_payload, dict):
         return [{"fieldName": "files", "fileName": filename, "content": content} for filename, content in files_payload.items()]
     return files_payload
 
 
-def detect_upload_file_type(file_name: str, field_name: str | None = None) -> str | None:
+def detect_upload_file_type(
+    file_name: str, field_name: str | None = None, content: bytes | None = None
+) -> str | None:
     override = UPLOAD_FIELD_TYPE_OVERRIDES.get(field_name or "")
     if override:
         return override
-    return detect_file_type(file_name)
+    return detect_file_type(file_name) or detect_file_type_by_header(content)
 
 
 def suggest_competence(rows: list[dict[str, str]]) -> str | None:
@@ -3705,7 +3805,7 @@ def preview_import_package(files_payload: dict[str, bytes] | list[dict[str, Any]
         if extension and extension != ".csv":
             unsupported_files.append({"fileName": filename, "fieldName": field_name, "reason": "Formato inválido. Use CSV."})
             continue
-        kind = detect_upload_file_type(filename, field_name)
+        kind = detect_upload_file_type(filename, field_name, content)
         if not kind:
             continue
         rows = parse_csv_bytes(content)
@@ -3833,7 +3933,7 @@ def import_package(
         filename = entry["fileName"]
         field_name = entry.get("fieldName")
         content = entry["content"]
-        kind = detect_upload_file_type(filename, field_name)
+        kind = detect_upload_file_type(filename, field_name, content)
         if not kind:
             continue
         rows = parse_csv_bytes(content)
@@ -3857,6 +3957,9 @@ def import_package(
             # cliente, dois atendimentos). O contador de ocorrência evita descartar
             # a segunda como duplicata, mantendo o dedupe de reimportação.
             sales_occurrence: Counter = Counter()
+            # Memória local do import: mesma pergunta repetida milhares de vezes
+            _cache_vendedor: dict[tuple[str, str], Any] = {}
+            _cache_cidade: dict[tuple[str, str], Any] = {}
             for row in rows:
                 seller_name = normalize_whitespace(row.get("Vendedor"))
                 client_name = normalize_whitespace(row.get("Cliente") or row.get("CLIENTE") or row.get("Razao Social/Nome")) or "CLIENTE NÃO INFORMADO"
@@ -3879,7 +3982,7 @@ def import_package(
                     "city": city_name,
                     "gtin": gtin_value,
                     "manufacturer": manufacturer_sku,
-                    "issue_date": dt_value.isoformat() if dt_value else "",
+                    "issue_date": dt_value.date().isoformat() if dt_value else "",
                     "quantity": parse_decimal(row.get("Quant.")),
                     "gross": parse_decimal(row.get("Bruto")),
                     "discount": parse_decimal(row.get("Desconto")),
@@ -3913,7 +4016,7 @@ def import_package(
                             manufacturer_sku,
                             brand_name,
                             sku_key,
-                            dt_value.isoformat() if dt_value else None,
+                            dt_value.date().isoformat() if dt_value else None,
                             payload["quantity"],
                             payload["gross"],
                             payload["discount"],
@@ -3935,20 +4038,27 @@ def import_package(
                             "WHERE company_id = ? AND competence = ? AND row_hash = ? "
                             "  AND COALESCE(brand_name, '') = ''",
                             (brand_name, company_id, row_competence, row_hash))
-                role, _ = current_role_and_unit(conn, company_id, seller_name, row_competence)
+                _ck = (seller_name, row_competence)
+                if _ck not in _cache_vendedor:
+                    _cache_vendedor[_ck] = current_role_and_unit(
+                        conn, company_id, seller_name, row_competence)[0]
+                role = _cache_vendedor[_ck]
                 if role is None:
                     register_issue(conn, company_id, import_id, row_competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
                 if city_name:
                     _comp_day = first_day_of_competence(row_competence).isoformat()
-                    city_match = conn.execute(
-                        """
-                        SELECT id FROM city_mappings
-                        WHERE company_id = ? AND city_name = ? AND date(valid_from) <= date(?)
-                          AND (valid_to IS NULL OR date(valid_to) >= date(?))
-                        LIMIT 1
-                        """,
-                        (company_id, city_name, _comp_day, _comp_day),
-                    ).fetchone()
+                    _cck = (city_name, row_competence)
+                    if _cck not in _cache_cidade:
+                        _cache_cidade[_cck] = conn.execute(
+                            """
+                            SELECT id FROM city_mappings
+                            WHERE company_id = ? AND city_name = ? AND date(valid_from) <= date(?)
+                              AND (valid_to IS NULL OR date(valid_to) >= date(?))
+                            LIMIT 1
+                            """,
+                            (company_id, city_name, _comp_day, _comp_day),
+                        ).fetchone()
+                    city_match = _cache_cidade[_cck]
                     if not city_match:
                         register_issue(conn, company_id, import_id, row_competence, "cidade_sem_correspondencia", city_name, {"kind": "city"})
         elif kind == "cadastro_clientes":
@@ -4275,7 +4385,7 @@ def import_package(
         ).fetchone()[0] or 0)
         _files_count = len([
             e for e in normalize_upload_entries(files_payload)
-            if detect_upload_file_type(e["fileName"], e.get("fieldName")) == "cadastro_clientes"
+            if detect_upload_file_type(e["fileName"], e.get("fieldName"), e.get("content")) == "cadastro_clientes"
         ])
         result["clientsBefore"] = clients_before
         result["clientsAfter"] = clients_after
