@@ -1743,8 +1743,10 @@ function setProspectStatus(status) {
 }
 
 function applyProspectSearch() {
+  // Lê do campo; se ele acabou de ser recriado por uma repintura, o estado
+  // guarda o que foi digitado.
   const campo = document.getElementById("prospect-search");
-  state.prospectFilters.search = campo ? campo.value.trim() : "";
+  state.prospectFilters.search = (campo ? campo.value : state.prospectFilters.search || "").trim();
   loadProspects();
 }
 
@@ -2564,6 +2566,7 @@ function prospeccaoView() {
           <input id="prospect-search" style="flex:1;min-width:200px"
             placeholder="🔍 Buscar por nome, contato, CNPJ ou cidade — Enter"
             value="${escapeHtml(f.search)}"
+            oninput="state.prospectFilters.search=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();applyProspectSearch();}" />
           <button class="btn btn-secondary btn-sm" onclick="applyProspectSearch()">Buscar</button>
           <button class="btn btn-primary btn-sm" onclick="novoProspect()">＋ Nova oficina</button>
@@ -7215,7 +7218,7 @@ async function loadMeetings(silencioso) {
 
 function applyMeetingSearch() {
   const campo = document.getElementById("meeting-search");
-  state.meetingFilters.search = campo ? campo.value.trim() : "";
+  state.meetingFilters.search = (campo ? campo.value : state.meetingFilters.search || "").trim();
   loadMeetings();
 }
 
@@ -7717,6 +7720,7 @@ function reunioesView() {
           <input id="meeting-search" style="flex:1;min-width:220px"
             placeholder="🔍 Buscar por assunto, tema, decisão ou participante — Enter para buscar"
             value="${escapeHtml(f.search)}"
+            oninput="state.meetingFilters.search=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();applyMeetingSearch();}" />
           <button class="btn btn-secondary btn-sm" onclick="applyMeetingSearch()">Buscar</button>
           ${temFiltro ? `<button class="btn btn-ghost btn-sm" onclick="clearMeetingFilters()">Limpar</button>` : ""}
@@ -8091,7 +8095,7 @@ function setFeedbackKind(kind) {
 
 function applyFeedbackPersonSearch() {
   const campo = document.getElementById("feedback-person-search");
-  state.feedbackFilters.person = campo ? campo.value.trim() : "";
+  state.feedbackFilters.person = (campo ? campo.value : state.feedbackFilters.person || "").trim();
   loadFeedback();
 }
 
@@ -8700,6 +8704,7 @@ function toggleBairro(chave) {
 function novaVisita(cliente) {
   state.visitEditor = {
     id: null,
+    clientSearch: "",   // o que foi digitado na busca de cliente
     clientKey: cliente?.clientKey || "",
     clientName: cliente?.clientName || "",
     cityName: cliente?.cityName || "",
@@ -8740,7 +8745,8 @@ async function buscarClienteVisita() {
   const e = state.visitEditor;
   if (!e) return;
   const campo = document.getElementById("visit-client-search");
-  const termo = campo ? campo.value.trim() : "";
+  const termo = (campo ? campo.value : e.clientSearch || "").trim();
+  e.clientSearch = termo;
   if (termo.length < 2) { addMessage("warn", "Digite ao menos 2 caracteres."); return; }
   e.searching = true; e.results = null; requestRender();
   try {
@@ -9296,6 +9302,8 @@ function visitaEditorModal() {
             <div style="display:flex;gap:8px">
               <input id="visit-client-search" style="flex:1"
                 placeholder="Buscar por código, razão social ou nome fantasia — Enter para buscar"
+                value="${escapeHtml(v.clientSearch || "")}"
+                oninput="state.visitEditor.clientSearch=this.value"
                 onkeydown="if(event.key==='Enter'){event.preventDefault();buscarClienteVisita();}" />
               <button class="btn btn-secondary" onclick="buscarClienteVisita()">
                 ${v.searching ? "Buscando…" : "Buscar"}</button>
@@ -9459,6 +9467,7 @@ function feedbackView() {
           ${podeDar ? `
             <input id="feedback-person-search" style="flex:1;min-width:180px" placeholder="🔍 Buscar por nome — Enter"
               value="${escapeHtml(f.person)}"
+              oninput="state.feedbackFilters.person=this.value"
               onkeydown="if(event.key==='Enter'){event.preventDefault();applyFeedbackPersonSearch();}" />
             <button class="btn btn-secondary btn-sm" onclick="applyFeedbackPersonSearch()">Buscar</button>` : ""}
           ${podeDar ? `
@@ -11216,7 +11225,7 @@ function setTaskStatus(valor) {
 
 function applyTaskSearch() {
   const campo = document.getElementById("task-search");
-  state.taskFilters.search = campo ? campo.value.trim() : "";
+  state.taskFilters.search = (campo ? campo.value : state.taskFilters.search || "").trim();
   loadCrmTasks();
 }
 
@@ -11348,6 +11357,7 @@ function crmTasksView() {
           <input id="task-search" style="flex:1;min-width:200px"
             placeholder="🔍 Buscar por título, cliente ou descrição — Enter"
             value="${escapeHtml(f.search)}"
+            oninput="state.taskFilters.search=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();applyTaskSearch();}" />
           <button class="btn btn-secondary btn-sm" onclick="applyTaskSearch()">Buscar</button>
           ${(state.tasks.sellers || []).length > 1 ? `
