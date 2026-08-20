@@ -35,6 +35,7 @@ const state = {
   brands: null,
   brandFilters: { scope: "" },
   brandOpen: {},   // marcas com o detalhe aberto
+  brandLoadingScope: "",  // aba de marcas que está sendo carregada agora
   phaseEditor: null,           // fase da unidade (diretoria)
   activityGoalEditor: null,    // metas de atividade
   assistant: null,        // tutorial, FAQ e dicas
@@ -2604,7 +2605,12 @@ async function loadBrands(silencioso) {
   const mes = state.filters.competenceEnd || state.filters.competenceStart;
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
-  if (!silencioso) state.ui.loading.brands = true;
+  if (!silencioso) {
+    state.ui.loading.brands = true;
+    // Pintar a tela ANTES de sair para a rede. Sem isto o "Carregando" só
+    // apareceria depois da resposta — ou seja, nunca.
+    requestRender();
+  }
   try {
     state.brands = await api(`/api/brands?${q.toString()}`);
   } catch (e) {
@@ -2616,12 +2622,26 @@ async function loadBrands(silencioso) {
   return state.brands;
 }
 
-function setBrandScope(id) {
+async function setBrandScope(id) {
+  // Segundo clique enquanto a troca ainda roda não faz nada: duas requisições
+  // concorrentes podem voltar fora de ordem e mostrar o recorte errado.
+  if (state.brandLoadingScope) return;
+  if (state.brandFilters.scope === id && state.brands) return;
   state.brandFilters.scope = id;
+  // A aba clicada já fica marcada e com "Carregando": a resposta pode demorar
+  // (o detalhe por vendedor varre o mês inteiro) e botão que não reage a clique
+  // parece quebrado — a pessoa clica de novo.
+  state.brandLoadingScope = id;
   // O detalhe aberto no recorte anterior não faz sentido no novo: no grupo ele
   // mostra unidades, em "por vendedor" mostra pessoas.
   state.brandOpen = {};
-  loadBrands();
+  requestRender();
+  try {
+    await loadBrands();
+  } finally {
+    state.brandLoadingScope = "";
+    requestRender();
+  }
 }
 
 function toggleBrand(marca) {
@@ -2638,7 +2658,9 @@ function marcasView() {
   const f = state.brandFilters;
   const t = d.totals || {};
   const linhas = d.rows || [];
-  const escopoAtual = d.scope;
+  // Enquanto troca, vale a aba clicada — não a que o servidor ainda devolve.
+  const trocando = state.brandLoadingScope;
+  const escopoAtual = trocando || d.scope;
 
   if (d.needsReimport) {
     return `
@@ -2671,13 +2693,16 @@ function marcasView() {
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
           <div style="display:flex;gap:6px;flex-wrap:wrap">
             ${(d.scopes || []).map((s) => `
-              <button type="button" onclick="setBrandScope('${s.id}')"
+              <button type="button" onclick="setBrandScope('${s.id}')" ${trocando ? "disabled" : ""}
                 style="border:1px solid ${escopoAtual === s.id ? "var(--accent)" : "var(--line)"};
                        background:${escopoAtual === s.id ? "#e8f0fe" : "#fff"};
                        color:${escopoAtual === s.id ? "var(--accent)" : "var(--muted)"};
                        border-radius:14px;padding:5px 14px;font-size:13px;
-                       font-weight:${escopoAtual === s.id ? "700" : "500"};cursor:pointer">
-                ${escapeHtml(s.label)}
+                       font-weight:${escopoAtual === s.id ? "700" : "500"};
+                       cursor:${trocando ? "wait" : "pointer"};opacity:${trocando && escopoAtual !== s.id ? "0.5" : "1"}">
+                ${trocando === s.id
+                  ? `<span class="girando">↻</span> Carregando…`
+                  : escapeHtml(s.label)}
               </button>`).join("")}
           </div>
           <span style="flex:1"></span>
@@ -2721,7 +2746,8 @@ function marcasView() {
             <div class="text-small">${number(linhas.length)} marca(s) na lista</div></div>
         </div>
         ${state.ui.loading.brands ? '<div class="loader">Carregando…</div>' : ""}
-        <div class="table-wrap">
+        <div class="table-wrap" style="${state.ui.loading.brands
+          ? "opacity:0.45;pointer-events:none;transition:opacity .15s" : ""}">
           <table class="data-table">
             <thead><tr>
               <th style="width:34px"></th>
