@@ -12561,6 +12561,41 @@ function importacoesView() {
                 <div id="import-crm-feedback" class="text-small"></div>
               </div>
             </div>
+
+            <div class="form-card subtle-card">
+              <div class="section-title"><div><h3>Produtos</h3>
+                <div class="text-small">Cadastro de itens e posição de estoque. Nenhum dos dois
+                  tem competência — cada envio atualiza a fotografia atual.</div></div></div>
+              <div class="stack">
+                <div class="two-column-form">
+                  <div class="field">
+                    <label>Cadastro de itens</label>
+                    <input id="import-catalog-file" type="file" accept=".csv" />
+                    <div class="text-small" style="color:var(--muted);margin-top:4px">
+                      Traz a <strong>linha do produto</strong> (amortecedor, kit de embreagem,
+                      filtro), a marca e o preço. Reenvie quando entrar linha nova.
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label>Posição de estoque</label>
+                    <input id="import-stock-file" type="file" accept=".xlsx,.csv" />
+                    <div class="text-small" style="color:var(--muted);margin-top:4px">
+                      Saldo <strong>por unidade</strong>, giro F1–F4 e curva ABC de cada filial.
+                      É o arquivo do Alfa em xlsx. Atualizar 1x ao dia.
+                    </div>
+                  </div>
+                </div>
+                <div class="actions">
+                  <button class="btn btn-secondary" onclick="previewImport('catalog')">Analisar itens</button>
+                  <button class="btn btn-primary" onclick="submitImport('catalog')">Importar itens</button>
+                  <span style="width:12px"></span>
+                  <button class="btn btn-secondary" onclick="previewImport('stock')">Analisar estoque</button>
+                  <button class="btn btn-primary" onclick="submitImport('stock')">Importar estoque</button>
+                </div>
+                <div id="import-catalog-feedback" class="text-small"></div>
+                <div id="import-stock-feedback" class="text-small"></div>
+              </div>
+            </div>
           </div>
         </div>
         <div class="form-card">
@@ -14517,11 +14552,20 @@ async function deleteVacation(id, personName) {
   }
 }
 
+/** Mês corrente como AAAA-MM — rótulo das importações que não têm competência. */
+function hojeCompetencia() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
 function importDomConfig(scope) {
   const configs = {
     cost: { files: ["import-cost-unit-file", "import-cost-vendor-file"], competence: "import-cost-competence", action: null, feedback: "import-cost-feedback", importScope: "cost" },
     sales: { files: ["import-sales-file"], competence: "import-sales-competence", action: "import-sales-action", feedback: "import-sales-feedback", importScope: "sales" },
     crm: { files: ["import-crm-clients-file", "import-crm-summary-file"], competence: "import-crm-competence", action: null, feedback: "import-crm-feedback", importScope: "crm" },
+    // Bases mestre: sem campo de competência, porque não têm mês.
+    catalog: { files: ["import-catalog-file"], competence: null, action: null, feedback: "import-catalog-feedback", importScope: "catalog" },
+    stock: { files: ["import-stock-file"], competence: null, action: null, feedback: "import-stock-feedback", importScope: "stock" },
   };
   return configs[scope] || null;
 }
@@ -14557,8 +14601,12 @@ async function previewImport(scope) {
     const fileEl = document.getElementById(fileId);
     if (fileEl?.files[0]) form.append(fileId, fileEl.files[0], fileEl.files[0].name);
   }
-  const compEl = document.getElementById(cfg.competence);
-  if (compEl?.value) form.set("competence", compEl.value.trim());
+  if (cfg.competence) {
+    const compEl = document.getElementById(cfg.competence);
+    if (compEl?.value) form.set("competence", compEl.value.trim());
+  } else {
+    form.set("competence", hojeCompetencia());
+  }
   if (cfg.action) {
     const actionEl = document.getElementById(cfg.action);
     if (actionEl?.value) form.set("importAction", actionEl.value);
@@ -14584,13 +14632,29 @@ async function submitImport(scope) {
   const feedbackEl = document.getElementById(cfg.feedback);
   if (feedbackEl) feedbackEl.textContent = "Importando...";
   const form = new FormData();
+  let escolheuArquivo = false;
   for (const fileId of cfg.files) {
     const fileEl = document.getElementById(fileId);
-    if (fileEl?.files[0]) form.append(fileId, fileEl.files[0], fileEl.files[0].name);
+    if (fileEl?.files[0]) {
+      form.append(fileId, fileEl.files[0], fileEl.files[0].name);
+      escolheuArquivo = true;
+    }
   }
-  const compEl = document.getElementById(cfg.competence);
-  const competence = compEl?.value?.trim() || "";
-  if (!competence) { addMessage("error", "Informe a competência antes de importar."); if (feedbackEl) feedbackEl.textContent = ""; return; }
+  // Dois envios no mesmo bloco: sem esta checagem, clicar no botão errado
+  // manda um pacote vazio e o erro vem do servidor, sem dizer o que faltou.
+  if (!escolheuArquivo) {
+    addMessage("error", "Escolha o arquivo antes de importar.");
+    if (feedbackEl) feedbackEl.textContent = "";
+    return;
+  }
+  // Bases mestre (catálogo, estoque) não têm competência: o mês entra só como
+  // rótulo do registro de importação.
+  let competence = hojeCompetencia();
+  if (cfg.competence) {
+    const compEl = document.getElementById(cfg.competence);
+    competence = compEl?.value?.trim() || "";
+    if (!competence) { addMessage("error", "Informe a competência antes de importar."); if (feedbackEl) feedbackEl.textContent = ""; return; }
+  }
   form.set("competence", competence);
   if (cfg.action) {
     const actionEl = document.getElementById(cfg.action);

@@ -155,6 +155,17 @@ AUTO_IMPORT_FOLDERS = [
     {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
      "label": "CRM · Faturamento Consolidado",
      "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
+    {"folder": "catalogo", "scope": "catalog",
+     "label": "Cadastro de Itens",
+     "hint": "Relatório de itens do Alfa. É ele que traz a LINHA do produto "
+             "(amortecedor, kit de embreagem, filtro), a marca e o preço. Sem competência: "
+             "cada importação atualiza o cadastro inteiro. Basta reenviar quando entrar "
+             "linha nova ou mudar preço."},
+    {"folder": "estoque", "scope": "stock",
+     "label": "Posição de Estoque",
+     "hint": "stockPosition do Alfa, em xlsx. Traz o saldo POR UNIDADE, a régua de giro "
+             "F1–F4 e a curva ABC de cada filial. Sem competência: substitui a posição das "
+             "unidades que vierem no arquivo. Atualizar 1x ao dia."},
     {"folder": "devolucao-garantia", "scope": "warranty",
      "label": "Devolução em Garantia",
      "hint": "Relatório de devoluções em garantia. A competência sai da data de cada devolução — "
@@ -3794,11 +3805,34 @@ def parse_xlsx_header(content: bytes) -> list[str]:
     return [str(c or "").strip() for c in primeira]
 
 
+# Toda importação lê o MESMO arquivo duas vezes: uma para a prévia (que valida
+# e conta linhas) e outra para gravar. Com 284 mil linhas em xlsx isso dobra um
+# trabalho de mais de um minuto. O cache guarda no máximo dois arquivos e é
+# esvaziado ao fim da importação — o pico de memória é o mesmo de antes, porque
+# a gravação já mantinha todas as linhas carregadas.
+_TABLE_PARSE_CACHE: dict[str, list[dict[str, str]]] = {}
+_TABLE_PARSE_CACHE_MAX = 2
+
+
 def parse_table_bytes(content: bytes, file_name: str = "") -> list[dict[str, str]]:
     """CSV ou XLSX, conforme o arquivo. O resto do importador não muda."""
+    chave = file_hash(content)
+    em_cache = _TABLE_PARSE_CACHE.get(chave)
+    if em_cache is not None:
+        return em_cache
     if file_name.lower().endswith((".xlsx", ".xlsm")) or content[:2] == b"PK":
-        return parse_xlsx_rows(content)
-    return parse_csv_bytes(content)
+        linhas = parse_xlsx_rows(content)
+    else:
+        linhas = parse_csv_bytes(content)
+    if len(_TABLE_PARSE_CACHE) >= _TABLE_PARSE_CACHE_MAX:
+        _TABLE_PARSE_CACHE.pop(next(iter(_TABLE_PARSE_CACHE)))
+    _TABLE_PARSE_CACHE[chave] = linhas
+    return linhas
+
+
+def clear_table_parse_cache() -> None:
+    """Libera a memória das linhas lidas. Chamado ao fim de cada importação."""
+    _TABLE_PARSE_CACHE.clear()
 
 
 def parse_csv_header(content: bytes) -> list[str]:
@@ -4649,6 +4683,7 @@ def import_package(
     if stock_rows_total:
         result["stockRows"] = stock_rows_total
         result["stockUnits"] = sorted(stock_units_seen)
+    clear_table_parse_cache()
     if sales_competences_seen:
         _ordered = sorted(sales_competences_seen)
         result["salesCompetences"] = _ordered
@@ -19005,7 +19040,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 if not preview.get("isValid"):
                     unsupported = preview.get("unsupportedFiles", [])
                     if unsupported:
-                        error_message = "Formato invalido para importacao operacional. Use CSV. Arquivos: " + ", ".join(
+                        error_message = "Formato inválido para importação operacional. Use CSV ou XLSX. Arquivos: " + ", ".join(
                             f["fileName"] for f in unsupported
                         )
                     else:
@@ -19965,6 +20000,10 @@ def _auto_import_build_payload(files: list[Path], scope: str) -> list[dict[str, 
             field_name = "import-crm-summary-file"
         elif scope == "warranty":
             field_name = "import-warranty-file"
+        elif scope == "catalog":
+            field_name = "import-catalog-file"
+        elif scope == "stock":
+            field_name = "import-stock-file"
         elif scope == "cost":
             field_name = _auto_import_detect_cost_field(content)
         elif scope == "crm":
@@ -19996,7 +20035,8 @@ def _auto_import_tick_inner() -> None:
             folder_path.mkdir(parents=True, exist_ok=True)
             continue
 
-        csv_files = sorted(folder_path.glob("*.csv"))
+        # O relatório de estoque do Alfa só sai em xlsx; os demais são CSV.
+        csv_files = sorted([*folder_path.glob("*.csv"), *folder_path.glob("*.xlsx")])
         if not csv_files:
             continue
 
@@ -20018,6 +20058,10 @@ def _auto_import_tick_inner() -> None:
                       f"aguardando {CRM_CLIENTS_SETTLE_SECONDS}s de estabilidade")
                 continue
             by_competence: dict[str, list[Path]] = {"_clients__all": list(csv_files)}
+        elif scope in {"catalog", "stock"}:
+            # Bases mestre, sem competência: é a fotografia atual do cadastro e
+            # do estoque. Cada arquivo entra sozinho, sem exigir mês no nome.
+            by_competence = {f"_master__{i}": [f] for i, f in enumerate(csv_files)}
         else:
             # Agrupa arquivos por competência extraída do nome
             by_competence = {}
@@ -20076,6 +20120,9 @@ def _auto_import_tick_inner() -> None:
                                          [f.name for f in files])
                     continue
                 competence = suggested
+            elif competence_key.startswith("_master__"):
+                # Rótulo só para o registro do import; nada é filtrado por ele.
+                competence = date.today().strftime("%Y-%m")
             elif competence_key.startswith("_clients__"):
                 # Cadastro de clientes não tem competência; usa o mês atual como rótulo
                 competence = date.today().strftime("%Y-%m")
