@@ -32,6 +32,8 @@ const state = {
   prospects: null,        // prospecção e fase da unidade
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
+  brands: null,
+  brandFilters: { scope: "", unit: "", seller: "" },
   phaseEditor: null,           // fase da unidade (diretoria)
   activityGoalEditor: null,    // metas de atividade
   assistant: null,        // tutorial, FAQ e dicas
@@ -76,6 +78,7 @@ const state = {
       contacts: false,
       inactives: false,
       leads: false,
+      brands: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
@@ -2587,6 +2590,209 @@ function prospeccaoView() {
     </div>`;
 }
 
+// ─── Vendas por Marca ───────────────────────────────────────────────────────
+//
+// Três recortes na mesma tela. O vendedor abre nas próprias vendas e pode
+// olhar a unidade e o grupo para se comparar; o gestor abre no grupo e desce
+// até o vendedor. O que muda entre os perfis é o que cada um pode selecionar,
+// nunca a forma da tabela — quem aprende a ler uma, lê as três.
+
+async function loadBrands(silencioso) {
+  const f = state.brandFilters;
+  const q = new URLSearchParams();
+  const mes = state.filters.competenceEnd || state.filters.competenceStart;
+  if (mes) q.set("competence", mes);
+  if (f.scope) q.set("scope", f.scope);
+  if (f.unit) q.set("unit", f.unit);
+  if (f.seller) q.set("seller", f.seller);
+  if (!silencioso) state.ui.loading.brands = true;
+  try {
+    state.brands = await api(`/api/brands?${q.toString()}`);
+  } catch (e) {
+    state.brands = { error: e.message, rows: [], scopes: [], insights: [], totals: {} };
+  } finally {
+    state.ui.loading.brands = false;
+    requestRender();
+  }
+  return state.brands;
+}
+
+function setBrandScope(id) {
+  state.brandFilters.scope = id;
+  // Trocar de recorte sem limpar o anterior deixaria "por vendedor" preso ao
+  // vendedor escolhido antes, mesmo depois de voltar para o grupo.
+  if (id !== "vendedor") state.brandFilters.seller = "";
+  loadBrands();
+}
+
+function setBrandUnit(v)   { state.brandFilters.unit = v;   loadBrands(); }
+function setBrandSeller(v) { state.brandFilters.seller = v; state.brandFilters.scope = "vendedor"; loadBrands(); }
+
+function marcasView() {
+  if (!state.brands) { loadBrands(); return `<div class="loader panel">Carregando marcas…</div>`; }
+  const d = state.brands;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+
+  const f = state.brandFilters;
+  const t = d.totals || {};
+  const linhas = d.rows || [];
+  const escopoAtual = d.scope;
+
+  if (d.needsReimport) {
+    return `
+      <div class="panel" style="padding:18px;border-left:4px solid #f4c25f">
+        <div style="font-weight:800;font-size:15px">A marca ainda não está no banco</div>
+        <div class="text-small" style="margin-top:6px;line-height:1.6">
+          A coluna <strong>Marca</strong> sempre veio no relatório de faturamento do Alfa,
+          mas não era gravada — por isso os meses já importados estão sem ela.
+          Reimporte o <strong>faturamento detalhado</strong> dos meses que quiser analisar em
+          Importações. A reimportação não duplica nada: as linhas já existentes apenas
+          recebem a marca.
+        </div>
+      </div>`;
+  }
+
+  const seta = (v) => v === null || v === undefined ? "" :
+    `<span style="color:${v >= 0 ? "var(--good)" : "var(--bad)"};font-weight:700">
+       ${v >= 0 ? "▲" : "▼"} ${Math.abs(v).toFixed(0)}%</span>`;
+
+  const kpi = (rotulo, valor, sub) => `
+    <div style="flex:1;min-width:120px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+      <div class="text-small" style="color:var(--muted)">${rotulo}</div>
+      <div style="font-size:20px;font-weight:800">${valor}</div>
+      ${sub ? `<div class="text-small" style="color:var(--muted)">${sub}</div>` : ""}
+    </div>`;
+
+  return `
+    <div class="stack">
+      <div class="panel" style="padding:14px 18px">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            ${(d.scopes || []).map((s) => `
+              <button type="button" onclick="setBrandScope('${s.id}')"
+                style="border:1px solid ${escopoAtual === s.id ? "var(--accent)" : "var(--line)"};
+                       background:${escopoAtual === s.id ? "#e8f0fe" : "#fff"};
+                       color:${escopoAtual === s.id ? "var(--accent)" : "var(--muted)"};
+                       border-radius:14px;padding:5px 14px;font-size:13px;
+                       font-weight:${escopoAtual === s.id ? "700" : "500"};cursor:pointer">
+                ${escapeHtml(s.label)}
+              </button>`).join("")}
+          </div>
+          <span style="flex:1"></span>
+          ${d.canPickUnit && escopoAtual !== "grupo" ? `
+            <select onchange="setBrandUnit(this.value)">
+              <option value="">Todas as unidades</option>
+              ${(d.units || []).map((u) => `
+                <option value="${escapeHtml(u)}" ${d.unit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select>` : ""}
+          ${d.canPickSeller ? `
+            <select onchange="setBrandSeller(this.value)">
+              <option value="">Escolher vendedor…</option>
+              ${(d.sellers || []).map((s) => `
+                <option value="${escapeHtml(s)}" ${d.seller === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
+            </select>` : ""}
+          ${botaoAtualizar("marcas", "loadBrands()", { mensagem: "Ranking de marcas atualizado." })}
+          <button class="btn btn-secondary btn-sm" onclick="exportBrandsXLSX()">⬇ Exportar</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Competência ${escapeHtml(d.competence || "—")} · comparado com ${escapeHtml(d.prevCompetence || "—")}
+          ${escopoAtual === "vendedor" && d.seller ? ` · ${escapeHtml(d.seller)}` : ""}
+          ${escopoAtual === "unidade" && d.unit ? ` · ${escapeHtml(d.unit)}` : ""}
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${kpi("Faturamento", currency(t.revenue), t.deltaPct !== null && t.deltaPct !== undefined
+              ? `${seta(t.deltaPct)} vs mês anterior` : "sem base de comparação")}
+        ${kpi("Marcas vendidas", number(t.brands))}
+        ${kpi("Itens vendidos", number(t.items))}
+        ${kpi("Códigos distintos", number(t.skus))}
+      </div>
+
+      ${(d.insights || []).length ? `
+        <div class="panel" style="padding:14px 18px">
+          <div style="font-weight:800;font-size:14px;margin-bottom:8px">💡 Leituras do mês</div>
+          <div class="stack" style="gap:8px">
+            ${d.insights.map((i) => `
+              <div style="display:flex;gap:10px;align-items:start;padding:9px 11px;border-radius:8px;
+                          background:${i.kind === "atencao" ? "#fef7e0" : i.kind === "bom" ? "#e6f4ea" : "#e8f0fe"}">
+                <div style="font-size:16px;line-height:1.2">${i.icon}</div>
+                <div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(i.title)}</div>
+                  <div class="text-small" style="line-height:1.5">${escapeHtml(i.text)}</div>
+                </div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>Ranking de marcas</h3>
+            <div class="text-small">${number(linhas.length)} marca(s) na lista</div></div>
+        </div>
+        ${state.ui.loading.brands ? '<div class="loader">Carregando…</div>' : ""}
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th style="width:44px">#</th>
+              <th>Marca</th>
+              <th style="text-align:right">Itens vendidos</th>
+              <th style="text-align:right">Códigos distintos</th>
+              <th style="text-align:right">Clientes</th>
+              <th style="text-align:right">Valor</th>
+              <th style="text-align:right">% do total</th>
+              <th style="text-align:right">vs mês anterior</th>
+            </tr></thead>
+            <tbody>
+              ${linhas.map((r) => `
+                <tr>
+                  <td>${r.rank}</td>
+                  <td><strong>${escapeHtml(r.brand)}</strong></td>
+                  <td style="text-align:right">${number(r.items)}</td>
+                  <td style="text-align:right">${number(r.skus)}</td>
+                  <td style="text-align:right">${number(r.clients)}</td>
+                  <td style="text-align:right">${currency(r.revenue)}</td>
+                  <td style="text-align:right">${r.share.toFixed(1)}%</td>
+                  <td style="text-align:right">
+                    ${r.isNew ? '<span class="status-tag good">novo</span>' : seta(r.deltaPct)}
+                  </td>
+                </tr>`).join("")
+                || `<tr><td colspan="8">${emptyStateCard("Sem faturamento com marca nesta competência.")}</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+        ${t.hiddenBrands ? `
+          <div class="text-small" style="color:var(--muted);padding:8px 12px">
+            ${number(t.hiddenBrands)} marca(s) abaixo de ${currency(t.minRevenue)} ficaram fora da lista
+            (${currency(t.hiddenRevenue)}). Elas entram no total, não no ranking.
+          </div>` : ""}
+      </div>
+
+      ${(d.disappeared || []).length ? `
+        <div class="panel" style="padding:14px 18px">
+          <div style="font-weight:800;font-size:14px">Vendiam no mês anterior e zeraram</div>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            ${d.disappeared.map((s) => `${escapeHtml(s.brand)} (${currency(s.prevRevenue)})`).join(" · ")}
+          </div>
+        </div>` : ""}
+    </div>`;
+}
+
+async function exportBrandsXLSX() {
+  const d = state.brands;
+  if (!d || !(d.rows || []).length) { addMessage("warn", "Nada para exportar."); return; }
+  const cabecalho = ["#", "Marca", "Itens vendidos", "Códigos distintos", "Clientes",
+                     "Valor", "% do total", "Mês anterior", "Variação %"];
+  const linhas = d.rows.map((r) => [r.rank, r.brand, r.items, r.skus, r.clients,
+                                    r.revenue, r.share, r.prevRevenue,
+                                    r.isNew ? "novo" : r.deltaPct]);
+  const rotulo = d.scope === "vendedor" ? (d.seller || "vendedor")
+               : d.scope === "unidade"  ? (d.unit || "unidade") : "grupo";
+  baixarPlanilha(`marcas-${rotulo}-${d.competence}`.replace(/\s+/g, "-").toLowerCase(),
+                 "Marcas", cabecalho, linhas);
+}
+
+
 function prospectCard(p, podeGerir) {
   const parado = p.status !== "CADASTRADO" && p.status !== "PERDIDO"
     && (p.daysSinceContact === null || p.daysSinceContact >= 7);
@@ -3620,6 +3826,9 @@ async function refreshCurrentTab() {
   // Dados gerais sempre recarregados
   if (["executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario"].includes(tab)) {
     promises.push(loadDashboard());
+  }
+  if (tab === "marcas") {
+    promises.push(loadBrands(true));
   }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
@@ -4795,6 +5004,9 @@ async function applyMainFilters() {
     // Filtros de período/unidade/vendedor afetam só o dashboard.
     // CRM usa sua própria filtragem independente — não recarregar aqui.
     await loadDashboard();
+    // Marcas lê a mesma competência do topo: sem isto, trocar o mês mudaria
+    // todos os números da tela menos o ranking de marcas.
+    if (state.activeTab === "marcas") await loadBrands(true);
   } finally {
     setLoading("filters", false);
   }
@@ -13279,6 +13491,7 @@ function topbarTitle() {
     "executivo":      { title: "Visão Executiva",         description: "Panorama consolidado de resultados, metas e comparativos." },
     "vendedores":     { title: "Análise de Vendedores",   description: "Ranking, score e desempenho individual de vendedores." },
     "unidades":       { title: "Análise de Unidades",     description: "Comparativo de desempenho entre unidades." },
+    "marcas":         { title: "Vendas por Marca",        description: "Ranking de marcas por itens, códigos e valor, com leitura do mês." },
     "clientes":       { title: "Base de Clientes",        description: "Carteira ativa, inativos e métricas por cliente." },
     "cidades":        { title: "Cobertura Geográfica",    description: "Distribuição de vendas e clientes por cidade." },
     "descontos":      { title: "Política de Descontos",   description: "Análise de desconto médio por vendedor." },
@@ -13655,6 +13868,7 @@ function dashboardView() {
     { id: "executivo",  title: "Executivo",  desc: "Panorama e KPIs",          icon: "📊" },
     { id: "vendedores", title: "Vendedores", desc: "Ranking e score",           icon: "👤" },
     { id: "unidades",   title: "Unidades",   desc: "Comparativo",               icon: "🏢" },
+    { id: "marcas",     title: "Marcas",     desc: "Ranking por marca",         icon: "🏷️" },
   ].filter((t) => allowed.includes(t.id));
 
   // Consultas ocasionais recolhidas: no mesmo nível do Executivo elas puxavam
@@ -13783,6 +13997,7 @@ function dashboardView() {
           ${state.activeTab === "executivo"     ? executivoView()      : ""}
           ${state.activeTab === "vendedores"    ? vendedoresView()     : ""}
           ${state.activeTab === "unidades"      ? unitsView()          : ""}
+          ${state.activeTab === "marcas"        ? marcasView()         : ""}
           ${state.activeTab === "clientes"      ? clientesView()       : ""}
           ${state.activeTab === "cidades"       ? cidadesView()        : ""}
           ${state.activeTab === "descontos"     ? descontosView()      : ""}
