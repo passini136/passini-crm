@@ -9521,6 +9521,55 @@ def brand_ranking_rows(
     }
 
 
+def brand_seller_breakdown(
+    conn: sqlite3.Connection, company_id: int, competence: str,
+    vendedores: list[str] | None, unidade_por_vendedor: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Marca × vendedor numa consulta só, indexado pela marca.
+
+    Uma consulta por vendedor seria exata do mesmo jeito, mas com 35 vendedores
+    seriam 35 idas ao banco a cada abertura da tela. Aqui os números por
+    vendedor continuam exatos: o DISTINCT é calculado dentro de cada par
+    (marca, vendedor), que é justamente o recorte exibido.
+    """
+    onde = ["company_id = ?", "competence = ?", "TRIM(COALESCE(brand_name,'')) <> ''"]
+    params: list[Any] = [company_id, competence]
+    if vendedores is not None:
+        if not vendedores:
+            return {}
+        marcadores = ",".join("?" for _ in vendedores)
+        onde.append(f"seller_name IN ({marcadores})")
+        params.extend(vendedores)
+    item = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+    saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in conn.execute(
+        f"""
+        SELECT brand_name AS marca, seller_name AS vendedor,
+               ROUND(SUM(quantity), 0)     AS itens,
+               COUNT(DISTINCT {item})      AS codigos,
+               ROUND(SUM(net_value), 2)    AS valor,
+               COUNT(DISTINCT client_name) AS clientes
+        FROM fact_sales_detail
+        WHERE {" AND ".join(onde)}
+        GROUP BY brand_name, seller_name
+        """, params).fetchall():
+        nome = normalize_whitespace(r["vendedor"])
+        if float(r["valor"] or 0) <= 0:
+            continue
+        saida[r["marca"]].append({
+            "sellerName": nome,
+            "unitName": (unidade_por_vendedor.get(person_key(nome))
+                         or unidade_por_vendedor.get(short_person_key(nome)) or "—"),
+            "items": int(r["itens"] or 0),
+            "skus": int(r["codigos"] or 0),
+            "revenue": float(r["valor"] or 0.0),
+            "clients": int(r["clientes"] or 0),
+        })
+    for lista in saida.values():
+        lista.sort(key=lambda x: x["revenue"], reverse=True)
+    return saida
+
+
 def brand_has_no_column(conn: sqlite3.Connection, company_id: int, competence: str) -> bool:
     """Tem faturamento no mês, mas nenhuma linha com marca? Falta reimportar."""
     linha = conn.execute(
@@ -9579,38 +9628,28 @@ def brand_sales_report(
     if not minha_unidade and permitidas:
         minha_unidade = permitidas[0]
 
+    # Dois recortes. A quebra por unidade saiu de aba própria e virou o detalhe
+    # que abre dentro da linha da marca — assim a comparação fica lado a lado,
+    # sem trocar de tela e perder de vista o número do grupo.
     if escopo_dados == "proprio":
         escopos = [{"id": "vendedor", "label": "Minhas vendas"},
-                   {"id": "unidade",  "label": minha_unidade or "Minha unidade"},
                    {"id": "grupo",    "label": "Grupo"}]
         padrao = "vendedor"
     else:
         escopos = [{"id": "grupo",    "label": "Grupo"},
-                   {"id": "unidade",  "label": "Por unidade"},
-                   {"id": "vendedor", "label": "Por vendedor"}]
+                   {"id": "equipe",   "label": "Por vendedor"}]
         padrao = "grupo"
     atual = scope if scope in {e["id"] for e in escopos} else padrao
 
-    # Quem entra na conta deste recorte
-    vendedor_alvo = normalize_whitespace(seller)
-    unidade_alvo = normalize_unit(unit) if unit else ""
-    if escopo_dados == "proprio":
-        vendedor_alvo, unidade_alvo = eu, minha_unidade
-    elif permitidas is not None:
-        if not permitidas:
-            unidade_alvo = "__SEM_ACESSO__"
-        elif unidade_alvo not in permitidas:
-            unidade_alvo = minha_unidade or permitidas[0]
-
     if atual == "vendedor":
-        filtro = seller_name_variants(conn, company_id, vendedor_alvo) if vendedor_alvo else []
-    elif atual == "unidade":
-        filtro = sellers_of_unit(conn, company_id, comp, unidade_alvo or minha_unidade)
+        # Só o próprio vendedor. O gestor não tem esta aba: a dele é "equipe",
+        # que já mostra todo mundo sem precisar escolher um por vez.
+        filtro = seller_name_variants(conn, company_id, eu) if eu else []
     else:
-        # Grupo: quem só enxerga a própria unidade continua limitado a ela,
-        # senão o "grupo" viraria porta lateral para a base inteira.
+        # Grupo e equipe: quem só enxerga a própria unidade continua limitado a
+        # ela, senão o "grupo" viraria porta lateral para a base inteira.
         filtro = (None if permitidas is None
-                  else sellers_of_unit(conn, company_id, comp, unidade_alvo or minha_unidade))
+                  else sellers_of_unit(conn, company_id, comp, minha_unidade))
 
     agora = brand_ranking_rows(conn, company_id, comp, filtro)
     antes = brand_ranking_rows(conn, company_id, anterior, filtro)
@@ -9638,6 +9677,40 @@ def brand_sales_report(
     for i, r in enumerate(linhas, 1):
         r["rank"] = i
 
+    # O que abre no "+": no grupo, as unidades; em "por vendedor", as pessoas.
+    # Calculado só para as marcas exibidas — abrir detalhe de marca que nem
+    # aparece seria trabalho jogado fora.
+    exibidas = {r["brand"] for r in linhas}
+    if atual == "equipe":
+        detalhe = brand_seller_breakdown(conn, company_id, comp, filtro, mapa_unidades)
+        for r in linhas:
+            r["breakdown"] = detalhe.get(r["brand"], [])
+    elif atual == "grupo":
+        por_unidade: dict[str, dict[str, dict[str, Any]]] = {}
+        for un in unidades:
+            nomes = sellers_of_unit(conn, company_id, comp, un)
+            if nomes:
+                por_unidade[un] = brand_ranking_rows(conn, company_id, comp, nomes)
+        for r in linhas:
+            itens = []
+            for un, rank in por_unidade.items():
+                v = rank.get(r["brand"])
+                if v and v["revenue"] > 0:
+                    itens.append({"unitName": un, **{k: v[k] for k in
+                                  ("items", "skus", "revenue", "clients")}})
+            itens.sort(key=lambda x: x["revenue"], reverse=True)
+            # Faturamento sem unidade acontece quando o vendedor não está no
+            # cadastro de pessoas. Dizer isso é melhor que somar errado.
+            coberto = sum(x["revenue"] for x in itens)
+            if r["revenue"] - coberto > 1:
+                itens.append({"unitName": "— sem unidade no cadastro —",
+                              "items": 0, "skus": 0, "clients": 0,
+                              "revenue": round(r["revenue"] - coberto, 2)})
+            r["breakdown"] = itens
+    else:
+        for r in linhas:
+            r["breakdown"] = []
+
     sumiram = sorted(
         ({"brand": m, "prevRevenue": round(v["revenue"], 2)}
          for m, v in antes.items()
@@ -9655,11 +9728,10 @@ def brand_sales_report(
         "scope": atual,
         "scopes": escopos,
         "units": unidades,
-        "unit": unidade_alvo if unidade_alvo != "__SEM_ACESSO__" else "",
-        "seller": vendedor_alvo,
-        "sellers": brand_seller_options(conn, company_id, comp, permitidas),
-        "canPickSeller": escopo_dados != "proprio",
-        "canPickUnit": escopo_dados != "proprio" and len(unidades) > 1,
+        "unit": minha_unidade,
+        "seller": eu if atual == "vendedor" else "",
+        "breakdownBy": ("unidade" if atual == "grupo"
+                        else "vendedor" if atual == "equipe" else ""),
         "rows": linhas,
         "disappeared": sumiram[:5],
         "totals": {
@@ -9676,7 +9748,7 @@ def brand_sales_report(
             "minRevenue": BRAND_MIN_REVENUE,
         },
         "insights": brand_insights(conn, company_id, comp, atual, linhas, total, sumiram,
-                                   minha_unidade, vendedor_alvo, escopo_dados, permitidas),
+                                   minha_unidade, eu, escopo_dados, permitidas),
         "needsReimport": not linhas and brand_has_no_column(conn, company_id, comp),
     }
 
@@ -9790,7 +9862,7 @@ def brand_insights(
                 })
 
     # 6. Para o gestor: vendedor destoando da unidade
-    if escopo in {"grupo", "unidade"} and escopo_dados != "proprio":
+    if escopo in {"grupo", "equipe"} and escopo_dados != "proprio":
         alvo = minha_unidade if permitidas else ""
         referencia = sellers_of_unit(conn, company_id, competence, alvo)
         vendedores = brand_seller_options(conn, company_id, competence, permitidas)

@@ -33,7 +33,8 @@ const state = {
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
   brands: null,
-  brandFilters: { scope: "", unit: "", seller: "" },
+  brandFilters: { scope: "" },
+  brandOpen: {},   // marcas com o detalhe aberto
   phaseEditor: null,           // fase da unidade (diretoria)
   activityGoalEditor: null,    // metas de atividade
   assistant: null,        // tutorial, FAQ e dicas
@@ -2603,8 +2604,6 @@ async function loadBrands(silencioso) {
   const mes = state.filters.competenceEnd || state.filters.competenceStart;
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
-  if (f.unit) q.set("unit", f.unit);
-  if (f.seller) q.set("seller", f.seller);
   if (!silencioso) state.ui.loading.brands = true;
   try {
     state.brands = await api(`/api/brands?${q.toString()}`);
@@ -2619,14 +2618,17 @@ async function loadBrands(silencioso) {
 
 function setBrandScope(id) {
   state.brandFilters.scope = id;
-  // Trocar de recorte sem limpar o anterior deixaria "por vendedor" preso ao
-  // vendedor escolhido antes, mesmo depois de voltar para o grupo.
-  if (id !== "vendedor") state.brandFilters.seller = "";
+  // O detalhe aberto no recorte anterior não faz sentido no novo: no grupo ele
+  // mostra unidades, em "por vendedor" mostra pessoas.
+  state.brandOpen = {};
   loadBrands();
 }
 
-function setBrandUnit(v)   { state.brandFilters.unit = v;   loadBrands(); }
-function setBrandSeller(v) { state.brandFilters.seller = v; state.brandFilters.scope = "vendedor"; loadBrands(); }
+function toggleBrand(marca) {
+  if (state.brandOpen[marca]) delete state.brandOpen[marca];
+  else state.brandOpen[marca] = true;
+  requestRender();
+}
 
 function marcasView() {
   if (!state.brands) { loadBrands(); return `<div class="loader panel">Carregando marcas…</div>`; }
@@ -2679,25 +2681,13 @@ function marcasView() {
               </button>`).join("")}
           </div>
           <span style="flex:1"></span>
-          ${d.canPickUnit && escopoAtual !== "grupo" ? `
-            <select onchange="setBrandUnit(this.value)">
-              <option value="">Todas as unidades</option>
-              ${(d.units || []).map((u) => `
-                <option value="${escapeHtml(u)}" ${d.unit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
-            </select>` : ""}
-          ${d.canPickSeller ? `
-            <select onchange="setBrandSeller(this.value)">
-              <option value="">Escolher vendedor…</option>
-              ${(d.sellers || []).map((s) => `
-                <option value="${escapeHtml(s)}" ${d.seller === s ? "selected" : ""}>${escapeHtml(s)}</option>`).join("")}
-            </select>` : ""}
           ${botaoAtualizar("marcas", "loadBrands()", { mensagem: "Ranking de marcas atualizado." })}
           <button class="btn btn-secondary btn-sm" onclick="exportBrandsXLSX()">⬇ Exportar</button>
         </div>
         <div class="text-small" style="color:var(--muted);margin-top:8px">
           Competência ${escapeHtml(d.competence || "—")} · comparado com ${escapeHtml(d.prevCompetence || "—")}
           ${escopoAtual === "vendedor" && d.seller ? ` · ${escapeHtml(d.seller)}` : ""}
-          ${escopoAtual === "unidade" && d.unit ? ` · ${escapeHtml(d.unit)}` : ""}
+          ${d.breakdownBy ? ` · clique no <strong>+</strong> para abrir a marca por ${escapeHtml(d.breakdownBy)}` : ""}
         </div>
       </div>
 
@@ -2734,6 +2724,7 @@ function marcasView() {
         <div class="table-wrap">
           <table class="data-table">
             <thead><tr>
+              <th style="width:34px"></th>
               <th style="width:44px">#</th>
               <th>Marca</th>
               <th style="text-align:right">Itens vendidos</th>
@@ -2744,8 +2735,14 @@ function marcasView() {
               <th style="text-align:right">vs mês anterior</th>
             </tr></thead>
             <tbody>
-              ${linhas.map((r) => `
-                <tr>
+              ${linhas.map((r) => {
+                const abre = (r.breakdown || []).length > 0;
+                const aberto = Boolean(state.brandOpen[r.brand]);
+                return `
+                <tr ${abre ? `style="cursor:pointer" onclick="toggleBrand('${jsAttr(r.brand)}')"` : ""}>
+                  <td>${abre ? `<span style="display:inline-block;width:20px;height:20px;line-height:18px;
+                        text-align:center;border:1px solid var(--line);border-radius:5px;
+                        font-weight:700;color:var(--muted)">${aberto ? "−" : "+"}</span>` : ""}</td>
                   <td>${r.rank}</td>
                   <td><strong>${escapeHtml(r.brand)}</strong></td>
                   <td style="text-align:right">${number(r.items)}</td>
@@ -2756,8 +2753,25 @@ function marcasView() {
                   <td style="text-align:right">
                     ${r.isNew ? '<span class="status-tag good">novo</span>' : seta(r.deltaPct)}
                   </td>
-                </tr>`).join("")
-                || `<tr><td colspan="8">${emptyStateCard("Sem faturamento com marca nesta competência.")}</td></tr>`}
+                </tr>
+                ${aberto ? (r.breakdown || []).map((b) => `
+                  <tr style="background:#f7f9fc">
+                    <td></td><td></td>
+                    <td style="padding-left:18px;color:var(--muted)">
+                      ↳ ${escapeHtml(b.sellerName || b.unitName || "—")}
+                      ${b.sellerName && b.unitName ? `<span class="text-small" style="color:var(--muted)"> · ${escapeHtml(b.unitName)}</span>` : ""}
+                    </td>
+                    <td style="text-align:right;color:var(--muted)">${number(b.items)}</td>
+                    <td style="text-align:right;color:var(--muted)">${number(b.skus)}</td>
+                    <td style="text-align:right;color:var(--muted)">${number(b.clients)}</td>
+                    <td style="text-align:right;color:var(--muted)">${currency(b.revenue)}</td>
+                    <td style="text-align:right;color:var(--muted)">
+                      ${r.revenue ? (b.revenue / r.revenue * 100).toFixed(1) : "0.0"}%
+                    </td>
+                    <td></td>
+                  </tr>`).join("") : ""}`;
+              }).join("")
+                || `<tr><td colspan="9">${emptyStateCard("Sem faturamento com marca nesta competência.")}</td></tr>`}
             </tbody>
           </table>
         </div>
@@ -2781,13 +2795,23 @@ function marcasView() {
 async function exportBrandsXLSX() {
   const d = state.brands;
   if (!d || !(d.rows || []).length) { addMessage("warn", "Nada para exportar."); return; }
-  const cabecalho = ["#", "Marca", "Itens vendidos", "Códigos distintos", "Clientes",
+  const detalha = Boolean(d.breakdownBy);
+  const cabecalho = ["#", "Marca", detalha ? "Detalhe" : "", "Unidade",
+                     "Itens vendidos", "Códigos distintos", "Clientes",
                      "Valor", "% do total", "Mês anterior", "Variação %"];
-  const linhas = d.rows.map((r) => [r.rank, r.brand, r.items, r.skus, r.clients,
-                                    r.revenue, r.share, r.prevRevenue,
-                                    r.isNew ? "novo" : r.deltaPct]);
+  const linhas = [];
+  d.rows.forEach((r) => {
+    linhas.push([r.rank, r.brand, "TOTAL DA MARCA", "", r.items, r.skus, r.clients,
+                 r.revenue, r.share, r.prevRevenue, r.isNew ? "novo" : r.deltaPct]);
+    (r.breakdown || []).forEach((b) => {
+      linhas.push(["", r.brand, b.sellerName || b.unitName || "",
+                   b.sellerName ? (b.unitName || "") : "",
+                   b.items, b.skus, b.clients, b.revenue,
+                   r.revenue ? Number((b.revenue / r.revenue * 100).toFixed(1)) : 0, "", ""]);
+    });
+  });
   const rotulo = d.scope === "vendedor" ? (d.seller || "vendedor")
-               : d.scope === "unidade"  ? (d.unit || "unidade") : "grupo";
+               : d.scope === "equipe"   ? "por-vendedor" : "grupo";
   baixarPlanilha(`marcas-${rotulo}-${d.competence}`.replace(/\s+/g, "-").toLowerCase(),
                  "Marcas", cabecalho, linhas);
 }
