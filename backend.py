@@ -9146,11 +9146,42 @@ def inactive_clients_for_unit(
 
 
 def save_prospect(
-    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any],
+    exigir_contato: bool = False,
 ) -> dict[str, Any]:
+    """Cria ou atualiza um prospect.
+
+    `exigir_contato` vale só para o cadastro feito à mão na tela: ali os quatro
+    campos que o setor de cadastro precisa (razão social, CNPJ, telefone e
+    e-mail) são obrigatórios, porque o prospect nasce para virar cliente e sem
+    eles o pedido de cadastro volta. A adoção de lead da base fria NÃO exige —
+    lá os dados vêm de fora e faltar e-mail é normal.
+    """
     nome = normalize_whitespace(payload.get("companyName"))
     if not nome:
         raise ValueError("Informe o nome da oficina.")
+
+    if exigir_contato:
+        faltando = [rotulo for rotulo, valor in (
+            ("razão social", nome),
+            ("CNPJ", payload.get("documentNumber")),
+            ("telefone", payload.get("phone")),
+            ("e-mail", payload.get("email")),
+        ) if not normalize_whitespace(valor)]
+        if faltando:
+            raise ValueError(
+                "Para abrir o cadastro faltam: " + ", ".join(faltando) +
+                ". São os dados que o setor de cadastro pede — sem eles o pedido volta.")
+        _doc = only_digits(payload.get("documentNumber"))
+        # 11 dígitos = CPF (oficina de dono único), 14 = CNPJ. Qualquer outro
+        # tamanho é digitação errada, e é justamente o CNPJ que faz o sistema
+        # reconhecer sozinho quando a oficina virar cliente.
+        if len(_doc) not in (11, 14):
+            raise ValueError(f"CNPJ/CPF com {len(_doc)} dígito(s). "
+                             "Confira: CNPJ tem 14 e CPF tem 11.")
+        _mail = normalize_whitespace(payload.get("email"))
+        if "@" not in _mail or "." not in _mail.split("@")[-1]:
+            raise ValueError(f"E-mail '{_mail}' não parece válido.")
 
     escopo = data_scope_for_user(conn, user)
     if escopo == "proprio":
@@ -18841,7 +18872,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 try:
                     with closing(get_connection()) as conn:
                         if path == "/api/prospects/save":
-                            resultado = save_prospect(conn, user["company_id"], user, payload)
+                            # Só o cadastro NOVO feito na tela exige os quatro
+                            # campos. Editar um prospect antigo, que nasceu da
+                            # base de leads sem e-mail, não pode ficar travado.
+                            resultado = save_prospect(
+                                conn, user["company_id"], user, payload,
+                                exigir_contato=not payload.get("id"))
                         elif path == "/api/prospects/delete":
                             delete_prospect(conn, user["company_id"], user, int(payload.get("prospectId") or 0))
                             resultado = {}

@@ -34,6 +34,7 @@ const state = {
   prospectFilters: { status: "", search: "", seller: "" },
   brands: null,
   brandFilters: { scope: "" },
+  prospectCadastro: null,  // dados prontos para pedir cadastro no WhatsApp
   brandOpen: {},   // marcas com o detalhe aberto
   brandLoadingScope: "",  // aba de marcas que está sendo carregada agora
   phaseEditor: null,           // fase da unidade (diretoria)
@@ -1799,7 +1800,11 @@ async function salvarProspect() {
     } else {
       addMessage("success", "Oficina registrada.");
     }
+    // Guarda os dados ANTES de limpar o editor: é deles que sai o texto do
+    // pedido de cadastro. Só para cadastro novo — editar não gera pedido.
+    const dados = p.id ? null : { ...p };
     state.prospectEditor = null;
+    if (dados && !r.duplicated) state.prospectCadastro = dados;
     await loadProspects(true);
   } catch (e) {
     addMessage("error", e.message);
@@ -2514,6 +2519,7 @@ function prospeccaoView() {
   return `
     <div class="stack">
       ${state.prospectEditor ? prospectEditorModal() : ""}
+      ${pedidoCadastroModal()}
       ${configFaseModal()}
       ${metasAtividadeModal()}
 
@@ -2947,9 +2953,97 @@ function prospectCard(p, podeGerir) {
           ? `<button class="btn btn-secondary btn-sm" onclick="openCrmClient('${jsAttr(p.clientCode)}', true)">Abrir ficha do cliente</button>`
           : `<button class="btn btn-primary btn-sm" onclick='contatarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>📞 Registrar contato</button>`}
         <button class="btn btn-ghost btn-sm" onclick='editarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>Editar</button>
+        ${!p.clientCode ? `
+          <button class="btn btn-ghost btn-sm" title="Copiar razão social, CNPJ, telefone e e-mail para mandar ao cadastro"
+            onclick="copiarPedidoCadastro(${p.id})">📋 Pedir cadastro</button>` : ""}
         ${p.status !== "CADASTRADO" && p.status !== "PERDIDO"
           ? `<button class="btn btn-ghost btn-sm" onclick="marcarProspectPerdido(${p.id})">Perdido</button>` : ""}
         ${podeGerir ? `<button class="btn btn-ghost btn-sm" onclick="excluirProspect(${p.id})">Excluir</button>` : ""}
+      </div>
+    </div>`;
+}
+
+// ─── Pedido de cadastro para o setor ────────────────────────────────────────
+//
+// A oficina prospectada só vira cliente quando o setor de cadastro a abre no
+// Alfa, e esse pedido vai por WhatsApp. Digitar tudo de novo na mão é onde o
+// dado se perde: CNPJ trocado, e-mail sem o ponto. Aqui o texto sai do que já
+// foi preenchido, sem redigitação.
+
+/** Formata CNPJ/CPF só quando o tamanho bate — número torto vai como veio. */
+function formatarDocumento(valor) {
+  const d = String(valor || "").replace(/\D/g, "");
+  if (d.length === 14) return `${d.slice(0,2)}.${d.slice(2,5)}.${d.slice(5,8)}/${d.slice(8,12)}-${d.slice(12)}`;
+  if (d.length === 11) return `${d.slice(0,3)}.${d.slice(3,6)}.${d.slice(6,9)}-${d.slice(9)}`;
+  return String(valor || "");
+}
+
+/** Texto do pedido. Os quatro obrigatórios primeiro, o resto como apoio. */
+function textoPedidoCadastro(p) {
+  const linhas = [
+    "*SOLICITAÇÃO DE CADASTRO — PASSINI*",
+    "",
+    `*Razão social:* ${p.companyName || ""}`,
+    `*CNPJ:* ${formatarDocumento(p.documentNumber)}`,
+    `*Telefone:* ${p.phone || ""}`,
+    `*E-mail:* ${p.email || ""}`,
+  ];
+  const apoio = [
+    ["Nome fantasia", p.tradeName],
+    ["Contato", p.contactName],
+    ["Endereço", [p.addressLine, p.neighborhood].filter(Boolean).join(", ")],
+    ["Cidade", p.cityName],
+  ].filter(([, v]) => String(v || "").trim());
+  if (apoio.length) {
+    linhas.push("");
+    apoio.forEach(([r, v]) => linhas.push(`${r}: ${v}`));
+  }
+  linhas.push("");
+  linhas.push(`Vendedor: ${p.sellerName || "—"}${p.unitName ? ` · ${p.unitName}` : ""}`);
+  return linhas.join("\n");
+}
+
+async function copiarPedidoCadastro(prospectId) {
+  // Aceita tanto o que acabou de ser salvo quanto uma oficina da lista.
+  const p = (prospectId
+    ? (state.prospects?.prospects || []).find((x) => String(x.id) === String(prospectId))
+    : state.prospectCadastro);
+  if (!p) { addMessage("warn", "Oficina não encontrada."); return; }
+  const texto = textoPedidoCadastro(p);
+  if (await copyToClipboard(texto)) {
+    addMessage("success", "Dados copiados. É só colar no WhatsApp do cadastro.");
+  } else {
+    // Servidor em HTTP não libera a área de transferência — abre para cópia manual.
+    showCopyFallback(texto, "Solicitação de cadastro");
+  }
+}
+
+function fecharPedidoCadastro() {
+  state.prospectCadastro = null;
+  requestRender();
+}
+
+/** Confirmação que aparece logo após salvar, com o texto pronto. */
+function pedidoCadastroModal() {
+  const p = state.prospectCadastro;
+  if (!p) return "";
+  const texto = textoPedidoCadastro(p);
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharPedidoCadastro()">
+      <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>✅ Oficina registrada</h3>
+            <div class="text-small">Mande estes dados para o setor de cadastro abrir a ficha no Alfa.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharPedidoCadastro()">Fechar</button>
+        </div>
+        <textarea readonly onclick="this.select()" rows="12"
+          style="width:100%;font-family:inherit;font-size:13px;line-height:1.6;margin-top:10px"
+          >${escapeHtml(texto)}</textarea>
+        <div class="actions" style="margin-top:12px">
+          <button class="btn btn-primary" onclick="copiarPedidoCadastro()">📋 Copiar dados</button>
+          <button class="btn btn-ghost" onclick="fecharPedidoCadastro()">Depois eu mando</button>
+        </div>
       </div>
     </div>`;
 }
@@ -2976,7 +3070,8 @@ function prospectEditorModal() {
         </div>
 
         <div class="field">
-          <label>CNPJ <span style="color:var(--muted);font-weight:400">(o mais importante)</span></label>
+          <label>CNPJ <span style="color:var(--bad)">*</span>
+            <span style="color:var(--muted);font-weight:400">(o mais importante)</span></label>
           <input value="${escapeHtml(p.documentNumber)}" oninput="state.prospectEditor.documentNumber=this.value"
             placeholder="00.000.000/0000-00" />
           <div class="text-small" style="color:var(--accent)">
@@ -2986,13 +3081,17 @@ function prospectEditorModal() {
         </div>
 
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-          <div class="field"><label>Telefone</label>
+          <div class="field"><label>Telefone <span style="color:var(--bad)">*</span></label>
             <input value="${escapeHtml(p.phone)}" oninput="state.prospectEditor.phone=this.value" /></div>
           <div class="field"><label>Contato</label>
             <input value="${escapeHtml(p.contactName)}" oninput="state.prospectEditor.contactName=this.value"
               placeholder="Quem decide a compra" /></div>
-          <div class="field"><label>E-mail</label>
+          <div class="field"><label>E-mail <span style="color:var(--bad)">*</span></label>
             <input value="${escapeHtml(p.email)}" oninput="state.prospectEditor.email=this.value" /></div>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin:-4px 0 8px">
+          Razão social, CNPJ, telefone e e-mail são o que o setor de cadastro pede.
+          Com os quatro preenchidos, ao salvar você recebe o texto pronto para mandar no WhatsApp.
         </div>
 
         <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:10px">
