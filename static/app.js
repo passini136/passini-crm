@@ -88,6 +88,7 @@ const state = {
     analysisOpen: false,   // subgrupo Análises do menu aberto
     leadsOpen: false,      // painel da base fria de leads
     refreshing: {},        // botões de atualizar que estão rodando agora
+    switching: {},         // troca de aba/filtro em andamento, por grupo de chips
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
     inactiveSearch: "",
     territoryCity: "",     // filtro de cidade na tela de territórios
@@ -271,6 +272,11 @@ function setLoading(key, value) {
     state.ui.loading = {};
   }
   state.ui.loading[key] = Boolean(value);
+  // Ao COMEÇAR a carregar, repinta na hora. Sem isto o "Carregando" da tela só
+  // apareceria depois da resposta — quando já não serve para nada, e a pessoa
+  // conclui que o clique não funcionou. Desligar não força render: quem termina
+  // já repinta com os dados novos.
+  if (value && state.user) requestRender();
 }
 
 function currency(value) {
@@ -1716,7 +1722,10 @@ async function loadProspects(silencioso) {
   if (f.status) q.set("status", f.status);
   if (f.search) q.set("q", f.search);
   if (f.seller) q.set("seller", f.seller);
-  if (!silencioso) state.ui.loading.prospects = true;
+  if (!silencioso) {
+    state.ui.loading.prospects = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     state.prospects = await api(`/api/prospects?${q.toString()}`);
   } catch (e) {
@@ -1728,8 +1737,9 @@ async function loadProspects(silencioso) {
 }
 
 function setProspectStatus(status) {
-  state.prospectFilters.status = state.prospectFilters.status === status ? "" : status;
-  loadProspects();
+  const novo = state.prospectFilters.status === status ? "" : status;
+  state.prospectFilters.status = novo;
+  trocarChip("prospectStatus", novo, () => loadProspects());
 }
 
 function applyProspectSearch() {
@@ -2563,12 +2573,16 @@ function prospeccaoView() {
         <div style="display:flex;gap:6px;flex-wrap:wrap">
           ${(d.statuses || []).map((s) => `
             <button type="button" onclick="setProspectStatus('${s.id}')" title="${escapeHtml(s.hint)}"
+              ${chipEmEspera("prospectStatus") ? "disabled" : ""}
               style="border:1px solid ${f.status === s.id ? s.color : "var(--line)"};
                      background:${f.status === s.id ? s.bg : "#fff"};
                      color:${f.status === s.id ? s.color : "var(--muted)"};
                      border-radius:14px;padding:4px 12px;font-size:12px;
-                     font-weight:${f.status === s.id ? "700" : "500"};cursor:pointer">
-              ${s.icon} ${escapeHtml(s.label)} (${number(fun.byStatus?.[s.id] || 0)})
+                     font-weight:${f.status === s.id ? "700" : "500"};
+                     ${chipEstadoCss("prospectStatus", f.status === s.id)}">
+              ${chipTrocando("prospectStatus") === s.id
+                ? `<span class="girando">↻</span> Carregando…`
+                : `${s.icon} ${escapeHtml(s.label)} (${number(fun.byStatus?.[s.id] || 0)})`}
             </button>`).join("")}
         </div>
         <div class="text-small" style="color:var(--muted);margin-top:2px">
@@ -2642,6 +2656,39 @@ async function setBrandScope(id) {
     state.brandLoadingScope = "";
     requestRender();
   }
+}
+
+/** Troca de aba/filtro avisando que o comando foi recebido.
+ *
+ *  `chave` identifica o grupo de chips; `id` é o clicado. Enquanto a carga
+ *  roda, `chipTrocando(chave)` devolve o id em andamento — é isso que faz o
+ *  chip mostrar "Carregando…" e os vizinhos travarem. Sem esse retorno visual
+ *  imediato o clique parece perdido e a pessoa clica de novo, disparando duas
+ *  buscas que podem voltar fora de ordem.
+ */
+async function trocarChip(chave, id, carregar) {
+  if (state.ui.switching[chave]) return;
+  state.ui.switching[chave] = id || "__todos__";
+  requestRender();
+  try {
+    await carregar();
+  } finally {
+    delete state.ui.switching[chave];
+    requestRender();
+  }
+}
+
+function chipTrocando(chave) {
+  const v = state.ui.switching[chave];
+  return v === "__todos__" ? "" : (v || null);
+}
+
+function chipEmEspera(chave) { return Boolean(state.ui.switching[chave]); }
+
+/** Estilo do chip durante a troca: some o cursor de clique e esmaece o resto. */
+function chipEstadoCss(chave, ativo) {
+  if (!chipEmEspera(chave)) return "cursor:pointer";
+  return `cursor:wait;opacity:${ativo ? "1" : "0.5"}`;
 }
 
 function toggleBrand(marca) {
@@ -7152,7 +7199,10 @@ async function loadMeetings(silencioso) {
   if (f.from) q.set("from", f.from);
   if (f.to) q.set("to", f.to);
   if (f.mine) q.set("mine", "1");
-  if (!silencioso) state.ui.loading.meetings = true;
+  if (!silencioso) {
+    state.ui.loading.meetings = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     state.meetings = await api(`/api/meetings?${q.toString()}`);
   } catch (e) {
@@ -7170,8 +7220,9 @@ function applyMeetingSearch() {
 }
 
 function setMeetingKindFilter(kind) {
-  state.meetingFilters.kind = state.meetingFilters.kind === kind ? "" : kind;
-  loadMeetings();
+  const novo = state.meetingFilters.kind === kind ? "" : kind;
+  state.meetingFilters.kind = novo;
+  trocarChip("meetingKind", novo, () => loadMeetings());
 }
 
 function clearMeetingFilters() {
@@ -7676,11 +7727,15 @@ function reunioesView() {
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
           ${(state.meetings.kinds || []).map((k) => `
             <button type="button" onclick="setMeetingKindFilter('${k.id}')"
+              ${chipEmEspera("meetingKind") ? "disabled" : ""}
               style="border:1px solid ${f.kind === k.id ? "var(--accent)" : "var(--line)"};
                      background:${f.kind === k.id ? "var(--accent)" : "#fff"};
                      color:${f.kind === k.id ? "#fff" : "var(--text)"};
-                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer">
-              ${k.icon} ${escapeHtml(k.label)}
+                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;
+                     ${chipEstadoCss("meetingKind", f.kind === k.id)}">
+              ${chipTrocando("meetingKind") === k.id
+                ? `<span class="girando">↻</span> Carregando…`
+                : `${k.icon} ${escapeHtml(k.label)}`}
             </button>`).join("")}
           <span class="text-small" style="color:var(--muted);margin-left:4px">Período</span>
           <input type="date" style="width:150px" value="${escapeHtml(f.from)}"
@@ -8006,7 +8061,10 @@ async function loadFeedback(silencioso) {
   if (f.kind) q.set("kind", f.kind);
   if (f.competence) q.set("competence", f.competence);
   if (f.person) q.set("person", f.person);
-  if (!silencioso) state.ui.loading.feedback = true;
+  if (!silencioso) {
+    state.ui.loading.feedback = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     state.feedback = await api(`/api/feedback?${q.toString()}`);
     if (!state.feedbackFilters.competence && state.feedback.latestCompetence) {
@@ -8026,8 +8084,9 @@ function setFeedbackCompetence(valor) {
 }
 
 function setFeedbackKind(kind) {
-  state.feedbackFilters.kind = state.feedbackFilters.kind === kind ? "" : kind;
-  loadFeedback();
+  const novo = state.feedbackFilters.kind === kind ? "" : kind;
+  state.feedbackFilters.kind = novo;
+  trocarChip("feedbackKind", novo, () => loadFeedback());
 }
 
 function applyFeedbackPersonSearch() {
@@ -8586,7 +8645,10 @@ function registroEditorModal() {
 // proximidade e o histórico do que já foi feito, com o efeito medido.
 
 async function loadVisits(silencioso) {
-  if (!silencioso) state.ui.loading.visits = true;
+  if (!silencioso) {
+    state.ui.loading.visits = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     state.visits = await api("/api/visits");
     if (state.visits.canManage) await loadVisitSuggestions(true);
@@ -8603,7 +8665,10 @@ async function loadVisitSuggestions(silencioso) {
   const q = new URLSearchParams();
   if (f.city) q.set("city", f.city);
   q.set("relationship", f.relationship ? "1" : "0");
-  if (!silencioso) state.ui.loading.visitRoute = true;
+  if (!silencioso) {
+    state.ui.loading.visitRoute = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     state.visitRoute = await api(`/api/visits/suggestions?${q.toString()}`);
   } catch (e) {
@@ -9381,11 +9446,15 @@ function feedbackView() {
           </select>
           ${(state.feedback.kinds || []).map((k) => `
             <button type="button" onclick="setFeedbackKind('${k.id}')"
+              ${chipEmEspera("feedbackKind") ? "disabled" : ""}
               style="border:1px solid ${f.kind === k.id ? "var(--accent)" : "var(--line)"};
                      background:${f.kind === k.id ? "var(--accent)" : "#fff"};
                      color:${f.kind === k.id ? "#fff" : "var(--text)"};
-                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;cursor:pointer">
-              ${k.icon} ${escapeHtml(k.label)}
+                     border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;
+                     ${chipEstadoCss("feedbackKind", f.kind === k.id)}">
+              ${chipTrocando("feedbackKind") === k.id
+                ? `<span class="girando">↻</span> Carregando…`
+                : `${k.icon} ${escapeHtml(k.label)}`}
             </button>`).join("")}
           ${podeDar ? `
             <input id="feedback-person-search" style="flex:1;min-width:180px" placeholder="🔍 Buscar por nome — Enter"
@@ -10026,8 +10095,9 @@ const SELLER_FILTER_CHIPS = [
 
 function toggleSellerChip(group, value) {
   const f = state.crm.crmClientFilters;
-  f[group] = f[group] === value ? "" : value;   // clicar de novo desliga
-  runCrmClientSearch();
+  const novo = f[group] === value ? "" : value;   // clicar de novo desliga
+  f[group] = novo;
+  trocarChip("sellerChips", `${group}:${novo}`, () => runCrmClientSearch());
 }
 
 function activeSellerFilterCount() {
@@ -10065,12 +10135,15 @@ function sellerFilterBar() {
           const on = f[c.group] === c.value;
           return `
             <button type="button" onclick="toggleSellerChip('${c.group}','${c.value}')"
+              ${chipEmEspera("sellerChips") ? "disabled" : ""}
               style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
                      background:${on ? "var(--accent)" : "#fff"};
                      color:${on ? "#fff" : "var(--text)"};
                      border-radius:14px;padding:4px 12px;font-size:12px;font-weight:600;
-                     cursor:pointer;white-space:nowrap;transition:all .15s">
-              ${c.icon} ${escapeHtml(c.label)}
+                     white-space:nowrap;transition:all .15s;${chipEstadoCss("sellerChips", on)}">
+              ${chipTrocando("sellerChips") === `${c.group}:${c.value}`
+                ? `<span class="girando">↻</span> Carregando…`
+                : `${c.icon} ${escapeHtml(c.label)}`}
             </button>`;
         }).join("")}
       </div>
@@ -11114,7 +11187,10 @@ async function loadCrmTasks(silencioso) {
   if (f.to) q.set("to", f.to);
   if (f.origin) q.set("origin", f.origin);
   if (f.search) q.set("q", f.search);
-  if (!silencioso) state.ui.loading.crmTasks = true;
+  if (!silencioso) {
+    state.ui.loading.crmTasks = true;
+    requestRender();   // pinta o "carregando" ANTES de ir à rede
+  }
   try {
     const r = await api(`/api/crm/tasks?${q.toString()}`);
     state.crm.taskRows = r.rows || [];
@@ -11128,13 +11204,14 @@ async function loadCrmTasks(silencioso) {
 }
 
 function setTaskFilter(campo, valor) {
-  state.taskFilters[campo] = state.taskFilters[campo] === valor ? "" : valor;
-  loadCrmTasks();
+  const novo = state.taskFilters[campo] === valor ? "" : valor;
+  state.taskFilters[campo] = novo;
+  trocarChip(`task_${campo}`, novo, () => loadCrmTasks());
 }
 
 function setTaskStatus(valor) {
   state.taskFilters.status = valor;
-  loadCrmTasks();
+  trocarChip("taskStatus", valor, () => loadCrmTasks());
 }
 
 function applyTaskSearch() {
@@ -11253,11 +11330,15 @@ function crmTasksView() {
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
           ${(state.tasks.statusFilters || []).map((s) => `
             <button type="button" onclick="setTaskStatus('${s.id}')"
+              ${chipEmEspera("taskStatus") ? "disabled" : ""}
               style="border:1px solid ${f.status === s.id ? "var(--accent)" : "var(--line)"};
                      background:${f.status === s.id ? "var(--accent)" : "#fff"};
                      color:${f.status === s.id ? "#fff" : "var(--text)"};
-                     border-radius:14px;padding:5px 14px;font-size:12px;font-weight:600;cursor:pointer">
-              ${escapeHtml(s.label)}
+                     border-radius:14px;padding:5px 14px;font-size:12px;font-weight:600;
+                     ${chipEstadoCss("taskStatus", f.status === s.id)}">
+              ${chipTrocando("taskStatus") === s.id
+                ? `<span class="girando">↻</span> Carregando…`
+                : escapeHtml(s.label)}
             </button>`).join("")}
           <span style="flex:1"></span>
           ${podeCriar ? `<button class="btn btn-primary btn-sm" onclick="novaTarefa()">＋ Nova tarefa</button>` : ""}
@@ -11287,12 +11368,16 @@ function crmTasksView() {
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px">
           ${(state.tasks.origins || []).map((o) => `
             <button type="button" onclick="setTaskFilter('origin','${o.id}')" title="${escapeHtml(o.hint)}"
+              ${chipEmEspera("task_origin") ? "disabled" : ""}
               style="border:1px solid ${f.origin === o.id ? o.color : "var(--line)"};
                      background:${f.origin === o.id ? o.bg : "#fff"};
                      color:${f.origin === o.id ? o.color : "var(--muted)"};
                      border-radius:14px;padding:4px 12px;font-size:12px;
-                     font-weight:${f.origin === o.id ? "700" : "500"};cursor:pointer">
-              ${o.icon} ${escapeHtml(o.label)}
+                     font-weight:${f.origin === o.id ? "700" : "500"};
+                     ${chipEstadoCss("task_origin", f.origin === o.id)}">
+              ${chipTrocando("task_origin") === o.id
+                ? `<span class="girando">↻</span> Carregando…`
+                : `${o.icon} ${escapeHtml(o.label)}`}
             </button>`).join("")}
         </div>
       </div>
