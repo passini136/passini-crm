@@ -1512,8 +1512,10 @@ async function logout() {
 
 function messageHtml() {
   if (!state.messages.length) return "";
+  // Fixo no topo e acima da camada dos modais. Antes ficava no fluxo da página,
+  // isto é: atrás de qualquer janela aberta.
   return `
-    <div class="stack">
+    <div class="toast-stack">
       ${state.messages
         .map((item) => `<div class="message ${item.type}">${escapeHtml(item.text)}</div>`)
         .join("")}
@@ -1781,14 +1783,43 @@ function editarProspect(p) {
 
 function fecharProspectEditor() { state.prospectEditor = null; requestRender(); }
 
+/** Erro do formulário: aparece DENTRO da janela, onde a pessoa está olhando. */
+function erroNoProspect(mensagem) {
+  if (state.prospectEditor) state.prospectEditor.error = mensagem;
+  requestRender();
+}
+
+/** Mesma regra do servidor, adiantada na tela para não gastar ida e volta. */
+function validarProspect(p) {
+  if (!String(p.companyName || "").trim()) return "Informe a razão social da oficina.";
+  if (!String(p.sellerName || "").trim()) {
+    return "Escolha o vendedor responsável — é ele que trabalha este prospect.";
+  }
+  if (p.id) return "";   // editar não exige os dados de cadastro
+  const faltando = [
+    ["CNPJ", p.documentNumber], ["telefone", p.phone], ["e-mail", p.email],
+  ].filter(([, v]) => !String(v || "").trim()).map(([r]) => r);
+  if (faltando.length) {
+    return "Para abrir o cadastro faltam: " + faltando.join(", ") +
+           ". São os dados que o setor de cadastro pede.";
+  }
+  const doc = String(p.documentNumber).replace(/\D/g, "");
+  if (doc.length !== 14 && doc.length !== 11) {
+    return `CNPJ/CPF com ${doc.length} dígito(s). Confira: CNPJ tem 14 e CPF tem 11.`;
+  }
+  const mail = String(p.email).trim();
+  if (!mail.includes("@") || !mail.split("@").pop().includes(".")) {
+    return `E-mail "${mail}" não parece válido.`;
+  }
+  return "";
+}
+
 async function salvarProspect() {
   const p = state.prospectEditor;
   if (!p) return;
-  if (!p.companyName.trim()) { addMessage("error", "Informe o nome da oficina."); return; }
-  if (!String(p.sellerName || "").trim()) {
-    addMessage("error", "Escolha o vendedor responsável — é ele que trabalha este prospect.");
-    return;
-  }
+  const problema = validarProspect(p);
+  if (problema) { erroNoProspect(problema); return; }
+  p.error = "";
   p.saving = true; requestRender();
   try {
     const r = await api("/api/prospects/save", { method: "POST", body: JSON.stringify(p) });
@@ -1807,9 +1838,9 @@ async function salvarProspect() {
     if (dados && !r.duplicated) state.prospectCadastro = dados;
     await loadProspects(true);
   } catch (e) {
-    addMessage("error", e.message);
+    // O erro vem do servidor: mostra dentro da janela, não atrás dela.
     if (state.prospectEditor) state.prospectEditor.saving = false;
-    requestRender();
+    erroNoProspect(e.message);
   }
 }
 
@@ -3064,7 +3095,7 @@ function prospectEditorModal() {
 
         <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-top:12px">
           <div class="field"><label>Nome da oficina <span style="color:var(--bad)">*</span></label>
-            <input value="${escapeHtml(p.companyName)}" oninput="state.prospectEditor.companyName=this.value" /></div>
+            <input value="${escapeHtml(p.companyName)}" oninput="state.prospectEditor.companyName=this.value;state.prospectEditor.error=''" /></div>
           <div class="field"><label>Nome fantasia</label>
             <input value="${escapeHtml(p.tradeName)}" oninput="state.prospectEditor.tradeName=this.value" /></div>
         </div>
@@ -3072,7 +3103,7 @@ function prospectEditorModal() {
         <div class="field">
           <label>CNPJ <span style="color:var(--bad)">*</span>
             <span style="color:var(--muted);font-weight:400">(o mais importante)</span></label>
-          <input value="${escapeHtml(p.documentNumber)}" oninput="state.prospectEditor.documentNumber=this.value"
+          <input value="${escapeHtml(p.documentNumber)}" oninput="state.prospectEditor.documentNumber=this.value;state.prospectEditor.error=''"
             placeholder="00.000.000/0000-00" />
           <div class="text-small" style="color:var(--accent)">
             É o CNPJ que faz o sistema reconhecer sozinho quando a oficina virar cliente e levar
@@ -3082,12 +3113,12 @@ function prospectEditorModal() {
 
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
           <div class="field"><label>Telefone <span style="color:var(--bad)">*</span></label>
-            <input value="${escapeHtml(p.phone)}" oninput="state.prospectEditor.phone=this.value" /></div>
+            <input value="${escapeHtml(p.phone)}" oninput="state.prospectEditor.phone=this.value;state.prospectEditor.error=''" /></div>
           <div class="field"><label>Contato</label>
             <input value="${escapeHtml(p.contactName)}" oninput="state.prospectEditor.contactName=this.value"
               placeholder="Quem decide a compra" /></div>
           <div class="field"><label>E-mail <span style="color:var(--bad)">*</span></label>
-            <input value="${escapeHtml(p.email)}" oninput="state.prospectEditor.email=this.value" /></div>
+            <input value="${escapeHtml(p.email)}" oninput="state.prospectEditor.email=this.value;state.prospectEditor.error=''" /></div>
         </div>
         <div class="text-small" style="color:var(--muted);margin:-4px 0 8px">
           Razão social, CNPJ, telefone e e-mail são o que o setor de cadastro pede.
@@ -3175,6 +3206,11 @@ function prospectEditorModal() {
                 no seu nome — não precisa lançar o contato de novo.
               </div>` : ""}</div>
         </div>
+
+        ${p.error ? `
+          <div class="message error" style="margin-top:12px;display:flex;gap:8px;align-items:start">
+            <span>⚠</span><span>${escapeHtml(p.error)}</span>
+          </div>` : ""}
 
         <div class="actions" style="margin-top:14px">
           <button class="btn btn-primary" ${p.saving ? "disabled" : ""} onclick="salvarProspect()">

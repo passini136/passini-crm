@@ -807,6 +807,30 @@ tbody tr:hover {
   font-size: 13px;
 }
 
+/* Avisos flutuam acima dos modais (que ficam em z-index 40-50). No fluxo da
+   página eles apareciam ATRÁS da janela aberta — justamente quando o erro
+   explicava por que o formulário não salvou. */
+.toast-stack {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(560px, calc(100vw - 32px));
+  pointer-events: none;
+}
+.toast-stack .message {
+  pointer-events: auto;
+  box-shadow: 0 8px 28px rgba(10, 27, 38, 0.18);
+  border: 1px solid rgba(10, 27, 38, 0.08);
+}
+.toast-stack .message.success { background: #e6f4ea; }
+.toast-stack .message.error   { background: #fce8e6; }
+.toast-stack .message.warn    { background: #fef7e0; color: #b06000; }
+
 .message.success {
   background: rgba(47, 158, 125, 0.12);
   color: var(--good);
