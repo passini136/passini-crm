@@ -175,12 +175,16 @@ UNIT_NORMALIZATION = {
     # Matriz
     "01 MATRIZ": "MATRIZ",
     "MATRIZ": "MATRIZ",
+    "MATRIZ SAO LEOPOLDO": "MATRIZ",
+    "PASSINI MATRIZ SAO LEOPOLDO": "MATRIZ",
     # Lajeado
     "02 LAJEADO": "LAJEADO",
     "LAJEADO": "LAJEADO",
+    "PASSINI LAJEADO": "LAJEADO",
     # Pelotas
     "03 PELOTAS": "PELOTAS",
     "PELOTAS": "PELOTAS",
+    "PASSINI PELOTAS": "PELOTAS",
     # Porto Alegre → renomeada para Zona Sul (Zona Sul assumiu o lugar de POA)
     "04 POA": "ZONA SUL",
     "04 PORTO ALEGRE": "ZONA SUL",
@@ -193,11 +197,13 @@ UNIT_NORMALIZATION = {
     "ZONA SUL": "ZONA SUL",
     "ZONASUL": "ZONA SUL",
     "POA ZONA SUL": "ZONA SUL",
+    "PASSINI POA ZONA SUL": "ZONA SUL",
     # Zona Norte (nova unidade, ainda sem operação)
     "04 ZONA NORTE": "ZONA NORTE",
     "ZONA NORTE": "ZONA NORTE",
     "ZONANORTE": "ZONA NORTE",
     "POA ZONA NORTE": "ZONA NORTE",
+    "PASSINI POA ZONA NORTE": "ZONA NORTE",
     # Xangrila
     "05 XANGRILA": "XANGRILA",
     "05 XANGRI-LA": "XANGRILA",
@@ -205,6 +211,8 @@ UNIT_NORMALIZATION = {
     "XANGRI-LA": "XANGRILA",
     "XANGRILÁ": "XANGRILA",
     "XANGRILA": "XANGRILA",
+    "PASSINI XANGRILA": "XANGRILA",
+    "PASSINI XANGRI LA": "XANGRILA",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -467,6 +475,8 @@ IMPORT_SCOPE_REQUIREMENTS = {
     "crm_clients": {"cadastro_clientes"},
     "crm_summary": {"faturamento_cliente_consolidado"},
     "warranty": {"devolucao_garantia"},
+    "catalog": {"cadastro_itens"},
+    "stock": {"posicao_estoque"},
 }
 IMPORT_SCOPE_LABELS = {
     "full": "pacote completo",
@@ -476,6 +486,8 @@ IMPORT_SCOPE_LABELS = {
     "crm_clients": "cadastro de clientes",
     "crm_summary": "faturamento consolidado por cliente",
     "warranty": "devolução em garantia",
+    "catalog": "cadastro de itens",
+    "stock": "posição de estoque",
 }
 IMPORT_SCOPE_TABLES = {
     "faturamento_detalhado": ("fact_sales_detail",),
@@ -484,6 +496,10 @@ IMPORT_SCOPE_TABLES = {
     "cadastro_clientes": ("crm_client_profiles",),
     "faturamento_cliente_consolidado": ("crm_client_summary",),
     "devolucao_garantia": ("fact_warranty_returns",),
+    # Catálogo é base MESTRE, sem competência: nunca apagar por mês.
+    "cadastro_itens": (),
+    # Estoque é fotografia atual, sem competência: substituído por unidade.
+    "posicao_estoque": (),
 }
 UPLOAD_FIELD_TYPE_OVERRIDES = {
     "cost_unit_file": "custo_unidade",
@@ -497,6 +513,10 @@ UPLOAD_FIELD_TYPE_OVERRIDES = {
     "import-crm-clients-file": "cadastro_clientes",
     "import-crm-summary-file": "faturamento_cliente_consolidado",
     "warranty_file": "devolucao_garantia",
+    "catalog_file": "cadastro_itens",
+    "stock_file": "posicao_estoque",
+    "import-stock-file": "posicao_estoque",
+    "import-catalog-file": "cadastro_itens",
     "import-warranty-file": "devolucao_garantia",
     "files": None,
 }
@@ -683,6 +703,24 @@ def normalize_client_key(value: str | None) -> str:
 def normalize_unit(value: str | None) -> str:
     base = normalize_upper(value)
     return UNIT_NORMALIZATION.get(base, base)
+
+
+def unit_from_branch_name(value: str | None) -> str:
+    """Nome da filial no relatório de estoque → unidade do sistema.
+
+    O Alfa escreve "PASSINI POA-ZONA SUL", "PASSINI MATRIZ SAO LEOPOLDO". A
+    Zona Norte virá como "PASSINI POA-ZONA NORTE". Normaliza o hífen e o
+    acento antes de consultar o mapa, para uma filial nova não entrar como
+    unidade desconhecida só por causa da pontuação.
+    """
+    texto = normalize_upper(strip_accents(value)).replace("-", " ")
+    texto = re.sub(r"\s+", " ", texto).strip()
+    achado = UNIT_NORMALIZATION.get(texto)
+    if achado:
+        return achado
+    # Sem "PASSINI" na frente, tenta de novo: é só um prefixo de razão social.
+    sem_prefixo = re.sub(r"^PASSINI\s+", "", texto).strip()
+    return UNIT_NORMALIZATION.get(sem_prefixo, sem_prefixo)
 
 
 def parse_decimal(value: str | None) -> float:
@@ -1041,6 +1079,72 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_crm_interactions_company_client
                 ON crm_interactions(company_id, client_key);
+
+            -- Catálogo de itens do Alfa. Base MESTRE, sem competência: é a
+            -- fotografia atual do cadastro e cada importação a substitui.
+            --
+            -- Existe para dar ao faturamento a dimensão que ele não tem: a
+            -- LINHA do produto (amortecedor, kit de embreagem, filtro). O
+            -- faturamento traz marca e código; a categoria mora só aqui.
+            --
+            -- A ligação é pelo CÓDIGO INTERNO. O campo GTIN do Alfa está
+            -- preenchido em 75% dos itens e não casa com o faturamento; o
+            -- código do fabricante casa, mas é ambíguo (a mesma referência
+            -- "15W40SL" existe em 13 óleos de marcas diferentes).
+            CREATE TABLE IF NOT EXISTS item_catalog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                item_code TEXT NOT NULL,          -- CODIGO: a chave com o faturamento
+                item_type TEXT,                   -- TIPO: a peça (AMORTECEDOR)
+                sub_description TEXT,
+                manufacturer_ref TEXT,            -- FABRICANTE (ambíguo, só exibição)
+                brand_name TEXT,
+                item_group TEXT,                  -- GRUPO ITEM: linha macro
+                item_subgroup TEXT,               -- SUB GRUPO ITEM: a "linha" do vendedor
+                gtin TEXT,
+                ncm TEXT,
+                application TEXT,                 -- OBS: aplicação (MERCEDES ../..)
+                supplier_ref TEXT,
+                unit_of_measure TEXT,
+                sale_price REAL NOT NULL DEFAULT 0,
+                cost_price REAL NOT NULL DEFAULT 0,
+                average_price REAL NOT NULL DEFAULT 0,
+                markup REAL NOT NULL DEFAULT 0,
+                stock_qty REAL NOT NULL DEFAULT 0, -- saldo da MATRIZ; não usar para filtrar
+                warranty_days TEXT,
+                updated_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(company_id, item_code),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_item_catalog_group
+                ON item_catalog(company_id, item_group);
+            CREATE INDEX IF NOT EXISTS idx_item_catalog_subgroup
+                ON item_catalog(company_id, item_subgroup);
+
+            -- Posição de estoque POR UNIDADE. Existe separada do catálogo
+            -- porque o mesmo item tem saldo, curva e frequência diferentes em
+            -- cada filial: o que é curva A em São Leopoldo não é em Pelotas.
+            -- Sugerir para o vendedor da Zona Sul com base no saldo da Matriz
+            -- seria mandá-lo atrás de peça que não está na praça dele.
+            CREATE TABLE IF NOT EXISTS item_stock (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                unit_name TEXT NOT NULL,
+                item_code TEXT NOT NULL,
+                quantity REAL NOT NULL DEFAULT 0,
+                sales_frequency TEXT,      -- F1..F4: régua de giro do Alfa
+                abc_overall TEXT,
+                abc_branch TEXT,           -- curva ABC NA FILIAL
+                average_cost REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                UNIQUE(company_id, unit_name, item_code),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_item_stock_unit
+                ON item_stock(company_id, unit_name, item_code);
         """
     )
     # Colunas acrescentadas depois que a tabela já existia em produção.
@@ -1052,6 +1156,12 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         # A coluna "Marca" sempre veio no arquivo do Alfa, mas não era gravada.
         # Fica NULL nas linhas antigas: só reimportar o mês traz a marca dele.
         conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN brand_name TEXT")
+    catalog_columns = {row["name"] for row in conn.execute("PRAGMA table_info(item_catalog)").fetchall()}
+    if catalog_columns and "item_name" not in catalog_columns:
+        # "JUNTA HOMOCINETICA LADO RODA 22 IN" é o que o vendedor lê e fala;
+        # o catálogo só tem TIPO + SUB DESCRICAO separados.
+        conn.execute("ALTER TABLE item_catalog ADD COLUMN item_name TEXT")
+
     if sales_columns:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sales_brand "
@@ -3637,6 +3747,60 @@ def parse_csv_bytes(content: bytes) -> list[dict[str, str]]:
     return [dict(row) for row in reader]
 
 
+def unwrap_excel_text(value: Any) -> str:
+    """Tira o ="..." que o Alfa usa para o Excel não comer zero à esquerda.
+
+    O relatório de itens exporta o código do fabricante como ="05461" e o GTIN
+    vazio como ="". Sem desembrulhar, o código nunca casa e o vazio vira texto.
+    """
+    texto = str(value or "").strip()
+    if texto.startswith("="):
+        texto = texto[1:]
+    if len(texto) >= 2 and texto[0] == '"' and texto[-1] == '"':
+        texto = texto[1:-1]
+    return normalize_whitespace(texto.strip('"'))
+
+
+def parse_xlsx_rows(content: bytes) -> list[dict[str, str]]:
+    """Lê a primeira aba de um .xlsx como lista de dicionários.
+
+    read_only + values_only: o arquivo de estoque tem 284 mil linhas e 20 MB.
+    Carregar tudo em memória do jeito normal derrubaria o servidor.
+    """
+    workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    linhas = sheet.iter_rows(values_only=True)
+    try:
+        cabecalho = [str(c or "").strip() for c in next(linhas)]
+    except StopIteration:
+        return []
+    saida = []
+    for linha in linhas:
+        saida.append({cabecalho[i]: ("" if v is None else str(v))
+                      for i, v in enumerate(linha) if i < len(cabecalho)})
+    workbook.close()
+    return saida
+
+
+def parse_xlsx_header(content: bytes) -> list[str]:
+    """Só a primeira linha do xlsx — usada para reconhecer o tipo do arquivo."""
+    workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    sheet = workbook[workbook.sheetnames[0]]
+    try:
+        primeira = next(sheet.iter_rows(values_only=True))
+    except StopIteration:
+        primeira = ()
+    workbook.close()
+    return [str(c or "").strip() for c in primeira]
+
+
+def parse_table_bytes(content: bytes, file_name: str = "") -> list[dict[str, str]]:
+    """CSV ou XLSX, conforme o arquivo. O resto do importador não muda."""
+    if file_name.lower().endswith((".xlsx", ".xlsm")) or content[:2] == b"PK":
+        return parse_xlsx_rows(content)
+    return parse_csv_bytes(content)
+
+
 def parse_csv_header(content: bytes) -> list[str]:
     """Só o cabeçalho. Ler 40 MB inteiros para descobrir o tipo é desperdício."""
     text = decode_text_content(content[:8192])
@@ -3668,6 +3832,8 @@ def detect_file_type(filename: str) -> str | None:
         "030-relatoriofaturamento consolidado cliente": "faturamento_cliente_consolidado",
         "030-relatoriopessoas": "cadastro_clientes",
         "030-relatoriodevolucao": "devolucao_garantia",
+        "030-relatorioitem": "cadastro_itens",
+        "stockposition": "posicao_estoque",
         "030-relatoriocustovenda unidade": "custo_unidade",
         "030-relatoriocustovenda vendedor consolidado": "custo_vendedor",
     }
@@ -3691,6 +3857,10 @@ def detect_file_type(filename: str) -> str | None:
         return "faturamento_cliente_consolidado"
     if re.fullmatch(r"030-relatoriofaturamento consolidado cliente \(\d+\)", stem_lower):
         return "faturamento_cliente_consolidado"
+    if re.fullmatch(r"030-relatorioitem ?\(\d+\)", stem_lower):
+        return "cadastro_itens"
+    if re.fullmatch(r"stockposition ?\(\d+\)", stem_lower):
+        return "posicao_estoque"
     if re.fullmatch(r"030-relatoriopessoas\(\d+\)", stem_lower):
         return "cadastro_clientes"
     if re.fullmatch(r"030-relatoriopessoas \(\d+\)", stem_lower):
@@ -3701,6 +3871,8 @@ def detect_file_type(filename: str) -> str | None:
 # Assinatura de colunas de cada relatório do Alfa. Basta o conjunto mínimo
 # aparecer no cabeçalho — colunas a mais não atrapalham.
 FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
+    ("posicao_estoque", {"BRANCHNAME", "ITEM", "ITEMNAME", "QUANTITY"}),
+    ("cadastro_itens", {"CODIGO", "TIPO", "GRUPO ITEM", "SUB GRUPO ITEM", "MARCA"}),
     ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "DATA EMISSAO", "LIQUIDO"}),
     ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "MARCA", "FABRICANTE", "LIQUIDO"}),
 ]
@@ -3711,7 +3883,9 @@ def detect_file_type_by_header(content: bytes | None) -> str | None:
     if not content:
         return None
     try:
-        cabecalho = parse_csv_header(content)
+        # xlsx é um zip: começa com "PK". Lê só o cabeçalho, não o arquivo todo.
+        cabecalho = (parse_xlsx_header(content) if content[:2] == b"PK"
+                     else parse_csv_header(content))
     except Exception:
         return None
     if not cabecalho:
@@ -3802,13 +3976,15 @@ def preview_import_package(files_payload: dict[str, bytes] | list[dict[str, Any]
         field_name = entry.get("fieldName")
         content = entry["content"]
         extension = Path(filename).suffix.lower()
-        if extension and extension != ".csv":
-            unsupported_files.append({"fileName": filename, "fieldName": field_name, "reason": "Formato inválido. Use CSV."})
+        # O relatório de posição de estoque do Alfa só exporta em xlsx.
+        if extension and extension not in (".csv", ".xlsx", ".xlsm"):
+            unsupported_files.append({"fileName": filename, "fieldName": field_name,
+                                      "reason": "Formato inválido. Use CSV ou XLSX."})
             continue
         kind = detect_upload_file_type(filename, field_name, content)
         if not kind:
             continue
-        rows = parse_csv_bytes(content)
+        rows = parse_table_bytes(content, filename)
         # Detecção pelo conteúdo: custo venda com nome genérico (NNNN) distingue por coluna
         if kind == "custo_unidade" and rows:
             first_col = (list(rows[0].keys()) or [""])[0].strip().upper()
@@ -3928,6 +4104,10 @@ def import_package(
     sales_rows_without_date = 0
     warranty_competences_seen: set[str] = set()
     warranty_total_value = 0.0
+    catalog_new_total = 0
+    catalog_updated_total = 0
+    stock_rows_total = 0
+    stock_units_seen: set[str] = set()
 
     for entry in normalize_upload_entries(files_payload):
         filename = entry["fileName"]
@@ -3936,7 +4116,7 @@ def import_package(
         kind = detect_upload_file_type(filename, field_name, content)
         if not kind:
             continue
-        rows = parse_csv_bytes(content)
+        rows = parse_table_bytes(content, filename)
         # Um mesmo import pode receber VÁRIOS arquivos do mesmo tipo (ex.: a base de
         # clientes do Alfa vem em duas exportações complementares). O UNIQUE
         # (import_id, file_type) é preservado acumulando nomes e contagem de linhas.
@@ -4210,6 +4390,118 @@ def import_package(
                 role, _ = current_role_and_unit(conn, company_id, seller_name, competence)
                 if role is None:
                     register_issue(conn, company_id, import_id, competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
+        elif kind == "posicao_estoque":
+            # Fotografia por unidade. Cada importação SUBSTITUI o saldo das
+            # unidades presentes no arquivo — estoque velho misturado com novo
+            # é pior que estoque nenhum. Unidades ausentes ficam intactas.
+            unidades_no_arquivo = {
+                unit_from_branch_name(r.get("branchName")) for r in rows
+                if normalize_whitespace(r.get("branchName"))}
+            # Apagar tudo antes de reinserir dobrava o trabalho: 284 mil
+            # DELETEs mais 284 mil INSERTs. O UPSERT já sobrescreve linha a
+            # linha; a limpeza no fim tira só o que sumiu do relatório.
+            _marca_import = now_iso()
+            estoque_linhas = 0
+            descricoes: dict[str, str] = {}
+            for row in rows:
+                codigo = normalize_whitespace(row.get("item"))
+                unidade = unit_from_branch_name(row.get("branchName"))
+                if not codigo or not unidade:
+                    continue
+                nome = normalize_whitespace(row.get("itemName"))
+                if nome:
+                    descricoes.setdefault(codigo, nome)
+                conn.execute(
+                    """
+                    INSERT INTO item_stock (company_id, unit_name, item_code, quantity,
+                        sales_frequency, abc_overall, abc_branch, average_cost, updated_at)
+                    VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(company_id, unit_name, item_code) DO UPDATE SET
+                        quantity = excluded.quantity,
+                        sales_frequency = excluded.sales_frequency,
+                        abc_overall = excluded.abc_overall,
+                        abc_branch = excluded.abc_branch,
+                        average_cost = excluded.average_cost,
+                        updated_at = excluded.updated_at
+                    """,
+                    (company_id, unidade, codigo, parse_decimal(row.get("quantity")),
+                     normalize_upper(row.get("itemSalesFrequencyAnalysis")),
+                     normalize_upper(row.get("itemAbcAnalysis")),
+                     normalize_upper(row.get("itemAbcAnalysisByBranch")),
+                     parse_decimal(row.get("averageCost")), _marca_import))
+                estoque_linhas += 1
+            # A descrição boa do item só existe neste relatório; o catálogo tem
+            # tipo e subdescrição separados, que não formam uma frase legível.
+            for codigo, nome in descricoes.items():
+                conn.execute("UPDATE item_catalog SET item_name = ? "
+                             "WHERE company_id = ? AND item_code = ? "
+                             "  AND COALESCE(item_name,'') = ''",
+                             (nome, company_id, codigo))
+            # Item que saiu do relatório desta unidade não pode ficar com o
+            # saldo velho pendurado: some quem não foi tocado agora.
+            for _un in unidades_no_arquivo:
+                conn.execute("DELETE FROM item_stock WHERE company_id = ? AND unit_name = ? "
+                             "AND updated_at < ?", (company_id, _un, _marca_import))
+            stock_rows_total += estoque_linhas
+            stock_units_seen.update(unidades_no_arquivo)
+            print(f"[estoque] {estoque_linhas} linha(s) em "
+                  f"{len(unidades_no_arquivo)} unidade(s): {sorted(unidades_no_arquivo)}", flush=True)
+        elif kind == "cadastro_itens":
+            # O Alfa exporta alguns campos como ="00123" para o Excel não comer
+            # o zero à esquerda. Sem tirar isso, nada casa com o faturamento.
+            catalogo_novos = catalogo_atualizados = 0
+            for row in rows:
+                codigo = unwrap_excel_text(row.get("CODIGO"))
+                if not codigo:
+                    continue
+                valores = (
+                    normalize_upper(row.get("TIPO")),
+                    normalize_whitespace(row.get("SUB DESCRICAO")),
+                    unwrap_excel_text(row.get("FABRICANTE")),
+                    normalize_upper(row.get("MARCA")),
+                    normalize_upper(row.get("GRUPO ITEM")),
+                    normalize_upper(row.get("SUB GRUPO ITEM")),
+                    unwrap_excel_text(row.get("GTIN")),
+                    normalize_whitespace(row.get("NCM")),
+                    normalize_whitespace(row.get("OBS")),
+                    normalize_whitespace(row.get("FORNECEDOR REFERENCIAL")),
+                    normalize_upper(row.get("UN")),
+                    parse_decimal(unwrap_excel_text(row.get("PRECO VENDA"))),
+                    parse_decimal(unwrap_excel_text(row.get("PRECO CUSTO"))),
+                    parse_decimal(unwrap_excel_text(row.get("PRECO MEDIO"))),
+                    parse_decimal(unwrap_excel_text(row.get("MARKUP"))),
+                    parse_decimal(unwrap_excel_text(row.get("QTD"))),
+                    normalize_whitespace(row.get("PRAZO GARANTIA")),
+                )
+                cur = conn.execute(
+                    """
+                    UPDATE item_catalog SET
+                        item_type = ?, sub_description = ?, manufacturer_ref = ?, brand_name = ?,
+                        item_group = ?, item_subgroup = ?, gtin = ?, ncm = ?, application = ?,
+                        supplier_ref = ?, unit_of_measure = ?, sale_price = ?, cost_price = ?,
+                        average_price = ?, markup = ?, stock_qty = ?, warranty_days = ?,
+                        updated_at = ?
+                    WHERE company_id = ? AND item_code = ?
+                    """,
+                    (*valores, now_iso(), company_id, codigo))
+                if cur.rowcount:
+                    catalogo_atualizados += 1
+                else:
+                    conn.execute(
+                        """
+                        INSERT INTO item_catalog (
+                            company_id, item_code, item_type, sub_description, manufacturer_ref,
+                            brand_name, item_group, item_subgroup, gtin, ncm, application,
+                            supplier_ref, unit_of_measure, sale_price, cost_price, average_price,
+                            markup, stock_qty, warranty_days, updated_at, created_at
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (company_id, codigo, *valores, now_iso(), now_iso()))
+                    catalogo_novos += 1
+            catalog_new_total += catalogo_novos
+            catalog_updated_total += catalogo_atualizados
+            print(f"[catalogo] {catalogo_novos} item(ns) novo(s), "
+                  f"{catalogo_atualizados} atualizado(s)", flush=True)
         elif kind == "devolucao_garantia":
             # A competência sai da DATA de cada devolução, linha a linha — o relatório
             # pode cobrir mais de um mês e cada devolução pertence ao mês em que ocorreu.
@@ -4351,6 +4643,12 @@ def import_package(
         "importScope": import_scope,
         "importedFileTypes": sorted(selected_file_types),
     }
+    if catalog_new_total or catalog_updated_total:
+        result["catalogNew"] = catalog_new_total
+        result["catalogUpdated"] = catalog_updated_total
+    if stock_rows_total:
+        result["stockRows"] = stock_rows_total
+        result["stockUnits"] = sorted(stock_units_seen)
     if sales_competences_seen:
         _ordered = sorted(sales_competences_seen)
         result["salesCompetences"] = _ordered
