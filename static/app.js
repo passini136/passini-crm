@@ -2660,6 +2660,12 @@ function prospeccaoView() {
 // até o vendedor. O que muda entre os perfis é o que cada um pode selecionar,
 // nunca a forma da tabela — quem aprende a ler uma, lê as três.
 
+// Cada chamada recebe um número. A resposta só é aceita se ainda for a mais
+// recente. Sem isso, a carga que a tela dispara ao abrir — mais lenta, porque
+// é a primeira — voltava DEPOIS da troca para Linha e sobrescrevia a tela com
+// a visão por Marca, enquanto o botão continuava marcado em Linha.
+let brandRequestSeq = 0;
+
 async function loadBrands(silencioso) {
   const f = state.brandFilters;
   const q = new URLSearchParams();
@@ -2667,20 +2673,25 @@ async function loadBrands(silencioso) {
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
   if (f.dimension) q.set("dimension", f.dimension);
+  const meuPedido = ++brandRequestSeq;
   if (!silencioso) {
     state.ui.loading.brands = true;
     // Pintar a tela ANTES de sair para a rede. Sem isto o "Carregando" só
     // apareceria depois da resposta — ou seja, nunca.
     requestRender();
   }
+  let resposta;
   try {
-    state.brands = await api(`/api/brands?${q.toString()}`);
+    resposta = await api(`/api/brands?${q.toString()}`);
   } catch (e) {
-    state.brands = { error: e.message, rows: [], scopes: [], insights: [], totals: {} };
-  } finally {
-    state.ui.loading.brands = false;
-    requestRender();
+    resposta = { error: e.message, rows: [], scopes: [], insights: [], totals: {} };
   }
+  // Chegou atrasada: outra chamada já saiu depois desta. Descartar é o certo —
+  // aplicar mostraria dados que ninguém pediu mais.
+  if (meuPedido !== brandRequestSeq) return state.brands;
+  state.brands = resposta;
+  state.ui.loading.brands = false;
+  requestRender();
   return state.brands;
 }
 
@@ -2789,7 +2800,12 @@ function blocoDimensaoMarca(d) {
 }
 
 function marcasView() {
-  if (!state.brands) { loadBrands(); return `<div class="loader panel">Carregando marcas…</div>`; }
+  if (!state.brands) {
+    // Guarda contra disparar uma carga nova a cada repintura enquanto a
+    // primeira ainda está no ar.
+    if (!state.ui.loading.brands) loadBrands();
+    return `<div class="loader panel">Carregando marcas…</div>`;
+  }
   const d = state.brands;
   if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
 
