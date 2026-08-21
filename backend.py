@@ -9864,23 +9864,46 @@ def sellers_of_unit(
             or mapa.get(short_person_key(r["seller_name"]))) == alvo]
 
 
+# As três formas de olhar o mesmo faturamento. A marca vem na própria linha da
+# venda; a linha e o grupo vêm do catálogo, ligados pelo CÓDIGO INTERNO — que é
+# o que o faturamento guarda na coluna gtin_value (o nome da coluna engana: não
+# é GTIN, é o código do Alfa).
+BRAND_DIMENSIONS = [
+    {"id": "marca", "label": "Marca",
+     "hint": "NAKATA, WEGA, PERFECT — quem fabrica a peça."},
+    {"id": "linha", "label": "Linha",
+     "hint": "AMORTECEDOR, KITS EMBREAGEM, FILTROS — como o vendedor conversa com o mecânico."},
+    {"id": "grupo", "label": "Grupo",
+     "hint": "SUSPENSAO, FREIO, TRANSMISSAO — a visão macro do mix."},
+]
+BRAND_DIMENSION_IDS = {d["id"] for d in BRAND_DIMENSIONS}
+
+_DIMENSION_EXPR = {
+    "marca": "f.brand_name",
+    "linha": "c.item_subgroup",
+    "grupo": "c.item_group",
+}
+
+
 def brand_ranking_rows(
     conn: sqlite3.Connection, company_id: int, competence: str,
-    vendedores: list[str] | None = None,
+    vendedores: list[str] | None = None, dimensao: str = "marca",
 ) -> dict[str, dict[str, Any]]:
-    """Ranking cru de uma competência, indexado pela marca."""
-    onde = ["company_id = ?", "competence = ?", "TRIM(COALESCE(brand_name,'')) <> ''"]
+    """Ranking cru de uma competência, indexado pela dimensão escolhida."""
+    coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
+    onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
     params: list[Any] = [company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
         marcadores = ",".join("?" for _ in vendedores)
-        onde.append(f"seller_name IN ({marcadores})")
+        onde.append(f"f.seller_name IN ({marcadores})")
         params.extend(vendedores)
-    item = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+    item = ("COALESCE(NULLIF(f.manufacturer_sku, ''), NULLIF(f.sku_key, ''), "
+            "NULLIF(f.gtin_value, ''), 'ITEM')")
     return {
-        r["marca"]: {
-            "brand": r["marca"],
+        r["chave"]: {
+            "brand": r["chave"],
             "items": int(r["itens"] or 0),
             "skus": int(r["codigos"] or 0),
             "revenue": float(r["valor"] or 0.0),
@@ -9888,14 +9911,16 @@ def brand_ranking_rows(
         }
         for r in conn.execute(
             f"""
-            SELECT brand_name AS marca,
-                   ROUND(SUM(quantity), 0)     AS itens,
-                   COUNT(DISTINCT {item})      AS codigos,
-                   ROUND(SUM(net_value), 2)    AS valor,
-                   COUNT(DISTINCT client_name) AS clientes
-            FROM fact_sales_detail
+            SELECT {coluna} AS chave,
+                   ROUND(SUM(f.quantity), 0)     AS itens,
+                   COUNT(DISTINCT {item})        AS codigos,
+                   ROUND(SUM(f.net_value), 2)    AS valor,
+                   COUNT(DISTINCT f.client_name) AS clientes
+            FROM fact_sales_detail f
+            LEFT JOIN item_catalog c
+              ON c.company_id = f.company_id AND c.item_code = f.gtin_value
             WHERE {" AND ".join(onde)}
-            GROUP BY brand_name
+            GROUP BY {coluna}
             """, params).fetchall()
     }
 
@@ -9903,6 +9928,7 @@ def brand_ranking_rows(
 def brand_seller_breakdown(
     conn: sqlite3.Connection, company_id: int, competence: str,
     vendedores: list[str] | None, unidade_por_vendedor: dict[str, str],
+    dimensao: str = "marca",
 ) -> dict[str, list[dict[str, Any]]]:
     """Marca × vendedor numa consulta só, indexado pela marca.
 
@@ -9911,31 +9937,35 @@ def brand_seller_breakdown(
     vendedor continuam exatos: o DISTINCT é calculado dentro de cada par
     (marca, vendedor), que é justamente o recorte exibido.
     """
-    onde = ["company_id = ?", "competence = ?", "TRIM(COALESCE(brand_name,'')) <> ''"]
+    coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
+    onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
     params: list[Any] = [company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
         marcadores = ",".join("?" for _ in vendedores)
-        onde.append(f"seller_name IN ({marcadores})")
+        onde.append(f"f.seller_name IN ({marcadores})")
         params.extend(vendedores)
-    item = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+    item = ("COALESCE(NULLIF(f.manufacturer_sku, ''), NULLIF(f.sku_key, ''), "
+            "NULLIF(f.gtin_value, ''), 'ITEM')")
     saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in conn.execute(
         f"""
-        SELECT brand_name AS marca, seller_name AS vendedor,
-               ROUND(SUM(quantity), 0)     AS itens,
-               COUNT(DISTINCT {item})      AS codigos,
-               ROUND(SUM(net_value), 2)    AS valor,
-               COUNT(DISTINCT client_name) AS clientes
-        FROM fact_sales_detail
+        SELECT {coluna} AS chave, f.seller_name AS vendedor,
+               ROUND(SUM(f.quantity), 0)     AS itens,
+               COUNT(DISTINCT {item})        AS codigos,
+               ROUND(SUM(f.net_value), 2)    AS valor,
+               COUNT(DISTINCT f.client_name) AS clientes
+        FROM fact_sales_detail f
+        LEFT JOIN item_catalog c
+          ON c.company_id = f.company_id AND c.item_code = f.gtin_value
         WHERE {" AND ".join(onde)}
-        GROUP BY brand_name, seller_name
+        GROUP BY {coluna}, f.seller_name
         """, params).fetchall():
         nome = normalize_whitespace(r["vendedor"])
         if float(r["valor"] or 0) <= 0:
             continue
-        saida[r["marca"]].append({
+        saida[r["chave"]].append({
             "sellerName": nome,
             "unitName": (unidade_por_vendedor.get(person_key(nome))
                          or unidade_por_vendedor.get(short_person_key(nome)) or "—"),
@@ -9980,6 +10010,7 @@ def brand_seller_options(
 def brand_sales_report(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     competence: str = "", scope: str = "", unit: str = "", seller: str = "",
+    dimension: str = "",
 ) -> dict[str, Any]:
     """Vendas por marca nos três recortes: grupo, unidade e vendedor.
 
@@ -9993,6 +10024,17 @@ def brand_sales_report(
         return {"competence": "", "rows": [], "scopes": [], "insights": [],
                 "totals": {}, "empty": "Ainda não há faturamento importado."}
     anterior = shift_competence(comp, -1)
+    dim = dimension if dimension in BRAND_DIMENSION_IDS else "marca"
+    # Linha e grupo dependem do catálogo de itens. Sem ele a tela ficaria vazia
+    # sem explicar o porquê — melhor dizer o que falta importar.
+    tem_catalogo = bool(conn.execute(
+        "SELECT 1 FROM item_catalog WHERE company_id = ? LIMIT 1", (company_id,)).fetchone())
+    if dim != "marca" and not tem_catalogo:
+        return {"competence": comp, "prevCompetence": anterior, "dimension": dim,
+                "dimensions": BRAND_DIMENSIONS, "rows": [], "scopes": [], "insights": [],
+                "totals": {}, "disappeared": [],
+                "needsCatalog": "A linha do produto vem do cadastro de itens do Alfa, "
+                                "que ainda não foi importado. Importações → Produtos."}
 
     escopo_dados = data_scope_for_user(conn, user)
     permitidas = crm_allowed_units_for_user(conn, user)
@@ -10030,8 +10072,8 @@ def brand_sales_report(
         filtro = (None if permitidas is None
                   else sellers_of_unit(conn, company_id, comp, minha_unidade))
 
-    agora = brand_ranking_rows(conn, company_id, comp, filtro)
-    antes = brand_ranking_rows(conn, company_id, anterior, filtro)
+    agora = brand_ranking_rows(conn, company_id, comp, filtro, dim)
+    antes = brand_ranking_rows(conn, company_id, anterior, filtro, dim)
     total = sum(v["revenue"] for v in agora.values())
     total_antes = sum(v["revenue"] for v in antes.values())
 
@@ -10061,7 +10103,7 @@ def brand_sales_report(
     # aparece seria trabalho jogado fora.
     exibidas = {r["brand"] for r in linhas}
     if atual == "equipe":
-        detalhe = brand_seller_breakdown(conn, company_id, comp, filtro, mapa_unidades)
+        detalhe = brand_seller_breakdown(conn, company_id, comp, filtro, mapa_unidades, dim)
         for r in linhas:
             r["breakdown"] = detalhe.get(r["brand"], [])
     elif atual == "grupo":
@@ -10069,7 +10111,7 @@ def brand_sales_report(
         for un in unidades:
             nomes = sellers_of_unit(conn, company_id, comp, un)
             if nomes:
-                por_unidade[un] = brand_ranking_rows(conn, company_id, comp, nomes)
+                por_unidade[un] = brand_ranking_rows(conn, company_id, comp, nomes, dim)
         for r in linhas:
             itens = []
             for un, rank in por_unidade.items():
@@ -10104,6 +10146,9 @@ def brand_sales_report(
     return {
         "competence": comp,
         "prevCompetence": anterior,
+        "dimension": dim,
+        "dimensions": BRAND_DIMENSIONS,
+        "hasCatalog": tem_catalogo,
         "scope": atual,
         "scopes": escopos,
         "units": unidades,
@@ -10127,7 +10172,7 @@ def brand_sales_report(
             "minRevenue": BRAND_MIN_REVENUE,
         },
         "insights": brand_insights(conn, company_id, comp, atual, linhas, total, sumiram,
-                                   minha_unidade, eu, escopo_dados, permitidas),
+                                   minha_unidade, eu, escopo_dados, permitidas, dim),
         "needsReimport": not linhas and brand_has_no_column(conn, company_id, comp),
     }
 
@@ -10136,7 +10181,7 @@ def brand_insights(
     conn: sqlite3.Connection, company_id: int, competence: str, escopo: str,
     linhas: list[dict[str, Any]], total: float, sumiram: list[dict[str, Any]],
     minha_unidade: str, vendedor: str, escopo_dados: str,
-    permitidas: list[str] | None,
+    permitidas: list[str] | None, dimensao: str = "marca",
 ) -> list[dict[str, Any]]:
     """Leituras do ranking — o que fazer, não o que já está na tabela.
 
@@ -10148,6 +10193,10 @@ def brand_insights(
     saida: list[dict[str, Any]] = []
     if not linhas:
         return saida
+    # O texto acompanha o que está sendo olhado: chamar uma linha de "marca"
+    # confundiria justamente quem usa a tela para decidir o mix.
+    palavra = {"marca": "marca", "linha": "linha", "grupo": "grupo"}.get(dimensao, "marca")
+    plural = {"marca": "marcas", "linha": "linhas", "grupo": "grupos"}.get(dimensao, "marcas")
 
     # 1. Concentração — vale para qualquer recorte
     lider = linhas[0]
@@ -10155,7 +10204,7 @@ def brand_insights(
         saida.append({
             "kind": "atencao", "icon": "⚠",
             "title": f"{lider['brand']} concentra {lider['share']:.0f}% do faturamento",
-            "text": "Concentração alta deixa o resultado refém de uma marca: falta de "
+            "text": f"Concentração alta deixa o resultado refém de uma {palavra}: falta de "
                     "estoque ou reajuste dela derruba o mês inteiro. Vale abrir mix nas "
                     "linhas seguintes.",
         })
@@ -10182,7 +10231,7 @@ def brand_insights(
         perdido = sum(s["prevRevenue"] for s in sumiram)
         saida.append({
             "kind": "atencao", "icon": "🚫",
-            "title": f"{len(sumiram)} marca(s) vendiam e zeraram neste mês",
+            "title": f"{len(sumiram)} {palavra}(s) vendiam e zeraram neste mês",
             "text": f"{nomes}{'…' if len(sumiram) > 3 else ''} — "
                     f"{brl(perdido)} que saíram da conta. "
                     "Costuma ser ruptura, não perda de cliente.",
@@ -10197,7 +10246,7 @@ def brand_insights(
             "kind": "bom", "icon": "📈",
             "title": f"{top['brand']} cresceu {top['deltaPct']:.0f}%",
             "text": f"Chegou a {brl(top['revenue'])} em {top['clients']} cliente(s). "
-                    "Marca em alta é a hora de ampliar a base — oferecer para quem ainda "
+                    f"{palavra.capitalize()} em alta é a hora de ampliar a base — oferecer para quem ainda "
                     "não comprou dela custa menos que abrir marca nova.",
         })
 
@@ -10209,15 +10258,15 @@ def brand_insights(
             "kind": "bom", "icon": "🆕",
             "title": f"{top['brand']} entrou este mês com {brl(top['revenue'])}",
             "text": (f"Não teve venda no mês anterior e já responde por {top['share']:.0f}% do total"
-                     + (f". Mais {len(novas) - 1} marca(s) também estrearam." if len(novas) > 1 else ".")
-                     + " Marca nova costuma vir de um cliente só — vale espalhar para os demais."),
+                     + (f". Mais {len(novas) - 1} {palavra}(s) também estrearam." if len(novas) > 1 else ".")
+                     + f" {palavra.capitalize()} nova costuma vir de um cliente só — vale espalhar para os demais."),
         })
 
     # 5. O insight que só existe comparando recortes: a lacuna
     if escopo == "vendedor" and vendedor:
         referencia = sellers_of_unit(conn, company_id, competence, minha_unidade)
         if referencia:
-            unidade_rank = brand_ranking_rows(conn, company_id, competence, referencia)
+            unidade_rank = brand_ranking_rows(conn, company_id, competence, referencia, dimensao)
             total_unidade = sum(v["revenue"] for v in unidade_rank.values())
             minhas = {r["brand"] for r in linhas}
             # Piso duplo: relevante na unidade E com dinheiro de verdade. Só o
@@ -10235,7 +10284,7 @@ def brand_insights(
                 nomes = ", ".join(f"{l['brand']} ({brl(l['revenue'])})" for l in lacunas)
                 saida.append({
                     "kind": "acao", "icon": "🎯",
-                    "title": "Marcas que a unidade gira e você não vendeu",
+                    "title": f"{plural.capitalize()} que a unidade gira e você não vendeu",
                     "text": f"{nomes}. São linhas com saída comprovada na sua praça — "
                             "o cliente já compra delas, só não com você.",
                 })
@@ -10249,7 +10298,7 @@ def brand_insights(
         divergentes: list[str] = []
         for nome in vendedores[:40]:
             variantes = seller_name_variants(conn, company_id, nome)
-            rank = brand_ranking_rows(conn, company_id, competence, variantes)
+            rank = brand_ranking_rows(conn, company_id, competence, variantes, dimensao)
             tot = sum(v["revenue"] for v in rank.values())
             if tot < 1000:
                 continue
@@ -10261,7 +10310,7 @@ def brand_insights(
                 "kind": "acao", "icon": "👥",
                 "title": "Vendedores fora do mix da equipe",
                 "text": ", ".join(divergentes[:5])
-                        + " não venderam marcas que estão no top da equipe. "
+                        + f" não venderam {plural} que estão no top da equipe. "
                         "Costuma ser desconhecimento da linha, não falta de oportunidade — "
                         "é pauta de treinamento, não de cobrança.",
             })
@@ -18462,7 +18511,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         competence=q.get("competence", [""])[0],
                         scope=q.get("scope", [""])[0],
                         unit=q.get("unit", [""])[0],
-                        seller=q.get("seller", [""])[0])
+                        seller=q.get("seller", [""])[0],
+                        dimension=q.get("dimension", [""])[0])
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))
                 return

@@ -33,7 +33,7 @@ const state = {
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
   brands: null,
-  brandFilters: { scope: "" },
+  brandFilters: { scope: "", dimension: "" },
   prospectCadastro: null,  // dados prontos para pedir cadastro no WhatsApp
   brandOpen: {},   // marcas com o detalhe aberto
   brandLoadingScope: "",  // aba de marcas que está sendo carregada agora
@@ -2666,6 +2666,7 @@ async function loadBrands(silencioso) {
   const mes = state.filters.competenceEnd || state.filters.competenceStart;
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
+  if (f.dimension) q.set("dimension", f.dimension);
   if (!silencioso) {
     state.ui.loading.brands = true;
     // Pintar a tela ANTES de sair para a rede. Sem isto o "Carregando" só
@@ -2738,10 +2739,53 @@ function chipEstadoCss(chave, ativo) {
   return `cursor:wait;opacity:${ativo ? "1" : "0.5"}`;
 }
 
+/** Troca entre olhar por marca, por linha ou por grupo. */
+async function setBrandDimension(id) {
+  if (state.brandLoadingScope) return;
+  if ((state.brandFilters.dimension || "marca") === id) return;
+  state.brandFilters.dimension = id;
+  state.brandOpen = {};
+  state.brandLoadingScope = "dim:" + id;
+  requestRender();
+  try {
+    await loadBrands();
+  } finally {
+    state.brandLoadingScope = "";
+    requestRender();
+  }
+}
+
 function toggleBrand(marca) {
   if (state.brandOpen[marca]) delete state.brandOpen[marca];
   else state.brandOpen[marca] = true;
   requestRender();
+}
+
+/** Marca, linha ou grupo — o mesmo faturamento, três formas de enxergar. */
+function blocoDimensaoMarca(d) {
+  const atual = state.brandFilters.dimension || d.dimension || "marca";
+  const trocando = String(state.brandLoadingScope || "");
+  return `
+    <div class="panel" style="padding:12px 18px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <span class="text-small" style="color:var(--muted);font-weight:700">Olhar por</span>
+        ${(d.dimensions || []).map((x) => `
+          <button type="button" onclick="setBrandDimension('${x.id}')"
+            title="${escapeHtml(x.hint)}" ${trocando ? "disabled" : ""}
+            style="border:1px solid ${atual === x.id ? "var(--accent)" : "var(--line)"};
+                   background:${atual === x.id ? "var(--accent)" : "#fff"};
+                   color:${atual === x.id ? "#fff" : "var(--text)"};
+                   border-radius:14px;padding:5px 16px;font-size:13px;font-weight:700;
+                   cursor:${trocando ? "wait" : "pointer"}">
+            ${trocando === "dim:" + x.id
+              ? `<span class="girando">↻</span> Carregando…`
+              : escapeHtml(x.label)}
+          </button>`).join("")}
+        <span class="text-small" style="color:var(--muted);margin-left:4px">
+          ${escapeHtml((d.dimensions || []).find((x) => x.id === atual)?.hint || "")}
+        </span>
+      </div>
+    </div>`;
 }
 
 function marcasView() {
@@ -2755,6 +2799,20 @@ function marcasView() {
   // Enquanto troca, vale a aba clicada — não a que o servidor ainda devolve.
   const trocando = state.brandLoadingScope;
   const escopoAtual = trocando || d.scope;
+  const rotuloDim = (d.dimensions || []).find((x) => x.id === d.dimension)?.label || "Marca";
+
+  if (d.needsCatalog) {
+    return `
+      <div class="stack">
+        ${blocoDimensaoMarca(d)}
+        <div class="panel" style="padding:18px;border-left:4px solid #f4c25f">
+          <div style="font-weight:800;font-size:15px">Falta o cadastro de itens</div>
+          <div class="text-small" style="margin-top:6px;line-height:1.6">
+            ${escapeHtml(d.needsCatalog)}
+          </div>
+        </div>
+      </div>`;
+  }
 
   if (d.needsReimport) {
     return `
@@ -2783,6 +2841,8 @@ function marcasView() {
 
   return `
     <div class="stack">
+      ${blocoDimensaoMarca(d)}
+
       <div class="panel" style="padding:14px 18px">
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
           <div style="display:flex;gap:6px;flex-wrap:wrap">
@@ -2813,7 +2873,7 @@ function marcasView() {
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         ${kpi("Faturamento", currency(t.revenue), t.deltaPct !== null && t.deltaPct !== undefined
               ? `${seta(t.deltaPct)} vs mês anterior` : "sem base de comparação")}
-        ${kpi("Marcas vendidas", number(t.brands))}
+        ${kpi(`${rotuloDim}s vendidas`, number(t.brands))}
         ${kpi("Itens vendidos", number(t.items))}
         ${kpi("Códigos distintos", number(t.skus))}
       </div>
@@ -2836,8 +2896,8 @@ function marcasView() {
 
       <div class="table-card">
         <div class="section-title">
-          <div><h3>Ranking de marcas</h3>
-            <div class="text-small">${number(linhas.length)} marca(s) na lista</div></div>
+          <div><h3>Ranking por ${escapeHtml(rotuloDim.toLowerCase())}</h3>
+            <div class="text-small">${number(linhas.length)} ${escapeHtml(rotuloDim.toLowerCase())}(s) na lista</div></div>
         </div>
         ${state.ui.loading.brands ? '<div class="loader">Carregando…</div>' : ""}
         <div class="table-wrap" style="${state.ui.loading.brands
@@ -2846,7 +2906,7 @@ function marcasView() {
             <thead><tr>
               <th style="width:34px"></th>
               <th style="width:44px">#</th>
-              <th>Marca</th>
+              <th>${escapeHtml(rotuloDim)}</th>
               <th style="text-align:right">Itens vendidos</th>
               <th style="text-align:right">Códigos distintos</th>
               <th style="text-align:right">Clientes</th>
@@ -2897,7 +2957,7 @@ function marcasView() {
         </div>
         ${t.hiddenBrands ? `
           <div class="text-small" style="color:var(--muted);padding:8px 12px">
-            ${number(t.hiddenBrands)} marca(s) abaixo de ${currency(t.minRevenue)} ficaram fora da lista
+            ${number(t.hiddenBrands)} ${escapeHtml(rotuloDim.toLowerCase())}(s) abaixo de ${currency(t.minRevenue)} ficaram fora da lista
             (${currency(t.hiddenRevenue)}). Elas entram no total, não no ranking.
           </div>` : ""}
       </div>
@@ -2916,7 +2976,8 @@ async function exportBrandsXLSX() {
   const d = state.brands;
   if (!d || !(d.rows || []).length) { addMessage("warn", "Nada para exportar."); return; }
   const detalha = Boolean(d.breakdownBy);
-  const cabecalho = ["#", "Marca", detalha ? "Detalhe" : "", "Unidade",
+  const rot = (d.dimensions || []).find((x) => x.id === d.dimension)?.label || "Marca";
+  const cabecalho = ["#", rot, detalha ? "Detalhe" : "", "Unidade",
                      "Itens vendidos", "Códigos distintos", "Clientes",
                      "Valor", "% do total", "Mês anterior", "Variação %"];
   const linhas = [];
@@ -2932,7 +2993,7 @@ async function exportBrandsXLSX() {
   });
   const rotulo = d.scope === "vendedor" ? (d.seller || "vendedor")
                : d.scope === "equipe"   ? "por-vendedor" : "grupo";
-  baixarPlanilha(`marcas-${rotulo}-${d.competence}`.replace(/\s+/g, "-").toLowerCase(),
+  baixarPlanilha(`${rot.toLowerCase()}-${rotulo}-${d.competence}`.replace(/\s+/g, "-").toLowerCase(),
                  "Marcas", cabecalho, linhas);
 }
 
