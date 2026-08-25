@@ -899,6 +899,14 @@ async function baixarPlanilha(nomeArquivo, aba, headers, linhas) {
 }
 
 /** Exporta a lista Sem Vendedor inteira — a tela mostra só os 200 maiores. */
+/** PJ, PF ou nada. Sem documento não dá para afirmar — e chutar aqui é pior
+ *  que omitir: o gestor usa isso para decidir a quem atribuir o cliente. */
+function seloPessoa(tipo) {
+  if (tipo === "PJ") return '<span class="status-tag" style="background:#e8f0fe;color:#1a5276">PJ</span>';
+  if (tipo === "PF") return '<span class="status-tag" style="background:#fef7e0;color:#b06000">PF</span>';
+  return '<span class="status-tag" style="background:#f1f3f4;color:#5f6368" title="Sem CNPJ ou CPF no cadastro">—</span>';
+}
+
 async function exportUnassignedXLSX() {
   try {
     addMessage("info", "Gerando planilha…");
@@ -908,7 +916,7 @@ async function exportUnassignedXLSX() {
     if (c.monthsWindow) q.set("window", String(c.monthsWindow));
     const data = await api(`/api/crm/unassigned?${q.toString()}`);
     const linhas = (data.items || []).map((i) => [
-      i.clientName, i.cityName || "", i.unitName || "", i.months,
+      i.clientName, i.personType || "", i.cityName || "", i.unitName || "", i.months,
       Number(i.revenue || 0), Number(i.avgMonthly || 0),
       (i.lastPurchaseAt || "").slice(0, 10),
       i.clientKey || "sem cadastro",
@@ -916,7 +924,7 @@ async function exportUnassignedXLSX() {
     ]);
     if (!linhas.length) { addMessage("warn", "Nada para exportar."); return; }
     await baixarPlanilha("clientes_sem_vendedor", "Sem vendedor",
-      ["Cliente", "Cidade", "Unidade", "Meses com compra", "Faturamento", "Média/mês",
+      ["Cliente", "Tipo", "Cidade", "Unidade", "Meses com compra", "Faturamento", "Média/mês",
        "Última compra", "Código no CRM", "Quem atendeu"], linhas);
     addMessage("success", `Planilha exportada — ${linhas.length} de ${number(data.total)} cliente(s).`);
   } catch (e) {
@@ -6836,7 +6844,11 @@ function semVendedorView() {
               <tbody>
                 ${items.map((i) => `
                   <tr>
-                    <td><strong>${escapeHtml(i.clientName)}</strong>
+                    <td>
+                      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                        ${seloPessoa(i.personType)}
+                        <strong>${escapeHtml(i.clientName)}</strong>
+                      </div>
                       ${i.clientKey ? `<div class="text-small" style="color:var(--muted)">cód. ${escapeHtml(i.clientKey)}</div>` : ""}
                       ${i.aliasOf ? `<div class="text-small" style="color:var(--muted)">conciliado com ${escapeHtml(i.aliasOf)}</div>` : ""}
                     </td>

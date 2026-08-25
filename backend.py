@@ -16841,12 +16841,19 @@ def compute_unassigned_clients(
     # nasce do faturamento, que só tem o nome. Cliente sem cadastro fica sem
     # código e, nesse caso, a tela não oferece o botão de ficha.
     code_by_name: dict[str, str] = {}
+    # PF ou PJ sai do documento do cadastro: 11 dígitos é CPF, 14 é CNPJ.
+    # Guardado por CÓDIGO porque o cliente pode chegar aqui por conciliação,
+    # quando o nome do faturamento não é o mesmo do cadastro.
+    doc_by_code: dict[str, str] = {}
     for row in conn.execute(
-        "SELECT client_code, client_name FROM crm_client_profiles WHERE company_id = ?",
+        "SELECT client_code, client_name, document_number FROM crm_client_profiles "
+        "WHERE company_id = ?",
         (company_id,),
     ).fetchall():
         key = normalize_client_key(row["client_name"])
         code = normalize_whitespace(row["client_code"])
+        if code:
+            doc_by_code.setdefault(code, normalize_whitespace(row["document_number"]))
         if key and code and key not in code_by_name:
             code_by_name[key] = code
 
@@ -16945,8 +16952,16 @@ def compute_unassigned_clients(
         sellers = sellers_by_client.get(key, [])[:5]
         receita = float(r["receita"] or 0.0)
         total_revenue += receita
+        codigo_cliente = code_by_name.get(key)
+        tipo_pessoa, _ = person_type_from_document(doc_by_code.get(codigo_cliente or ""))
+        if not tipo_pessoa:
+            # Sem cadastro, o documento costuma vir colado no nome do
+            # faturamento ("FULANO 90133587053"). É a única pista que resta.
+            tipo_pessoa, _ = person_type_from_document(
+                "".join(re.findall(r"\d", r["client_name"] or "")))
         items.append({
-            "clientKey": code_by_name.get(key),
+            "clientKey": codigo_cliente,
+            "personType": tipo_pessoa,
             "clientName": r["client_name"],
             "aliasOf": (aliases.get(key) or {}).get("clientName"),
             "cityName": r["city_name"],
