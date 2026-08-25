@@ -1778,8 +1778,13 @@ function novoProspect() {
     contactName: "", email: "", cityName: "", neighborhood: "", addressLine: "",
     origin: "", serviceType: "", carsWeek: "", mainLine: "", payment: "",
     closingTrigger: "", notes: "",
+    // Campos da ficha cadastral — nascem vazios e são preenchidos pelo
+    // comprovante da Receita ou à mão.
+    stateRegistration: "", addressNumber: "", addressComplement: "", postalCode: "",
+    stateName: "", landline: "", emailFinance: "", emailXml: "", paymentTerms: "",
+    businessLine: "", buyers: ["", "", ""], cnaeCode: "", openedAt: "", registryStatus: "",
     unitName: p.unitName || "", sellerName: p.canManage ? "" : (p.myName || ""),
-    saving: false,
+    saving: false, importando: false,
   };
   requestRender();
 }
@@ -3078,7 +3083,9 @@ function prospectCard(p, podeGerir) {
         <button class="btn btn-ghost btn-sm" onclick='editarProspect(${JSON.stringify(p).replace(/'/g, "&#39;")})'>Editar</button>
         ${!p.clientCode ? `
           <button class="btn btn-ghost btn-sm" title="Copiar razão social, CNPJ, telefone e e-mail para mandar ao cadastro"
-            onclick="copiarPedidoCadastro(${p.id})">📋 Pedir cadastro</button>` : ""}
+            onclick="copiarPedidoCadastro(${p.id})">📋 Pedir cadastro</button>
+          <button class="btn btn-ghost btn-sm" title="Ficha cadastral em PDF para o cliente assinar"
+            onclick="baixarFichaCadastral(${p.id})">📄 Ficha</button>` : ""}
         ${p.status !== "CADASTRADO" && p.status !== "PERDIDO"
           ? `<button class="btn btn-ghost btn-sm" onclick="marcarProspectPerdido(${p.id})">Perdido</button>` : ""}
         ${podeGerir ? `<button class="btn btn-ghost btn-sm" onclick="excluirProspect(${p.id})">Excluir</button>` : ""}
@@ -3170,6 +3177,161 @@ function pedidoCadastroModal() {
       </div>
     </div>`;
 }
+
+// ─── Ficha cadastral do cliente ────────────────────────────────────────────
+//
+// O vendedor sobe o comprovante do CNPJ, o formulário se preenche e a ficha
+// sai em PDF para o cliente só assinar. O que a Receita não tem — inscrição
+// estadual, e-mail de XML, WhatsApp e quem pode comprar — continua manual.
+
+const FICHA_CONDICOES = ["À vista", "Faturado"];
+const FICHA_RAMOS = [
+  "Autopeças Leve", "Autopeças Pesada", "Autopeças Mista", "Auto Center",
+  "Oficina Mecânica Leve", "Oficina Mecânica Pesada", "Oficina Mecânica Mista",
+  "Transportadora", "Órgão Público", "Consumo Manut. Própria", "Outros",
+];
+
+async function importarComprovanteReceita(input) {
+  const arquivo = input?.files?.[0];
+  if (!arquivo) return;
+  const p = state.prospectEditor;
+  if (!p) return;
+  p.importando = true; p.error = ""; requestRender();
+  try {
+    const form = new FormData();
+    form.append("receita", arquivo, arquivo.name);
+    const r = await api("/api/prospects/receita", { method: "POST", body: form });
+    const d = r.data || {};
+    // Só preenche o que veio; o que a pessoa já digitou não é sobrescrito por
+    // vazio. Campo em branco no comprovante não pode apagar trabalho feito.
+    Object.entries({
+      companyName: d.companyName, tradeName: d.tradeName, documentNumber: d.documentNumber,
+      addressLine: d.addressLine, addressNumber: d.addressNumber,
+      addressComplement: d.addressComplement, neighborhood: d.neighborhood,
+      cityName: d.cityName, stateName: d.stateName, postalCode: d.postalCode,
+      landline: d.landline, email: d.email, emailFinance: d.emailFinance,
+      businessLine: d.businessLine, cnaeCode: d.cnaeCode, openedAt: d.openedAt,
+      registryStatus: d.registryStatus, businessLineHint: d.businessLineHint,
+    }).forEach(([campo, valor]) => { if (valor) p[campo] = valor; });
+    const quantos = Object.values(d).filter(Boolean).length;
+    addMessage("success", `Comprovante lido — ${quantos} campo(s) preenchido(s). `
+      + "Falta a inscrição estadual, que não vem da Receita.");
+    if (d.registryStatus && d.registryStatus !== "ATIVA") {
+      addMessage("warn", `Situação na Receita: ${d.registryStatus}. Confira antes de cadastrar.`);
+    }
+  } catch (e) {
+    erroNoProspect(e.message);
+  } finally {
+    if (state.prospectEditor) state.prospectEditor.importando = false;
+    input.value = "";
+    requestRender();
+  }
+}
+
+function baixarFichaCadastral(prospectId) {
+  if (!prospectId) { addMessage("warn", "Salve a oficina antes de gerar a ficha."); return; }
+  downloadFile(`/api/prospects/ficha.pdf?id=${encodeURIComponent(prospectId)}`);
+}
+
+function setFichaComprador(indice, valor) {
+  const p = state.prospectEditor;
+  if (!p) return;
+  p.buyers = p.buyers || [];
+  while (p.buyers.length < 3) p.buyers.push("");
+  p.buyers[indice] = valor;
+}
+
+/** Bloco da ficha dentro do editor de oficina. */
+function blocoFichaCadastral(p) {
+  const compradores = [...(p.buyers || []), "", "", ""].slice(0, 3);
+  return `
+    <div class="subtle-card padded-card" style="margin-top:8px">
+      <div class="section-title">
+        <div><h3>Ficha cadastral</h3>
+          <div class="text-small">Dados que o setor de cadastro precisa. Suba o comprovante do
+            CNPJ e a maior parte se preenche sozinha.</div></div>
+      </div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0">
+        <label class="btn btn-secondary btn-sm" style="margin:0;cursor:pointer">
+          ${p.importando ? "⏳ Lendo…" : "📄 Importar comprovante da Receita"}
+          <input type="file" accept=".pdf" style="display:none"
+            onchange="importarComprovanteReceita(this)" ${p.importando ? "disabled" : ""} />
+        </label>
+        ${p.registryStatus ? `<span class="status-tag ${p.registryStatus === "ATIVA" ? "good" : "bad"}">
+          Receita: ${escapeHtml(p.registryStatus)}</span>` : ""}
+        ${p.cnaeCode ? `<span class="text-small" style="color:var(--muted)">CNAE ${escapeHtml(p.cnaeCode)}</span>` : ""}
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div class="field"><label>Condição <span style="color:var(--muted);font-weight:400">(análise de crédito)</span></label>
+          <select onchange="state.prospectEditor.paymentTerms=this.value">
+            <option value="">A definir</option>
+            ${FICHA_CONDICOES.map((c) => `<option ${p.paymentTerms === c ? "selected" : ""}>${c}</option>`).join("")}
+          </select></div>
+        <div class="field"><label>Inscrição Estadual</label>
+          <input value="${escapeHtml(p.stateRegistration || "")}"
+            oninput="state.prospectEditor.stateRegistration=this.value"
+            placeholder="Em branco = isento" />
+          ${!normalizeTexto(p.stateRegistration) ? `
+            <div class="text-small" style="color:#b06000;margin-top:4px">
+              Sem inscrição, a ficha sai marcada como <strong>isento</strong>.
+            </div>` : ""}</div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px">
+        <div class="field"><label>Endereço</label>
+          <input value="${escapeHtml(p.addressLine || "")}" oninput="state.prospectEditor.addressLine=this.value" /></div>
+        <div class="field"><label>Número</label>
+          <input value="${escapeHtml(p.addressNumber || "")}" oninput="state.prospectEditor.addressNumber=this.value" /></div>
+        <div class="field"><label>Complemento</label>
+          <input value="${escapeHtml(p.addressComplement || "")}" oninput="state.prospectEditor.addressComplement=this.value" /></div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr 60px 1fr;gap:10px">
+        <div class="field"><label>Bairro</label>
+          <input value="${escapeHtml(p.neighborhood || "")}" oninput="state.prospectEditor.neighborhood=this.value" /></div>
+        <div class="field"><label>Cidade</label>
+          <input value="${escapeHtml(p.cityName || "")}" oninput="state.prospectEditor.cityName=this.value" /></div>
+        <div class="field"><label>UF</label>
+          <input maxlength="2" value="${escapeHtml(p.stateName || "")}" oninput="state.prospectEditor.stateName=this.value.toUpperCase()" /></div>
+        <div class="field"><label>CEP</label>
+          <input value="${escapeHtml(p.postalCode || "")}" oninput="state.prospectEditor.postalCode=this.value" /></div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <div class="field"><label>Telefone fixo</label>
+          <input value="${escapeHtml(p.landline || "")}" oninput="state.prospectEditor.landline=this.value" /></div>
+        <div class="field"><label>E-mail para XML</label>
+          <input value="${escapeHtml(p.emailXml || "")}" oninput="state.prospectEditor.emailXml=this.value"
+            placeholder="Onde a nota eletrônica é recebida" /></div>
+      </div>
+
+      <div class="field"><label>Ramo de atividade</label>
+        <select onchange="state.prospectEditor.businessLine=this.value">
+          <option value="">—</option>
+          ${FICHA_RAMOS.map((r) => `<option ${p.businessLine === r ? "selected" : ""}>${r}</option>`).join("")}
+        </select>
+        ${p.businessLineHint && !p.businessLine ? `
+          <div class="text-small" style="color:#b06000;margin-top:4px">
+            O CNAE indica <strong>${escapeHtml(p.businessLineHint)}</strong>, mas não diz se é
+            leve, pesada ou mista — escolha acima.
+          </div>`
+        : p.cnaeCode ? `<div class="text-small" style="color:var(--muted);margin-top:4px">
+            Sugerido pelo CNAE do comprovante. Ajuste se a oficina for de outro tipo.
+          </div>` : ""}</div>
+
+      <div class="field"><label>Pessoas autorizadas a comprar</label>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          ${compradores.map((nome, i) => `
+            <input value="${escapeHtml(nome)}" placeholder="Nome ${i + 1}"
+              oninput="setFichaComprador(${i}, this.value)" />`).join("")}
+        </div></div>
+    </div>`;
+}
+
+/** Texto sem espaços sobrando — usado só para decidir se um campo está vazio. */
+function normalizeTexto(v) { return String(v || "").trim(); }
 
 function prospectEditorModal() {
   const p = state.prospectEditor;
@@ -3285,6 +3447,8 @@ function prospectEditorModal() {
           </div>
         </div>
 
+        ${blocoFichaCadastral(p)}
+
         <div style="display:grid;grid-template-columns:1fr 2fr;gap:10px;margin-top:8px">
           <div class="field"><label>Como chegou até ela</label>
             <input value="${escapeHtml(p.origin)}" oninput="state.prospectEditor.origin=this.value"
@@ -3307,6 +3471,8 @@ function prospectEditorModal() {
         <div class="actions" style="margin-top:14px">
           <button class="btn btn-primary" ${p.saving ? "disabled" : ""} onclick="salvarProspect()">
             ${p.saving ? "Salvando…" : "Salvar"}</button>
+          ${p.id ? `<button class="btn btn-secondary" onclick="baixarFichaCadastral(${p.id})">
+            📄 Gerar ficha para assinar</button>` : ""}
           <button class="btn btn-ghost" onclick="fecharProspectEditor()">Cancelar</button>
         </div>
       </div>

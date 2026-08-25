@@ -1183,6 +1183,30 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         # brand_name é exatamente quem tem a identidade no formato antigo.
         rehash_sales_detail(conn)
 
+    prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
+    if prospect_columns:
+        # A ficha cadastral do cliente pede mais que a prospecção precisava.
+        # Sem estes campos o PDF sairia com metade das linhas em branco.
+        for coluna, tipo in (
+            ("state_registration", "TEXT"),      # Inscrição Estadual
+            ("tax_exempt", "INTEGER NOT NULL DEFAULT 0"),
+            ("address_number", "TEXT"),
+            ("address_complement", "TEXT"),
+            ("postal_code", "TEXT"),
+            ("state_name", "TEXT"),              # UF
+            ("landline", "TEXT"),                # telefone fixo, separado do whatsapp
+            ("email_finance", "TEXT"),
+            ("email_xml", "TEXT"),
+            ("payment_terms", "TEXT"),           # condição
+            ("business_line", "TEXT"),           # ramo de atividade da ficha
+            ("buyers_json", "TEXT"),             # pessoas autorizadas a comprar
+            ("cnae_code", "TEXT"),
+            ("opened_at", "TEXT"),
+            ("registry_status", "TEXT"),         # situação cadastral na Receita
+        ):
+            if coluna not in prospect_columns:
+                conn.execute(f"ALTER TABLE prospects ADD COLUMN {coluna} {tipo}")
+
     lead_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospect_leads)").fetchall()}
     if lead_columns and "client_code" not in lead_columns:
         conn.execute("ALTER TABLE prospect_leads ADD COLUMN client_code TEXT")
@@ -8954,6 +8978,21 @@ def prospect_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "lostReason": row["lost_reason"] or "",
         # Vendedor do CADASTRO de clientes. Tendo dono lá, a oficina virou
         # carteira e sai da prospecção — o trabalho passa a ser outro.
+        "stateRegistration": (row["state_registration"] if "state_registration" in row.keys() else "") or "",
+        "taxExempt": bool(row["tax_exempt"] if "tax_exempt" in row.keys() else 0),
+        "addressNumber": (row["address_number"] if "address_number" in row.keys() else "") or "",
+        "addressComplement": (row["address_complement"] if "address_complement" in row.keys() else "") or "",
+        "postalCode": (row["postal_code"] if "postal_code" in row.keys() else "") or "",
+        "stateName": (row["state_name"] if "state_name" in row.keys() else "") or "",
+        "landline": (row["landline"] if "landline" in row.keys() else "") or "",
+        "emailFinance": (row["email_finance"] if "email_finance" in row.keys() else "") or "",
+        "emailXml": (row["email_xml"] if "email_xml" in row.keys() else "") or "",
+        "paymentTerms": (row["payment_terms"] if "payment_terms" in row.keys() else "") or "",
+        "businessLine": (row["business_line"] if "business_line" in row.keys() else "") or "",
+        "buyers": json.loads(row["buyers_json"] or "[]") if "buyers_json" in row.keys() and row["buyers_json"] else [],
+        "cnaeCode": (row["cnae_code"] if "cnae_code" in row.keys() else "") or "",
+        "openedAt": (row["opened_at"] if "opened_at" in row.keys() else "") or "",
+        "registryStatus": (row["registry_status"] if "registry_status" in row.keys() else "") or "",
         "portfolioSeller": (row["carteira_vendedor"]
                             if "carteira_vendedor" in row.keys() else "") or "",
         "createdAt": row["created_at"],
@@ -9493,6 +9532,378 @@ def inactive_clients_for_unit(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Comprovante de inscrição do CNPJ (Receita Federal)
+#
+# O site da Receita tem captcha, então não há como consultar por robô. O que o
+# vendedor tem em mãos é o PDF do comprovante — e ele é gerado pela própria
+# Receita, com layout fixo. Ler esse arquivo preenche cerca de 70% da ficha
+# cadastral sem digitação, e sem depender de serviço de terceiro nem de o
+# servidor ter saída para a internet.
+#
+# O que a Receita NÃO tem: Inscrição Estadual (é da Sefaz), e-mail de XML,
+# WhatsApp e as pessoas autorizadas a comprar. Esses continuam manuais.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CNAE principal → ramo da ficha da Passini. Só os prefixos que importam para o
+# ramo automotivo; o resto cai em "Outros", que é honesto.
+# O CNAE diz a FAMÍLIA do negócio, nunca se é leve, pesada ou mista — isso não
+# existe na classificação da Receita. Onde a família tem uma opção só na ficha,
+# marca direto; onde tem variantes, devolve a família como sugestão e deixa o
+# vendedor escolher. Ele está com a oficina na linha e sabe a resposta;
+# adivinhar "Leve" seria escrever no documento algo que ninguém verificou.
+CNAE_TO_BUSINESS_LINE = [
+    ("4530", "Autopeças"),          # família com variantes
+    ("4541", "Autopeças"),
+    ("4520", "Oficina Mecânica"),   # família com variantes
+    ("4542", "Oficina Mecânica"),
+    ("4543", "Oficina Mecânica"),
+    ("4511", "Auto Center"),        # opção única
+    ("4512", "Auto Center"),
+    ("4930", "Transportadora"),
+    ("4921", "Transportadora"),
+    ("4922", "Transportadora"),
+    ("8411", "Órgão Público"),
+    ("8412", "Órgão Público"),
+    ("8413", "Órgão Público"),
+]
+
+
+def business_line_from_cnae(codigo: str | None) -> tuple[str, str]:
+    """Devolve (ramo_exato, familia_sugerida).
+
+    Só um dos dois vem preenchido: ou a ficha tem a opção exata, ou o vendedor
+    precisa escolher a variante.
+    """
+    digitos = only_digits(codigo)[:4]
+    familia = next((ramo for prefixo, ramo in CNAE_TO_BUSINESS_LINE if digitos == prefixo), "")
+    if not familia:
+        return "", ""
+    exatas = [r for r in FICHA_RAMOS if r == familia]
+    if exatas:
+        return exatas[0], ""
+    return "", familia
+
+
+def _receita_vazio(valor: str) -> str:
+    """A Receita escreve ******** onde não há informação."""
+    texto = normalize_whitespace(valor)
+    return "" if not texto or set(texto) <= {"*"} else texto
+
+
+def _receita_linha_apos(linhas: list[str], rotulo: str) -> str:
+    """Primeira linha com conteúdo depois do rótulo, sem normalizar espaços.
+
+    O alinhamento importa: é ele que separa os campos que vêm lado a lado.
+    """
+    for i, l in enumerate(linhas):
+        if rotulo in l.upper():
+            for prox in linhas[i + 1:i + 3]:
+                if prox.strip():
+                    return prox
+            return ""
+    return ""
+
+
+def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
+    """Extrai os dados do comprovante do CNPJ em PDF."""
+    try:
+        import pdfplumber
+    except ImportError as exc:
+        raise ValueError(
+            "O leitor de PDF não está instalado no servidor. "
+            "Rode: pip install pdfplumber") from exc
+
+    try:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
+            if not pdf.pages:
+                raise ValueError("PDF vazio.")
+            texto = pdf.pages[0].extract_text(layout=True) or ""
+    except ValueError:
+        raise
+    except Exception as exc:
+        # A mensagem crua da biblioteca ("No /Root object") não diz nada a quem
+        # só quer saber que mandou o arquivo errado.
+        raise ValueError("Não consegui ler este arquivo como PDF. "
+                         "Envie o comprovante de inscrição gerado pela Receita.") from exc
+
+    linhas = [l.rstrip() for l in texto.split("\n")]
+    if "CADASTRO NACIONAL DA PESSOA" not in texto.upper():
+        raise ValueError("Este PDF não parece o comprovante de inscrição do CNPJ da Receita.")
+
+    def depois_de(rotulo: str) -> str:
+        """Valor que vem na linha seguinte ao rótulo."""
+        for i, l in enumerate(linhas):
+            if rotulo in l.upper():
+                for prox in linhas[i + 1:i + 3]:
+                    if normalize_whitespace(prox):
+                        return _receita_vazio(prox)
+                return ""
+        return ""
+
+    # Campos que vêm lado a lado são separados por EXPRESSÃO, não por coluna:
+    # o rótulo e o valor não começam na mesma posição no PDF da Receita, então
+    # fatiar por coluna cortava "DEMAIS" em "DEMA" + "IS".
+
+    dados: dict[str, Any] = {}
+    m = re.search(r"\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}", texto)
+    if not m:
+        raise ValueError("Não encontrei o CNPJ neste PDF.")
+    dados["documentNumber"] = m.group(0)
+
+    # Data de abertura fica na mesma linha do CNPJ, na coluna da direita
+    for l in linhas:
+        if m.group(0) in l:
+            datas = re.findall(r"\d{2}/\d{2}/\d{4}", l)
+            if datas:
+                dados["openedAt"] = datas[-1]
+            break
+
+    dados["companyName"] = depois_de("NOME EMPRESARIAL")
+
+    linha = _receita_linha_apos(linhas, "TÍTULO DO ESTABELECIMENTO")
+    m2 = re.match(r"\s*(.+?)\s{2,}(\S.*?)\s*$", linha)
+    if m2:
+        dados["tradeName"] = _receita_vazio(m2.group(1))
+        dados["size"] = _receita_vazio(m2.group(2))
+    elif linha.strip():
+        dados["tradeName"] = _receita_vazio(linha)
+
+    cnae = depois_de("ATIVIDADE ECONÔMICA PRINCIPAL")
+    if cnae:
+        partes = cnae.split(" - ", 1)
+        dados["cnaeCode"] = partes[0].strip()
+        dados["cnaeDescription"] = partes[1].strip() if len(partes) > 1 else ""
+        ramo, familia = business_line_from_cnae(dados["cnaeCode"])
+        if ramo:
+            dados["businessLine"] = ramo
+        if familia:
+            dados["businessLineHint"] = familia
+
+    linha = _receita_linha_apos(linhas, "LOGRADOURO")
+    m3 = re.match(r"\s*(.+?)\s{2,}(\S+)(?:\s+(\S+))?\s*$", linha)
+    if m3:
+        dados["addressLine"] = _receita_vazio(m3.group(1))
+        dados["addressNumber"] = _receita_vazio(m3.group(2))
+        dados["addressComplement"] = _receita_vazio(m3.group(3) or "")
+
+    # CEP, bairro, município e UF: o CEP e o bairro chegam separados por UM
+    # espaço só, então o CEP tem de ser reconhecido pelo próprio formato.
+    linha = _receita_linha_apos(linhas, "BAIRRO/DISTRITO")
+    m4 = re.match(r"\s*(\d{2}\.?\d{3}-?\d{3})\s+(.+?)\s{2,}(.+?)\s{2,}([A-Z]{2})\s*$", linha)
+    if m4:
+        dados["postalCode"] = only_digits(m4.group(1))
+        dados["neighborhood"] = _receita_vazio(m4.group(2))
+        dados["cityName"] = _receita_vazio(m4.group(3))
+        dados["stateName"] = m4.group(4)
+
+    linha = _receita_linha_apos(linhas, "ENDEREÇO ELETRÔNICO")
+    m5 = re.search(r"([\w.+-]+@[\w.-]+\.\w+)", linha)
+    if m5:
+        dados["email"] = m5.group(1).lower()
+        dados["emailFinance"] = m5.group(1).lower()
+    m6 = re.search(r"\(?\d{2}\)?\s*\d{4,5}-?\d{4}", linha)
+    if m6:
+        dados["landline"] = normalize_whitespace(m6.group(0))
+
+    # "SITUAÇÃO CADASTRAL" casa também com "MOTIVO DE SITUAÇÃO CADASTRAL":
+    # buscar a linha exata evita pegar o bloco errado.
+    linha = _receita_linha_apos(linhas, "SITUAÇÃO CADASTRAL")
+    m7 = re.match(r"\s*([A-ZÁÉÍÓÚÃÕÇ]+)\b", linha)
+    if m7:
+        dados["registryStatus"] = m7.group(1)
+    return {k: v for k, v in dados.items() if v}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ficha cadastral do cliente, em PDF
+#
+# Reproduz o formulário que a Passini já usa em papel. O vendedor preenche na
+# prospecção, gera o PDF e o cliente só assina — sem redigitar nada e sem o
+# risco de letra ilegível chegar ao setor de cadastro.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Condição de compra decidida na análise de crédito. Não confundir com a
+# pergunta "como costuma pagar" da qualificação: aquela é o hábito da oficina,
+# esta é o que a Passini concede.
+FICHA_CONDICOES = ["À vista", "Faturado"]
+
+FICHA_RAMOS = [
+    "Autopeças Leve", "Autopeças Pesada", "Autopeças Mista", "Auto Center",
+    "Oficina Mecânica Leve", "Oficina Mecânica Pesada", "Oficina Mecânica Mista",
+    "Transportadora", "Órgão Público", "Consumo Manut. Própria", "Outros",
+]
+
+PASSINI_RODAPE = [
+    "Av. Parobé, 136 - Scharlau, São Leopoldo - RS, 93125-000",
+    "Fone/Fax: (51) 3579 7200",
+    "CNPJ: 96735329/0001-70 - Inscrição Estadual: 124/0013393",
+    "cobrancasl@passiniautopecas.com.br",
+]
+
+
+def _ficha_documento(valor: str) -> str:
+    d = only_digits(valor)
+    if len(d) == 14:
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:]}"
+    if len(d) == 11:
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}"
+    return normalize_whitespace(valor)
+
+
+def _ficha_cep(valor: str) -> str:
+    d = only_digits(valor)
+    return f"{d[:5]}-{d[5:]}" if len(d) == 8 else normalize_whitespace(valor)
+
+
+def build_client_registration_pdf(prospect: dict[str, Any]) -> bytes:
+    """Monta a ficha cadastral pronta para o cliente assinar."""
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as _canvas
+
+    buffer = io.BytesIO()
+    c = _canvas.Canvas(buffer, pagesize=A4)
+    largura, altura = A4
+    esquerda, direita = 15 * mm, largura - 15 * mm
+    util = direita - esquerda
+    y = altura - 16 * mm
+
+    def titulo(texto: str, tamanho: int = 15) -> None:
+        nonlocal y
+        c.setFont("Helvetica-Bold", tamanho)
+        c.drawCentredString(largura / 2, y, texto)
+        y -= tamanho + 3
+
+    def faixa(texto: str) -> None:
+        """Barra de seção — separa PERFIL e COMPRADORES do bloco de dados."""
+        nonlocal y
+        y -= 4
+        c.setFillColorRGB(0.90, 0.92, 0.95)
+        c.rect(esquerda, y - 3, util, 13, stroke=0, fill=1)
+        c.setFillColorRGB(0, 0, 0)
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(esquerda + 4, y + 1, texto)
+        y -= 15
+
+    def campos(linha: list[tuple[str, str, float]]) -> None:
+        """Uma linha do formulário: rótulo pequeno em cima, valor sublinhado.
+
+        A proporção de cada campo é dada em fração da largura útil, para o
+        formulário acompanhar o papel sem números mágicos espalhados.
+        """
+        nonlocal y
+        x = esquerda
+        for rotulo, valor, fracao in linha:
+            w = util * fracao
+            c.setFont("Helvetica", 6.5)
+            c.setFillColorRGB(0.35, 0.35, 0.35)
+            c.drawString(x + 1, y + 9, rotulo.upper())
+            c.setFillColorRGB(0, 0, 0)
+            c.setFont("Helvetica-Bold", 9)
+            texto = normalize_whitespace(valor)
+            # Corta o que não cabe em vez de invadir o campo vizinho.
+            while texto and c.stringWidth(texto, "Helvetica-Bold", 9) > w - 6:
+                texto = texto[:-1]
+            c.drawString(x + 2, y + 1, texto)
+            c.setLineWidth(0.4)
+            c.setStrokeColorRGB(0.6, 0.6, 0.6)
+            c.line(x, y - 1.5, x + w - 3, y - 1.5)
+            x += w
+        y -= 17
+
+    # ── Cabeçalho ────────────────────────────────────────────────────────
+    titulo("Cadastro de Clientes")
+    c.setFont("Helvetica", 9.5)
+    c.drawCentredString(largura / 2, y, "Passini Distribuidora de Autopeças")
+    y -= 16
+
+    campos([("Vendedor", prospect.get("sellerName") or "", 0.62),
+            ("Condição", prospect.get("paymentTerms") or "", 0.38)])
+    campos([("Razão Social", prospect.get("companyName") or "", 0.62),
+            ("CNPJ", _ficha_documento(prospect.get("documentNumber") or ""), 0.38)])
+    # Regra da casa: inscrição estadual em branco significa isento. Deixar a
+    # marcação separada permitiria a ficha sair com IE preenchida E isento
+    # marcado, que é contradição e volta do setor de cadastro.
+    inscricao = normalize_whitespace(prospect.get("stateRegistration") or "")
+    isento = "(   ) Isento" if inscricao else "( X ) Isento"
+    campos([("Nome Fantasia", prospect.get("tradeName") or "", 0.40),
+            ("Inscrição Estadual", inscricao, 0.36),
+            ("", isento, 0.24)])
+    campos([("Endereço", prospect.get("addressLine") or "", 0.52),
+            ("Número", prospect.get("addressNumber") or "", 0.16),
+            ("Complemento", prospect.get("addressComplement") or "", 0.32)])
+    campos([("Bairro", prospect.get("neighborhood") or "", 0.34),
+            ("Cidade", prospect.get("cityName") or "", 0.36),
+            ("UF", prospect.get("stateName") or "", 0.10),
+            ("CEP", _ficha_cep(prospect.get("postalCode") or ""), 0.20)])
+    campos([("Telefone Fixo", prospect.get("landline") or "", 0.50),
+            ("Telefone WhatsApp", prospect.get("phone") or "", 0.50)])
+    campos([("E-mail Financeiro", prospect.get("emailFinance") or prospect.get("email") or "", 0.50),
+            ("E-mail XML", prospect.get("emailXml") or "", 0.50)])
+
+    # ── Perfil ───────────────────────────────────────────────────────────
+    faixa("PERFIL")
+    c.setFont("Helvetica", 6.5)
+    c.setFillColorRGB(0.35, 0.35, 0.35)
+    c.drawString(esquerda + 1, y + 6, "RAMO DE ATIVIDADE")
+    c.setFillColorRGB(0, 0, 0)
+    y -= 4
+    escolhido = normalize_upper(strip_accents(prospect.get("businessLine") or ""))
+    c.setFont("Helvetica", 8)
+    por_linha = 4
+    for i, ramo in enumerate(FICHA_RAMOS):
+        col = i % por_linha
+        if col == 0 and i:
+            y -= 12
+        marca = "X" if normalize_upper(strip_accents(ramo)) == escolhido else " "
+        c.drawString(esquerda + col * (util / por_linha), y, f"( {marca} ) {ramo}")
+    y -= 16
+
+    # ── Compradores ──────────────────────────────────────────────────────
+    faixa("PESSOAS AUTORIZADAS A REALIZAR COMPRAS")
+    compradores = list(prospect.get("buyers") or [])
+    while len(compradores) < 3:
+        compradores.append("")
+    for nome in compradores[:3]:
+        campos([("Nome", nome, 1.0)])
+
+    faixa("OBSERVAÇÕES")
+    obs = normalize_whitespace(prospect.get("notes") or "")
+    c.setFont("Helvetica", 8.5)
+    for pedaco in [obs[i:i + 110] for i in range(0, len(obs), 110)][:3]:
+        c.drawString(esquerda + 2, y, pedaco)
+        y -= 11
+    y -= 8
+    for _ in range(2):
+        c.setStrokeColorRGB(0.75, 0.75, 0.75)
+        c.line(esquerda, y, direita, y)
+        y -= 13
+
+    # ── Assinatura e rodapé ──────────────────────────────────────────────
+    y -= 16
+    meio = largura / 2
+    c.setStrokeColorRGB(0, 0, 0)
+    c.setLineWidth(0.7)
+    c.line(meio - 45 * mm, y, meio + 45 * mm, y)
+    y -= 10
+    c.setFont("Helvetica", 8.5)
+    c.drawCentredString(meio, y, "Assinatura")
+    y -= 6
+    c.setFont("Helvetica", 6.5)
+    c.setFillColorRGB(0.45, 0.45, 0.45)
+    c.drawCentredString(meio, y, f"Emitido em {date.today().strftime('%d/%m/%Y')} pelo CRM Passini")
+
+    rodape_y = 20 * mm
+    c.setFont("Helvetica", 7)
+    c.setFillColorRGB(0.3, 0.3, 0.3)
+    for i, linha_rodape in enumerate(PASSINI_RODAPE):
+        c.drawCentredString(meio, rodape_y - i * 9, linha_rodape)
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
+
+
 def save_prospect(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any],
     exigir_contato: bool = False,
@@ -9584,6 +9995,33 @@ def save_prospect(
         normalize_whitespace(payload.get("notes")),
     )
 
+    # Campos da ficha cadastral. Vão à parte porque são muitos e opcionais:
+    # a prospecção continua funcionando sem nenhum deles, e eles só passam a
+    # importar na hora de gerar a ficha para o cliente assinar.
+    compradores = [normalize_whitespace(x) for x in (payload.get("buyers") or [])]
+    compradores = [x for x in compradores if x][:3]
+    campos_ficha = (
+        normalize_whitespace(payload.get("stateRegistration")),
+        1 if payload.get("taxExempt") else 0,
+        normalize_whitespace(payload.get("addressNumber")),
+        normalize_whitespace(payload.get("addressComplement")),
+        only_digits(payload.get("postalCode")),
+        normalize_upper(payload.get("stateName"))[:2],
+        normalize_whitespace(payload.get("landline")),
+        normalize_whitespace(payload.get("emailFinance")),
+        normalize_whitespace(payload.get("emailXml")),
+        normalize_whitespace(payload.get("paymentTerms")),
+        normalize_whitespace(payload.get("businessLine")),
+        json.dumps(compradores, ensure_ascii=False),
+        normalize_whitespace(payload.get("cnaeCode")),
+        normalize_whitespace(payload.get("openedAt")),
+        normalize_upper(payload.get("registryStatus")),
+    )
+    SQL_FICHA = ("state_registration=?, tax_exempt=?, address_number=?, address_complement=?, "
+                 "postal_code=?, state_name=?, landline=?, email_finance=?, email_xml=?, "
+                 "payment_terms=?, business_line=?, buyers_json=?, cnae_code=?, opened_at=?, "
+                 "registry_status=?")
+
     if prospect_id:
         conn.execute(
             """
@@ -9591,10 +10029,10 @@ def save_prospect(
                    document_number=?, document_digits=?, phone=?, contact_name=?, email=?,
                    city_name=?, neighborhood=?, address_line=?, origin=?,
                    q_service_type=?, q_cars_week=?, q_main_line=?, q_payment=?,
-                   closing_trigger=?, notes=?, updated_at=?
+                   closing_trigger=?, notes=?, """ + SQL_FICHA + """, updated_at=?
             WHERE company_id = ? AND id = ?
             """,
-            (*campos, now_iso(), company_id, int(prospect_id)),
+            (*campos, *campos_ficha, now_iso(), company_id, int(prospect_id)),
         )
         novo_id = int(prospect_id)
     else:
@@ -9613,10 +10051,17 @@ def save_prospect(
             INSERT INTO prospects (unit_name, seller_name, company_name, trade_name,
                 document_number, document_digits, phone, contact_name, email, city_name,
                 neighborhood, address_line, origin, q_service_type, q_cars_week, q_main_line,
-                q_payment, closing_trigger, notes, company_id, status, created_by_user_id, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'NOVO',?,?)
+                q_payment, closing_trigger, notes,
+                state_registration, tax_exempt, address_number, address_complement,
+                postal_code, state_name, landline, email_finance, email_xml,
+                payment_terms, business_line, buyers_json, cnae_code, opened_at,
+                registry_status,
+                company_id, status, created_by_user_id, created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                    ?, 'NOVO',?,?)
             """,
-            (*campos, company_id, user["id"], now_iso()),
+            (*campos, *campos_ficha, company_id, user["id"], now_iso()),
         )
         novo_id = int(cursor.lastrowid)
 
@@ -18469,6 +18914,33 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
+            if path == "/api/prospects/ficha.pdf":
+                user = self._require_auth()
+                if not user:
+                    return
+                consulta = parse_qs(parsed.query)
+                try:
+                    prospect_id = int(consulta.get("id", ["0"])[0])
+                except ValueError:
+                    prospect_id = 0
+                with closing(get_connection()) as conn:
+                    linha = conn.execute(
+                        "SELECT * FROM prospects WHERE company_id = ? AND id = ?",
+                        (user["company_id"], prospect_id)).fetchone()
+                    if not linha:
+                        self._set_headers(404)
+                        self.wfile.write(json_dumps({"error": "Oficina não encontrada."}))
+                        return
+                    dados = prospect_row_to_dict(linha)
+                    # Vendedor: quem trabalha a oficina, não quem clicou.
+                    dados["sellerName"] = linha["seller_name"]
+                conteudo = build_client_registration_pdf(dados)
+                nome_arquivo = re.sub(r"[^A-Za-z0-9]+", "-",
+                                      strip_accents(dados.get("companyName") or "ficha")).strip("-")[:50]
+                self._set_headers(200, "application/pdf", {
+                    "Content-Disposition": f'attachment; filename="ficha-{nome_arquivo.lower()}.pdf"'})
+                self.wfile.write(conteudo)
+                return
             if path == "/api/prospects/inactive":
                 user = self._require_auth()
                 if not user:
@@ -19272,6 +19744,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json_dumps(res))
                 except Exception as exc:
                     traceback.print_exc()
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path == "/api/prospects/receita":
+                user = self._require_auth()
+                if not user:
+                    return
+                arquivos, _campos = self._parse_multipart()
+                try:
+                    if not arquivos:
+                        raise ValueError("Envie o PDF do comprovante da Receita.")
+                    dados = parse_receita_cnpj_pdf(arquivos[0]["content"])
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"data": dados}))
+                except Exception as exc:
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
                 return
