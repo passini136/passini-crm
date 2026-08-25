@@ -9618,7 +9618,9 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             if not pdf.pages:
                 raise ValueError("PDF vazio.")
-            texto = pdf.pages[0].extract_text(layout=True) or ""
+            # Impresso pelo navegador, o comprovante costuma sair em 2 páginas.
+            # Ler só a primeira funcionava por sorte; juntar todas é o certo.
+            texto = "\n".join((pg.extract_text(layout=True) or "") for pg in pdf.pages)
     except ValueError:
         raise
     except Exception as exc:
@@ -9628,8 +9630,14 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
                          "Envie o comprovante de inscrição gerado pela Receita.") from exc
 
     linhas = [l.rstrip() for l in texto.split("\n")]
-    if "CADASTRO NACIONAL DA PESSOA" not in texto.upper():
-        raise ValueError("Este PDF não parece o comprovante de inscrição do CNPJ da Receita.")
+    # Impresso pelo navegador, o título sai com espaçamento variável
+    # ("CADASTRO  NACIONAL  DA PESSOA"). Comparar o texto cru rejeitava
+    # comprovante legítimo — o espaçamento depende de quem imprimiu.
+    if not re.search(r"CADASTRO\s+NACIONAL\s+DA\s+PESSOA", texto.upper()):
+        raise ValueError(
+            "Este PDF não parece o comprovante de inscrição do CNPJ. "
+            "Ele deve ser a página do site da Receita — se você imprimiu como PDF "
+            "pelo navegador, funciona igual.")
 
     def depois_de(rotulo: str) -> str:
         """Valor que vem na linha seguinte ao rótulo."""
@@ -9681,7 +9689,7 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
             dados["businessLineHint"] = familia
 
     linha = _receita_linha_apos(linhas, "LOGRADOURO")
-    m3 = re.match(r"\s*(.+?)\s{2,}(\S+)(?:\s+(\S+))?\s*$", linha)
+    m3 = re.match(r"\s*(.+?)\s{2,}(\S+)(?:\s+(.*?))?\s*$", linha)
     if m3:
         dados["addressLine"] = _receita_vazio(m3.group(1))
         dados["addressNumber"] = _receita_vazio(m3.group(2))
@@ -9702,6 +9710,8 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
     if m5:
         dados["email"] = m5.group(1).lower()
         dados["emailFinance"] = m5.group(1).lower()
+    # Pode vir mais de um telefone separado por barra: fica com o primeiro,
+    # que é o principal na exportação da Receita.
     m6 = re.search(r"\(?\d{2}\)?\s*\d{4,5}-?\d{4}", linha)
     if m6:
         dados["landline"] = normalize_whitespace(m6.group(0))
