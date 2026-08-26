@@ -89,6 +89,7 @@ const state = {
     analysisOpen: false,   // subgrupo Análises do menu aberto
     leadsOpen: false,      // painel da base fria de leads
     refreshing: {},        // botões de atualizar que estão rodando agora
+    fichaAberta: null,     // null = decide sozinho; true/false = escolha da pessoa
     switching: {},         // troca de aba/filtro em andamento, por grupo de chips
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
     inactiveSearch: "",
@@ -1794,7 +1795,13 @@ function editarProspect(p) {
   requestRender();
 }
 
-function fecharProspectEditor() { state.prospectEditor = null; requestRender(); }
+function fecharProspectEditor() {
+  state.prospectEditor = null;
+  // A próxima oficina decide sozinha se abre a ficha; a escolha vale só para
+  // o cadastro que estava aberto.
+  state.ui.fichaAberta = null;
+  requestRender();
+}
 
 /** Erro do formulário: aparece DENTRO da janela, onde a pessoa está olhando. */
 function erroNoProspect(mensagem) {
@@ -3241,92 +3248,102 @@ function setFichaComprador(indice, valor) {
   p.buyers[indice] = valor;
 }
 
-/** Bloco da ficha dentro do editor de oficina. */
+/** Abre e fecha o bloco da ficha.
+ *
+ *  Recebe o estado que está NA TELA porque o bloco também abre sozinho quando
+ *  já tem dado preenchido. Invertendo só a preferência guardada, o primeiro
+ *  clique numa ficha auto-aberta não fazia nada.
+ */
+function alternarFichaCadastral(abertoAgora) {
+  state.ui.fichaAberta = !abertoAgora;
+  requestRender();
+}
+
+/** Bloco da ficha cadastral: só o que NÃO aparece na parte de cima.
+ *
+ *  Antes cidade, bairro e endereço estavam aqui E lá em cima — a pessoa via o
+ *  mesmo campo duas vezes e não sabia qual valia. Agora cada dado tem um lugar
+ *  só, e o que é exclusivo da ficha fica recolhido: para prospectar bastam
+ *  quatro campos, e a ficha só importa quando a oficina vai virar cliente.
+ */
 function blocoFichaCadastral(p) {
   const compradores = [...(p.buyers || []), "", "", ""].slice(0, 3);
+  const daFicha = [p.paymentTerms, p.stateRegistration, p.addressLine, p.addressNumber,
+                   p.postalCode, p.stateName, p.businessLine];
+  const preenchidos = daFicha.filter((v) => normalizeTexto(v)).length;
+  // Sem escolha da pessoa (null), abre sozinha quando já há dado preenchido.
+  const aberto = state.ui.fichaAberta === null || state.ui.fichaAberta === undefined
+    ? preenchidos > 0 : Boolean(state.ui.fichaAberta);
+
   return `
-    <div class="subtle-card padded-card" style="margin-top:8px">
-      <div class="section-title">
-        <div><h3>Ficha cadastral</h3>
-          <div class="text-small">Dados que o setor de cadastro precisa. Suba o comprovante do
-            CNPJ e a maior parte se preenche sozinha.</div></div>
+    <div class="subtle-card padded-card" style="margin-top:10px">
+      <button type="button" onclick="alternarFichaCadastral(${aberto})"
+        style="width:100%;display:flex;justify-content:space-between;align-items:center;
+               background:transparent;border:none;cursor:pointer;padding:0">
+        <span style="font-weight:700;font-size:14px">
+          ${aberto ? "▾" : "▸"} Dados da ficha cadastral
+        </span>
+        <span class="text-small" style="color:${preenchidos === daFicha.length ? "var(--good)" : "var(--muted)"}">
+          ${preenchidos} de ${daFicha.length} preenchidos
+        </span>
+      </button>
+      <div class="text-small" style="color:var(--muted);margin-top:2px">
+        Só precisa quando a oficina for virar cliente. Para prospectar, deixe para depois.
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0">
-        <label class="btn btn-secondary btn-sm" style="margin:0;cursor:pointer">
-          ${p.importando ? "⏳ Lendo…" : "📄 Importar comprovante da Receita"}
-          <input type="file" accept=".pdf" style="display:none"
-            onchange="importarComprovanteReceita(this)" ${p.importando ? "disabled" : ""} />
-        </label>
-        ${p.registryStatus ? `<span class="status-tag ${p.registryStatus === "ATIVA" ? "good" : "bad"}">
-          Receita: ${escapeHtml(p.registryStatus)}</span>` : ""}
-        ${p.cnaeCode ? `<span class="text-small" style="color:var(--muted)">CNAE ${escapeHtml(p.cnaeCode)}</span>` : ""}
-      </div>
+      ${aberto ? `
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+          <div class="field"><label>Condição <span style="color:var(--muted);font-weight:400">(análise de crédito)</span></label>
+            <select onchange="state.prospectEditor.paymentTerms=this.value">
+              <option value="">A definir</option>
+              ${FICHA_CONDICOES.map((c) => `<option ${p.paymentTerms === c ? "selected" : ""}>${c}</option>`).join("")}
+            </select></div>
+          <div class="field"><label>Inscrição Estadual</label>
+            <input value="${escapeHtml(p.stateRegistration || "")}"
+              oninput="state.prospectEditor.stateRegistration=this.value"
+              placeholder="Em branco = isento" />
+            ${!normalizeTexto(p.stateRegistration) ? `
+              <div class="text-small" style="color:#b06000;margin-top:4px">
+                Sem inscrição, a ficha sai marcada como <strong>isento</strong>.
+              </div>` : ""}</div>
+        </div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div class="field"><label>Condição <span style="color:var(--muted);font-weight:400">(análise de crédito)</span></label>
-          <select onchange="state.prospectEditor.paymentTerms=this.value">
-            <option value="">A definir</option>
-            ${FICHA_CONDICOES.map((c) => `<option ${p.paymentTerms === c ? "selected" : ""}>${c}</option>`).join("")}
-          </select></div>
-        <div class="field"><label>Inscrição Estadual</label>
-          <input value="${escapeHtml(p.stateRegistration || "")}"
-            oninput="state.prospectEditor.stateRegistration=this.value"
-            placeholder="Em branco = isento" />
-          ${!normalizeTexto(p.stateRegistration) ? `
-            <div class="text-small" style="color:#b06000;margin-top:4px">
-              Sem inscrição, a ficha sai marcada como <strong>isento</strong>.
-            </div>` : ""}</div>
-      </div>
+        <div style="display:grid;grid-template-columns:2fr 70px 1fr;gap:10px">
+          <div class="field"><label>Endereço</label>
+            <input value="${escapeHtml(p.addressLine || "")}" oninput="state.prospectEditor.addressLine=this.value" /></div>
+          <div class="field"><label>Número</label>
+            <input value="${escapeHtml(p.addressNumber || "")}" oninput="state.prospectEditor.addressNumber=this.value" /></div>
+          <div class="field"><label>Complemento</label>
+            <input value="${escapeHtml(p.addressComplement || "")}" oninput="state.prospectEditor.addressComplement=this.value" /></div>
+        </div>
 
-      <div style="display:grid;grid-template-columns:2fr 1fr 1fr;gap:10px">
-        <div class="field"><label>Endereço</label>
-          <input value="${escapeHtml(p.addressLine || "")}" oninput="state.prospectEditor.addressLine=this.value" /></div>
-        <div class="field"><label>Número</label>
-          <input value="${escapeHtml(p.addressNumber || "")}" oninput="state.prospectEditor.addressNumber=this.value" /></div>
-        <div class="field"><label>Complemento</label>
-          <input value="${escapeHtml(p.addressComplement || "")}" oninput="state.prospectEditor.addressComplement=this.value" /></div>
-      </div>
+        <div style="display:grid;grid-template-columns:70px 1fr 2fr;gap:10px">
+          <div class="field"><label>UF</label>
+            <input maxlength="2" value="${escapeHtml(p.stateName || "")}"
+              oninput="state.prospectEditor.stateName=this.value.toUpperCase()" /></div>
+          <div class="field"><label>CEP</label>
+            <input value="${escapeHtml(p.postalCode || "")}" oninput="state.prospectEditor.postalCode=this.value" /></div>
+          <div class="field"><label>Ramo de atividade</label>
+            <select onchange="state.prospectEditor.businessLine=this.value">
+              <option value="">—</option>
+              ${FICHA_RAMOS.map((r) => `<option ${p.businessLine === r ? "selected" : ""}>${r}</option>`).join("")}
+            </select>
+            ${p.businessLineHint && !p.businessLine ? `
+              <div class="text-small" style="color:#b06000;margin-top:4px">
+                O CNAE indica <strong>${escapeHtml(p.businessLineHint)}</strong>, mas não diz se é
+                leve, pesada ou mista — escolha aqui.
+              </div>`
+            : p.cnaeCode ? `<div class="text-small" style="color:var(--muted);margin-top:4px">
+                Sugerido pelo CNAE ${escapeHtml(p.cnaeCode)}.
+              </div>` : ""}</div>
+        </div>
 
-      <div style="display:grid;grid-template-columns:1fr 1fr 60px 1fr;gap:10px">
-        <div class="field"><label>Bairro</label>
-          <input value="${escapeHtml(p.neighborhood || "")}" oninput="state.prospectEditor.neighborhood=this.value" /></div>
-        <div class="field"><label>Cidade</label>
-          <input value="${escapeHtml(p.cityName || "")}" oninput="state.prospectEditor.cityName=this.value" /></div>
-        <div class="field"><label>UF</label>
-          <input maxlength="2" value="${escapeHtml(p.stateName || "")}" oninput="state.prospectEditor.stateName=this.value.toUpperCase()" /></div>
-        <div class="field"><label>CEP</label>
-          <input value="${escapeHtml(p.postalCode || "")}" oninput="state.prospectEditor.postalCode=this.value" /></div>
-      </div>
-
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
-        <div class="field"><label>Telefone fixo</label>
-          <input value="${escapeHtml(p.landline || "")}" oninput="state.prospectEditor.landline=this.value" /></div>
-        <div class="field"><label>E-mail para XML</label>
-          <input value="${escapeHtml(p.emailXml || "")}" oninput="state.prospectEditor.emailXml=this.value"
-            placeholder="Onde a nota eletrônica é recebida" /></div>
-      </div>
-
-      <div class="field"><label>Ramo de atividade</label>
-        <select onchange="state.prospectEditor.businessLine=this.value">
-          <option value="">—</option>
-          ${FICHA_RAMOS.map((r) => `<option ${p.businessLine === r ? "selected" : ""}>${r}</option>`).join("")}
-        </select>
-        ${p.businessLineHint && !p.businessLine ? `
-          <div class="text-small" style="color:#b06000;margin-top:4px">
-            O CNAE indica <strong>${escapeHtml(p.businessLineHint)}</strong>, mas não diz se é
-            leve, pesada ou mista — escolha acima.
-          </div>`
-        : p.cnaeCode ? `<div class="text-small" style="color:var(--muted);margin-top:4px">
-            Sugerido pelo CNAE do comprovante. Ajuste se a oficina for de outro tipo.
-          </div>` : ""}</div>
-
-      <div class="field"><label>Pessoas autorizadas a comprar</label>
-        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-          ${compradores.map((nome, i) => `
-            <input value="${escapeHtml(nome)}" placeholder="Nome ${i + 1}"
-              oninput="setFichaComprador(${i}, this.value)" />`).join("")}
-        </div></div>
+        <div class="field"><label>Pessoas autorizadas a comprar</label>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+            ${compradores.map((nome, i) => `
+              <input value="${escapeHtml(nome)}" placeholder="Nome ${i + 1}"
+                oninput="setFichaComprador(${i}, this.value)" />`).join("")}
+          </div></div>` : ""}
     </div>`;
 }
 
@@ -3347,7 +3364,25 @@ function prospectEditorModal() {
           <button class="btn btn-ghost btn-sm" onclick="fecharProspectEditor()">Fechar</button>
         </div>
 
-        <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-top:12px">
+        <!-- Primeira ação da tela: é ela que preenche a maior parte do resto. -->
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+                    background:#f5f9ff;border:1px solid var(--accent);border-radius:10px;
+                    padding:10px 12px;margin-top:12px">
+          <label class="btn btn-primary btn-sm" style="margin:0;cursor:pointer">
+            ${p.importando ? "⏳ Lendo…" : "📄 Importar comprovante do CNPJ"}
+            <input type="file" accept=".pdf" style="display:none"
+              onchange="importarComprovanteReceita(this)" ${p.importando ? "disabled" : ""} />
+          </label>
+          <span class="text-small" style="color:var(--muted);flex:1;min-width:220px">
+            Imprima a consulta do CNPJ no site da Receita como PDF e solte aqui —
+            preenche razão social, endereço, telefone e ramo de uma vez.
+          </span>
+          ${p.registryStatus ? `<span class="status-tag ${p.registryStatus === "ATIVA" ? "good" : "bad"}">
+            Receita: ${escapeHtml(p.registryStatus)}</span>` : ""}
+        </div>
+
+        <div class="text-small" style="color:var(--muted);font-weight:700;margin:14px 0 4px">IDENTIFICAÇÃO</div>
+        <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
           <div class="field"><label>Nome da oficina <span style="color:var(--bad)">*</span></label>
             <input value="${escapeHtml(p.companyName)}" oninput="state.prospectEditor.companyName=this.value;state.prospectEditor.error=''" /></div>
           <div class="field"><label>Nome fantasia</label>
@@ -3365,27 +3400,33 @@ function prospectEditorModal() {
           </div>
         </div>
 
+        <div class="text-small" style="color:var(--muted);font-weight:700;margin:14px 0 4px">CONTATO</div>
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
-          <div class="field"><label>Telefone <span style="color:var(--bad)">*</span></label>
+          <div class="field"><label>WhatsApp <span style="color:var(--bad)">*</span></label>
             <input value="${escapeHtml(p.phone)}" oninput="state.prospectEditor.phone=this.value;state.prospectEditor.error=''" /></div>
+          <div class="field"><label>Telefone fixo</label>
+            <input value="${escapeHtml(p.landline || "")}" oninput="state.prospectEditor.landline=this.value" /></div>
           <div class="field"><label>Contato</label>
             <input value="${escapeHtml(p.contactName)}" oninput="state.prospectEditor.contactName=this.value"
               placeholder="Quem decide a compra" /></div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div class="field"><label>E-mail <span style="color:var(--bad)">*</span></label>
             <input value="${escapeHtml(p.email)}" oninput="state.prospectEditor.email=this.value;state.prospectEditor.error=''" /></div>
-        </div>
-        <div class="text-small" style="color:var(--muted);margin:-4px 0 8px">
-          Razão social, CNPJ, telefone e e-mail são o que o setor de cadastro pede.
-          Com os quatro preenchidos, ao salvar você recebe o texto pronto para mandar no WhatsApp.
+          <div class="field"><label>E-mail para XML</label>
+            <input value="${escapeHtml(p.emailXml || "")}" oninput="state.prospectEditor.emailXml=this.value"
+              placeholder="Onde recebe a nota eletrônica" /></div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr 2fr;gap:10px">
+        <div class="text-small" style="color:var(--muted);font-weight:700;margin:14px 0 4px">ONDE FICA</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
           <div class="field"><label>Cidade</label>
             <input value="${escapeHtml(p.cityName)}" oninput="state.prospectEditor.cityName=this.value" /></div>
           <div class="field"><label>Bairro</label>
-            <input value="${escapeHtml(p.neighborhood)}" oninput="state.prospectEditor.neighborhood=this.value" /></div>
-          <div class="field"><label>Endereço</label>
-            <input value="${escapeHtml(p.addressLine)}" oninput="state.prospectEditor.addressLine=this.value" /></div>
+            <input value="${escapeHtml(p.neighborhood)}" oninput="state.prospectEditor.neighborhood=this.value" />
+            <div class="text-small" style="color:var(--muted);margin-top:4px">
+              Cidade e bairro definem a unidade que atende.
+            </div></div>
         </div>
 
         ${d.canManage ? `
@@ -4125,12 +4166,31 @@ function quadrantHtml(quadrant) {
   `;
 }
 
+/** Situação do vínculo do vendedor no mês.
+ *
+ *  "Pendente" significa que ninguém cadastrou a pessoa em Administração →
+ *  Pessoas: é tarefa aberta. Quem foi desligado não é pendência — o registro
+ *  existe e está fechado. Misturar os dois fazia o gestor procurar problema
+ *  onde já estava resolvido.
+ */
+function seloVinculoVendedor(row) {
+  if (row.terminated) {
+    return '<span class="status-tag" style="background:#f1f3f4;color:#5f6368"'
+      + ' title="Desligado: sem vínculo vigente nesta competência">Desligado</span>';
+  }
+  if (row.pendingMapping) {
+    return '<span class="status-tag warn"'
+      + ' title="Sem cadastro em Administração → Pessoas">Pendente</span>';
+  }
+  return "";
+}
+
 function sellerRows(rows) {
   return rows
     .map(
       (row) => `
       <tr>
-        <td>${escapeHtml(row.sellerName)} ${row.pendingMapping ? '<span class="status-tag warn">Pendente</span>' : ""}</td>
+        <td>${escapeHtml(row.sellerName)} ${seloVinculoVendedor(row)}</td>
         <td>${escapeHtml(row.baseUnit || "-")}</td>
         <td>${currency(row.revenueNet)}</td>
         <td>${currency(row.revenueGoal)}</td>
@@ -4480,7 +4540,7 @@ function vendedoresViewTableOnly() {
               .map(
                 (row) => `
                 <tr>
-                  <td>${escapeHtml(row.sellerName)} ${row.pendingMapping ? '<span class="status-tag warn">Pendente</span>' : ""}</td>
+                  <td>${escapeHtml(row.sellerName)} ${seloVinculoVendedor(row)}</td>
                   <td>${escapeHtml(row.baseUnit || "-")}</td>
                   <td>${currency(row.revenueNet)}</td>
                   <td>${currency(row.revenueGoal)}</td>

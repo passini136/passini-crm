@@ -13397,22 +13397,35 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         if _city_name_key and _city_name_key not in _city_map:
             _city_map[_city_name_key] = normalize_unit(_r["principal_unit"])
 
+    # Vínculo do vendedor na competência. Indexado pela chave normalizada do
+    # nome porque o faturamento escreve "FULANO (VENDAS)" e o cadastro de
+    # pessoas costuma gravar só "FULANO" — comparar o texto cru marcava como
+    # pendente quem estava cadastrado.
     _seller_unit_map: dict[str, str | None] = {}
     _seller_role_map: dict[str, str | None] = {}
+    # Quem TEM cadastro, mesmo fora da vigência: serve para separar "falta
+    # cadastrar" de "foi desligado". São situações diferentes e só a primeira
+    # é pendência de alguém resolver.
+    _seller_desligado_map: dict[str, str | None] = {}
     for _r in conn.execute(
         """
-        SELECT person_name, base_unit, role_classification
+        SELECT person_name, base_unit, role_classification, valid_from, valid_to
         FROM people_records
-        WHERE company_id = ? AND date(valid_from) <= date(?)
-          AND (valid_to IS NULL OR date(valid_to) >= date(?))
+        WHERE company_id = ?
         ORDER BY date(valid_from) DESC
         """,
-        (company_id, _comp_target, _comp_target),
+        (company_id,),
     ).fetchall():
-        _pname_key = normalize_whitespace(_r["person_name"])
-        if _pname_key and _pname_key not in _seller_unit_map:
-            _seller_unit_map[_pname_key] = normalize_unit(_r["base_unit"])
-            _seller_role_map[_pname_key] = _r["role_classification"]
+        _vigente = (str(_r["valid_from"] or "") <= _comp_target
+                    and (not _r["valid_to"] or str(_r["valid_to"]) >= _comp_target))
+        for _pname_key in (person_key(_r["person_name"]), short_person_key(_r["person_name"])):
+            if not _pname_key:
+                continue
+            if _vigente and _pname_key not in _seller_unit_map:
+                _seller_unit_map[_pname_key] = normalize_unit(_r["base_unit"])
+                _seller_role_map[_pname_key] = _r["role_classification"]
+            if _pname_key not in _seller_desligado_map:
+                _seller_desligado_map[_pname_key] = normalize_unit(_r["base_unit"])
     # ────────────────────────────────────────────────────────────────────────
 
     detail_rows_all: list[dict[str, Any]] = []
@@ -13807,8 +13820,17 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             seller_name,
             {"revenueNet": 0.0, "grossSales": 0.0, "grossSalesPct": 0.0, "discountValue": 0.0, "returnValue": 0.0, "clients": set(), "sku": set(), "baseUnit": None},
         )
-        role = _seller_role_map.get(seller_name)
-        base_unit = _seller_unit_map.get(seller_name)
+        _chave_v = person_key(seller_name)
+        _chave_c = short_person_key(seller_name)
+        role = _seller_role_map.get(_chave_v) or _seller_role_map.get(_chave_c)
+        base_unit = _seller_unit_map.get(_chave_v) or _seller_unit_map.get(_chave_c)
+        # Sem vigência nesta competência, mas com cadastro: foi desligado.
+        # Fica com a última unidade conhecida para não sumir do comparativo.
+        _tem_cadastro = _chave_v in _seller_desligado_map or _chave_c in _seller_desligado_map
+        _desligado = role is None and _tem_cadastro
+        if _desligado and not base_unit:
+            base_unit = (_seller_desligado_map.get(_chave_v)
+                         or _seller_desligado_map.get(_chave_c))
         resolved_base_unit = normalize_unit(base_unit or metrics.get("baseUnit"))
         if role not in (None, "Vendedor"):
             continue
@@ -13821,12 +13843,13 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         max_ticket = max(max_ticket, ticket)
         max_clients = max(max_clients, len(metrics["clients"]))
         max_mix = max(max_mix, len(metrics["sku"]))
-        candidate_sellers.append((seller_name, metrics, official_row, role, resolved_base_unit))
+        candidate_sellers.append((seller_name, metrics, official_row, role,
+                                  resolved_base_unit, _desligado))
 
     seller_rows = []
     total_company_seller_goal = 0.0
     total_company_seller_returns_goal = 0.0
-    for seller_name, metrics, official_row, role, base_unit in candidate_sellers:
+    for seller_name, metrics, official_row, role, base_unit, _desligado in candidate_sellers:
         gross_sales = float(official_row.get("sale_value") or 0.0)
         revenue_net_raw = float(official_row.get("net_value") or 0.0)
         gross_sales_pct = float(metrics.get("grossSalesPct") or 0.0)
@@ -13928,7 +13951,11 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "returnsTotalRatioPct": round(safe_div(returns_total, revenue_net) * 100 if revenue_net else 0.0, 2),
                 "marginValue": (lambda _m: round(_m, 2) if _m is not None else None)(finite_or_none(margin_value)),
                 "score": round(score, 2),
-                "pendingMapping": role is None,
+                # Pendente = ninguém cadastrou este vendedor. Desligado NÃO é
+                # pendência: já foi resolvido, e marcar como pendente faz o
+                # gestor procurar um problema que não existe.
+                "pendingMapping": role is None and not _desligado,
+                "terminated": _desligado,
                 "missingGoal": revenue_goal <= 0,
                 "inDeployment": normalize_unit(base_unit) in unidades_implantacao,
                 "metaDiaria": round(daily_goal_value, 2),
