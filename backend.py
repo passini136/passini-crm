@@ -13440,7 +13440,10 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         seller_name = normalize_whitespace(row["seller_name"])
         city_name = normalize_upper(row["city_name"])
         resolved_unit = _city_map.get(city_name)
-        seller_base_unit = _seller_unit_map.get(seller_name)
+        # Mesma chave usada para montar o mapa: o faturamento escreve
+        # "FULANO (VENDAS)" e o cadastro de pessoas grava só "FULANO".
+        seller_base_unit = (_seller_unit_map.get(person_key(seller_name))
+                            or _seller_unit_map.get(short_person_key(seller_name)))
         enriched = dict(row)
         enriched["seller_name"] = seller_name
         enriched["client_name"] = normalize_whitespace(row["client_name"])
