@@ -1162,8 +1162,7 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     # CREATE TABLE IF NOT EXISTS não altera tabela existente — sem este ALTER,
     # o servidor sobe e só quebra na hora do clique, com "no such column".
     sales_columns = {row["name"] for row in conn.execute("PRAGMA table_info(fact_sales_detail)").fetchall()}
-    _rehash_faturamento = bool(sales_columns) and "brand_name" not in sales_columns
-    if _rehash_faturamento:
+    if bool(sales_columns) and "brand_name" not in sales_columns:
         # A coluna "Marca" sempre veio no arquivo do Alfa, mas não era gravada.
         # Fica NULL nas linhas antigas: só reimportar o mês traz a marca dele.
         conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN brand_name TEXT")
@@ -1178,9 +1177,11 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_sales_brand "
             "ON fact_sales_detail(company_id, competence, brand_name)")
 
-    if _rehash_faturamento:
-        # Roda uma vez só, junto da criação da coluna: quem ainda não tinha
-        # brand_name é exatamente quem tem a identidade no formato antigo.
+    # Roda quando AINDA HOUVER linha no formato antigo — olhando o dado, não a
+    # ordem dos deploys. O gatilho anterior era a criação da coluna da marca, e
+    # ele nunca disparou em produção: quando esta migração foi escrita, a coluna
+    # já existia. Resultado: a reimportação do faturamento duplicou os meses.
+    if sales_columns and sales_detail_needs_rehash(conn):
         rehash_sales_detail(conn)
 
     prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
@@ -3720,20 +3721,41 @@ def decode_text_content(content: bytes) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+def sales_detail_needs_rehash(conn: sqlite3.Connection) -> bool:
+    """Ainda há linha gravada no formato antigo (issue_date com hora)?
+
+    O gatilho anterior era a criação da coluna da marca, e isso furou: quando a
+    migração foi escrita, a coluna já existia em produção e ela nunca rodou.
+    Olhar o próprio dado é o único critério que não depende da ordem em que os
+    deploys aconteceram.
+    """
+    try:
+        linha = conn.execute(
+            "SELECT 1 FROM fact_sales_detail "
+            "WHERE issue_date IS NOT NULL AND length(issue_date) > 10 LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False
+    return bool(linha)
+
+
 def rehash_sales_detail(conn: sqlite3.Connection) -> int:
-    """Recalcula a identidade das linhas de faturamento sem a hora.
+    """Recalcula a identidade das linhas de faturamento sem a hora e remove o
+    que entrou duplicado por causa disso.
 
-    Necessário uma única vez. As linhas antigas foram gravadas com a hora cheia
-    na assinatura; o mesmo relatório do Alfa sai ora com segundos, ora sem, e
-    então a MESMA venda entraria de novo numa reimportação — dobrando o mês.
-    Recalculando aqui, a linha antiga passa a ter a mesma identidade que o
-    importador vai gerar, e a reimportação é reconhecida como repetição.
+    A assinatura da linha passou a usar a data sem hora, porque o mesmo
+    relatório do Alfa sai ora com segundos, ora sem. As linhas antigas ficaram
+    com a assinatura velha — então uma reimportação não as reconhecia e entrava
+    de novo, dobrando o mês.
 
-    Só mexe em row_hash e no formato de issue_date. Não apaga, não soma, não
-    altera nenhum valor de venda.
+    Aqui as duas coisas são resolvidas juntas: recalcula a identidade de todas
+    as linhas no critério novo e, onde a mesma venda aparecer mais vezes do que
+    qualquer importação sozinha trouxe, apaga o excedente.
+
+    Valor de venda nenhum é alterado — só a identidade e as linhas repetidas.
     """
     linhas = conn.execute(
-        "SELECT id, company_id, competence, seller_name, client_name, city_name, "
+        "SELECT id, company_id, competence, import_id, seller_name, client_name, city_name, "
         "       gtin_value, manufacturer_sku, issue_date, quantity, gross_value, "
         "       discount_value, freight_value, return_quantity, return_value, "
         "       net_value, sale_share "
@@ -3742,10 +3764,12 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
     if not linhas:
         return 0
 
-    ocorrencia: Counter = Counter()
-    atualizacoes = []
+    # Assinatura de negócio da linha, sem a hora.
+    por_assinatura: dict[tuple[Any, ...], list[sqlite3.Row]] = defaultdict(list)
+    dia_por_id: dict[int, str] = {}
     for r in linhas:
         dia = normalize_whitespace(r["issue_date"])[:10]
+        dia_por_id[r["id"]] = dia
         payload = {
             "seller": r["seller_name"],
             "client": r["client_name"],
@@ -3763,17 +3787,44 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
             "sale_share": float(r["sale_share"] or 0),
         }
         sig = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        # A contagem é por (empresa, competência) porque é aí que vale o UNIQUE.
-        chave = (r["company_id"], r["competence"], sig)
-        ocorrencia[chave] += 1
-        atualizacoes.append((hash_text(f"{sig}#{ocorrencia[chave]}"), dia or None, r["id"]))
+        por_assinatura[(r["company_id"], r["competence"], sig)].append(r)
 
+    remover: list[int] = []
+    atualizar: list[tuple[str, str | None, int]] = []
+    for (company_id, competence, sig), grupo in por_assinatura.items():
+        # Quantas vezes esta venda existe DE VERDADE: o máximo que uma única
+        # importação trouxe. Cada arquivo do Alfa contém o período inteiro, então
+        # se junho tem a mesma venda duas vezes, todo arquivo de junho a traz
+        # duas vezes. O que passar disso veio de reimportação.
+        por_import: Counter = Counter(r["import_id"] for r in grupo)
+        verdadeiro = max(por_import.values()) if por_import else len(grupo)
+        # Mantém as linhas da importação MAIS ANTIGA que atingiu esse número —
+        # é a que já estava no ar e a que o restante do sistema referencia.
+        import_escolhido = min(
+            (imp for imp, qtd in por_import.items() if qtd == verdadeiro),
+            key=lambda x: (x is None, x))
+        mantidos = [r for r in grupo if r["import_id"] == import_escolhido][:verdadeiro]
+        mantidos_ids = {r["id"] for r in mantidos}
+        for r in grupo:
+            if r["id"] not in mantidos_ids:
+                remover.append(r["id"])
+        for i, r in enumerate(mantidos, 1):
+            atualizar.append((hash_text(f"{sig}#{i}"), dia_por_id[r["id"]] or None, r["id"]))
+
+    # Apaga ANTES de reescrever: o UNIQUE (empresa, competência, hash) não
+    # aceitaria duas linhas com a mesma identidade convivendo nem por um instante.
+    if remover:
+        for inicio in range(0, len(remover), 500):
+            lote = remover[inicio:inicio + 500]
+            marcadores = ",".join("?" for _ in lote)
+            conn.execute(f"DELETE FROM fact_sales_detail WHERE id IN ({marcadores})", lote)
     conn.executemany(
-        "UPDATE fact_sales_detail SET row_hash = ?, issue_date = ? WHERE id = ?",
-        atualizacoes)
-    print(f"[faturamento] identidade de {len(atualizacoes)} linha(s) recalculada sem a hora "
-          f"— reimportar não vai duplicar", flush=True)
-    return len(atualizacoes)
+        "UPDATE fact_sales_detail SET row_hash = ?, issue_date = ? WHERE id = ?", atualizar)
+    conn.commit()
+    print(f"[faturamento] identidade recalculada em {len(atualizar)} linha(s) sem a hora"
+          + (f" · {len(remover)} linha(s) duplicada(s) removida(s)" if remover else ""),
+          flush=True)
+    return len(remover)
 
 
 def parse_csv_bytes(content: bytes) -> list[dict[str, str]]:
