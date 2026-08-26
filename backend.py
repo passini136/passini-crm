@@ -7127,7 +7127,7 @@ def search_clients_for_visit(
 
 def suggest_visits(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
-    city: str = "", include_relationship: bool = True,
+    city: str = "", include_relationship: bool = True, neighborhood: str = "",
 ) -> dict[str, Any]:
     """Roteiro sugerido, agrupado por cidade → bairro → rua."""
     competence = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
@@ -7183,6 +7183,9 @@ def suggest_visits(
     codigos = [c["clientKey"] for c in clientes]
     enderecos = client_addresses(conn, company_id, codigos)
     cidade_filtro = normalize_upper(city)
+    bairro_filtro = normalize_upper(strip_accents(neighborhood))
+    # Bairros que existem na cidade escolhida, para alimentar o seletor da tela.
+    bairros_disponiveis: set[str] = set()
 
     candidatos: list[dict[str, Any]] = []
     for c in clientes:
@@ -7190,6 +7193,11 @@ def suggest_visits(
         endereco = enderecos.get(c["clientKey"], {})
         cidade = endereco.get("cityName") or normalize_upper(c.get("cityName"))
         if cidade_filtro and cidade != cidade_filtro:
+            continue
+        _bairro = normalize_upper(endereco.get("neighborhood") or c.get("neighborhood") or "")
+        if _bairro:
+            bairros_disponiveis.add(_bairro)
+        if bairro_filtro and normalize_upper(strip_accents(_bairro)) != bairro_filtro:
             continue
 
         pedido = pedidos.get(chave)
@@ -7297,6 +7305,10 @@ def suggest_visits(
         "route": roteiro,
         "total": len(candidatos),
         "cities": sorted({r["cityName"] for r in roteiro if r["cityName"]}),
+        # Da cidade escolhida quando há uma; de todas quando não há. Vem da
+        # varredura completa, não do resultado já filtrado — senão escolher um
+        # bairro apagaria os outros da lista e travaria a troca.
+        "neighborhoods": sorted(b for b in bairros_disponiveis if b),
         "params": {
             "callWindowDays": VISIT_CALL_WINDOW_DAYS,
             "cooldownDays": VISIT_COOLDOWN_DAYS,
@@ -18422,6 +18434,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn, user["company_id"], user,
                         city=normalize_whitespace(query.get("city", [""])[0]),
                         include_relationship=query.get("relationship", ["1"])[0] == "1",
+                        neighborhood=normalize_whitespace(query.get("neighborhood", [""])[0]),
                     )
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))

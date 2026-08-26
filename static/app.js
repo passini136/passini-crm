@@ -24,7 +24,7 @@ const state = {
   visits: null,           // visitas + pedidos
   visitRoute: null,        // roteiro sugerido por proximidade
   visitEditor: null,       // visita em registro
-  visitFilters: { city: "", relationship: true },
+  visitFilters: { city: "", neighborhood: "", relationship: true },
   visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
   tasks: null,            // tarefas + filtros + contadores
   taskEditor: null,       // nova tarefa de direcionamento
@@ -9125,6 +9125,7 @@ async function loadVisitSuggestions(silencioso) {
   const f = state.visitFilters;
   const q = new URLSearchParams();
   if (f.city) q.set("city", f.city);
+  if (f.neighborhood) q.set("neighborhood", f.neighborhood);
   q.set("relationship", f.relationship ? "1" : "0");
   if (!silencioso) {
     state.ui.loading.visitRoute = true;
@@ -9143,6 +9144,14 @@ async function loadVisitSuggestions(silencioso) {
 
 function setVisitCity(cidade) {
   state.visitFilters.city = cidade;
+  // Bairro pertence à cidade: trocar de cidade sem limpar deixaria um bairro
+  // de outra praça selecionado e o roteiro voltaria vazio sem explicação.
+  state.visitFilters.neighborhood = "";
+  loadVisitSuggestions();
+}
+
+function setVisitNeighborhood(bairro) {
+  state.visitFilters.neighborhood = bairro;
   loadVisitSuggestions();
 }
 
@@ -9378,7 +9387,14 @@ function visitaCard(v, podeGerir) {
 function roteiroParaSaida() {
   const rota = state.visitRoute || {};
   const cidades = (rota.route || []).filter(
-    (c) => !state.visitFilters.city || c.cityName === state.visitFilters.city);
+    (c) => !state.visitFilters.city || c.cityName === state.visitFilters.city)
+    // O que o gestor imprime tem de ser o que ele está vendo na tela.
+    .map((c) => !state.visitFilters.neighborhood ? c : {
+      ...c,
+      neighborhoods: (c.neighborhoods || []).filter(
+        (b) => b.neighborhood === state.visitFilters.neighborhood),
+    })
+    .filter((c) => (c.neighborhoods || []).length);
   return cidades;
 }
 
@@ -9666,6 +9682,13 @@ function visitasView() {
               <option value="">Todas</option>
               ${(rota.cities || []).map((c) => `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
             </select>
+            <span class="text-small" style="font-weight:700;color:var(--muted)">BAIRRO</span>
+            <select style="min-width:170px" onchange="setVisitNeighborhood(this.value)">
+              <option value="">Todos${f.city ? ` de ${escapeHtml(f.city)}` : ""}</option>
+              ${(rota.neighborhoods || []).map((b) => `
+                <option value="${escapeHtml(b)}" ${f.neighborhood === b ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
+            </select>
+            ${f.neighborhood ? `<button class="btn btn-ghost btn-sm" onclick="setVisitNeighborhood('')">Limpar bairro</button>` : ""}
             <label class="check-row" style="font-weight:500">
               <input type="checkbox" ${f.relationship ? "checked" : ""} onchange="toggleVisitRelationship()" />
               <span>Incluir visitas de relacionamento no caminho</span>
