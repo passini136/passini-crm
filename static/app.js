@@ -1853,9 +1853,15 @@ async function salvarProspect() {
     }
     // Guarda os dados ANTES de limpar o editor: é deles que sai o texto do
     // pedido de cadastro. Só para cadastro novo — editar não gera pedido.
-    const dados = p.id ? null : { ...p };
+    const dados = p.id ? null : { ...p, id: r.prospectId };
     state.prospectEditor = null;
     if (dados && !r.duplicated) state.prospectCadastro = dados;
+    // Deixa a oficina recém-criada NA FRENTE: sem isto ela cai no meio de uma
+    // lista longa e a pessoa não a encontra para imprimir a ficha.
+    if (!p.id && !r.duplicated) {
+      state.prospectFilters.search = (p.companyName || "").trim();
+      state.prospectFilters.status = "";
+    }
     await loadProspects(true);
   } catch (e) {
     // O erro vem do servidor: mostra dentro da janela, não atrás dela.
@@ -3179,7 +3185,12 @@ function pedidoCadastroModal() {
           >${escapeHtml(texto)}</textarea>
         <div class="actions" style="margin-top:12px">
           <button class="btn btn-primary" onclick="copiarPedidoCadastro()">📋 Copiar dados</button>
+          ${p.id ? `<button class="btn btn-secondary" onclick="baixarFichaCadastral(${p.id})">
+            📄 Gerar ficha para assinar</button>` : ""}
           <button class="btn btn-ghost" onclick="fecharPedidoCadastro()">Depois eu mando</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          A oficina ficou filtrada na lista atrás desta janela — é só fechar para vê-la.
         </div>
       </div>
     </div>`;
@@ -3226,6 +3237,8 @@ async function importarComprovanteReceita(input) {
     if (d.registryStatus && d.registryStatus !== "ATIVA") {
       addMessage("warn", `Situação na Receita: ${d.registryStatus}. Confira antes de cadastrar.`);
     }
+    // Este CNPJ já está na casa? Descobrir agora evita cadastrar de novo.
+    p.existing = r.existing && r.existing.kind ? r.existing : null;
   } catch (e) {
     erroNoProspect(e.message);
   } finally {
@@ -3266,6 +3279,63 @@ function alternarFichaCadastral(abertoAgora) {
  *  só, e o que é exclusivo da ficha fica recolhido: para prospectar bastam
  *  quatro campos, e a ficha só importa quando a oficina vai virar cliente.
  */
+/** Aviso de CNPJ que já está na base, com a saída pronta.
+ *
+ *  Sem isto o vendedor preenchia a ficha inteira para descobrir depois — ou não
+ *  descobrir — que a oficina já era cliente. E dois cadastros do mesmo CNPJ
+ *  significam duas fichas circulando e o histórico dividido em dois lugares.
+ */
+function blocoJaExiste(e) {
+  if (e.kind === "cliente") {
+    return `
+      <div class="message" style="background:#e6f4ea;color:#1e8e3e;margin-top:12px;
+                  display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span>✓</span>
+        <div style="flex:1;min-width:220px">
+          <strong>Este CNPJ já é cliente:</strong> ${escapeHtml(e.clientName)} (cód. ${escapeHtml(e.clientCode)})
+          ${e.sellerName ? ` · carteira de ${escapeHtml(e.sellerName)}` : " · sem vendedor"}
+          <div class="text-small">Não precisa cadastrar de novo — abra a ficha dele e imprima ali.</div>
+        </div>
+        <button class="btn btn-secondary btn-sm" type="button"
+          onclick="fecharProspectEditor();openCrmClient('${jsAttr(e.clientCode)}', true)">Abrir ficha</button>
+        <button class="btn btn-ghost btn-sm" type="button"
+          onclick="imprimirFichaCliente('${jsAttr(e.clientCode)}')">📄 Imprimir ficha</button>
+      </div>`;
+  }
+  return `
+    <div class="message" style="background:#fef7e0;color:#b06000;margin-top:12px;
+                display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <span>⚠</span>
+      <div style="flex:1;min-width:220px">
+        <strong>Já existe prospect com este CNPJ:</strong> ${escapeHtml(e.clientName)}
+        ${e.sellerName ? ` · com ${escapeHtml(e.sellerName)}` : ""}
+        <div class="text-small">Salvar de novo vai recusar por duplicidade.</div>
+      </div>
+      <button class="btn btn-secondary btn-sm" type="button"
+        onclick="abrirProspectExistente(${e.prospectId}, '${jsAttr(e.clientName)}')">Abrir o existente</button>
+    </div>`;
+}
+
+/** Ficha em PDF de um cliente já cadastrado. */
+function imprimirFichaCliente(codigo) {
+  if (!codigo) { addMessage("warn", "Cliente sem código no cadastro."); return; }
+  downloadFile(`/api/crm/clients/ficha.pdf?code=${encodeURIComponent(codigo)}`);
+}
+
+/** Abre o prospect que já existe, em vez de criar um segundo. */
+async function abrirProspectExistente(prospectId, nome) {
+  const achado = (state.prospects?.prospects || []).find((x) => String(x.id) === String(prospectId));
+  if (achado) { editarProspect(achado); return; }
+  // Não está na lista carregada: filtra pelo nome e abre quando aparecer.
+  fecharProspectEditor();
+  state.prospectFilters.search = nome || "";
+  state.prospectFilters.status = "";
+  await loadProspects();
+  const agora = (state.prospects?.prospects || []).find((x) => String(x.id) === String(prospectId));
+  if (agora) editarProspect(agora);
+  else addMessage("warn", "O cadastro existe, mas está com outro vendedor ou unidade.");
+}
+
 function blocoFichaCadastral(p) {
   const compradores = [...(p.buyers || []), "", "", ""].slice(0, 3);
   const daFicha = [p.paymentTerms, p.stateRegistration, p.addressLine, p.addressNumber,
@@ -3380,6 +3450,8 @@ function prospectEditorModal() {
           ${p.registryStatus ? `<span class="status-tag ${p.registryStatus === "ATIVA" ? "good" : "bad"}">
             Receita: ${escapeHtml(p.registryStatus)}</span>` : ""}
         </div>
+
+        ${p.existing ? blocoJaExiste(p.existing) : ""}
 
         <div class="text-small" style="color:var(--muted);font-weight:700;margin:14px 0 4px">IDENTIFICAÇÃO</div>
         <div style="display:grid;grid-template-columns:2fr 1fr;gap:10px">
@@ -11534,6 +11606,11 @@ function clientDrawerView() {
               title="Criar tarefa de contato para o vendedor responsável">
               📣 Cobrar contato
             </button>` : ""}
+          <button class="btn btn-ghost" ${client.clientCode || client.clientKey ? "" : "disabled"}
+            onclick="imprimirFichaCliente('${jsAttr(client.clientCode || client.clientKey || "")}')"
+            title="Ficha cadastral em PDF, já preenchida com o que existe no cadastro, para o cliente assinar">
+            📄 Ficha para assinatura
+          </button>
         </div>
         ${state.ui.loading.clientDrawer ? `<div class="message success">Carregando ficha do cliente...</div>` : ""}
         ${state.ui.clientDrawerError ? `<div class="message error">Não foi possível abrir a ficha do cliente.</div>` : ""}

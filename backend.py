@@ -9977,6 +9977,86 @@ def build_client_registration_pdf(prospect: dict[str, Any]) -> bytes:
     return buffer.getvalue()
 
 
+def client_registration_payload(
+    conn: sqlite3.Connection, company_id: int, client_code: str
+) -> dict[str, Any]:
+    """Dados do cliente JÁ CADASTRADO no formato da ficha.
+
+    O cadastro do Alfa não guarda tudo que a ficha pede — inscrição estadual,
+    e-mail de XML e quem pode comprar ficam em branco para o cliente completar
+    à caneta. Melhor uma ficha com lacunas do que redigitar o que já existe.
+    """
+    linha = conn.execute(
+        "SELECT * FROM crm_client_profiles WHERE company_id = ? AND TRIM(client_code) = ?",
+        (company_id, normalize_whitespace(client_code)),
+    ).fetchone()
+    if not linha:
+        return {}
+    campos = linha.keys()
+
+    def val(nome: str) -> str:
+        return normalize_whitespace(linha[nome]) if nome in campos else ""
+
+    return {
+        "companyName": val("client_name"),
+        "tradeName": val("trade_name"),
+        "documentNumber": val("document_number"),
+        "stateRegistration": val("state_registration"),
+        "addressLine": val("address_line"),
+        "addressNumber": val("address_number"),
+        "neighborhood": val("neighborhood"),
+        "cityName": val("city_name"),
+        "stateName": val("state_name")[:2],
+        "postalCode": val("postal_code"),
+        "phone": val("updated_phone") or val("phone"),
+        "landline": val("phone"),
+        "email": val("email"),
+        "emailFinance": val("email"),
+        "contactName": val("primary_contact_name"),
+        "sellerName": val("internal_seller_name") or val("external_seller_name"),
+        "buyers": [],
+    }
+
+
+def find_existing_by_document(
+    conn: sqlite3.Connection, company_id: int, documento: str
+) -> dict[str, Any]:
+    """Este CNPJ já está na casa? Procura no cadastro de clientes e nos prospects.
+
+    Descobrir isso ANTES de digitar a ficha inteira evita o retrabalho de
+    cadastrar quem já é cliente — e evita duas fichas do mesmo CNPJ circulando.
+    """
+    digitos = only_digits(documento)
+    if len(digitos) not in (11, 14):
+        return {}
+    cliente = conn.execute(
+        """
+        SELECT client_code, client_name, city_name,
+               NULLIF(TRIM(internal_seller_name), '') AS seller_name
+        FROM crm_client_profiles
+        WHERE company_id = ?
+          AND REPLACE(REPLACE(REPLACE(COALESCE(document_number,''),'.',''),'/',''),'-','') = ?
+        LIMIT 1
+        """,
+        (company_id, digitos),
+    ).fetchone()
+    if cliente:
+        return {"kind": "cliente", "clientCode": cliente["client_code"],
+                "clientName": cliente["client_name"], "cityName": cliente["city_name"] or "",
+                "sellerName": cliente["seller_name"] or ""}
+    prospect = conn.execute(
+        "SELECT id, company_name, seller_name, status FROM prospects "
+        "WHERE company_id = ? AND document_digits = ? LIMIT 1",
+        (company_id, digitos),
+    ).fetchone()
+    if prospect:
+        return {"kind": "prospect", "prospectId": int(prospect["id"]),
+                "clientName": prospect["company_name"],
+                "sellerName": prospect["seller_name"] or "",
+                "status": prospect["status"]}
+    return {}
+
+
 def save_prospect(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any],
     exigir_contato: bool = False,
@@ -19018,6 +19098,25 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
+            if path == "/api/crm/clients/ficha.pdf":
+                user = self._require_auth()
+                if not user:
+                    return
+                consulta = parse_qs(parsed.query)
+                codigo = normalize_whitespace(consulta.get("code", [""])[0])
+                with closing(get_connection()) as conn:
+                    dados = client_registration_payload(conn, user["company_id"], codigo)
+                if not dados:
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps({"error": "Cliente não encontrado."}))
+                    return
+                conteudo = build_client_registration_pdf(dados)
+                nome_arquivo = re.sub(r"[^A-Za-z0-9]+", "-",
+                                      strip_accents(dados.get("companyName") or "ficha")).strip("-")[:50]
+                self._set_headers(200, "application/pdf", {
+                    "Content-Disposition": f'attachment; filename="ficha-{nome_arquivo.lower()}.pdf"'})
+                self.wfile.write(conteudo)
+                return
             if path == "/api/prospects/ficha.pdf":
                 user = self._require_auth()
                 if not user:
@@ -19860,8 +19959,13 @@ class AppHandler(BaseHTTPRequestHandler):
                     if not arquivos:
                         raise ValueError("Envie o PDF do comprovante da Receita.")
                     dados = parse_receita_cnpj_pdf(arquivos[0]["content"])
+                    # Avisa na hora se o CNPJ já está na casa — antes de a
+                    # pessoa preencher a ficha inteira à toa.
+                    with closing(get_connection()) as conn:
+                        existente = find_existing_by_document(
+                            conn, user["company_id"], dados.get("documentNumber", ""))
                     self._set_headers(200)
-                    self.wfile.write(json_dumps({"data": dados}))
+                    self.wfile.write(json_dumps({"data": dados, "existing": existente}))
                 except Exception as exc:
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
