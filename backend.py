@@ -16742,7 +16742,8 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
         ws.append([key, value])
 
     ws_sellers = wb.create_sheet("Vendedores")
-    ws_sellers.append(["Vendedor", "Unidade Base", "Faturamento Líquido", "Meta", "% Meta", "Ticket",
+    ws_sellers.append(["Vendedor", "Unidade Base", "Faturamento Líquido", "Meta", "% Meta",
+                       "Projeção do mês", "% Projeção", "Ticket",
                        "Clientes", "Mix", "Devolução Comercial", "Devolução Garantia", "Devolução Total", "Score"])
     for row in data["sellerRanking"]:
         ws_sellers.append([
@@ -16751,6 +16752,8 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
             row["revenueNet"],
             row["revenueGoal"],
             row["goalAttainmentPct"],
+            row.get("projectedRevenue", 0),
+            row.get("projectedGoalAttainmentPct", 0),
             row["ticketAverage"],
             row["distinctClients"],
             row["mixSku"],
@@ -16762,9 +16765,11 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
 
     ws_units = wb.create_sheet("Unidades")
     ws_units.append(["Unidade", "Faturamento Líquido", "Meta", "% Meta",
+                     "Projeção do mês", "% Projeção",
                      "Devolução Comercial", "Devolução Garantia", "Devolução Total", "Margem"])
     for row in data["unitPerformance"]:
         ws_units.append([row["unitName"], row["revenueNet"], row["revenueGoal"], row["goalAttainmentPct"],
+                         row.get("projectedRevenue", 0), row.get("projectedGoalAttainmentPct", 0),
                          row["returnsValue"], row.get("warrantyReturnsValue", 0),
                          row.get("returnsTotalValue", row["returnsValue"]), row["marginValue"]])
 

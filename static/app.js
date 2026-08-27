@@ -4267,6 +4267,7 @@ function sellerRows(rows) {
         <td>${currency(row.revenueNet)}</td>
         <td>${currency(row.revenueGoal)}</td>
         <td>${farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)}</td>
+        <td>${celulaProjecao(row)}</td>
         <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
         <td>${currency(row.ticketAverage)}</td>
         <td>${number(row.distinctClients)}</td>
@@ -4297,6 +4298,24 @@ function celulaRitmo(pace, alvo = 100) {
     <div class="text-small" style="color:var(--muted)">atual ${currency(pace.dailyActual)}</div>`;
 }
 
+/** Projeção de faturamento do mês em reais.
+ *
+ *  É o líquido de hoje esticado pelos dias úteis que faltam. Aparece junto do
+ *  "% Proj." porque o percentual sozinho não diz quanto falta em dinheiro — e
+ *  é em dinheiro que a conversa com o vendedor acontece.
+ */
+function celulaProjecao(row) {
+  const projecao = Number(row.projectedRevenue || 0);
+  if (!projecao) return "—";
+  const meta = Number(row.revenueGoal || 0);
+  const falta = meta - projecao;
+  const cor = !meta ? "var(--muted)" : falta > 0 ? "var(--bad)" : "var(--good)";
+  return `<div style="font-weight:700">${currency(projecao)}</div>`
+    + (meta ? `<div class="text-small" style="color:${cor}">
+        ${falta > 0 ? `faltam ${currency(falta)}` : `+${currency(-falta)}`}
+      </div>` : "");
+}
+
 function unitRows(rows) {
   return rows
     .map(
@@ -4306,6 +4325,7 @@ function unitRows(rows) {
         <td>${currency(row.revenueNet)}</td>
         <td>${currency(row.revenueGoal)}</td>
         <td>${farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)}</td>
+        <td>${celulaProjecao(row)}</td>
         <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
         <td>${currency(row.returnsValue)}</td>
         <td>${farolValue(pct(row.returnRatioPct || 0), row.farol?.returnRatio)}</td>
@@ -4766,6 +4786,11 @@ function vendedoresView() {
                       <span style="width:${projectedBar}%"></span>
                     </div>
                   </div>
+                  ${Number(row.projectedRevenue || 0) ? `
+                    <div class="seller-visual-bar-head" style="margin-top:2px">
+                      <span>Projeção do mês</span>
+                      <strong>${currency(row.projectedRevenue)}</strong>
+                    </div>` : ""}
                 </div>
                 <div class="seller-visual-foot">
                   <span>Dev. ${pct(returnPct)}</span>
@@ -14387,6 +14412,10 @@ function executivoView() {
       <div class="kpi-grid">
         ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal), s.farol?.goalAttainment)}
         ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct), s.farol?.goalAttainment)}
+        ${kpiCard("Projeção do mês", currency(s.projectedRevenue || 0),
+                  Number(s.revenueGoal || 0) > Number(s.projectedRevenue || 0) ? "Faltam" : "Acima da meta",
+                  currency(Math.abs(Number(s.revenueGoal || 0) - Number(s.projectedRevenue || 0))),
+                  s.farol?.projectedAttainment)}
         ${kpiCard("Ticket médio", currency(s.ticketAverage), "Clientes", number(s.distinctClients))}
         ${kpiCard("Ticket PJ", currency(s.ticketAveragePj || 0), "Clientes PJ", number(s.pjClients || 0))}
         ${kpiCard("Ticket PF", currency(s.ticketAveragePf || 0), "Clientes PF", number(s.pfClients || 0))}
@@ -14473,6 +14502,7 @@ function executivoView() {
               ${sortableTh("vendedores","Líquido","revenueNet")}
               ${sortableTh("vendedores","Meta","revenueGoal")}
               ${sortableTh("vendedores","% Meta","goalAttainmentPct")}
+              ${sortableTh("vendedores","Projeção","projectedRevenue")}
               ${sortableTh("vendedores","% Proj.","projectedGoalAttainmentPct")}
               ${sortableTh("vendedores","Ticket","ticketAverage")}
               ${sortableTh("vendedores","Clientes","distinctClients")}
@@ -14497,6 +14527,7 @@ function executivoView() {
               ${sortableTh("unidades","Líquido","revenueNet")}
               ${sortableTh("unidades","Meta","revenueGoal")}
               ${sortableTh("unidades","% Meta","goalAttainmentPct")}
+              ${sortableTh("unidades","Projeção","projectedRevenue")}
               ${sortableTh("unidades","% Proj.","projectedGoalAttainmentPct")}
               ${sortableTh("unidades","Dev. comercial","returnsValue")}
               ${sortableTh("unidades","% Dev.","returnRatioPct")}
