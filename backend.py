@@ -18390,7 +18390,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     folders_info = []
                     for cfg in AUTO_IMPORT_FOLDERS:
                         p = AUTO_IMPORT_BASE / cfg["folder"]
-                        pending = [f.name for f in p.glob("*.csv")] if p.exists() else []
+                        # O relatório de estoque do Alfa só sai em xlsx: contar
+                        # apenas CSV fazia a pasta aparecer vazia com o arquivo
+                        # lá dentro, esperando para ser importado.
+                        pending = sorted(
+                            f.name for f in ([*p.glob("*.csv"), *p.glob("*.xlsx")] if p.exists() else [])
+                        )
                         folders_info.append({
                             "folder": cfg["folder"], "label": cfg["label"],
                             "scope": cfg["scope"], "path": str(p),
@@ -20806,6 +20811,17 @@ def _auto_import_tick_inner() -> None:
             continue
 
         scope = cfg["scope"]
+
+        # Arquivo grande copiado pela rede chega em pedaços: ler antes de a
+        # cópia terminar quebra a importação com um erro que não explica nada.
+        # O estoque tem 20 MB, então espera o arquivo parar de crescer.
+        if scope in {"stock", "catalog"}:
+            _agora = time.time()
+            _instaveis = [f for f in csv_files if (_agora - f.stat().st_mtime) < 30]
+            if _instaveis:
+                print(f"[auto-import] {cfg['folder']}: {len(_instaveis)} arquivo(s) ainda "
+                      f"sendo gravado(s), aguardando")
+                continue
 
         # Cadastro de clientes: base mestre do Alfa, SEM competência.
         # O Alfa não exporta a base inteira em um arquivo — são DUAS (ou mais)
