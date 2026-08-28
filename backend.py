@@ -3721,6 +3721,59 @@ def decode_text_content(content: bytes) -> str:
     return content.decode("utf-8", errors="replace")
 
 
+# Versão da assinatura que identifica uma linha de faturamento. Ao mudar a
+# regra, sobe o número aqui: a migração no boot compara com o que está gravado
+# e recalcula tudo. O gatilho por versão existe porque o anterior — "quando a
+# coluna da marca for criada" — dependia da ordem dos deploys e nunca disparou.
+SALES_SIGNATURE_VERSION = 3
+
+
+def sales_row_signature(
+    seller: str, client: str, city: str, manufacturer: str, brand: str, day: str,
+    quantity: float, gross: float, discount: float, freight: float,
+    qty_return: float, value_return: float, net: float,
+) -> str:
+    """Identidade de uma linha de venda, estável entre exportações do Alfa.
+
+    Ficam de fora, de propósito:
+
+    - o CÓDIGO INTERNO do item: o relatório diário exporta essa coluna vazia e o
+      relatório completo a preenche. Com ela na assinatura, a mesma venda tinha
+      duas identidades e entrava duas vezes — foi o que inflou o faturamento.
+    - o %venda: vem preenchido em 21% das linhas num relatório e 69% no outro.
+
+    A MARCA entra no lugar delas. Sem ela, dois óleos de fabricantes diferentes
+    com a mesma referência ("15W40SL") vendidos ao mesmo cliente no mesmo dia
+    pelo mesmo valor seriam tratados como a mesma linha.
+    """
+    return json.dumps({
+        "seller": seller, "client": client, "city": city or "",
+        "manufacturer": manufacturer or "", "brand": brand or "",
+        "issue_date": day or "",
+        "quantity": float(quantity or 0), "gross": float(gross or 0),
+        "discount": float(discount or 0), "freight": float(freight or 0),
+        "qty_return": float(qty_return or 0), "value_return": float(value_return or 0),
+        "net": float(net or 0),
+    }, ensure_ascii=False, sort_keys=True)
+
+
+def stored_signature_version(conn: sqlite3.Connection) -> int:
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    linha = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'sales_signature_version'").fetchone()
+    try:
+        return int(linha["value"]) if linha else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_signature_version(conn: sqlite3.Connection, versao: int) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES ('sales_signature_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(versao),))
+
+
 def sales_detail_needs_rehash(conn: sqlite3.Connection) -> bool:
     """Ainda há linha gravada no formato antigo (issue_date com hora)?
 
@@ -3730,13 +3783,11 @@ def sales_detail_needs_rehash(conn: sqlite3.Connection) -> bool:
     deploys aconteceram.
     """
     try:
-        linha = conn.execute(
-            "SELECT 1 FROM fact_sales_detail "
-            "WHERE issue_date IS NOT NULL AND length(issue_date) > 10 LIMIT 1"
-        ).fetchone()
+        if stored_signature_version(conn) < SALES_SIGNATURE_VERSION:
+            return bool(conn.execute("SELECT 1 FROM fact_sales_detail LIMIT 1").fetchone())
     except sqlite3.OperationalError:
         return False
-    return bool(linha)
+    return False
 
 
 def rehash_sales_detail(conn: sqlite3.Connection) -> int:
@@ -3756,12 +3807,14 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
     """
     linhas = conn.execute(
         "SELECT id, company_id, competence, import_id, seller_name, client_name, city_name, "
-        "       gtin_value, manufacturer_sku, issue_date, quantity, gross_value, "
+        "       gtin_value, manufacturer_sku, brand_name, issue_date, quantity, gross_value, "
         "       discount_value, freight_value, return_quantity, return_value, "
         "       net_value, sale_share "
         "FROM fact_sales_detail ORDER BY id"
     ).fetchall()
     if not linhas:
+        set_signature_version(conn, SALES_SIGNATURE_VERSION)
+        conn.commit()
         return 0
 
     # Assinatura de negócio da linha, sem a hora.
@@ -3770,23 +3823,11 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
     for r in linhas:
         dia = normalize_whitespace(r["issue_date"])[:10]
         dia_por_id[r["id"]] = dia
-        payload = {
-            "seller": r["seller_name"],
-            "client": r["client_name"],
-            "city": r["city_name"] or "",
-            "gtin": r["gtin_value"] or "",
-            "manufacturer": r["manufacturer_sku"] or "",
-            "issue_date": dia,
-            "quantity": float(r["quantity"] or 0),
-            "gross": float(r["gross_value"] or 0),
-            "discount": float(r["discount_value"] or 0),
-            "freight": float(r["freight_value"] or 0),
-            "qty_return": float(r["return_quantity"] or 0),
-            "value_return": float(r["return_value"] or 0),
-            "net": float(r["net_value"] or 0),
-            "sale_share": float(r["sale_share"] or 0),
-        }
-        sig = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        sig = sales_row_signature(
+            r["seller_name"], r["client_name"], r["city_name"],
+            r["manufacturer_sku"], r["brand_name"], dia,
+            r["quantity"], r["gross_value"], r["discount_value"], r["freight_value"],
+            r["return_quantity"], r["return_value"], r["net_value"])
         por_assinatura[(r["company_id"], r["competence"], sig)].append(r)
 
     remover: list[int] = []
@@ -3820,6 +3861,7 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
             conn.execute(f"DELETE FROM fact_sales_detail WHERE id IN ({marcadores})", lote)
     conn.executemany(
         "UPDATE fact_sales_detail SET row_hash = ?, issue_date = ? WHERE id = ?", atualizar)
+    set_signature_version(conn, SALES_SIGNATURE_VERSION)
     conn.commit()
     print(f"[faturamento] identidade recalculada em {len(atualizar)} linha(s) sem a hora"
           + (f" · {len(remover)} linha(s) duplicada(s) removida(s)" if remover else ""),
@@ -4266,12 +4308,6 @@ def import_package(
                 sales_rows_by_competence[row_competence] += 1
                 sku_key = normalize_sku(gtin_value, manufacturer_sku)
                 payload = {
-                    "seller": seller_name,
-                    "client": client_name,
-                    "city": city_name,
-                    "gtin": gtin_value,
-                    "manufacturer": manufacturer_sku,
-                    "issue_date": dt_value.date().isoformat() if dt_value else "",
                     "quantity": parse_decimal(row.get("Quant.")),
                     "gross": parse_decimal(row.get("Bruto")),
                     "discount": parse_decimal(row.get("Desconto")),
@@ -4281,7 +4317,12 @@ def import_package(
                     "net": parse_decimal(row.get("Liquido")),
                     "sale_share": parse_decimal(row.get("%venda")),
                 }
-                _sig = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                _sig = sales_row_signature(
+                    seller_name, client_name, city_name, manufacturer_sku, brand_name,
+                    dt_value.date().isoformat() if dt_value else "",
+                    payload["quantity"], payload["gross"], payload["discount"],
+                    payload["freight"], payload["qty_return"], payload["value_return"],
+                    payload["net"])
                 sales_occurrence[_sig] += 1
                 row_hash = hash_text(f"{_sig}#{sales_occurrence[_sig]}")
                 try:
