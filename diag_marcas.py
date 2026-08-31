@@ -123,16 +123,22 @@ else:
 
 # ── 4. De onde veio cada linha ───────────────────────────────────────────
 print("\n4) IMPORTAÇÕES QUE ALIMENTAM ESTA COMPETÊNCIA")
+print(f"   {'IMPORT':<8}{'QUANDO':<21}{'LINHAS':>8}{'VALOR TOTAL':>19}{'POR LINHA':>11}"
+      f"{'  ' + marca:>16}")
 for x in conn.execute(
-    "SELECT d.import_id, i.imported_at, COUNT(*) linhas, ROUND(SUM(d.net_value),2) v "
+    "SELECT d.import_id, MAX(i.imported_at) quando, COUNT(*) linhas, "
+    "       ROUND(SUM(d.net_value),2) v, "
+    "       ROUND(SUM(CASE WHEN d.brand_name = ? THEN d.net_value ELSE 0 END),2) vm "
     "FROM fact_sales_detail d LEFT JOIN imports i ON i.id = d.import_id "
     "WHERE d.company_id = ? AND d.competence = ? GROUP BY d.import_id "
-    "ORDER BY i.imported_at", (company_id, competencia)).fetchall():
+    "ORDER BY quando", (marca, company_id, competencia)).fetchall():
     # Valor por linha denuncia o arquivo estranho: os diários ficam todos na
-    # mesma faixa, e o que destoa costuma ser o problema.
+    # mesma faixa, e o que destoa costuma ser o problema. A última coluna mostra
+    # quanto da MARCA consultada cada importação trouxe — é ela que diz se
+    # remover uma importação vai derrubar a marca abaixo do relatório do Alfa.
     _por_linha = float(x["v"] or 0) / (x["linhas"] or 1)
-    print(f"   import {str(x['import_id']):<6} {str(x['imported_at'])[:19]:<20} "
-          f"{x['linhas']:>7} linha(s)  {money(x['v'])}   {_por_linha:>8.2f}/linha")
+    print(f"   {str(x['import_id']):<8}{str(x['quando'])[:19]:<21}{x['linhas']:>8}"
+          f"{money(x['v'])}{_por_linha:>11.2f}{float(x['vm'] or 0):>16,.2f}")
 
 # ── 4b. Confronto com a fonte oficial ────────────────────────────────────
 print("\n5) DETALHADO x OFICIAL (relatório de custo x venda)")
