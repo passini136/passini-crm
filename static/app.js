@@ -4177,6 +4177,21 @@ function farolValue(value, farol) {
   return `<span style="color:${farol.color}" title="${escapeHtml(farol.detail || farol.hint || "")}">${value} ${farol.icon}</span>`;
 }
 
+/** KPI que abre um detalhe. Mesma aparência dos vizinhos, com o convite no pé. */
+function kpiCardClicavel(title, value, chamada, onclick) {
+  return `
+    <button type="button" class="kpi-card" onclick="${onclick}"
+      style="text-align:left;cursor:pointer;font:inherit;width:100%;display:block">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:6px">
+        <span>${title}</span>
+      </div>
+      <strong>${value}</strong>
+      <div class="kpi-foot">
+        <span style="color:var(--accent);font-weight:600">${escapeHtml(chamada)} →</span>
+      </div>
+    </button>`;
+}
+
 function kpiCard(title, value, footLeft, footRight, farol) {
   const temFarol = farol && farol.level && farol.level !== "neutral";
   return `
@@ -4265,6 +4280,14 @@ function seloVinculoVendedor(row) {
 // conversa e em CSV para o gestor cruzar do jeito dele.
 
 async function abrirClientesDoVendedor(vendedor, escopo) {
+  // Sem vendedor definido, abre com o seletor: é o caminho de quem chegou pelo
+  // botão do topo, sem ter clicado num número de alguém.
+  if (!vendedor && !roleIsSeller()) {
+    state.sellerClients = { loading: false, sellerName: "", scope: escopo || "todos",
+                            items: [], totals: {}, precisaEscolher: true };
+    requestRender();
+    return;
+  }
   state.sellerClients = { loading: true, sellerName: vendedor, scope: escopo || "todos" };
   requestRender();
   try {
@@ -4327,6 +4350,21 @@ function clientesDoVendedorModal() {
         ${d.error ? `<div class="message error" style="margin-top:10px">${escapeHtml(d.error)}</div>` : ""}
         ${d.loading ? '<div class="loader">Carregando…</div>' : ""}
 
+        ${vendedoresParaRelatorio().length ? `
+          <div class="field" style="margin-top:10px;max-width:360px">
+            <label>Vendedor</label>
+            <select onchange="abrirClientesDoVendedor(this.value, '${d.scope || "todos"}')">
+              <option value="">Escolha o vendedor…</option>
+              ${vendedoresParaRelatorio().map((v) => `
+                <option value="${escapeHtml(v)}" ${d.sellerName === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+            </select>
+          </div>` : ""}
+
+        ${d.precisaEscolher ? `
+          <div class="message" style="background:#e8f0fe;color:var(--accent);margin-top:10px">
+            Escolha um vendedor acima para ver os clientes que ele faturou no mês.
+          </div>` : ""}
+
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0">
           ${aba("todos", "Todos", t.clients)}
           ${aba("carteira", "Da carteira dele", t.ownClients)}
@@ -4385,6 +4423,14 @@ function celulaCarteiraVendedor(row, escopo, valor) {
   return `<button type="button" class="link-num"
     title="Ver os clientes e exportar"
     onclick="abrirClientesDoVendedor('${jsAttr(row.sellerName)}', '${escopo}')">${number(n)}</button>`;
+}
+
+/** Vendedores que o gestor pode consultar. O vendedor não escolhe: é ele. */
+function vendedoresParaRelatorio() {
+  if (roleIsSeller()) return [];
+  return (state.dashboard?.sellerRanking || [])
+    .map((r) => r.sellerName)
+    .filter(Boolean);
 }
 
 /** De quem é o cliente. É a coluna que dá sentido ao relatório. */
@@ -4850,6 +4896,10 @@ function vendedoresView() {
             <h3>Leitura visual dos vendedores</h3>
             <div class="text-small">Resumo rapido para destacar ritmo de meta, qualidade da venda e pontos de atencao.</div>
           </div>
+          <button class="btn btn-secondary btn-sm" onclick="abrirClientesDoVendedor('', 'todos')"
+            title="Lista dos clientes faturados no mês, com o dono da carteira de cada um">
+            📄 Clientes faturados por vendedor
+          </button>
         </div>
         <div class="seller-visual-grid">
           ${topVisualSellers.map((row) => {
@@ -4900,9 +4950,16 @@ function vendedoresView() {
                     <span>Clientes</span>
                     <strong>${number(row.distinctClients)}</strong>
                     ${(row.ownClients != null || row.otherClients != null) ? `
-                      <div style="font-size:10px;color:var(--muted);margin-top:2px;line-height:1.4">
-                        <span style="color:var(--good)">${number(row.ownClients || 0)} carteira</span> ·
-                        <span style="color:#e67e22">${number(row.otherClients || 0)} fora</span>
+                      <div style="font-size:10px;margin-top:2px;line-height:1.4">
+                        <button type="button" class="link-num" style="color:var(--good);font-size:10px"
+                          title="Ver os clientes da carteira dele"
+                          onclick="abrirClientesDoVendedor('${jsAttr(row.sellerName)}','carteira')"
+                          >${number(row.ownClients || 0)} carteira</button>
+                        <span style="color:var(--muted)"> · </span>
+                        <button type="button" class="link-num" style="color:#e67e22;font-size:10px"
+                          title="Ver os clientes de fora da carteira dele"
+                          onclick="abrirClientesDoVendedor('${jsAttr(row.sellerName)}','fora')"
+                          >${number(row.otherClients || 0)} fora</button>
                       </div>` : ""}
                   </div>
                   <div>
@@ -14555,6 +14612,9 @@ function executivoView() {
       <div class="kpi-grid">
         ${kpiCard("Faturamento líquido", currency(s.revenueNet), "Meta", currency(s.revenueGoal), s.farol?.goalAttainment)}
         ${kpiCard("% Atingimento", pct(s.goalAttainmentPct), "Projeção", pct(s.projectedGoalAttainmentPct), s.farol?.goalAttainment)}
+        ${kpiCardClicavel("Clientes faturados", number(s.distinctClients || 0),
+                          "Ver a lista com a carteira de cada um",
+                          "abrirClientesDoVendedor('','todos')")}
         ${kpiCard("Projeção do mês", currency(s.projectedRevenue || 0),
                   Number(s.revenueGoal || 0) > Number(s.projectedRevenue || 0) ? "Faltam" : "Acima da meta",
                   currency(Math.abs(Number(s.revenueGoal || 0) - Number(s.projectedRevenue || 0))),
