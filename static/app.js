@@ -35,6 +35,7 @@ const state = {
   brands: null,
   brandFilters: { scope: "", dimension: "" },
   prospectCadastro: null,  // dados prontos para pedir cadastro no WhatsApp
+  sellerClients: null,     // relatório de clientes faturados por um vendedor
   brandOpen: {},   // marcas com o detalhe aberto
   brandLoadingScope: "",  // aba de marcas que está sendo carregada agora
   phaseEditor: null,           // fase da unidade (diretoria)
@@ -4257,6 +4258,148 @@ function seloVinculoVendedor(row) {
   return "";
 }
 
+// ─── Clientes faturados no mês, com o dono da carteira ─────────────────────
+//
+// Abre a partir dos números "Carteira" e "Fora" do ranking — que é onde a
+// pergunta "quais clientes são esses?" nasce. Sai em PDF para levar impresso à
+// conversa e em CSV para o gestor cruzar do jeito dele.
+
+async function abrirClientesDoVendedor(vendedor, escopo) {
+  state.sellerClients = { loading: true, sellerName: vendedor, scope: escopo || "todos" };
+  requestRender();
+  try {
+    const q = new URLSearchParams({ seller: vendedor, scope: escopo || "todos" });
+    const mes = state.filters.competenceEnd || state.filters.competenceStart;
+    if (mes) q.set("competence", mes);
+    const r = await api(`/api/crm/seller-clients?${q.toString()}`);
+    state.sellerClients = { ...r, loading: false, scope: escopo || "todos" };
+  } catch (e) {
+    state.sellerClients = { error: e.message, loading: false, sellerName: vendedor, items: [] };
+  }
+  requestRender();
+}
+
+function fecharClientesDoVendedor() {
+  state.sellerClients = null;
+  requestRender();
+}
+
+function trocarEscopoClientesVendedor(escopo) {
+  const d = state.sellerClients;
+  if (d && !d.loading) abrirClientesDoVendedor(d.sellerName, escopo);
+}
+
+function baixarClientesDoVendedor(formato) {
+  const d = state.sellerClients;
+  if (!d || !d.sellerName) return;
+  const q = new URLSearchParams({ seller: d.sellerName, scope: d.scope || "todos" });
+  if (d.competence) q.set("competence", d.competence);
+  downloadFile(`/api/crm/seller-clients.${formato}?${q.toString()}`);
+}
+
+function clientesDoVendedorModal() {
+  const d = state.sellerClients;
+  if (!d) return "";
+  const t = d.totals || {};
+  const itens = d.items || [];
+  const aba = (id, rotulo, contador) => `
+    <button type="button" onclick="trocarEscopoClientesVendedor('${id}')"
+      ${d.loading ? "disabled" : ""}
+      style="border:1px solid ${d.scope === id ? "var(--accent)" : "var(--line)"};
+             background:${d.scope === id ? "#e8f0fe" : "#fff"};
+             color:${d.scope === id ? "var(--accent)" : "var(--muted)"};
+             border-radius:14px;padding:5px 14px;font-size:12px;
+             font-weight:${d.scope === id ? "700" : "500"};cursor:pointer">
+      ${rotulo}${contador != null ? ` (${number(contador)})` : ""}
+    </button>`;
+
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharClientesDoVendedor()">
+      <div class="panel modal-panel" style="max-width:1000px;margin:5vh auto;padding:22px;
+                  max-height:90vh;overflow:auto" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>Clientes faturados no mês</h3>
+            <div class="text-small">${escapeHtml(d.sellerName || "")}
+              ${d.competence ? ` · ${escapeHtml(d.competence)}` : ""}</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharClientesDoVendedor()">Fechar</button>
+        </div>
+
+        ${d.error ? `<div class="message error" style="margin-top:10px">${escapeHtml(d.error)}</div>` : ""}
+        ${d.loading ? '<div class="loader">Carregando…</div>' : ""}
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:12px 0">
+          ${aba("todos", "Todos", t.clients)}
+          ${aba("carteira", "Da carteira dele", t.ownClients)}
+          ${aba("fora", "Fora da carteira", t.otherClients)}
+          <span style="flex:1"></span>
+          <button class="btn btn-secondary btn-sm" onclick="baixarClientesDoVendedor('csv')">⬇ CSV</button>
+          <button class="btn btn-secondary btn-sm" onclick="baixarClientesDoVendedor('pdf')">📄 PDF</button>
+        </div>
+
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+          ${[["Faturado no mês", currency(t.revenue), `${number(t.clients)} cliente(s)`],
+             ["Da carteira dele", currency(t.ownRevenue), `${number(t.ownClients)} cliente(s)`],
+             ["Fora da carteira", currency(t.otherRevenue), `${number(t.otherClients)} cliente(s)`],
+             ["Sem vendedor no cadastro", currency(t.noOwnerRevenue), `${number(t.noOwnerClients)} cliente(s)`]]
+            .map(([rot, val, sub]) => `
+              <div style="flex:1;min-width:150px;background:#fff;border:1px solid var(--line);
+                          border-radius:10px;padding:9px 11px">
+                <div class="text-small" style="color:var(--muted)">${rot}</div>
+                <div style="font-size:17px;font-weight:800">${val}</div>
+                <div class="text-small" style="color:var(--muted)">${sub}</div>
+              </div>`).join("")}
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>Código</th><th>Cliente</th><th>Cidade</th><th>Carteira de</th>
+              <th style="text-align:right">Faturamento</th>
+              <th style="text-align:right">Itens</th>
+              <th>Última compra</th>
+            </tr></thead>
+            <tbody>
+              ${itens.map((i) => `
+                <tr>
+                  <td class="text-small">${escapeHtml(i.clientCode || "—")}</td>
+                  <td><strong>${escapeHtml(i.clientName)}</strong></td>
+                  <td class="text-small">${escapeHtml(i.cityName || "—")}</td>
+                  <td>${seloCarteira(i)}</td>
+                  <td style="text-align:right">${currency(i.revenue)}</td>
+                  <td style="text-align:right">${number(i.items)}</td>
+                  <td class="text-small">${i.lastPurchaseAt ? shortDate(i.lastPurchaseAt) : "—"}</td>
+                </tr>`).join("")
+                || (d.loading ? "" : `<tr><td colspan="7">
+                     ${emptyStateCard("Nenhum cliente faturado neste recorte.")}</td></tr>`)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
+/** Número clicável: abre a lista dos clientes por trás dele. */
+function celulaCarteiraVendedor(row, escopo, valor) {
+  const n = Number(valor || 0);
+  if (!n) return "0";
+  return `<button type="button" class="link-num"
+    title="Ver os clientes e exportar"
+    onclick="abrirClientesDoVendedor('${jsAttr(row.sellerName)}', '${escopo}')">${number(n)}</button>`;
+}
+
+/** De quem é o cliente. É a coluna que dá sentido ao relatório. */
+function seloCarteira(item) {
+  if (item.isOwn) {
+    return '<span class="status-tag good">própria</span>';
+  }
+  if (item.portfolioSeller === "Sem vendedor") {
+    return '<span class="status-tag" style="background:#f1f3f4;color:#5f6368"'
+      + ' title="Cliente sem vendedor interno no cadastro">Sem vendedor</span>';
+  }
+  return `<span class="status-tag" style="background:#fef7e0;color:#b06000"
+    title="Cliente da carteira de outro vendedor">${escapeHtml(item.portfolioSeller)}</span>`;
+}
+
 function sellerRows(rows) {
   return rows
     .map(
@@ -4271,8 +4414,8 @@ function sellerRows(rows) {
         <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
         <td>${currency(row.ticketAverage)}</td>
         <td>${number(row.distinctClients)}</td>
-        <td>${number(row.ownClients || 0)}</td>
-        <td>${number(row.otherClients || 0)}</td>
+        <td>${celulaCarteiraVendedor(row, "carteira", row.ownClients)}</td>
+        <td>${celulaCarteiraVendedor(row, "fora", row.otherClients)}</td>
         <td>${number(row.mixSku)}</td>
         <td>${currency(row.returnsValue)}</td>
         <td>${farolValue(pct(row.returnRatioPct), row.farol?.returnRatio)}</td>
@@ -14781,6 +14924,7 @@ function dashboardView() {
       ${assignTaskModal()}
       ${scheduleContactModal()}
       ${conciliacaoModal()}
+      ${clientesDoVendedorModal()}
       ${apoioModal()}
       ${coberturaModal()}
       ${receptiveModal()}

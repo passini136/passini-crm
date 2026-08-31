@@ -17487,6 +17487,175 @@ def save_client_alias(
             "clientCode": cliente["client_code"], "clientName": cliente["client_name"]}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Clientes que o vendedor faturou no mês, com o dono da carteira
+#
+# Responde a pergunta que os números "Carteira" e "Fora" levantam no ranking:
+# QUAIS clientes são esses? Usa exatamente a mesma regra do dashboard — dono é
+# quem está como vendedor interno no cadastro — para a lista nunca discordar do
+# número que a originou.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def seller_month_clients(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    seller: str = "", competence: str = "", escopo_lista: str = "todos",
+) -> dict[str, Any]:
+    comp = valid_competence(competence) or crm_latest_competence(conn, company_id) or ""
+    escopo_dados = data_scope_for_user(conn, user)
+    vendedor = normalize_whitespace(seller)
+    if escopo_dados == "proprio":
+        # O vendedor só vê a si mesmo, venha o que vier na consulta.
+        vendedor = seller_identity_for_user(user)
+    if not vendedor or not comp:
+        return {"competence": comp, "sellerName": vendedor, "items": [], "totals": {}}
+
+    # Dono da carteira por nome do cliente — o faturamento não traz o código.
+    donos: dict[str, str] = {}
+    codigos: dict[str, str] = {}
+    cidades: dict[str, str] = {}
+    for o in conn.execute(
+        "SELECT client_code, client_name, city_name, "
+        "       NULLIF(TRIM(internal_seller_name), '') AS dono "
+        "FROM crm_client_profiles WHERE company_id = ?", (company_id,),
+    ).fetchall():
+        chave = normalize_client_key(o["client_name"])
+        if not chave:
+            continue
+        if o["dono"]:
+            donos.setdefault(chave, normalize_whitespace(o["dono"]))
+        codigos.setdefault(chave, normalize_whitespace(o["client_code"]))
+        cidades.setdefault(chave, normalize_upper(o["city_name"]))
+
+    variantes = seller_name_variants(conn, company_id, vendedor) or [vendedor]
+    marcadores = ",".join("?" for _ in variantes)
+    linhas = conn.execute(
+        f"""
+        SELECT client_name,
+               MAX(city_name) AS cidade,
+               ROUND(SUM(net_value), 2) AS valor,
+               ROUND(SUM(quantity), 0)  AS itens,
+               COUNT(*) AS linhas,
+               MAX(issue_date) AS ultima
+        FROM fact_sales_detail
+        WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores})
+        GROUP BY client_name
+        ORDER BY valor DESC
+        """,
+        (company_id, comp, *variantes),
+    ).fetchall()
+
+    eu = normalize_upper(vendedor)
+    itens: list[dict[str, Any]] = []
+    for r in linhas:
+        chave = normalize_client_key(r["client_name"])
+        dono = donos.get(chave, "")
+        proprio = bool(dono) and normalize_upper(dono) == eu
+        itens.append({
+            "clientCode": codigos.get(chave, ""),
+            "clientName": normalize_whitespace(r["client_name"]),
+            "cityName": normalize_upper(r["cidade"] or cidades.get(chave, "")),
+            "revenue": float(r["valor"] or 0.0),
+            "items": int(r["itens"] or 0),
+            "lastPurchaseAt": normalize_whitespace(r["ultima"])[:10],
+            # É isto que o relatório existe para mostrar: de quem é o cliente.
+            "portfolioSeller": dono or "Sem vendedor",
+            "isOwn": proprio,
+        })
+
+    if escopo_lista == "carteira":
+        itens = [i for i in itens if i["isOwn"]]
+    elif escopo_lista == "fora":
+        itens = [i for i in itens if not i["isOwn"]]
+
+    proprios = [i for i in itens if i["isOwn"]]
+    fora = [i for i in itens if not i["isOwn"]]
+    sem_dono = [i for i in fora if i["portfolioSeller"] == "Sem vendedor"]
+    return {
+        "competence": comp,
+        "sellerName": vendedor,
+        "scope": escopo_lista,
+        "items": itens,
+        "totals": {
+            "clients": len(itens),
+            "revenue": round(sum(i["revenue"] for i in itens), 2),
+            "ownClients": len(proprios),
+            "ownRevenue": round(sum(i["revenue"] for i in proprios), 2),
+            "otherClients": len(fora),
+            "otherRevenue": round(sum(i["revenue"] for i in fora), 2),
+            "noOwnerClients": len(sem_dono),
+            "noOwnerRevenue": round(sum(i["revenue"] for i in sem_dono), 2),
+        },
+    }
+
+
+def seller_month_clients_pdf(dados: dict[str, Any]) -> bytes:
+    """A mesma lista em PDF, para levar impressa à conversa com o vendedor."""
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as _canvas
+
+    buffer = io.BytesIO()
+    c = _canvas.Canvas(buffer, pagesize=A4)
+    largura, altura = A4
+    esquerda, direita = 12 * mm, largura - 12 * mm
+    t = dados.get("totals", {})
+
+    def cabecalho(pagina: int) -> float:
+        y = altura - 16 * mm
+        c.setFont("Helvetica-Bold", 13)
+        c.drawString(esquerda, y, "Clientes faturados no mês")
+        c.setFont("Helvetica", 9)
+        y -= 13
+        c.drawString(esquerda, y, f"{dados.get('sellerName','')} · competência "
+                                  f"{dados.get('competence','')}")
+        y -= 12
+        c.setFont("Helvetica", 8)
+        c.setFillColorRGB(0.35, 0.35, 0.35)
+        c.drawString(esquerda, y,
+                     f"{t.get('clients',0)} cliente(s) · {brl(t.get('revenue',0))}   |   "
+                     f"da carteira: {t.get('ownClients',0)} ({brl(t.get('ownRevenue',0))})   |   "
+                     f"fora dela: {t.get('otherClients',0)} ({brl(t.get('otherRevenue',0))})")
+        c.setFillColorRGB(0, 0, 0)
+        y -= 14
+        c.setFont("Helvetica-Bold", 7.5)
+        c.drawString(esquerda, y, "CÓDIGO")
+        c.drawString(esquerda + 55, y, "CLIENTE")
+        c.drawString(esquerda + 250, y, "CIDADE")
+        c.drawString(esquerda + 330, y, "CARTEIRA DE")
+        c.drawRightString(direita, y, "FATURAMENTO")
+        y -= 3
+        c.setLineWidth(0.5)
+        c.line(esquerda, y, direita, y)
+        c.setFont("Helvetica", 5.5)
+        c.drawRightString(direita, 10 * mm, f"página {pagina}")
+        return y - 11
+
+    pagina = 1
+    y = cabecalho(pagina)
+    for item in dados.get("items", []):
+        if y < 20 * mm:
+            c.showPage()
+            pagina += 1
+            y = cabecalho(pagina)
+        # Cliente de outra carteira em cinza-escuro; o próprio em preto. A
+        # distinção é o assunto do relatório e precisa saltar na folha.
+        proprio = item.get("isOwn")
+        c.setFont("Helvetica", 7.5)
+        c.setFillColorRGB(0, 0, 0) if proprio else c.setFillColorRGB(0.35, 0.35, 0.35)
+        c.drawString(esquerda, y, str(item.get("clientCode") or "—")[:12])
+        c.drawString(esquerda + 55, y, str(item.get("clientName") or "")[:44])
+        c.drawString(esquerda + 250, y, str(item.get("cityName") or "")[:18])
+        c.setFont("Helvetica-Bold" if not proprio else "Helvetica", 7.5)
+        c.drawString(esquerda + 330, y,
+                     ("própria" if proprio else str(item.get("portfolioSeller") or ""))[:28])
+        c.setFont("Helvetica", 7.5)
+        c.drawRightString(direita, y, brl(item.get("revenue", 0)))
+        y -= 10
+    c.setFillColorRGB(0, 0, 0)
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
+
+
 def compute_unassigned_clients(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     min_months: int = 2, months_window: int = 6, limit: int = 200, export: bool = False,
@@ -19146,6 +19315,49 @@ class AppHandler(BaseHTTPRequestHandler):
                     dados["sellers"] = ([s["sellerName"] for s in
                                          sellers_available_for_assignment(conn, user["company_id"], user)]
                                         if escopo_lead != "proprio" else [])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
+            if path in ("/api/crm/seller-clients", "/api/crm/seller-clients.pdf",
+                        "/api/crm/seller-clients.csv"):
+                user = self._require_auth()
+                if not user:
+                    return
+                q = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = seller_month_clients(
+                        conn, user["company_id"], user,
+                        seller=q.get("seller", [""])[0],
+                        competence=q.get("competence", [""])[0],
+                        escopo_lista=q.get("scope", ["todos"])[0])
+                base = re.sub(r"[^A-Za-z0-9]+", "-",
+                              strip_accents(dados.get("sellerName") or "vendedor")).strip("-").lower()
+                nome = f"clientes-{base}-{dados.get('competence','')}"
+                if path.endswith(".pdf"):
+                    self._set_headers(200, "application/pdf", {
+                        "Content-Disposition": f'attachment; filename="{nome}.pdf"'})
+                    self.wfile.write(seller_month_clients_pdf(dados))
+                    return
+                if path.endswith(".csv"):
+                    saida = io.StringIO()
+                    # ; e BOM: é assim que o Excel em português abre o arquivo
+                    # com as colunas separadas, sem pedir importação.
+                    escritor = csv.writer(saida, delimiter=";")
+                    escritor.writerow(["Código", "Cliente", "Cidade", "Carteira de",
+                                       "Da própria carteira", "Faturamento", "Itens",
+                                       "Última compra"])
+                    for i in dados["items"]:
+                        escritor.writerow([
+                            i["clientCode"], i["clientName"], i["cityName"],
+                            "própria" if i["isOwn"] else i["portfolioSeller"],
+                            "sim" if i["isOwn"] else "não",
+                            f"{i['revenue']:.2f}".replace(".", ","),
+                            i["items"], i["lastPurchaseAt"]])
+                    conteudo = ("\ufeff" + saida.getvalue()).encode("utf-8")
+                    self._set_headers(200, "text/csv; charset=utf-8", {
+                        "Content-Disposition": f'attachment; filename="{nome}.csv"'})
+                    self.wfile.write(conteudo)
+                    return
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
