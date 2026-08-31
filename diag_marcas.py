@@ -192,9 +192,15 @@ else:
     print("   Nenhuma. Cada venda aparece em uma importação só.")
 
 # ── 7. Correção ──────────────────────────────────────────────────────────
-if corrigir and (excedente_linhas or pendente):
+if corrigir and (excedente_linhas or pendente or repetido_linhas):
     print("\n7) CORRIGINDO")
-    removidas = backend.rehash_sales_detail(conn)
+    removidas = backend.rehash_sales_detail(conn) if (excedente_linhas or pendente) else 0
+    # A repetição por chave frouxa é removida em TODAS as competências: o
+    # problema não é só do mês consultado.
+    solto = backend.remove_repeticao_entre_importacoes(conn, company_id, simular=False)
+    if solto["rows"]:
+        print(f"   {solto['rows']} linha(s) repetida(s) entre importações removida(s), "
+              f"somando {money(solto['value'])}")
     novo = conn.execute(
         "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_sales_detail "
         "WHERE company_id = ? AND competence = ? AND brand_name = ?",
@@ -203,9 +209,6 @@ if corrigir and (excedente_linhas or pendente):
     print(f"   {marca} em {competencia} agora: {novo['n']} linha(s) · {money(novo['v'])}")
     backend.invalidate_crm_cache(company_id)
     print("   Cache limpo. Recarregue a tela.")
-elif corrigir and repetido_linhas:
-    print("\n7) A repetição encontrada é por chave frouxa — a correção automática")
-    print("   não a remove, porque as linhas não são idênticas. Me mande esta saída.")
 elif corrigir:
     print("\n7) Nada a corrigir.")
 

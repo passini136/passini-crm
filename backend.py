@@ -3774,6 +3774,69 @@ def set_signature_version(conn: sqlite3.Connection, versao: int) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(versao),))
 
 
+def remove_repeticao_entre_importacoes(
+    conn: sqlite3.Connection, company_id: int, competence: str = "",
+    simular: bool = True,
+) -> dict[str, Any]:
+    """Remove a MESMA venda que entrou por importações diferentes.
+
+    Vai além da assinatura exata: compara só vendedor, cliente, dia e valor
+    líquido. Existe porque dois relatórios do Alfa descrevem a mesma venda com
+    pequenas diferenças de conteúdo, e a comparação exata deixa passar.
+
+    Duas salvaguardas contra apagar venda de verdade:
+
+    - só considera repetição quando a linha aparece em importações DIFERENTES;
+      repetida dentro do mesmo arquivo é venda real (mesma peça, dois pedidos);
+    - mantém a quantidade que a maior importação sozinha trouxe. Se um arquivo
+      traz a mesma combinação três vezes, três ficam.
+
+    Mantém sempre as linhas da importação mais antiga, que é a que o resto do
+    sistema já referencia.
+    """
+    onde = "company_id = ?" + (" AND competence = ?" if competence else "")
+    params = [company_id] + ([competence] if competence else [])
+    linhas = conn.execute(
+        f"SELECT id, competence, import_id, seller_name, client_name, issue_date, net_value "
+        f"FROM fact_sales_detail WHERE {onde} ORDER BY id", params).fetchall()
+
+    grupos: dict[tuple[Any, ...], list[sqlite3.Row]] = defaultdict(list)
+    for r in linhas:
+        grupos[(
+            r["competence"],
+            normalize_whitespace(r["seller_name"]),
+            normalize_client_key(r["client_name"]),
+            normalize_whitespace(r["issue_date"])[:10],
+            round(float(r["net_value"] or 0), 2),
+        )].append(r)
+
+    remover: list[int] = []
+    valor = 0.0
+    for grupo in grupos.values():
+        if len(grupo) < 2:
+            continue
+        por_import = Counter(g["import_id"] for g in grupo)
+        if len(por_import) < 2:
+            continue
+        verdadeiro = max(por_import.values())
+        escolhido = min((i for i, q in por_import.items() if q == verdadeiro),
+                        key=lambda x: (x is None, x))
+        mantidos = {g["id"] for g in grupo if g["import_id"] == escolhido}
+        mantidos = set(sorted(mantidos)[:verdadeiro])
+        for g in grupo:
+            if g["id"] not in mantidos:
+                remover.append(g["id"])
+                valor += float(g["net_value"] or 0)
+
+    if not simular and remover:
+        for i in range(0, len(remover), 500):
+            lote = remover[i:i + 500]
+            marcadores = ",".join("?" for _ in lote)
+            conn.execute(f"DELETE FROM fact_sales_detail WHERE id IN ({marcadores})", lote)
+        conn.commit()
+    return {"rows": len(remover), "value": round(valor, 2), "applied": not simular}
+
+
 def sales_detail_needs_rehash(conn: sqlite3.Connection) -> bool:
     """Ainda há linha gravada no formato antigo (issue_date com hora)?
 
@@ -4024,8 +4087,13 @@ def detect_file_type(filename: str) -> str | None:
 FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
     ("posicao_estoque", {"BRANCHNAME", "ITEM", "ITEMNAME", "QUANTITY"}),
     ("cadastro_itens", {"CODIGO", "TIPO", "GRUPO ITEM", "SUB GRUPO ITEM", "MARCA"}),
+    # O consolidado por cliente vem ANTES do detalhado e é reconhecido pelo
+    # CODIGO, que o detalhado não tem. Os dois se chamam "relatorioFaturamento"
+    # e têm quase as mesmas colunas: o que separa um do outro é o CODIGO de um
+    # lado e a DATA EMISSAO do outro. Confundi-los faz o total do mês entrar
+    # como se fosse item a item.
+    ("faturamento_cliente_consolidado", {"VENDEDOR", "CODIGO", "CLIENTE", "LIQUIDO"}),
     ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "DATA EMISSAO", "LIQUIDO"}),
-    ("faturamento_detalhado", {"VENDEDOR", "CLIENTE", "MARCA", "FABRICANTE", "LIQUIDO"}),
 ]
 
 
@@ -21019,6 +21087,28 @@ def _auto_import_detect_crm_field(content: bytes, filename: str = "") -> str:
     return "import-crm-summary-file"
 
 
+def arquivo_bate_com_a_pasta(content: bytes, scope: str) -> bool:
+    """O conteúdo do arquivo corresponde ao que a pasta espera?
+
+    A pasta define o tipo, o que é prático — mas cega. Em 10/08/2026 um
+    relatório CONSOLIDADO POR CLIENTE foi parar na pasta do detalhado e entrou
+    como se fosse item a item: 1.472 linhas somando R$ 1,16 milhão, contra as
+    ~R$ 150 por linha dos arquivos normais. Um mês inteiro de faturamento
+    contado duas vezes por causa de um arquivo na pasta errada.
+
+    Agora o cabeçalho precisa concordar com a pasta. Só recusa quando reconhece
+    o arquivo como sendo de OUTRO tipo — cabeçalho desconhecido segue o
+    caminho antigo, para não travar formato novo do Alfa.
+    """
+    esperado = IMPORT_SCOPE_REQUIREMENTS.get(scope) or set()
+    if not esperado:
+        return True
+    reconhecido = detect_file_type_by_header(content)
+    if not reconhecido:
+        return True
+    return reconhecido in esperado
+
+
 def _auto_import_build_payload(files: list[Path], scope: str) -> list[dict[str, Any]]:
     """
     Monta o files_payload como lista de dicts com fieldName correto.
@@ -21085,6 +21175,22 @@ def _auto_import_tick_inner() -> None:
             if _instaveis:
                 print(f"[auto-import] {cfg['folder']}: {len(_instaveis)} arquivo(s) ainda "
                       f"sendo gravado(s), aguardando")
+                continue
+
+        # A pasta diz o tipo, mas o cabeçalho tem de concordar. Sem isto, um
+        # arquivo na pasta errada entra como se fosse do tipo da pasta.
+        _recusados = [f for f in csv_files if not arquivo_bate_com_a_pasta(f.read_bytes(), scope)]
+        if _recusados:
+            with closing(get_connection()) as conn:
+                for f in _recusados:
+                    _auto_import_log(
+                        conn, cfg["folder"], scope, None, "erro",
+                        f"'{f.name}' não é do tipo esperado nesta pasta "
+                        f"({IMPORT_SCOPE_LABELS.get(scope, scope)}). O arquivo foi ignorado.",
+                        [f.name])
+                    print(f"[auto-import] RECUSADO {f.name}: conteúdo não bate com {cfg['folder']}")
+            csv_files = [f for f in csv_files if f not in _recusados]
+            if not csv_files:
                 continue
 
         # Cadastro de clientes: base mestre do Alfa, SEM competência.
