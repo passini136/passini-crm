@@ -138,7 +138,7 @@ for x in conn.execute(
     # remover uma importação vai derrubar a marca abaixo do relatório do Alfa.
     _por_linha = float(x["v"] or 0) / (x["linhas"] or 1)
     print(f"   {str(x['import_id']):<8}{str(x['quando'])[:19]:<21}{x['linhas']:>8}"
-          f"{money(x['v'])}{_por_linha:>11.2f}{float(x['vm'] or 0):>16,.2f}")
+          f"{money(x['v']):>19}{_por_linha:>11.2f}{float(x['vm'] or 0):>16,.2f}")
 
 # ── 4b. Confronto com a fonte oficial ────────────────────────────────────
 print("\n5) DETALHADO x OFICIAL (relatório de custo x venda)")

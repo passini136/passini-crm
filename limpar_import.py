@@ -89,8 +89,8 @@ for import_id in ids:
             # limpeza deixa de ser correção e vira perda de dado.
             nota = ">> NENHUMA — é a única fonte deste mês, NÃO REMOVER"
             sozinho.append(c["competence"])
-        print(f"   {c['competence']:<10}{c['rows']:>8}{money(c['value'])}   {nota}")
-    print(f"   {'TOTAL':<10}{res['rows']:>8}{money(res['value'])}")
+        print(f"   {c['competence']:<10}{c['rows']:>8}{money(c['value']):>19}   {nota}")
+    print(f"   {'TOTAL':<10}{res['rows']:>8}{money(res['value']):>19}")
     if sozinho and not meses:
         print(f"\n   ATENÇÃO: {', '.join(sozinho)} só tem esta importação.")
         print("   Remover tudo apagaria esses meses. Use --mes para escolher:")
