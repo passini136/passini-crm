@@ -35,6 +35,8 @@ import backend  # noqa: E402
 
 aplicar = "--aplicar" in sys.argv
 ids = [int(a) for a in sys.argv[1:] if a.isdigit()]
+# --mes 2026-08 (pode repetir) limita a remoção a certas competências
+meses = [a for a in sys.argv[1:] if len(a) == 7 and a[4] == "-"]
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
@@ -69,14 +71,33 @@ if not ids:
 total_linhas = 0
 total_valor = 0.0
 for import_id in ids:
-    res = backend.delete_import_rows(conn, company_id, import_id, simular=not aplicar)
+    res = backend.delete_import_rows(conn, company_id, import_id,
+                                     competences=meses or None, simular=not aplicar)
     print(f"IMPORTAÇÃO {import_id}")
     if not res["rows"]:
-        print("   Nada gravado por esta importação.\n")
+        print("   Nada gravado por esta importação"
+              + (f" nos meses {', '.join(meses)}." if meses else ".") + "\n")
         continue
+    print(f"   {'MÊS':<10}{'LINHAS':>8}{'VALOR':>19}   OUTRAS IMPORTAÇÕES DO MESMO MÊS")
+    sozinho = []
     for c in res["byCompetence"]:
-        print(f"   {c['competence']}  {c['rows']:>7} linha(s)  {money(c['value'])}")
-    print(f"   {'TOTAL':<9}{res['rows']:>7} linha(s)  {money(res['value'])}")
+        if c["otherImports"]:
+            nota = (f"{c['otherImports']} importação(ões), {c['otherRows']} linha(s), "
+                    f"{money(c['otherValue']).strip()}")
+        else:
+            # Sem outra fonte, remover apaga o mês inteiro. É o caso em que a
+            # limpeza deixa de ser correção e vira perda de dado.
+            nota = ">> NENHUMA — é a única fonte deste mês, NÃO REMOVER"
+            sozinho.append(c["competence"])
+        print(f"   {c['competence']:<10}{c['rows']:>8}{money(c['value'])}   {nota}")
+    print(f"   {'TOTAL':<10}{res['rows']:>8}{money(res['value'])}")
+    if sozinho and not meses:
+        print(f"\n   ATENÇÃO: {', '.join(sozinho)} só tem esta importação.")
+        print("   Remover tudo apagaria esses meses. Use --mes para escolher:")
+        seguros = [c["competence"] for c in res["byCompetence"] if c["otherImports"]]
+        if seguros:
+            print(f"      limpar_import.py {import_id} "
+                  + " ".join(seguros) + " --aplicar")
     if res["applied"]:
         print("   REMOVIDO")
         if res.get("backup"):

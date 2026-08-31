@@ -3815,28 +3815,57 @@ def backup_database(conn: sqlite3.Connection, motivo: str = "manutencao") -> Pat
 
 
 def delete_import_rows(
-    conn: sqlite3.Connection, company_id: int, import_id: int, simular: bool = True,
+    conn: sqlite3.Connection, company_id: int, import_id: int,
+    competences: list[str] | None = None, simular: bool = True,
 ) -> dict[str, Any]:
-    """Remove tudo que UMA importação trouxe.
+    """Remove o que UMA importação trouxe, opcionalmente só de certos meses.
 
     É o caminho seguro para desfazer um arquivo que não devia ter entrado: um
-    relatório na pasta errada, ou uma reimportação manual por cima do que já
-    estava lá. Diferente de procurar linha repetida por semelhança, aqui não há
-    palpite — cada linha sabe de qual importação veio.
+    relatório na pasta errada, ou uma reimportação por cima do que já estava lá.
+    Diferente de procurar linha parecida, aqui não há palpite — cada linha sabe
+    de qual importação veio.
+
+    Para CADA mês devolve também quanto as OUTRAS importações trouxeram. É essa
+    informação que decide: mês em que esta é a única fonte não pode ser
+    limpo, porque não sobraria nada no lugar.
     """
+    filtro_mes = ""
+    params_extra: list[Any] = []
+    if competences:
+        marcadores = ",".join("?" for _ in competences)
+        filtro_mes = f" AND competence IN ({marcadores})"
+        params_extra = list(competences)
+
     linhas = conn.execute(
-        "SELECT competence, COUNT(*) n, ROUND(SUM(net_value),2) v "
-        "FROM fact_sales_detail WHERE company_id = ? AND import_id = ? "
-        "GROUP BY competence ORDER BY competence",
-        (company_id, import_id)).fetchall()
-    resumo = [{"competence": r["competence"], "rows": r["n"], "value": float(r["v"] or 0)}
-              for r in linhas]
+        f"SELECT competence, COUNT(*) n, ROUND(SUM(net_value),2) v "
+        f"FROM fact_sales_detail WHERE company_id = ? AND import_id = ?{filtro_mes} "
+        f"GROUP BY competence ORDER BY competence",
+        (company_id, import_id, *params_extra)).fetchall()
+
+    resumo = []
+    for r in linhas:
+        outras = conn.execute(
+            "SELECT COUNT(DISTINCT import_id) imports, COUNT(*) n, ROUND(SUM(net_value),2) v "
+            "FROM fact_sales_detail "
+            "WHERE company_id = ? AND competence = ? AND import_id <> ?",
+            (company_id, r["competence"], import_id)).fetchone()
+        resumo.append({
+            "competence": r["competence"],
+            "rows": r["n"],
+            "value": float(r["v"] or 0),
+            "otherImports": int(outras["imports"] or 0),
+            "otherRows": int(outras["n"] or 0),
+            "otherValue": float(outras["v"] or 0),
+        })
+
     total = sum(r["rows"] for r in resumo)
     copia = None
     if not simular and total:
         copia = backup_database(conn, f"antes-de-remover-import-{import_id}")
-        conn.execute("DELETE FROM fact_sales_detail WHERE company_id = ? AND import_id = ?",
-                     (company_id, import_id))
+        conn.execute(
+            f"DELETE FROM fact_sales_detail "
+            f"WHERE company_id = ? AND import_id = ?{filtro_mes}",
+            (company_id, import_id, *params_extra))
         conn.commit()
     return {"importId": import_id, "rows": total,
             "value": round(sum(r["value"] for r in resumo), 2),
