@@ -4374,6 +4374,8 @@ function clientesDoVendedorModal() {
           <button class="btn btn-secondary btn-sm" onclick="baixarClientesDoVendedor('pdf')">📄 PDF</button>
         </div>
 
+        ${avisoDivergenciaFaturamento(d)}
+
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:10px">
           ${[["Faturado no mês", currency(t.revenue), `${number(t.clients)} cliente(s)`],
              ["Da carteira dele", currency(t.ownRevenue), `${number(t.ownClients)} cliente(s)`],
@@ -4423,6 +4425,33 @@ function celulaCarteiraVendedor(row, escopo, valor) {
   return `<button type="button" class="link-num"
     title="Ver os clientes e exportar"
     onclick="abrirClientesDoVendedor('${jsAttr(row.sellerName)}', '${escopo}')">${number(n)}</button>`;
+}
+
+/** Compara a soma da lista com o número oficial do vendedor.
+ *
+ *  A lista vem do faturamento DETALHADO; o ranking do dashboard vem do
+ *  relatório de custo x venda. Quando as duas fontes discordam, mostrar só uma
+ *  faz o gestor achar que o sistema mente. Melhor dizer que discordam, de
+ *  quanto, e o que fazer.
+ */
+function avisoDivergenciaFaturamento(d) {
+  const detalhe = Number(d?.totals?.revenue || 0);
+  const oficial = Number(d?.officialRevenue || 0);
+  if (!oficial || !detalhe) return "";
+  const dif = detalhe - oficial;
+  if (Math.abs(dif) / oficial <= 0.02) return "";   // até 2% é arredondamento
+  return `
+    <div class="message" style="background:#fef7e0;color:#b06000;margin-bottom:10px;line-height:1.55">
+      <strong>⚠ Esta lista soma ${currency(detalhe)}, mas o resultado oficial do vendedor
+      no mês é ${currency(oficial)}</strong> — diferença de ${currency(Math.abs(dif))}
+      (${(Math.abs(dif) / oficial * 100).toFixed(0)}%).
+      <div class="text-small" style="margin-top:4px">
+        A lista vem do faturamento detalhado; o ranking vem do relatório de custo x venda.
+        Diferença acima de 2% costuma ser linha repetida no detalhado — rode
+        <code>diag_marcas.py</code> no servidor para medir. Use os nomes e a coluna
+        <strong>Carteira de</strong>, que não dependem disso.
+      </div>
+    </div>`;
 }
 
 /** Vendedores que o gestor pode consultar. O vendedor não escolhe: é ele. */

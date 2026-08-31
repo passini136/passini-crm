@@ -66,11 +66,10 @@ print("   Compare com o relatório do Alfa para esta marca e mês.\n")
 pendente = backend.sales_detail_needs_rehash(conn)
 print("2) MIGRAÇÃO DE IDENTIDADE")
 if pendente:
-    quantas = conn.execute(
-        "SELECT COUNT(*) c FROM fact_sales_detail "
-        "WHERE issue_date IS NOT NULL AND length(issue_date) > 10").fetchone()["c"]
-    print(f"   >> PENDENTE: {quantas} linha(s) ainda no formato antigo.")
-    print("   Reinicie o serviço — ela roda sozinha no boot.")
+    print(f"   >> PENDENTE: a base está na versão "
+          f"{backend.stored_signature_version(conn)} e o sistema usa a "
+          f"{backend.SALES_SIGNATURE_VERSION}.")
+    print("   Reinicie o serviço — a migração roda sozinha no boot.")
 else:
     print("   OK: todas as linhas já estão no formato novo.")
 
@@ -129,12 +128,72 @@ for x in conn.execute(
     "FROM fact_sales_detail d LEFT JOIN imports i ON i.id = d.import_id "
     "WHERE d.company_id = ? AND d.competence = ? GROUP BY d.import_id "
     "ORDER BY i.imported_at", (company_id, competencia)).fetchall():
+    # Valor por linha denuncia o arquivo estranho: os diários ficam todos na
+    # mesma faixa, e o que destoa costuma ser o problema.
+    _por_linha = float(x["v"] or 0) / (x["linhas"] or 1)
     print(f"   import {str(x['import_id']):<6} {str(x['imported_at'])[:19]:<20} "
-          f"{x['linhas']:>7} linha(s)  {money(x['v'])}")
+          f"{x['linhas']:>7} linha(s)  {money(x['v'])}   {_por_linha:>8.2f}/linha")
 
-# ── 5. Correção ──────────────────────────────────────────────────────────
+# ── 4b. Confronto com a fonte oficial ────────────────────────────────────
+print("\n5) DETALHADO x OFICIAL (relatório de custo x venda)")
+det = conn.execute(
+    "SELECT ROUND(SUM(net_value),2) v FROM fact_sales_detail "
+    "WHERE company_id = ? AND competence = ?", (company_id, competencia)).fetchone()["v"] or 0
+ofi = conn.execute(
+    "SELECT ROUND(SUM(net_value),2) v FROM fact_unit_summary "
+    "WHERE company_id = ? AND competence = ?", (company_id, competencia)).fetchone()["v"] or 0
+print(f"   faturamento detalhado : {money(det)}")
+print(f"   resumo por unidade    : {money(ofi)}")
+if ofi:
+    print(f"   diferença             : {money(det - ofi)}  ({100 * (det / ofi - 1):+.0f}%)")
+    if abs(det - ofi) / ofi > 0.05:
+        print("   >> O detalhado está acima do oficial. Ver o item 6.")
+
+# ── 6. Repetição por chave frouxa ────────────────────────────────────────
+# A assinatura exata não pega tudo: dois relatórios do Alfa podem descrever a
+# mesma venda com pequenas diferenças. Aqui a comparação é só por cliente, dia
+# e valor — se a MESMA combinação aparece em importações diferentes, é forte
+# indício de que o mesmo dia entrou duas vezes.
+print("\n6) MESMA VENDA EM IMPORTAÇÕES DIFERENTES (chave frouxa)")
+frouxo = defaultdict(list)
+for x in linhas:
+    frouxo[(
+        backend.normalize_client_key(x["client_name"]),
+        backend.normalize_whitespace(x["issue_date"])[:10],
+        round(float(x["net_value"] or 0), 2),
+        backend.normalize_whitespace(x["seller_name"]),
+    )].append(x)
+
+repetido_valor = 0.0
+repetido_linhas = 0
+por_import_extra: Counter = Counter()
+for k, grupo in frouxo.items():
+    if len(grupo) < 2:
+        continue
+    imports = Counter(g["import_id"] for g in grupo)
+    if len(imports) < 2:
+        continue      # repetiu dentro do MESMO arquivo: pode ser venda real
+    verdadeiro = max(imports.values())
+    sobra = len(grupo) - verdadeiro
+    if sobra > 0:
+        repetido_linhas += sobra
+        repetido_valor += sobra * float(grupo[0]["net_value"] or 0)
+        ordenados = sorted(imports.items(), key=lambda x: (x[0] is None, x[0]))
+        for imp, _ in ordenados[1:]:
+            por_import_extra[imp] += 1
+
+if repetido_linhas:
+    print(f"   >> {repetido_linhas} linha(s) repetida(s) entre importações, "
+          f"somando {money(repetido_valor)}")
+    print("   Importações que mais trouxeram repetição:")
+    for imp, qtd in por_import_extra.most_common(6):
+        print(f"      import {imp}: {qtd} linha(s)")
+else:
+    print("   Nenhuma. Cada venda aparece em uma importação só.")
+
+# ── 7. Correção ──────────────────────────────────────────────────────────
 if corrigir and (excedente_linhas or pendente):
-    print("\n5) CORRIGINDO")
+    print("\n7) CORRIGINDO")
     removidas = backend.rehash_sales_detail(conn)
     novo = conn.execute(
         "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_sales_detail "
@@ -144,7 +203,10 @@ if corrigir and (excedente_linhas or pendente):
     print(f"   {marca} em {competencia} agora: {novo['n']} linha(s) · {money(novo['v'])}")
     backend.invalidate_crm_cache(company_id)
     print("   Cache limpo. Recarregue a tela.")
+elif corrigir and repetido_linhas:
+    print("\n7) A repetição encontrada é por chave frouxa — a correção automática")
+    print("   não a remove, porque as linhas não são idênticas. Me mande esta saída.")
 elif corrigir:
-    print("\n5) Nada a corrigir.")
+    print("\n7) Nada a corrigir.")
 
 conn.close()

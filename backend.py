@@ -17567,6 +17567,16 @@ def seller_month_clients(
     elif escopo_lista == "fora":
         itens = [i for i in itens if not i["isOwn"]]
 
+    # O ranking do dashboard usa o RESUMO POR VENDEDOR (relatório de custo x
+    # venda), não o detalhado. Quando as duas fontes discordam, o relatório
+    # precisa dizer isso — senão o gestor compara os dois números e conclui que
+    # um deles mente, sem saber qual.
+    oficial = conn.execute(
+        f"SELECT ROUND(SUM(net_value),2) v FROM fact_vendor_summary "
+        f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores})",
+        (company_id, comp, *variantes)).fetchone()
+    oficial_valor = float(oficial["v"] or 0.0) if oficial else 0.0
+
     proprios = [i for i in itens if i["isOwn"]]
     fora = [i for i in itens if not i["isOwn"]]
     sem_dono = [i for i in fora if i["portfolioSeller"] == "Sem vendedor"]
@@ -17575,6 +17585,7 @@ def seller_month_clients(
         "sellerName": vendedor,
         "scope": escopo_lista,
         "items": itens,
+        "officialRevenue": round(oficial_valor, 2),
         "totals": {
             "clients": len(itens),
             "revenue": round(sum(i["revenue"] for i in itens), 2),
