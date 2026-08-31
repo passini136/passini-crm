@@ -3774,67 +3774,74 @@ def set_signature_version(conn: sqlite3.Connection, versao: int) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(versao),))
 
 
-def remove_repeticao_entre_importacoes(
-    conn: sqlite3.Connection, company_id: int, competence: str = "",
-    simular: bool = True,
-) -> dict[str, Any]:
-    """Remove a MESMA venda que entrou por importações diferentes.
+def backup_database(conn: sqlite3.Connection, motivo: str = "manutencao") -> Path | None:
+    """Copia o banco antes de qualquer operação que apague linha.
 
-    Vai além da assinatura exata: compara só vendedor, cliente, dia e valor
-    líquido. Existe porque dois relatórios do Alfa descrevem a mesma venda com
-    pequenas diferenças de conteúdo, e a comparação exata deixa passar.
+    Existe porque em 31/08/2026 uma limpeza mal calibrada apagou vendas de
+    verdade, e o backup só existia porque o comando digitado à mão por acaso o
+    incluía. Segurança que depende de alguém lembrar não é segurança.
 
-    Duas salvaguardas contra apagar venda de verdade:
+    Usa a API de backup do próprio SQLite, e NÃO uma cópia do arquivo: o banco
+    roda em modo WAL, então boa parte do que foi gravado ainda está no arquivo
+    de log quando a cópia acontece. Copiar só o .db devolve um backup sem as
+    últimas alterações — foi o que o teste pegou aqui.
 
-    - só considera repetição quando a linha aparece em importações DIFERENTES;
-      repetida dentro do mesmo arquivo é venda real (mesma peça, dois pedidos);
-    - mantém a quantidade que a maior importação sozinha trouxe. Se um arquivo
-      traz a mesma combinação três vezes, três ficam.
-
-    Mantém sempre as linhas da importação mais antiga, que é a que o resto do
-    sistema já referencia.
+    Guarda as 10 cópias mais recentes e descarta as antigas, para não encher o
+    disco: o banco passa de 400 MB.
     """
-    onde = "company_id = ?" + (" AND competence = ?" if competence else "")
-    params = [company_id] + ([competence] if competence else [])
+    try:
+        origem = Path(DB_PATH)
+        if not origem.exists():
+            return None
+        pasta = origem.parent / "backups"
+        pasta.mkdir(parents=True, exist_ok=True)
+        carimbo = datetime.now().strftime("%Y%m%d-%H%M%S")
+        destino = pasta / f"{carimbo}-{re.sub(r'[^a-z0-9]+', '-', motivo.lower())}.db"
+        with closing(sqlite3.connect(destino)) as copia:
+            conn.backup(copia)
+        antigos = sorted(pasta.glob("*.db"), key=lambda f: f.stat().st_mtime, reverse=True)
+        for velho in antigos[10:]:
+            try:
+                velho.unlink()
+            except OSError:
+                pass
+        print(f"[backup] cópia de segurança em {destino}", flush=True)
+        return destino
+    except Exception as exc:
+        # Backup que falha não pode impedir a operação de rodar — mas quem
+        # chamou precisa saber que está sem rede de proteção.
+        print(f"[backup] FALHOU: {exc}", flush=True)
+        return None
+
+
+def delete_import_rows(
+    conn: sqlite3.Connection, company_id: int, import_id: int, simular: bool = True,
+) -> dict[str, Any]:
+    """Remove tudo que UMA importação trouxe.
+
+    É o caminho seguro para desfazer um arquivo que não devia ter entrado: um
+    relatório na pasta errada, ou uma reimportação manual por cima do que já
+    estava lá. Diferente de procurar linha repetida por semelhança, aqui não há
+    palpite — cada linha sabe de qual importação veio.
+    """
     linhas = conn.execute(
-        f"SELECT id, competence, import_id, seller_name, client_name, issue_date, net_value "
-        f"FROM fact_sales_detail WHERE {onde} ORDER BY id", params).fetchall()
-
-    grupos: dict[tuple[Any, ...], list[sqlite3.Row]] = defaultdict(list)
-    for r in linhas:
-        grupos[(
-            r["competence"],
-            normalize_whitespace(r["seller_name"]),
-            normalize_client_key(r["client_name"]),
-            normalize_whitespace(r["issue_date"])[:10],
-            round(float(r["net_value"] or 0), 2),
-        )].append(r)
-
-    remover: list[int] = []
-    valor = 0.0
-    for grupo in grupos.values():
-        if len(grupo) < 2:
-            continue
-        por_import = Counter(g["import_id"] for g in grupo)
-        if len(por_import) < 2:
-            continue
-        verdadeiro = max(por_import.values())
-        escolhido = min((i for i, q in por_import.items() if q == verdadeiro),
-                        key=lambda x: (x is None, x))
-        mantidos = {g["id"] for g in grupo if g["import_id"] == escolhido}
-        mantidos = set(sorted(mantidos)[:verdadeiro])
-        for g in grupo:
-            if g["id"] not in mantidos:
-                remover.append(g["id"])
-                valor += float(g["net_value"] or 0)
-
-    if not simular and remover:
-        for i in range(0, len(remover), 500):
-            lote = remover[i:i + 500]
-            marcadores = ",".join("?" for _ in lote)
-            conn.execute(f"DELETE FROM fact_sales_detail WHERE id IN ({marcadores})", lote)
+        "SELECT competence, COUNT(*) n, ROUND(SUM(net_value),2) v "
+        "FROM fact_sales_detail WHERE company_id = ? AND import_id = ? "
+        "GROUP BY competence ORDER BY competence",
+        (company_id, import_id)).fetchall()
+    resumo = [{"competence": r["competence"], "rows": r["n"], "value": float(r["v"] or 0)}
+              for r in linhas]
+    total = sum(r["rows"] for r in resumo)
+    copia = None
+    if not simular and total:
+        copia = backup_database(conn, f"antes-de-remover-import-{import_id}")
+        conn.execute("DELETE FROM fact_sales_detail WHERE company_id = ? AND import_id = ?",
+                     (company_id, import_id))
         conn.commit()
-    return {"rows": len(remover), "value": round(valor, 2), "applied": not simular}
+    return {"importId": import_id, "rows": total,
+            "value": round(sum(r["value"] for r in resumo), 2),
+            "byCompetence": resumo, "applied": not simular,
+            "backup": str(copia) if copia else ""}
 
 
 def sales_detail_needs_rehash(conn: sqlite3.Connection) -> bool:
@@ -3918,6 +3925,7 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
     # Apaga ANTES de reescrever: o UNIQUE (empresa, competência, hash) não
     # aceitaria duas linhas com a mesma identidade convivendo nem por um instante.
     if remover:
+        backup_database(conn, "antes-da-migracao-de-identidade")
         for inicio in range(0, len(remover), 500):
             lote = remover[inicio:inicio + 500]
             marcadores = ",".join("?" for _ in lote)

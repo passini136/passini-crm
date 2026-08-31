@@ -192,15 +192,15 @@ else:
     print("   Nenhuma. Cada venda aparece em uma importação só.")
 
 # ── 7. Correção ──────────────────────────────────────────────────────────
-if corrigir and (excedente_linhas or pendente or repetido_linhas):
+if repetido_linhas:
+    print("\n   ATENÇÃO: esta contagem é só um INDÍCIO. A chave frouxa junta vendas")
+    print("   diferentes de mesmo valor para o mesmo cliente no mesmo dia, então")
+    print("   ela superestima. NÃO use como base para apagar — use limpar_import.py,")
+    print("   que remove uma importação inteira e identificada.")
+
+if corrigir and (excedente_linhas or pendente):
     print("\n7) CORRIGINDO")
-    removidas = backend.rehash_sales_detail(conn) if (excedente_linhas or pendente) else 0
-    # A repetição por chave frouxa é removida em TODAS as competências: o
-    # problema não é só do mês consultado.
-    solto = backend.remove_repeticao_entre_importacoes(conn, company_id, simular=False)
-    if solto["rows"]:
-        print(f"   {solto['rows']} linha(s) repetida(s) entre importações removida(s), "
-              f"somando {money(solto['value'])}")
+    removidas = backend.rehash_sales_detail(conn)
     novo = conn.execute(
         "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_sales_detail "
         "WHERE company_id = ? AND competence = ? AND brand_name = ?",
