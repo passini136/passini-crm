@@ -4531,6 +4531,51 @@ def import_package(
         )
 
         if kind == "faturamento_detalhado":
+            # ── Trava contra dobrar o mês ao reimportar com marca ─────────────
+            #
+            # A marca faz parte da identidade da linha. Linha antiga sem marca e
+            # a mesma linha com marca são vendas DIFERENTES para o dedupe, então
+            # subir o relatório completo por cima de um mês sem marca não
+            # preenche nada: insere tudo de novo e o mês dobra. Medido: 30.139
+            # linhas viraram 60.270 e R$ 5,1 milhões viraram R$ 10,2 milhões,
+            # com apenas 8 linhas reconhecidas como repetidas.
+            #
+            # E "substituir" não protege: o faturamento detalhado é sempre
+            # acrescentar, porque cada linha é um fato próprio e o histórico só
+            # cresce. Quem quer refazer um mês precisa zerá-lo antes.
+            _entrando: Counter = Counter()
+            _entrando_com_marca: Counter = Counter()
+            for row in rows:
+                _c = competence_from_date(parse_sales_row_date(row)) or competence
+                _entrando[_c] += 1
+                if normalize_upper(row.get("Marca")):
+                    _entrando_com_marca[_c] += 1
+            _travados = []
+            for _c, _n in _entrando.items():
+                _ex = conn.execute(
+                    "SELECT COUNT(*) n, SUM(CASE WHEN TRIM(COALESCE(brand_name,'')) <> '' "
+                    "THEN 1 ELSE 0 END) cm FROM fact_sales_detail "
+                    "WHERE company_id = ? AND competence = ?", (company_id, _c)).fetchone()
+                _existentes = int(_ex["n"] or 0)
+                # Só vale para reimportação de mês inteiro: poucas linhas de uma
+                # competência antiga são venda retroativa legítima, não refação.
+                if not _existentes or _n < 500 or _n < _existentes * 0.5:
+                    continue
+                _marca_base = 100.0 * (_ex["cm"] or 0) / _existentes
+                _marca_arq = 100.0 * _entrando_com_marca[_c] / _n
+                if _marca_base < 50 <= _marca_arq:
+                    _travados.append((_c, _existentes, _n))
+            if _travados:
+                _det = "; ".join(
+                    f"{c}: a base tem {ex} linha(s) sem marca e o arquivo traz {n}"
+                    for c, ex, n in sorted(_travados))
+                raise ValueError(
+                    "Importação bloqueada para não dobrar o faturamento. " + _det + ". "
+                    "A marca faz parte da identidade da linha, então estas linhas "
+                    "entrariam como vendas novas em vez de completar as existentes. "
+                    "Zere o mês antes de importar: no servidor, "
+                    "limpar_import.py --zerar-mes " + sorted(_travados)[0][0] + " --aplicar")
+
             # Duas vendas idênticas no mesmo dia são possíveis (mesma peça, mesmo
             # cliente, dois atendimentos). O contador de ocorrência evita descartar
             # a segunda como duplicata, mantendo o dedupe de reimportação.
