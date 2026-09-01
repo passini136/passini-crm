@@ -255,6 +255,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
     {"id": "unidades",       "label": "Unidades",           "group": "Resultados"},
     {"id": "marcas",         "label": "Vendas por Marca",   "group": "Resultados"},
+    {"id": "devolucoes",     "label": "Devoluções",         "group": "Resultados"},
     {"id": "clientes",       "label": "Clientes",           "group": "Resultados"},
     {"id": "cidades",        "label": "Cidades",            "group": "Resultados"},
     {"id": "descontos",      "label": "Descontos",          "group": "Resultados"},
@@ -303,7 +304,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback",
-            "executivo", "vendedores", "unidades", "marcas", "clientes", "cidades", "descontos", "calendario",
+            "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
         "can_manage_users": 0,
@@ -312,7 +313,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Analista",
         "description": "Consulta de resultados e apoio a importações.",
         "modules": [
-            "crm-clientes", "executivo", "vendedores", "unidades", "marcas", "clientes",
+            "crm-clientes", "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes",
             "cidades", "descontos", "calendario", "importacoes",
         ],
         "data_scope": "todos",
@@ -326,7 +327,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
             "meu-placar", "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
-            "executivo", "marcas", "calendario",
+            "executivo", "marcas", "devolucoes", "calendario",
         ],
         "data_scope": "proprio",
         "can_manage_users": 0,
@@ -10962,6 +10963,76 @@ def brand_seller_options(
     return nomes
 
 
+RETURN_DIMENSIONS = [
+    {"id": "motivo",   "label": "Motivo"},
+    {"id": "vendedor", "label": "Vendedor"},
+    {"id": "unidade",  "label": "Unidade"},
+    {"id": "marca",    "label": "Marca"},
+    {"id": "cliente",  "label": "Cliente"},
+    {"id": "item",     "label": "Item"},
+]
+RETURN_DIMENSION_COLUMNS = {
+    "motivo":   "reason",
+    "vendedor": "seller_name",
+    "unidade":  "unit_name",
+    "marca":    "brand_name",
+    "cliente":  "client_name",
+    "item":     "item_description",
+}
+
+
+def return_rows_by_dimension(
+    conn: sqlite3.Connection, company_id: int, competence: str,
+    dimension: str, sellers: list[str] | None = None, units: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Devoluções agrupadas por uma dimensão, no recorte pedido.
+
+    Sempre separa garantia de comercial dentro do mesmo grupo: uma marca pode
+    ter muita devolução por defeito e nenhuma por erro de venda, e as duas
+    coisas pedem providências diferentes — uma é conversa com o fornecedor, a
+    outra é conversa com o vendedor.
+    """
+    coluna = RETURN_DIMENSION_COLUMNS.get(dimension, "reason")
+    condicoes = ["company_id = ?", "competence = ?"]
+    params: list[Any] = [company_id, competence]
+    if sellers is not None:
+        if not sellers:
+            return []
+        condicoes.append(f"seller_name IN ({', '.join('?' for _ in sellers)})")
+        params.extend(sellers)
+    if units is not None:
+        if not units:
+            return []
+        condicoes.append(f"unit_name IN ({', '.join('?' for _ in units)})")
+        params.extend(units)
+    linhas = conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM({coluna}), ''), 'NÃO INFORMADO') AS nome,
+               COUNT(*) AS linhas,
+               COALESCE(SUM(quantity), 0) AS itens,
+               COALESCE(SUM(total_value), 0) AS valor,
+               COALESCE(SUM(CASE WHEN reason = ? THEN total_value ELSE 0 END), 0) AS garantia,
+               COUNT(DISTINCT return_number) AS notas
+        FROM fact_warranty_returns
+        WHERE {' AND '.join(condicoes)}
+        GROUP BY nome ORDER BY valor DESC
+        """,
+        [RETURN_REASON_WARRANTY, *params],
+    ).fetchall()
+    return [
+        {
+            "name": normalize_upper(r["nome"]),
+            "rows": int(r["linhas"] or 0),
+            "items": round(float(r["itens"] or 0), 0),
+            "returns": int(r["notas"] or 0),
+            "value": round(float(r["valor"] or 0), 2),
+            "warrantyValue": round(float(r["garantia"] or 0), 2),
+            "commercialValue": round(float(r["valor"] or 0) - float(r["garantia"] or 0), 2),
+        }
+        for r in linhas
+    ]
+
+
 def brand_sales_report(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     competence: str = "", scope: str = "", unit: str = "", seller: str = "",
@@ -11130,6 +11201,177 @@ def brand_sales_report(
                                    minha_unidade, eu, escopo_dados, permitidas, dim),
         "needsReimport": not linhas and brand_has_no_column(conn, company_id, comp),
     }
+
+
+def returns_report(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    competence: str = "", scope: str = "", dimension: str = "",
+) -> dict[str, Any]:
+    """Devoluções do mês: quanto, de quê e de quem.
+
+    O valor que manda no resultado continua sendo o do custo x venda. Esta tela
+    não recalcula faturamento — ela explica a devolução, que é o que dá para
+    corrigir. Devolução comercial é sintoma de venda mal feita; garantia é
+    defeito de peça e assunto com o fornecedor.
+    """
+    comp = valid_competence(competence) or crm_latest_competence(conn, company_id)
+    if not comp:
+        return {"competence": "", "rows": [], "scopes": [], "insights": [], "totals": {},
+                "empty": "Ainda não há competência importada."}
+    anterior = shift_competence(comp, -1)
+    dim = dimension if dimension in {d["id"] for d in RETURN_DIMENSIONS} else "motivo"
+
+    escopo_dados = data_scope_for_user(conn, user)
+    permitidas = crm_allowed_units_for_user(conn, user)
+    eu = seller_identity_for_user(user)
+
+    # Só o vendedor tem recorte para escolher: o dele ou o do grupo. Para gestor
+    # não existe aba de escopo — "por vendedor" já é uma das dimensões, e ter as
+    # duas coisas fazendo o mesmo só dá dúvida sobre qual usar.
+    if escopo_dados == "proprio":
+        escopos = [{"id": "vendedor", "label": "Minhas devoluções"},
+                   {"id": "grupo", "label": "Grupo"}]
+        padrao = "vendedor"
+    else:
+        escopos = []
+        padrao = "grupo"
+    atual = scope if scope in {e["id"] for e in escopos} else padrao
+
+    # Recorte de dados. Vendedor vê o dele; gerente vê as unidades dele; a
+    # diretoria vê tudo. O recorte vale para os dois meses comparados.
+    sellers = None
+    units = None
+    if atual == "vendedor":
+        # O mesmo helper do ranking de marcas: o nome do vendedor aparece com
+        # variações no Alfa (com e sem "(VENDAS)", com e sem acento), e resolver
+        # isso à mão aqui seria repetir uma regra que já tem dono.
+        sellers = seller_name_variants(conn, company_id, eu) if eu else []
+    elif permitidas is not None:
+        units = list(permitidas)
+
+    linhas = return_rows_by_dimension(conn, company_id, comp, dim, sellers, units)
+    antes = {r["name"]: r for r in
+             return_rows_by_dimension(conn, company_id, anterior, dim, sellers, units)}
+    total = sum(r["value"] for r in linhas)
+    for r in linhas:
+        r["sharePct"] = round(100 * r["value"] / total, 1) if total else 0.0
+        _ant = antes.get(r["name"])
+        r["prevValue"] = _ant["value"] if _ant else 0.0
+        r["deltaValue"] = round(r["value"] - r["prevValue"], 2)
+        r["deltaPct"] = (round(100 * (r["value"] / r["prevValue"] - 1), 1)
+                         if r["prevValue"] else None)
+        r["kind"] = ("garantia" if r["warrantyValue"] and not r["commercialValue"]
+                     else "comercial" if not r["warrantyValue"] else "misto")
+
+    garantia = sum(r["warrantyValue"] for r in linhas)
+    # Faturamento do mesmo recorte, para dizer quanto a devolução pesa. Sem essa
+    # referência R$ 200 mil não significa nada — pode ser muito ou pouco.
+    _fat_cond = ["company_id = ?", "competence = ?"]
+    _fat_params: list[Any] = [company_id, comp]
+    if units is not None:
+        if units:
+            _fat_cond.append(f"unit_name IN ({', '.join('?' for _ in units)})")
+            _fat_params.extend(units)
+    faturamento = float(conn.execute(
+        f"SELECT COALESCE(SUM(sale_value), 0) v FROM fact_unit_summary "
+        f"WHERE {' AND '.join(_fat_cond)}", _fat_params).fetchone()["v"] or 0.0)
+    if sellers is not None:
+        faturamento = float(conn.execute(
+            f"SELECT COALESCE(SUM(sale_value), 0) v FROM fact_vendor_summary "
+            f"WHERE company_id = ? AND competence = ? "
+            f"AND seller_name IN ({', '.join('?' for _ in sellers)})",
+            (company_id, comp, *sellers)).fetchone()["v"] or 0.0)
+    total_anterior = sum(r["value"] for r in antes.values())
+
+    return {
+        "competence": comp,
+        "prevCompetence": anterior,
+        "dimension": dim,
+        "dimensions": RETURN_DIMENSIONS,
+        "scope": atual,
+        "scopes": escopos,
+        "rows": linhas,
+        "totals": {
+            "value": round(total, 2),
+            "warrantyValue": round(garantia, 2),
+            "commercialValue": round(total - garantia, 2),
+            "prevValue": round(total_anterior, 2),
+            "deltaPct": (round(100 * (total / total_anterior - 1), 1)
+                         if total_anterior else None),
+            "revenue": round(faturamento, 2),
+            "ratioPct": round(100 * total / faturamento, 2) if faturamento else 0.0,
+        },
+        "insights": returns_insights(linhas, total, garantia, faturamento,
+                                     total_anterior, dim, atual),
+        "empty": ("Nenhuma devolução importada para este mês. O relatório de devoluções "
+                  "do Alfa entra em Importações → Devoluções." if not linhas else ""),
+    }
+
+
+def returns_insights(
+    linhas: list[dict[str, Any]], total: float, garantia: float, faturamento: float,
+    total_anterior: float, dimensao: str, escopo: str,
+) -> list[dict[str, Any]]:
+    """Leitura do mês em frases. Só entra o que sugere uma ação."""
+    saida: list[dict[str, Any]] = []
+    if not linhas:
+        return saida
+    comercial = total - garantia
+    rotulo = {"motivo": "motivo", "vendedor": "vendedor", "unidade": "unidade",
+              "marca": "marca", "cliente": "cliente", "item": "item"}.get(dimensao, dimensao)
+
+    if faturamento:
+        peso = 100 * total / faturamento
+        saida.append({
+            "tone": "alerta" if peso >= 5 else "info",
+            "title": f"Devolução representa {peso:.1f}% do faturamento",
+            "text": (f"{brl(total)} devolvidos sobre {brl(faturamento)} vendidos. "
+                     f"Desses, {brl(comercial)} são comerciais — os que dependem da venda."),
+        })
+    if total_anterior:
+        variacao = 100 * (total / total_anterior - 1)
+        if abs(variacao) >= 15:
+            saida.append({
+                "tone": "alerta" if variacao > 0 else "bom",
+                "title": ("Devolução subiu" if variacao > 0 else "Devolução caiu")
+                         + f" {abs(variacao):.0f}% no mês",
+                "text": f"De {brl(total_anterior)} no mês anterior para {brl(total)}.",
+            })
+    # Concentração: quando poucos respondem por muito, a conversa é curta e tem
+    # endereço. Espalhado, o problema é de processo e não de pessoa.
+    # Concentração só diz algo quando há muitos nomes disputando. Entre quatro
+    # motivos, "os três maiores somam 100%" é aritmética, não informação — e a
+    # lista de motivos é curta por natureza.
+    comerciais = [r for r in linhas if r["commercialValue"] > 0]
+    if dimensao != "motivo" and len(comerciais) >= 6 and comercial:
+        topo = comerciais[:3]
+        fatia = 100 * sum(r["commercialValue"] for r in topo) / comercial
+        if fatia >= 50:
+            nomes = ", ".join(r["name"].title() for r in topo)
+            saida.append({
+                "tone": "alerta",
+                "title": (f"3 {rotulo}s de {len(comerciais)} concentram "
+                          f"{fatia:.0f}% da devolução comercial"),
+                "text": f"{nomes}. É por aí que a conversa começa.",
+            })
+    if garantia and total:
+        saida.append({
+            "tone": "info",
+            "title": f"Garantia é {100 * garantia / total:.0f}% da devolução",
+            "text": (f"{brl(garantia)} de defeito de peça — assunto com o fornecedor, "
+                     f"não com o vendedor. Não desconta do resultado comercial."),
+        })
+    piorou = sorted([r for r in linhas if r["prevValue"] and r["deltaValue"] > 0],
+                    key=lambda r: -r["deltaValue"])[:1]
+    if piorou:
+        r = piorou[0]
+        saida.append({
+            "tone": "alerta",
+            "title": f"{r['name'].title()} foi quem mais cresceu em devolução",
+            "text": (f"De {brl(r['prevValue'])} para {brl(r['value'])}, "
+                     f"{brl(r['deltaValue'])} a mais que no mês passado."),
+        })
+    return saida
 
 
 def brand_insights(
@@ -19824,6 +20066,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         scope=q.get("scope", [""])[0],
                         unit=q.get("unit", [""])[0],
                         seller=q.get("seller", [""])[0],
+                        dimension=q.get("dimension", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
+                return
+            if path == "/api/returns":
+                user = self._require_auth()
+                if not user:
+                    return
+                q = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    res = returns_report(
+                        conn, user["company_id"], user,
+                        competence=q.get("competence", [""])[0],
+                        scope=q.get("scope", [""])[0],
                         dimension=q.get("dimension", [""])[0])
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))

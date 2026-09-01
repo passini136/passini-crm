@@ -34,6 +34,9 @@ const state = {
   prospectFilters: { status: "", search: "", seller: "" },
   brands: null,
   brandFilters: { scope: "", dimension: "" },
+  returns: null,
+  returnFilters: { scope: "", dimension: "" },
+  returnLoadingScope: null,
   prospectCadastro: null,  // dados prontos para pedir cadastro no WhatsApp
   sellerClients: null,     // relatório de clientes faturados por um vendedor
   brandOpen: {},   // marcas com o detalhe aberto
@@ -83,6 +86,7 @@ const state = {
       inactives: false,
       leads: false,
       brands: false,
+      returns: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
@@ -2826,6 +2830,201 @@ function blocoDimensaoMarca(d) {
     </div>`;
 }
 
+let returnsRequestSeq = 0;
+
+async function loadReturns(silencioso) {
+  const f = state.returnFilters;
+  const q = new URLSearchParams();
+  const mes = state.filters.competenceEnd || state.filters.competenceStart;
+  if (mes) q.set("competence", mes);
+  if (f.scope) q.set("scope", f.scope);
+  if (f.dimension) q.set("dimension", f.dimension);
+  const meuPedido = ++returnsRequestSeq;
+  if (!silencioso) {
+    state.ui.loading.returns = true;
+    requestRender();
+  }
+  let resposta;
+  try {
+    resposta = await api(`/api/returns?${q.toString()}`);
+  } catch (e) {
+    resposta = { error: e.message, rows: [], scopes: [], insights: [], totals: {} };
+  }
+  // Resposta atrasada de uma troca de aba anterior: descartar, senão a tela
+  // volta sozinha para o recorte que o usuário já abandonou.
+  if (meuPedido !== returnsRequestSeq) return state.returns;
+  state.returns = resposta;
+  state.returnLoadingScope = null;
+  state.ui.loading.returns = false;
+  requestRender();
+  return resposta;
+}
+
+function setReturnScope(id) {
+  if (state.returnFilters.scope === id) return;
+  state.returnFilters.scope = id;
+  state.returnLoadingScope = id;
+  requestRender();
+  loadReturns(true);
+}
+
+function setReturnDimension(id) {
+  if (state.returnFilters.dimension === id) return;
+  state.returnFilters.dimension = id;
+  state.returns = null;
+  requestRender();
+  loadReturns();
+}
+
+function devolucoesView() {
+  if (!state.returns) {
+    if (!state.ui.loading.returns) loadReturns();
+    return `<div class="loader panel">Carregando devoluções…</div>`;
+  }
+  const d = state.returns;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+
+  const t = d.totals || {};
+  const linhas = d.rows || [];
+  const trocando = state.returnLoadingScope;
+  const escopoAtual = trocando || d.scope;
+  const rotuloDim = (d.dimensions || []).find((x) => x.id === d.dimension)?.label || "Motivo";
+
+  const seta = (v) => v === null || v === undefined ? "" :
+    `<span style="color:${v >= 0 ? "var(--bad)" : "var(--good)"};font-weight:700">
+       ${v >= 0 ? "▲" : "▼"} ${Math.abs(v).toFixed(0)}%</span>`;
+
+  const kpi = (rotulo, valor, sub, cor) => `
+    <div style="flex:1;min-width:130px;background:#fff;border:1px solid var(--line);
+                border-radius:10px;padding:10px 12px${cor ? `;border-left:4px solid ${cor}` : ""}">
+      <div class="text-small" style="color:var(--muted)">${rotulo}</div>
+      <div style="font-size:20px;font-weight:800">${valor}</div>
+      ${sub ? `<div class="text-small" style="color:var(--muted)">${sub}</div>` : ""}
+    </div>`;
+
+  const seletorDimensao = `
+    <div style="display:flex;gap:6px;flex-wrap:wrap">
+      ${(d.dimensions || []).map((x) => `
+        <button type="button" onclick="setReturnDimension('${x.id}')"
+          style="border:1px solid ${d.dimension === x.id ? "var(--accent)" : "var(--line)"};
+                 background:${d.dimension === x.id ? "#e8f0fe" : "#fff"};
+                 color:${d.dimension === x.id ? "var(--accent)" : "var(--muted)"};
+                 border-radius:14px;padding:5px 14px;font-size:13px;
+                 font-weight:${d.dimension === x.id ? "700" : "500"};cursor:pointer">
+          ${escapeHtml(x.label)}
+        </button>`).join("")}
+    </div>`;
+
+  if (d.empty) {
+    return `
+      <div class="stack">
+        <div class="panel" style="padding:18px;border-left:4px solid #f4c25f">
+          <div style="font-weight:800;font-size:15px">Sem devoluções neste mês</div>
+          <div class="text-small" style="margin-top:6px;line-height:1.6">${escapeHtml(d.empty)}</div>
+        </div>
+      </div>`;
+  }
+
+  return `
+    <div class="stack">
+      <div class="panel" style="padding:14px 18px">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            ${(d.scopes || []).map((s) => `
+              <button type="button" onclick="setReturnScope('${s.id}')" ${trocando ? "disabled" : ""}
+                style="border:1px solid ${escopoAtual === s.id ? "var(--accent)" : "var(--line)"};
+                       background:${escopoAtual === s.id ? "#e8f0fe" : "#fff"};
+                       color:${escopoAtual === s.id ? "var(--accent)" : "var(--muted)"};
+                       border-radius:14px;padding:5px 14px;font-size:13px;
+                       font-weight:${escopoAtual === s.id ? "700" : "500"};
+                       cursor:${trocando ? "wait" : "pointer"};opacity:${trocando && escopoAtual !== s.id ? "0.5" : "1"}">
+                ${trocando === s.id ? `<span class="girando">↻</span> Carregando…` : escapeHtml(s.label)}
+              </button>`).join("")}
+          </div>
+          <span style="flex:1"></span>
+          ${botaoAtualizar("returns", "loadReturns()", { mensagem: "Devoluções atualizadas." })}
+        </div>
+        <div style="margin-top:10px">${seletorDimensao}</div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.5">
+          Competência ${escapeHtml(d.competence || "—")} · comparado com ${escapeHtml(d.prevCompetence || "—")} ·
+          a devolução entra no mês em que <strong>deu entrada</strong>, não no mês da nota de venda.
+          Estes números são informativos: meta e comissão saem do relatório de custo × venda.
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        ${kpi("Total devolvido", currency(t.value),
+              t.deltaPct !== null && t.deltaPct !== undefined
+                ? `${seta(t.deltaPct)} vs mês anterior` : "sem base de comparação")}
+        ${kpi("Comercial", currency(t.commercialValue),
+              "desistência, erro de venda e separação", "var(--accent)")}
+        ${kpi("Garantia", currency(t.warrantyValue),
+              "defeito de peça — assunto do fornecedor", "#e67e22")}
+        ${kpi("% do faturamento", `${(t.ratioPct || 0).toFixed(2)}%`,
+              `sobre ${currency(t.revenue || 0)}`)}
+      </div>
+
+      ${(d.insights || []).length ? `
+        <div class="panel" style="padding:14px 18px">
+          <div style="font-weight:800;font-size:14px;margin-bottom:8px">💡 Leituras do mês</div>
+          <div class="stack" style="gap:8px">
+            ${d.insights.map((i) => `
+              <div style="display:flex;gap:10px;align-items:start;padding:9px 11px;border-radius:8px;
+                          background:${i.tone === "alerta" ? "#fef7e0" : i.tone === "bom" ? "#e6f4ea" : "#e8f0fe"}">
+                <div style="font-size:16px;line-height:1.2">${
+                  i.tone === "alerta" ? "⚠️" : i.tone === "bom" ? "✅" : "ℹ️"}</div>
+                <div>
+                  <div style="font-weight:700;font-size:13px">${escapeHtml(i.title)}</div>
+                  <div class="text-small" style="line-height:1.5">${escapeHtml(i.text)}</div>
+                </div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+
+      <div class="panel">
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>${escapeHtml(rotuloDim)}</th>
+                <th style="text-align:right">Devoluções</th>
+                <th style="text-align:right">Itens</th>
+                <th style="text-align:right">Comercial</th>
+                <th style="text-align:right">Garantia</th>
+                <th style="text-align:right">Total</th>
+                <th style="text-align:right">% do mês</th>
+                <th style="text-align:right">vs mês anterior</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${linhas.map((r) => `
+                <tr>
+                  <td>
+                    <strong>${escapeHtml(r.name)}</strong>
+                    ${r.kind === "garantia"
+                      ? `<span class="text-small" style="color:#e67e22"> · só garantia</span>` : ""}
+                  </td>
+                  <td style="text-align:right">${number(r.returns)}</td>
+                  <td style="text-align:right">${number(r.items)}</td>
+                  <td style="text-align:right">${currency(r.commercialValue)}</td>
+                  <td style="text-align:right;color:${r.warrantyValue ? "#e67e22" : "var(--muted)"}">
+                    ${currency(r.warrantyValue)}</td>
+                  <td style="text-align:right;font-weight:700">${currency(r.value)}</td>
+                  <td style="text-align:right">${(r.sharePct || 0).toFixed(1)}%</td>
+                  <td style="text-align:right">
+                    ${r.prevValue
+                      ? `${seta(r.deltaPct)} <span class="text-small" style="color:var(--muted)">${
+                          currency(r.prevValue)}</span>`
+                      : `<span class="text-small" style="color:var(--muted)">novo</span>`}
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
 function marcasView() {
   if (!state.brands) {
     // Guarda contra disparar uma carga nova a cada repintura enquanto a
@@ -4723,6 +4922,9 @@ async function refreshCurrentTab() {
   if (tab === "marcas") {
     promises.push(loadBrands(true));
   }
+  if (tab === "devolucoes") {
+    promises.push(loadReturns(true));
+  }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
   }
@@ -5916,6 +6118,7 @@ async function applyMainFilters() {
     // Marcas lê a mesma competência do topo: sem isto, trocar o mês mudaria
     // todos os números da tela menos o ranking de marcas.
     if (state.activeTab === "marcas") await loadBrands(true);
+    if (state.activeTab === "devolucoes") await loadReturns(true);
   } finally {
     setLoading("filters", false);
   }
@@ -14513,6 +14716,7 @@ function topbarTitle() {
     "vendedores":     { title: "Análise de Vendedores",   description: "Ranking, score e desempenho individual de vendedores." },
     "unidades":       { title: "Análise de Unidades",     description: "Comparativo de desempenho entre unidades." },
     "marcas":         { title: "Vendas por Marca",        description: "Ranking de marcas por itens, códigos e valor, com leitura do mês." },
+    "devolucoes":     { title: "Devoluções",              description: "Devolução comercial e de garantia por motivo, vendedor, marca e cliente." },
     "clientes":       { title: "Base de Clientes",        description: "Carteira ativa, inativos e métricas por cliente." },
     "cidades":        { title: "Cobertura Geográfica",    description: "Distribuição de vendas e clientes por cidade." },
     "descontos":      { title: "Política de Descontos",   description: "Análise de desconto médio por vendedor." },
@@ -14900,6 +15104,7 @@ function dashboardView() {
     { id: "vendedores", title: "Vendedores", desc: "Ranking e score",           icon: "👤" },
     { id: "unidades",   title: "Unidades",   desc: "Comparativo",               icon: "🏢" },
     { id: "marcas",     title: "Marcas",     desc: "Ranking por marca",         icon: "🏷️" },
+    { id: "devolucoes", title: "Devoluções", desc: "Comercial x garantia",      icon: "↩️" },
   ].filter((t) => allowed.includes(t.id));
 
   // Consultas ocasionais recolhidas: no mesmo nível do Executivo elas puxavam
@@ -15029,6 +15234,7 @@ function dashboardView() {
           ${state.activeTab === "vendedores"    ? vendedoresView()     : ""}
           ${state.activeTab === "unidades"      ? unitsView()          : ""}
           ${state.activeTab === "marcas"        ? marcasView()         : ""}
+          ${state.activeTab === "devolucoes"    ? devolucoesView()     : ""}
           ${state.activeTab === "clientes"      ? clientesView()       : ""}
           ${state.activeTab === "cidades"       ? cidadesView()        : ""}
           ${state.activeTab === "descontos"     ? descontosView()      : ""}
