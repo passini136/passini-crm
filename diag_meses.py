@@ -122,12 +122,17 @@ for m in meses:
         "CON": consolidado.get(m, 0) > 0,
         "DEV": devolucoes.get(m, 0) > 0,
     }
-    if not so_devolucao and linhas:
+    # Mês com resumo mas SEM detalhado é o caso mais grave: foi zerado e não
+    # reimportado. Antes eu só olhava meses com linha, então exatamente esse
+    # ficava de fora do checklist — o buraco não aparecia em lugar nenhum.
+    tem_alguma_fonte = any(tem.values())
+    if tem_alguma_fonte and not so_devolucao:
         faltando = [k for k, v in tem.items() if not v]
-        if pct_marca < 50:
-            faltando.append("MARCA")
-        if dif is not None and dif > 15:
-            faltando.append("INFLADO")
+        if tem["DET"]:
+            if pct_marca < 50:
+                faltando.append("MARCA")
+            if dif is not None and dif > 15:
+                faltando.append("INFLADO")
         if faltando:
             pendencias[m] = faltando
         else:
@@ -151,12 +156,22 @@ if pendencias:
         # inflado, o detalhado precisa ser zerado antes. Se falta só uma fonte,
         # é importar por cima, sem apagar nada.
         precisa_zerar = "MARCA" in falta or "INFLADO" in falta
-        rotulo = "REFAZER" if precisa_zerar else "completar"
+        sem_detalhado = "DET" in falta
+        rotulo = ("URGENTE" if sem_detalhado
+                  else "REFAZER" if precisa_zerar else "completar")
         legiveis = {"DET": "faturamento detalhado", "CST": "custo x venda",
                     "CON": "consolidado por cliente", "DEV": "devoluções",
                     "MARCA": "marca", "INFLADO": "valor inflado"}
         print(f"\n   {m}  {rotulo}: falta {', '.join(legiveis.get(f, f) for f in falta)}")
-        if precisa_zerar:
+        if sem_detalhado:
+            # O mês foi zerado e não reimportado: não há venda por cliente, por
+            # marca nem por item. Só importar resolve, e não precisa zerar nada
+            # porque já está vazio.
+            print("      O mês está SEM venda detalhada — provavelmente zerado e "
+                  "não reimportado.")
+            print("      Importe o FAT DETALHADO do mês pelo CRM. Não precisa zerar: "
+                  "já está vazio.")
+        elif precisa_zerar:
             print(f"      limpar_import.py --zerar-mes {m} --aplicar")
             print(f"      e importar: FAT DETALHADO do mês, depois o que mais faltar")
         else:
