@@ -112,11 +112,14 @@ if manter:
 
 if not ids:
     print("Informe o número da importação. As do faturamento detalhado:\n")
-    print(f"   {'IMPORT':<8}{'QUANDO':<22}{'LINHAS':>9}{'VALOR':>20}{'POR LINHA':>12}")
+    print(f"   {'IMPORT':<8}{'QUANDO':<22}{'LINHAS':>9}{'VALOR':>20}{'POR LINHA':>12}"
+          f"   MESES QUE ALIMENTA")
     for r in conn.execute(
         """
         SELECT d.import_id, MAX(i.imported_at) quando, COUNT(*) n,
-               ROUND(SUM(d.net_value), 2) v
+               ROUND(SUM(d.net_value), 2) v,
+               COUNT(DISTINCT d.competence) meses,
+               MIN(d.competence) primeiro, MAX(d.competence) ultimo
         FROM fact_sales_detail d LEFT JOIN imports i ON i.id = d.import_id
         WHERE d.company_id = ? GROUP BY d.import_id ORDER BY quando DESC LIMIT 40
         """, (company_id,)).fetchall():
@@ -124,8 +127,14 @@ if not ids:
         # O valor por linha denuncia o arquivo errado: os diários ficam todos na
         # mesma faixa e o consolidado por cliente destoa em várias vezes.
         marca = "  <<< destoa" if por_linha > 400 else ""
+        # Sem os meses a lista engana: uma carga histórica tem valor gigante por
+        # cobrir o ano inteiro, e um diário pode nem tocar no mês que se procura.
+        if r["meses"] == 1:
+            periodo = str(r["primeiro"])
+        else:
+            periodo = f"{r['primeiro']} a {r['ultimo']} ({r['meses']} meses)"
         print(f"   {str(r['import_id']):<8}{str(r['quando'])[:19]:<22}{r['n']:>9}"
-              f"{money(r['v'])}{por_linha:>12.2f}{marca}")
+              f"{money(r['v']):>20}{por_linha:>12.2f}   {periodo}{marca}")
     print("\nRode de novo passando o número, ex: limpar_import.py 88")
     conn.close()
     sys.exit(0)
