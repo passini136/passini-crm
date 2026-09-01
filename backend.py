@@ -10862,6 +10862,96 @@ def valid_competence(value: Any) -> str:
     return texto if re.fullmatch(r"\d{4}-\d{2}", texto or "") else ""
 
 
+OFFICIAL_SELLER_SUM_FIELDS = (
+    "net_value", "sale_value", "return_value", "return_cost",
+    "cost_value", "profit_value", "net_profit_value", "qty_sold",
+)
+
+
+def entries_for_person(mapa: dict[str, Any], nome: str) -> list[Any]:
+    """Valores de um dicionário indexado por nome, achando qualquer grafia.
+
+    Vários mapas do painel são indexados pelo nome como o Alfa escreve. A
+    consulta chega com o nome do usuário do CRM. Quando os dois divergem — e
+    divergem sempre que alguém muda de função — o `.get` devolve nada e a tela
+    mostra zero sem dar erro.
+
+    A ordem é proposital: nome idêntico, depois chave normalizada (ignora
+    acento, pontuação e o sufixo entre parênteses) e só então o nome curto.
+    """
+    if not nome:
+        return []
+    exata = mapa.get(normalize_whitespace(nome))
+    if exata is not None:
+        return [exata]
+    chave = person_key(nome)
+    if not chave:
+        return []
+    achadas = [v for k, v in mapa.items() if person_key(k) == chave]
+    if achadas:
+        return achadas
+    curta = short_person_key(nome)
+    if not curta:
+        return []
+    return [v for k, v in mapa.items() if short_person_key(k) == curta]
+
+
+def merge_seller_metrics(entradas: list[dict[str, Any]]) -> dict[str, Any]:
+    """Junta as métricas do detalhado quando o vendedor tem mais de uma grafia.
+
+    Número soma; conjunto de clientes e de SKU se une — contar duas vezes o
+    mesmo cliente inflaria o ticket e o mix. Texto fica o primeiro que existir.
+    """
+    if not entradas:
+        return {}
+    if len(entradas) == 1:
+        return entradas[0]
+    junto: dict[str, Any] = {}
+    for entrada in entradas:
+        for campo, valor in entrada.items():
+            atual = junto.get(campo)
+            if isinstance(valor, set):
+                junto[campo] = (atual or set()) | valor
+            elif isinstance(valor, (int, float)) and not isinstance(valor, bool):
+                junto[campo] = (atual or 0) + valor
+            elif atual in (None, "", 0):
+                junto[campo] = valor
+    return junto
+
+
+def official_row_for_seller(
+    por_vendedor: dict[str, Any], nome: str
+) -> dict[str, Any]:
+    """Linha oficial do vendedor, achada por qualquer grafia do nome dele.
+
+    O dicionário vem indexado pelo nome como o Alfa escreve — com "(VENDAS)" ou
+    "(TELEVENDAS)" — e a consulta chega com o nome do usuário do CRM, quase
+    sempre sem sufixo. Buscar pela chave crua devolvia nada, e o vendedor via a
+    Visão Executiva inteira zerada enquanto aparecia normalmente no ranking.
+
+    Quando a mesma pessoa tem mais de uma grafia no mês (mudou de função no meio
+    dele), as linhas são SOMADAS: são vendas dela nos dois papéis.
+    """
+    achadas = entries_for_person(por_vendedor, nome)
+    if not achadas:
+        return {}
+    if len(achadas) == 1:
+        return dict(achadas[0])
+    somada: dict[str, Any] = {}
+    for campo in OFFICIAL_SELLER_SUM_FIELDS:
+        somada[campo] = sum(float(linha[campo] or 0) if campo in linha.keys() else 0.0
+                            for linha in achadas)
+    # Margem é percentual: somar não faria sentido, então pondera pelo líquido.
+    liquido = somada.get("net_value") or 0.0
+    if liquido:
+        somada["margin_value"] = sum(
+            float(l["margin_value"] or 0) * float(l["net_value"] or 0)
+            for l in achadas if "margin_value" in l.keys()) / liquido
+    else:
+        somada["margin_value"] = 0.0
+    return somada
+
+
 def seller_filter_sql(
     conn: sqlite3.Connection, company_id: int, nome: str,
     coluna: str = "seller_name", maiusculas: bool = False,
@@ -14938,9 +15028,16 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
 
     use_detail_summary = bool(filters["city_name"])
     if filters["seller_name"] and not filters["city_name"]:
-        seller_metrics = detail_by_seller.get(filters["seller_name"], {})
-        official_seller = vendor_summary_by_seller.get(filters["seller_name"], {})
-        seller_goal = goal_by_seller.get(filters["seller_name"], {"revenueGoal": 0.0, "returnsGoal": 0.0})
+        # O detalhado já veio filtrado por TODAS as grafias deste vendedor, então
+        # o que estiver em detail_by_seller é dele — juntar tudo é o certo, e
+        # pegar uma chave só perderia a metade que veio com o outro sufixo.
+        seller_metrics = merge_seller_metrics(
+            entries_for_person(detail_by_seller, filters["seller_name"]))
+        official_seller = official_row_for_seller(vendor_summary_by_seller, filters["seller_name"])
+        _metas = entries_for_person(goal_by_seller, filters["seller_name"])
+        # Meta não é somada: é uma por pessoa por mês. Duas grafias com meta
+        # própria seriam cadastro duplicado, tratado na tela de metas.
+        seller_goal = _metas[0] if _metas else {"revenueGoal": 0.0, "returnsGoal": 0.0}
         summary_revenue = float(official_seller.get("net_value") or 0.0)
         summary_goal = float(seller_goal["revenueGoal"] or 0)
         summary_returns = float(official_seller.get("return_value") or 0.0)
@@ -15527,9 +15624,11 @@ def single_competence_summary(
     official_totals_unit = aggregate_official_summary_rows(unit_summary_rows)
 
     if scoped_filters["seller_name"] and not scoped_filters["city_name"]:
-        seller_metrics = detail_by_seller.get(scoped_filters["seller_name"], {})
-        official_seller = vendor_summary_by_seller.get(scoped_filters["seller_name"], {})
-        seller_goal = goal_by_seller.get(scoped_filters["seller_name"], {"revenueGoal": 0.0, "returnsGoal": 0.0})
+        seller_metrics = merge_seller_metrics(
+            entries_for_person(detail_by_seller, scoped_filters["seller_name"]))
+        official_seller = official_row_for_seller(vendor_summary_by_seller, scoped_filters["seller_name"])
+        _metas = entries_for_person(goal_by_seller, scoped_filters["seller_name"])
+        seller_goal = _metas[0] if _metas else {"revenueGoal": 0.0, "returnsGoal": 0.0}
         summary_revenue = float(official_seller.get("net_value") or 0.0)
         summary_goal = float(seller_goal["revenueGoal"] or 0)
         summary_returns = float(official_seller.get("return_value") or 0.0)
