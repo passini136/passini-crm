@@ -4236,6 +4236,13 @@ FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
     # Sem esta assinatura o arquivo dependia do nome exato, e um "(8)" no fim
     # bastava para ele entrar como tipo nenhum e a importação não gravar nada.
     ("devolucao_garantia", {"DEVOLUCAO", "MOTIVO", "EMISSAO", "TOTAL"}),
+    # Custo x venda: os dois relatórios só diferem na primeira coluna (EMPRESA
+    # ou VENDEDOR). Sem assinatura, eles não eram reconhecidos por conteúdo — e
+    # a trava de pasta, que só recusa o que consegue identificar, deixava passar.
+    # Um custo x venda na pasta do consolidado entrava COMO consolidado, e como
+    # consolidado substitui o mês, apagava o consolidado verdadeiro.
+    ("custo_unidade", {"EMPRESA", "QTD VENDIDA", "CUSTO", "VENDA"}),
+    ("custo_vendedor", {"VENDEDOR", "QTD VENDIDA", "CUSTO", "VENDA"}),
     ("posicao_estoque", {"BRANCHNAME", "ITEM", "ITEMNAME", "QUANTITY"}),
     ("cadastro_itens", {"CODIGO", "TIPO", "GRUPO ITEM", "SUB GRUPO ITEM", "MARCA"}),
     # O consolidado por cliente vem ANTES do detalhado e é reconhecido pelo
