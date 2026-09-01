@@ -6388,30 +6388,56 @@ def safe_feedback_indicators(
         }
 
 
+SELLER_NAME_SOURCES = (
+    ("fact_sales_detail", "seller_name"),
+    ("fact_vendor_summary", "seller_name"),
+    ("crm_client_summary", "seller_name"),
+    ("crm_interactions", "seller_name"),
+    ("crm_client_profiles", "internal_seller_name"),
+    ("fact_warranty_returns", "seller_name"),
+    ("people_records", "person_name"),
+)
+
+
 def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str) -> list[str]:
     """Todas as grafias do mesmo vendedor que existem nas tabelas.
 
-    O faturamento grava "THIELLY HENRIQUES ROCHA (VENDAS)", o CRM grava o nome
-    que está no cadastro do usuário, e o cadastro de pessoas pode ter uma
-    terceira variação. Contar ligações comparando uma grafia só devolvia zero.
-    A comparação usa person_key, que ignora acento, pontuação e o sufixo entre
-    parênteses — sem recorte curto, para não somar a atividade de outra pessoa.
+    O Alfa escreve "FULANO (VENDAS)" no faturamento, "FULANO (TELEVENDAS)"
+    depois que a pessoa muda de função, e o usuário do CRM foi cadastrado com o
+    nome sem sufixo nenhum. São a mesma pessoa, e comparar por nome exato faz o
+    vendedor abrir a tela e ver tudo zerado — sem erro, sem aviso, só vazio.
+
+    A comparação usa person_key, que ignora acento, pontuação e o que está entre
+    parênteses. Se nada casar assim, tenta o nome curto (nome + primeiro
+    sobrenome), que resolve "Marcelo Santos" no login contra "MARCELO DA CRUZ
+    SANTOS" no faturamento. O curto é FALLBACK de propósito: usado sempre, ele
+    juntaria dois "João Silva" diferentes.
     """
-    chaves = {person_key(n) for n in nomes if normalize_whitespace(n)}
+    informados = {normalize_whitespace(n) for n in nomes if normalize_whitespace(n)}
+    chaves = {person_key(n) for n in informados}
     chaves.discard("")
     if not chaves:
         return []
-    encontrados = {normalize_whitespace(n) for n in nomes if normalize_whitespace(n)}
-    for tabela in ("crm_interactions", "crm_client_summary", "fact_sales_detail"):
+
+    candidatos: list[str] = []
+    for tabela, coluna in SELLER_NAME_SOURCES:
         try:
             linhas = conn.execute(
-                f"SELECT DISTINCT seller_name FROM {tabela} WHERE company_id = ?", (company_id,)
-            ).fetchall()
+                f"SELECT DISTINCT {coluna} AS nome FROM {tabela} WHERE company_id = ?",
+                (company_id,)).fetchall()
         except sqlite3.OperationalError:
             continue
-        for r in linhas:
-            nome = normalize_whitespace(r["seller_name"])
-            if nome and person_key(nome) in chaves:
+        candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
+
+    encontrados = set(informados)
+    for nome in candidatos:
+        if nome and person_key(nome) in chaves:
+            encontrados.add(nome)
+    if encontrados == informados:
+        curtas = {short_person_key(n) for n in informados}
+        curtas.discard("")
+        for nome in candidatos:
+            if nome and short_person_key(nome) in curtas:
                 encontrados.add(nome)
     return sorted(encontrados)
 
@@ -7961,10 +7987,14 @@ def list_visits(
     params: list[Any] = [company_id]
     if data_scope_for_user(conn, user) == "proprio":
         # O vendedor vê as visitas dos clientes dele e aquelas em que participou.
-        sql += " AND (UPPER(seller_name) = ? OR client_key IN (SELECT client_code FROM crm_client_profiles "
-        sql += "     WHERE company_id = ? AND UPPER(TRIM(COALESCE(internal_seller_name,''))) = ?))"
-        eu = normalize_upper(seller_identity_for_user(user))
-        params.extend([eu, company_id, eu])
+        eu = seller_identity_for_user(user)
+        _cond_a, _p_a = seller_filter_sql(conn, company_id, eu, "UPPER(seller_name)", maiusculas=True)
+        _cond_b, _p_b = seller_filter_sql(
+            conn, company_id, eu,
+            "UPPER(TRIM(COALESCE(internal_seller_name,'')))", maiusculas=True)
+        sql += f" AND ({_cond_a} OR client_key IN (SELECT client_code FROM crm_client_profiles "
+        sql += f"     WHERE company_id = ? AND {_cond_b}))"
+        params.extend([*_p_a, company_id, *_p_b])
     else:
         permitidas = crm_allowed_units_for_user(conn, user)
         if permitidas is not None:
@@ -10832,22 +10862,24 @@ def valid_competence(value: Any) -> str:
     return texto if re.fullmatch(r"\d{4}-\d{2}", texto or "") else ""
 
 
-def seller_name_variants(
-    conn: sqlite3.Connection, company_id: int, nome: str
-) -> list[str]:
-    """Todas as grafias do vendedor no faturamento.
+def seller_filter_sql(
+    conn: sqlite3.Connection, company_id: int, nome: str,
+    coluna: str = "seller_name", maiusculas: bool = False,
+) -> tuple[str, list[str]]:
+    """Condição SQL que casa o vendedor por TODAS as grafias dele.
 
-    O mesmo vendedor aparece como "FULANO (VENDAS)" e "FULANO (TELEVENDAS)".
-    Somar só uma das grafias esconderia parte das vendas dele.
+    Existe porque filtrar por nome exato quebra sozinho: o Alfa acrescenta
+    "(TELEVENDAS)" ao nome de quem muda de função e, no instante seguinte, o
+    vendedor abre o CRM e vê tudo zerado. Nada quebra visivelmente — as
+    consultas continuam válidas, só não encontram nada.
+
+    `coluna` aceita expressão, porque a carteira compara
+    UPPER(TRIM(internal_seller_name)); nesse caso `maiusculas` alinha os
+    parâmetros com o que a coluna devolve.
     """
-    chave = person_key(nome)
-    if not chave:
-        return []
-    return [r["seller_name"] for r in conn.execute(
-        "SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ?",
-        (company_id,)).fetchall()
-        if person_key(r["seller_name"]) == chave
-        or short_person_key(r["seller_name"]) == chave]
+    variantes = seller_name_variants(conn, company_id, nome) or [nome]
+    valores = [normalize_upper(v) if maiusculas else v for v in variantes]
+    return f"{coluna} IN ({', '.join('?' for _ in valores)})", valores
 
 
 def sellers_of_unit(
@@ -11725,8 +11757,13 @@ def crm_base_client_scope_query(
     base_params: list[Any] = [company_id, current_competence, company_id, company_id, current_competence, company_id]
     filter_params: list[Any] = []
     if seller_name:
-        where_clauses.append("UPPER(TRIM(COALESCE(p.internal_seller_name, ''))) = ?")
-        filter_params.append(seller_name)
+        # Carteira também por todas as grafias: o cadastro do cliente guarda o
+        # nome do vendedor como o Alfa escreve hoje, que muda com o tempo.
+        _cond_c, _params_c = seller_filter_sql(
+            conn, company_id, seller_name,
+            "UPPER(TRIM(COALESCE(p.internal_seller_name, '')))", maiusculas=True)
+        where_clauses.append(_cond_c)
+        filter_params.extend(_params_c)
     if city_name:
         where_clauses.append("COALESCE(p.city_name, s.summary_city_name) = ?")
         filter_params.append(city_name)
@@ -14152,10 +14189,12 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     summary_unit_params: list[Any] = [company_id, primary_competence]
 
     if filters["seller_name"]:
-        detail_conditions.append("seller_name = ?")
-        detail_params.append(filters["seller_name"])
-        summary_vendor_conditions.append("seller_name = ?")
-        summary_vendor_params.append(filters["seller_name"])
+        # Todas as grafias do vendedor, não só a que veio no filtro.
+        _cond_v, _params_v = seller_filter_sql(conn, company_id, filters["seller_name"])
+        detail_conditions.append(_cond_v)
+        detail_params.extend(_params_v)
+        summary_vendor_conditions.append(_cond_v)
+        summary_vendor_params.extend(_params_v)
 
     detail_source_rows = conn.execute(
         f"""
@@ -14950,8 +14989,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     _ret_conditions = ["company_id = ?", "competence = ?"]
     _ret_params: list[Any] = [company_id, primary_competence]
     if filters.get("seller_name"):
-        _ret_conditions.append("seller_name = ?")
-        _ret_params.append(filters["seller_name"])
+        _c_v, _p_v = seller_filter_sql(conn, company_id, filters["seller_name"])
+        _ret_conditions.append(_c_v)
+        _ret_params.extend(_p_v)
     if filters.get("unit_name"):
         _ret_conditions.append("unit_name = ?")
         _ret_params.append(normalize_unit(filters["unit_name"]))
@@ -15281,10 +15321,11 @@ def single_competence_summary(
     summary_unit_params: list[Any] = [company_id, competence]
 
     if scoped_filters["seller_name"]:
-        detail_conditions.append("seller_name = ?")
-        detail_params.append(scoped_filters["seller_name"])
-        summary_vendor_conditions.append("seller_name = ?")
-        summary_vendor_params.append(scoped_filters["seller_name"])
+        _cond_v, _params_v = seller_filter_sql(conn, company_id, scoped_filters["seller_name"])
+        detail_conditions.append(_cond_v)
+        detail_params.extend(_params_v)
+        summary_vendor_conditions.append(_cond_v)
+        summary_vendor_params.extend(_params_v)
 
     detail_source_rows = conn.execute(
         f"""

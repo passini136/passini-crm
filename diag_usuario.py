@@ -33,7 +33,13 @@ procurado = " ".join(a for a in sys.argv[1:] if not a.startswith("-")).strip().u
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
-comp = backend.crm_latest_competence(conn, company_id) or ""
+# A competência mais recente pode ser o mês corrente, que ainda não tem
+# faturamento detalhado — usá-la faria o script acusar "não existe" para todo
+# mundo. A referência tem que ser o último mês que REALMENTE tem venda.
+comp = (conn.execute(
+    "SELECT MAX(competence) c FROM fact_sales_detail WHERE company_id = ?",
+    (company_id,)).fetchone()["c"]
+    or backend.crm_latest_competence(conn, company_id) or "")
 
 print(f"Banco: {backend.DB_PATH}")
 print(f"Competência de referência: {comp}\n")
