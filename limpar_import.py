@@ -57,6 +57,12 @@ else:
     manter = []
     ids = [int(a) for a in argv if a.isdigit()]
 
+# --zerar-mes apaga o faturamento detalhado inteiro de UM mês, para que ele seja
+# reimportado de um arquivo só. É necessário porque o importador descarta linha
+# repetida: subir o relatório completo por cima do que já existe grava só a
+# sobra, e a base fica com um retrato incompleto do arquivo.
+zerar = "--zerar-mes" in argv
+
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
 
@@ -76,6 +82,35 @@ def resumo_import(import_id, competencia):
         "FROM fact_sales_detail WHERE company_id = ? AND competence = ? AND import_id = ?",
         (company_id, competencia, import_id)).fetchone()
 
+
+if zerar:
+    if manter:
+        print("Use --exceto OU --zerar-mes, não os dois.")
+        conn.close()
+        sys.exit(1)
+    if len(meses) != 1:
+        print("Com --zerar-mes é obrigatório informar UM mês, ex:")
+        print("   limpar_import.py --zerar-mes 2026-08")
+        conn.close()
+        sys.exit(1)
+    competencia = meses[0]
+    ids = [r["import_id"] for r in conn.execute(
+        "SELECT DISTINCT import_id FROM fact_sales_detail "
+        "WHERE company_id = ? AND competence = ? ORDER BY import_id",
+        (company_id, competencia)).fetchall()]
+    antes = conn.execute(
+        "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_sales_detail "
+        "WHERE company_id = ? AND competence = ?",
+        (company_id, competencia)).fetchone()
+    if not ids:
+        print(f"{competencia} já está sem faturamento detalhado. Nada a fazer.")
+        conn.close()
+        sys.exit(0)
+    print(f"ZERAR {competencia}: sai TUDO — {len(ids)} importação(ões), "
+          f"{antes['n']} linha(s), {money(antes['v']).strip()}")
+    print("Os outros meses não são tocados.")
+    print("Depois de aplicar, o mês fica VAZIO até você reimportar o arquivo "
+          "completo.\n")
 
 if manter:
     if len(meses) != 1:
@@ -112,12 +147,13 @@ if manter:
 
 if not ids:
     print("Informe o número da importação. As do faturamento detalhado:\n")
-    print(f"   {'IMPORT':<8}{'QUANDO':<22}{'LINHAS':>9}{'VALOR':>20}{'POR LINHA':>12}"
-          f"   MESES QUE ALIMENTA")
+    print(f"   {'IMPORT':<8}{'QUANDO':<22}{'LINHAS':>9}{'IGNOR.':>8}{'VALOR':>20}"
+          f"{'POR LINHA':>12}   MESES QUE ALIMENTA")
     for r in conn.execute(
         """
         SELECT d.import_id, MAX(i.imported_at) quando, COUNT(*) n,
                ROUND(SUM(d.net_value), 2) v,
+               MAX(COALESCE(i.duplicate_rows_skipped, 0)) ignoradas,
                COUNT(DISTINCT d.competence) meses,
                MIN(d.competence) primeiro, MAX(d.competence) ultimo
         FROM fact_sales_detail d LEFT JOIN imports i ON i.id = d.import_id
@@ -133,8 +169,12 @@ if not ids:
             periodo = str(r["primeiro"])
         else:
             periodo = f"{r['primeiro']} a {r['ultimo']} ({r['meses']} meses)"
+        # IGNOR. = linhas do arquivo que já existiam e foram descartadas. Número
+        # alto quer dizer que o arquivo trazia muito do que a base já tinha —
+        # e que essa importação NÃO representa o arquivo inteiro.
         print(f"   {str(r['import_id']):<8}{str(r['quando'])[:19]:<22}{r['n']:>9}"
-              f"{money(r['v']):>20}{por_linha:>12.2f}   {periodo}{marca}")
+              f"{r['ignoradas'] or 0:>8}{money(r['v']):>20}{por_linha:>12.2f}"
+              f"   {periodo}{marca}")
     print("\nRode de novo passando o número, ex: limpar_import.py 88")
     conn.close()
     sys.exit(0)
@@ -152,7 +192,10 @@ for import_id in ids:
     print(f"   {'MÊS':<10}{'LINHAS':>8}{'VALOR':>19}   OUTRAS IMPORTAÇÕES DO MESMO MÊS")
     sozinho = []
     for c in res["byCompetence"]:
-        if c["otherImports"]:
+        if zerar:
+            # Aqui o mês ficar sem fonte é o objetivo, não um acidente.
+            nota = "(zerando o mês)"
+        elif c["otherImports"]:
             nota = (f"{c['otherImports']} importação(ões), {c['otherRows']} linha(s), "
                     f"{money(c['otherValue']).strip()}")
         else:
@@ -183,6 +226,18 @@ for import_id in ids:
 
 if len(ids) > 1:
     print(f"SOMA: {total_linhas} linha(s) · {money(total_valor)}\n")
+
+if zerar:
+    restou = conn.execute(
+        "SELECT COUNT(*) n FROM fact_sales_detail WHERE company_id = ? AND competence = ?",
+        (company_id, meses[0])).fetchone()["n"]
+    if aplicar:
+        print(f"{meses[0]} está com {restou} linha(s) de faturamento detalhado.")
+        print("AGORA reimporte o relatório completo do mês pelo CRM.")
+        print("Como o mês está vazio, nenhuma linha será descartada por repetição.")
+    else:
+        print(f"Ficaria com 0 linha(s). Hoje tem {restou}.")
+    print()
 
 if manter:
     # Mostrar como o mês fica, para conferir contra o relatório do Alfa antes
