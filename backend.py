@@ -540,6 +540,15 @@ IMPORT_REPLACE_LABELS = {
     "competencia": "substitui o mês",
     "acrescenta": "acrescenta ao histórico",
 }
+# Devolução tem duas naturezas e elas não se misturam na análise. GARANTIA é
+# defeito de fábrica: não diz nada sobre a venda. Todo o resto é COMERCIAL —
+# desistência, vendido errado, separado errado — e aí sim é sintoma de venda mal
+# feita, que é o que interessa acompanhar por vendedor.
+RETURN_REASON_WARRANTY = "DEVOLUCAO EM GARANTIA"
+# Expressão reaproveitada nas consultas para não repetir a regra em cada uma.
+RETURN_KIND_SQL = (f"CASE WHEN reason = '{RETURN_REASON_WARRANTY}' "
+                   f"THEN 'garantia' ELSE 'comercial' END")
+
 FILE_TYPE_LABELS = {
     "cadastro_clientes": "cadastro de clientes",
     "cadastro_itens": "cadastro de itens",
@@ -1222,6 +1231,11 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     # já existia. Resultado: a reimportação do faturamento duplicou os meses.
     if sales_columns and sales_detail_needs_rehash(conn):
         rehash_sales_detail(conn)
+
+    # Devolução deixou de morar no faturamento. Tira de uma vez o que já entrou
+    # antes da mudança; a partir daqui a importação nem grava.
+    if sales_columns and stored_returns_purge_version(conn) < SALES_RETURNS_PURGE_VERSION:
+        purge_sales_return_rows(conn)
 
     prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
     if prospect_columns:
@@ -3813,6 +3827,59 @@ def set_signature_version(conn: sqlite3.Connection, versao: int) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(versao),))
 
 
+# Limpeza única: tirar do faturamento as linhas que são devolução. Versão
+# própria, separada da assinatura, para não obrigar a recalcular a identidade de
+# 200 mil linhas só por causa disto.
+SALES_RETURNS_PURGE_VERSION = 1
+
+
+def stored_returns_purge_version(conn: sqlite3.Connection) -> int:
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    linha = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'sales_returns_purge_version'").fetchone()
+    try:
+        return int(linha["value"]) if linha else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def purge_sales_return_rows(conn: sqlite3.Connection) -> int:
+    """Tira do faturamento detalhado as linhas que na verdade são devolução.
+
+    Elas entraram carimbadas com a data da NOTA DE VENDA, então um relatório de
+    hoje pingava valor negativo dentro de meses fechados e até criava
+    competências de anos anteriores que nunca tiveram carga de venda.
+
+    Devolução não some da base: ela tem relatório próprio, com data de entrada,
+    motivo, cliente, vendedor e item. Aqui só sai de onde não devia estar.
+
+    A linha é reconhecida pelo que ela é, não por semelhança com outra:
+    quantidade vendida zerada e quantidade devolvida preenchida. No relatório do
+    Alfa nenhuma linha de venda tem essa combinação.
+    """
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    alvo = conn.execute(
+        "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v, COUNT(DISTINCT competence) meses "
+        "FROM fact_sales_detail "
+        "WHERE COALESCE(quantity,0) <= 0 AND COALESCE(return_quantity,0) > 0"
+    ).fetchone()
+    total = int(alvo["n"] or 0)
+    if total:
+        backup_database(conn, "antes-de-tirar-devolucao-do-faturamento")
+        conn.execute(
+            "DELETE FROM fact_sales_detail "
+            "WHERE COALESCE(quantity,0) <= 0 AND COALESCE(return_quantity,0) > 0")
+        print(f"[faturamento] {total} linha(s) de devolução retirada(s) "
+              f"({brl(alvo['v'] or 0)}) em {alvo['meses']} competência(s). "
+              f"Elas continuam no relatório de devoluções.", flush=True)
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES ('sales_returns_purge_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SALES_RETURNS_PURGE_VERSION),))
+    conn.commit()
+    return total
+
+
 def backup_database(conn: sqlite3.Connection, motivo: str = "manutencao") -> Path | None:
     """Copia o banco antes de qualquer operação que apague linha.
 
@@ -4135,6 +4202,9 @@ def detect_file_type(filename: str) -> str | None:
         return "custo_unidade"  # fallback conservador; fieldName override tem prioridade
     if re.fullmatch(r"030-relatoriofaturamento\(\d+\)", stem_lower):
         return "faturamento_detalhado"
+    # O Alfa numera o arquivo a cada novo download: 030-relatorioDevolucao(8).csv
+    if re.fullmatch(r"030-relatoriodevolucao ?\(\d+\)", stem_lower):
+        return "devolucao_garantia"
     if re.fullmatch(r"030-relatoriofaturamento detalhado\(\d+\)", stem_lower):
         return "faturamento_detalhado"
     if re.fullmatch(r"030-relatoriofaturamento detalhado \(\d+\)", stem_lower):
@@ -4161,6 +4231,10 @@ def detect_file_type(filename: str) -> str | None:
 # Assinatura de colunas de cada relatório do Alfa. Basta o conjunto mínimo
 # aparecer no cabeçalho — colunas a mais não atrapalham.
 FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
+    # Devolução vem primeiro e é inconfundível: só ela tem MOTIVO e DEVOLUCAO.
+    # Sem esta assinatura o arquivo dependia do nome exato, e um "(8)" no fim
+    # bastava para ele entrar como tipo nenhum e a importação não gravar nada.
+    ("devolucao_garantia", {"DEVOLUCAO", "MOTIVO", "EMISSAO", "TOTAL"}),
     ("posicao_estoque", {"BRANCHNAME", "ITEM", "ITEMNAME", "QUANTITY"}),
     ("cadastro_itens", {"CODIGO", "TIPO", "GRUPO ITEM", "SUB GRUPO ITEM", "MARCA"}),
     # O consolidado por cliente vem ANTES do detalhado e é reconhecido pelo
@@ -4423,6 +4497,7 @@ def import_package(
     sales_competences_seen: set[str] = set()
     sales_rows_by_competence: Counter = Counter()
     sales_rows_without_date = 0
+    sales_returns_skipped = 0
     warranty_competences_seen: set[str] = set()
     warranty_total_value = 0.0
     catalog_new_total = 0
@@ -4470,6 +4545,19 @@ def import_package(
                 manufacturer_sku = normalize_whitespace(row.get("Fabricante"))
                 brand_name = normalize_upper(row.get("Marca"))
                 dt_value = parse_sales_row_date(row)
+                # DEVOLUÇÃO NÃO ENTRA AQUI. No relatório de faturamento ela vem
+                # como linha própria — Quant. e Bruto zerados, QTD. Dev.
+                # preenchida e Líquido negativo — e carimbada com a data da NOTA
+                # DE VENDA, não com a data em que a devolução entrou. O efeito é
+                # que um relatório de hoje reescreve meses já fechados: o export
+                # de agosto/2026 jogou 182 linhas negativas dentro de julho e
+                # criou competências de 2024 que nunca tiveram carga de venda.
+                # A devolução tem relatório próprio, com data de entrada, motivo
+                # e item — é lá que ela é contada.
+                if (parse_decimal(row.get("Quant.")) or 0) <= 0 \
+                        and (parse_decimal(row.get("QTD. Dev.")) or 0) > 0:
+                    sales_returns_skipped += 1
+                    continue
                 # Competência POR LINHA, derivada da data de emissão. Um único arquivo
                 # pode conter vários meses; cada linha vai para o mês correto.
                 row_competence = competence_from_date(dt_value) or competence
@@ -5037,6 +5125,10 @@ def import_package(
         if _rest > 0:
             _msg += f" +{_rest} outra(s)"
         _msg += f" | {duplicate_rows_skipped} linha(s) já existentes ignoradas"
+        if sales_returns_skipped:
+            result["salesReturnsSkipped"] = sales_returns_skipped
+            _msg += (f" | {sales_returns_skipped} devolução(ões) ignorada(s) — "
+                     f"elas entram pelo relatório de devoluções")
         if sales_rows_without_date:
             _msg += f" | {sales_rows_without_date} sem data usaram {competence}"
         result["message"] = _msg
