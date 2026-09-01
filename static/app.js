@@ -4211,6 +4211,36 @@ function kpiCard(title, value, footLeft, footRight, farol) {
 }
 
 /** Legenda do farol — explica o critério para quem olha a tela pela primeira vez. */
+// Motivo da devolução, direto do relatório do Alfa. O valor total do painel vem
+// do custo x venda; esta lista existe para explicar de onde ele veio — e é o
+// motivo, não o valor, que aponta o que dá para corrigir na venda.
+function blocoMotivosDevolucao(s) {
+  const motivos = Array.isArray(s.returnsByReason) ? s.returnsByReason : [];
+  if (!motivos.length) return "";
+  const totalMotivos = motivos.reduce((soma, m) => soma + Number(m.value || 0), 0);
+  const linhas = motivos.map((m) => {
+    const fatia = totalMotivos ? (100 * Number(m.value || 0)) / totalMotivos : 0;
+    const ehGarantia = m.kind === "garantia";
+    return `
+      <div style="display:flex;align-items:center;gap:8px;min-width:210px">
+        <span style="width:8px;height:8px;border-radius:50%;flex:none;background:${
+          ehGarantia ? "#e67e22" : "var(--accent)"}"></span>
+        <span class="text-small" style="flex:1">${m.reason}
+          <span style="color:var(--muted)"> · ${ehGarantia ? "garantia" : "comercial"}</span></span>
+        <strong class="text-small">${currency(m.value || 0)}</strong>
+        <span class="text-small" style="color:var(--muted);width:44px;text-align:right">${
+          fatia.toFixed(0)}%</span>
+      </div>`;
+  }).join("");
+  return `
+    <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+      <div class="text-small" style="color:var(--muted);margin-bottom:6px">
+        POR MOTIVO — ${number(motivos.length)} motivo(s) no relatório de devoluções
+      </div>
+      <div style="display:flex;gap:16px;flex-wrap:wrap">${linhas}</div>
+    </div>`;
+}
+
 function farolLegend(paceExpectedPct) {
   return `
     <div class="form-card" style="padding:10px 16px">
@@ -14720,6 +14750,7 @@ function executivoView() {
                 <span class="text-small" style="color:var(--muted)"> (${pct(s.returnRatioPct || 0)})</span></div>
             </div>
           </div>
+          ${blocoMotivosDevolucao(s)}
         </div>` : ""}
       <div class="grid-2">
         ${summaryDiffCard("Receita líquida — comparativos", comp.group)}

@@ -14086,19 +14086,23 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     # ── Devoluções em garantia ────────────────────────────────────────────────
     # Vêm dentro do total de devoluções do custo/venda, mas são defeito de peça,
     # não erro de venda. Ficam separadas para não penalizar o resultado comercial.
+    #
+    # O FILTRO DE MOTIVO É OBRIGATÓRIO. A tabela guarda TODAS as devoluções desde
+    # que o relatório passou a ser importado inteiro; somá-la sem filtrar faz a
+    # garantia engolir o total e a devolução comercial aparecer como zero.
     warranty_by_seller: dict[str, float] = {}
     for _w in conn.execute(
         "SELECT seller_name, SUM(total_value) AS total FROM fact_warranty_returns "
-        "WHERE company_id = ? AND competence = ? GROUP BY seller_name",
-        (company_id, primary_competence),
+        "WHERE company_id = ? AND competence = ? AND reason = ? GROUP BY seller_name",
+        (company_id, primary_competence, RETURN_REASON_WARRANTY),
     ).fetchall():
         warranty_by_seller[normalize_whitespace(_w["seller_name"])] = float(_w["total"] or 0.0)
 
     warranty_by_unit: dict[str, float] = {}
     for _w in conn.execute(
         "SELECT unit_name, SUM(total_value) AS total FROM fact_warranty_returns "
-        "WHERE company_id = ? AND competence = ? GROUP BY unit_name",
-        (company_id, primary_competence),
+        "WHERE company_id = ? AND competence = ? AND reason = ? GROUP BY unit_name",
+        (company_id, primary_competence, RETURN_REASON_WARRANTY),
     ).fetchall():
         warranty_by_unit[normalize_unit(_w["unit_name"])] = float(_w["total"] or 0.0)
 
@@ -14650,23 +14654,50 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     # ── Dedução da garantia no consolidado ────────────────────────────────────
     # Aplica o mesmo tratamento do vendedor e da unidade no total do grupo,
     # respeitando o recorte de vendedor/unidade que estiver ativo.
-    _warranty_conditions = ["company_id = ?", "competence = ?"]
-    _warranty_params: list[Any] = [company_id, primary_competence]
+    # O motivo entra já aqui: só GARANTIA volta para o faturamento. Desistência,
+    # vendido errado e separado errado são devolução comercial e continuam
+    # descontadas, porque falam da venda.
+    # Recorte comum (empresa, mês, vendedor, unidade). O motivo entra depois,
+    # porque a mesma seleção serve para duas perguntas: quanto foi de garantia e
+    # quanto foi de cada motivo.
+    _ret_conditions = ["company_id = ?", "competence = ?"]
+    _ret_params: list[Any] = [company_id, primary_competence]
     if filters.get("seller_name"):
-        _warranty_conditions.append("seller_name = ?")
-        _warranty_params.append(filters["seller_name"])
+        _ret_conditions.append("seller_name = ?")
+        _ret_params.append(filters["seller_name"])
     if filters.get("unit_name"):
-        _warranty_conditions.append("unit_name = ?")
-        _warranty_params.append(normalize_unit(filters["unit_name"]))
+        _ret_conditions.append("unit_name = ?")
+        _ret_params.append(normalize_unit(filters["unit_name"]))
     elif scoped_units:
         _ph = ", ".join("?" for _ in scoped_units)
-        _warranty_conditions.append(f"unit_name IN ({_ph})")
-        _warranty_params.extend(scoped_units)
+        _ret_conditions.append(f"unit_name IN ({_ph})")
+        _ret_params.extend(scoped_units)
     summary_warranty = float(conn.execute(
         f"SELECT COALESCE(SUM(total_value), 0) AS total FROM fact_warranty_returns "
-        f"WHERE {' AND '.join(_warranty_conditions)}",
-        _warranty_params,
+        f"WHERE {' AND '.join(_ret_conditions)} AND reason = ?",
+        [*_ret_params, RETURN_REASON_WARRANTY],
     ).fetchone()["total"] or 0.0)
+
+    # Quebra por motivo, direto do relatório de devoluções. O total do painel
+    # continua saindo do custo x venda — isto aqui explica o número, não o
+    # substitui. Sem a explicação, "devolução comercial" é só um valor sem causa,
+    # e a causa é o que dá para corrigir: peça errada, promessa errada, cliente
+    # que desiste.
+    summary_returns_by_reason = [
+        {
+            "reason": normalize_upper(_r["reason"]) or "SEM MOTIVO",
+            "kind": "garantia" if normalize_upper(_r["reason"]) == RETURN_REASON_WARRANTY
+                    else "comercial",
+            "value": round(float(_r["total"] or 0.0), 2),
+            "rows": int(_r["n"] or 0),
+        }
+        for _r in conn.execute(
+            f"SELECT reason, SUM(total_value) AS total, COUNT(*) AS n "
+            f"FROM fact_warranty_returns WHERE {' AND '.join(_ret_conditions)} "
+            f"GROUP BY reason ORDER BY total DESC",
+            _ret_params,
+        ).fetchall()
+    ]
 
     summary_returns_total = summary_returns
     summary_warranty = min(summary_warranty, summary_returns_total)
@@ -14839,6 +14870,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "returnsValue": round(summary_returns, 2),
             # Garantia separada do resultado comercial
             "warrantyReturnsValue": round(summary_warranty, 2),
+            "returnsByReason": summary_returns_by_reason,
             "returnsTotalValue": round(summary_returns_total, 2),
             "revenueNetWithWarranty": round(summary_revenue_with_warranty, 2),
             "returnCost": round(summary_return_cost, 2),
