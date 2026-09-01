@@ -62,6 +62,7 @@ print(f"   {'MÊS':<9}{'IMPORTS':>8}{'LINHAS':>9}{'DETALHADO':>16}{'OFICIAL':>16
 
 refazer = []
 sem_marca = []
+sem_oficial = []
 for m in meses:
     d = detalhado.get(m)
     o = oficial.get(m, 0.0)
@@ -71,23 +72,34 @@ for m in meses:
     pct_marca = 100.0 * (d["com_marca"] or 0) / linhas if linhas else 0.0
     dif = (100 * (valor / o - 1)) if o else None
 
+    # Mês com pouquíssimas linhas e soma negativa não é um mês carregado: são só
+    # as devoluções que os relatórios recentes arrastam com a data da nota
+    # original. Tratar isso como mês a refazer gera lista de alarme falso.
+    so_devolucao = linhas > 0 and (valor <= 0 or linhas < 500)
+
     notas = []
-    # Um mês correto vem de UM relatório completo. Vários imports quase sempre
-    # querem dizer diários sobrepostos.
-    if imports > 1:
-        notas.append(f"{imports} importações")
-    if dif is not None and dif > 15:
-        notas.append("inflado")
-    if linhas and pct_marca < 50:
-        notas.append("sem marca")
+    if so_devolucao:
+        notas.append("só devoluções, sem carga de venda")
+    else:
+        # Número de importações NÃO é sinal de problema: entre relatórios
+        # diários o descarte por repetição funciona, porque descrevem a venda do
+        # mesmo jeito. O que estraga é misturar diário com relatório completo, e
+        # isso aparece na diferença contra o oficial — não na contagem.
+        if imports > 1:
+            notas.append(f"{imports} importações")
+        if dif is not None and dif > 15:
+            notas.append("INFLADO")
+        if linhas and pct_marca < 50:
+            notas.append("sem marca")
     if o and not linhas:
         notas.append("só o resumo, sem detalhado")
-    if not o and linhas:
-        notas.append("sem resumo para comparar")
+    if not o and linhas and not so_devolucao:
+        notas.append("falta o custo x venda para comparar")
+        sem_oficial.append(m)
 
-    if linhas and (imports > 1 or (dif is not None and dif > 15)):
+    if not so_devolucao and dif is not None and dif > 15:
         refazer.append(m)
-    if linhas and pct_marca < 50:
+    if not so_devolucao and linhas and pct_marca < 50:
         sem_marca.append(m)
 
     _dif = f"{dif:+.0f}%" if dif is not None else "  —"
@@ -96,14 +108,22 @@ for m in meses:
 
 print("\nVEREDITO")
 if refazer:
-    print(f"   Refazer ({len(refazer)}): {', '.join(refazer)}")
-    print("   Para cada um, a sequência é:")
-    print("      limpar_import.py --zerar-mes <mês> --aplicar")
-    print("      e depois importar o FAT DETALHADO completo daquele mês pelo CRM.")
+    print(f"   1. INFLADO, refazer ({len(refazer)}): {', '.join(refazer)}")
+    print("      Para cada um:")
+    print("         limpar_import.py --zerar-mes <mês> --aplicar")
+    print("      e depois importar o FAT DETALHADO completo do mês pelo CRM.")
 else:
-    print("   Nenhum mês precisa ser refeito.")
+    print("   1. Nenhum mês está inflado. O número bate com o custo x venda.")
+
+if sem_oficial:
+    print(f"\n   2. Sem custo x venda ({len(sem_oficial)}): {', '.join(sem_oficial)}")
+    print("      Sem ele não dá para saber se o mês está certo. Importar o")
+    print("      custo x venda desses meses é barato e vem antes de refazer.")
+
 if sem_marca:
-    print(f"\n   Sem marca ({len(sem_marca)}): {', '.join(sem_marca)}")
-    print("   Esses meses não aparecem na tela de Marcas. Refazer resolve junto.")
+    print(f"\n   3. Sem marca ({len(sem_marca)}): {', '.join(sem_marca)}")
+    print("      Esses meses não aparecem na tela de Marcas. Só refazer resolve,")
+    print("      e é um export por mês — decida se a tela de Marcas precisa do")
+    print("      histórico ou se basta daqui para frente.")
 
 conn.close()
