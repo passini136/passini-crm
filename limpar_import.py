@@ -8,8 +8,16 @@ Uso no servidor:
     # remover de verdade
     /srv/passini/venv/crm/bin/python /srv/passini/apps/crm-comercial/limpar_import.py 88 --aplicar
 
+    # deixar o mês com UMA fonte só: fica a 130, sai todo o resto de agosto
+    /srv/passini/venv/crm/bin/python /srv/passini/apps/crm-comercial/limpar_import.py 2026-08 --exceto 130
+
 Serve para desfazer um arquivo que não devia ter entrado: um relatório na pasta
 errada, ou uma reimportação manual por cima do que os diários já traziam.
+
+O --exceto existe porque os relatórios diários do Alfa trazem um intervalo de
+dias, não um dia só. Importados todo dia, eles se sobrepõem e o mês soma mais de
+uma vez a mesma venda. Quando o mês fecha, o certo é subir um relatório completo
+e deixar só ele.
 
 É o caminho SEGURO. Procurar linha repetida por semelhança apaga venda de
 verdade — duas peças diferentes de mesmo preço, para o mesmo cliente, no mesmo
@@ -33,10 +41,21 @@ if not os.environ.get("PASSINI_CRM_DATA"):
 
 import backend  # noqa: E402
 
-aplicar = "--aplicar" in sys.argv
-ids = [int(a) for a in sys.argv[1:] if a.isdigit()]
-# --mes 2026-08 (pode repetir) limita a remoção a certas competências
-meses = [a for a in sys.argv[1:] if len(a) == 7 and a[4] == "-"]
+argv = sys.argv[1:]
+aplicar = "--aplicar" in argv
+# Passar 2026-08 (pode repetir) limita a remoção a certas competências
+meses = [a for a in argv if len(a) == 7 and a[4] == "-"]
+
+# --exceto inverte a conta: em vez de dizer o que sai, diz o único que FICA.
+# É o caminho para "esse mês vai ter uma fonte só", quando um arquivo completo
+# substitui vários parciais que se sobrepõem.
+if "--exceto" in argv:
+    corte = argv.index("--exceto")
+    manter = [int(a) for a in argv[corte + 1:] if a.isdigit()]
+    ids = [int(a) for a in argv[:corte] if a.isdigit()]
+else:
+    manter = []
+    ids = [int(a) for a in argv if a.isdigit()]
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
@@ -47,6 +66,49 @@ def money(v):
 
 
 print(f"Banco: {backend.DB_PATH}\n")
+
+
+def resumo_import(import_id, competencia):
+    return conn.execute(
+        "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v, "
+        "       SUM(CASE WHEN TRIM(COALESCE(brand_name,'')) <> '' THEN 1 ELSE 0 END) com, "
+        "       MIN(issue_date) de, MAX(issue_date) ate "
+        "FROM fact_sales_detail WHERE company_id = ? AND competence = ? AND import_id = ?",
+        (company_id, competencia, import_id)).fetchone()
+
+
+if manter:
+    if len(meses) != 1:
+        print("Com --exceto é obrigatório informar UM mês, ex:")
+        print("   limpar_import.py 2026-08 --exceto 130")
+        conn.close()
+        sys.exit(1)
+    competencia = meses[0]
+    presentes = [r["import_id"] for r in conn.execute(
+        "SELECT DISTINCT import_id FROM fact_sales_detail "
+        "WHERE company_id = ? AND competence = ? ORDER BY import_id",
+        (company_id, competencia)).fetchall()]
+    faltando = [i for i in manter if i not in presentes]
+    if faltando:
+        # Guardar um número que não existe no mês apagaria o mês inteiro.
+        print(f"A(s) importação(ões) {', '.join(str(i) for i in faltando)} não tem "
+              f"linha nenhuma em {competencia}.")
+        print("Confira o número antes de continuar — nada foi alterado.")
+        conn.close()
+        sys.exit(1)
+    print(f"FICA em {competencia}:")
+    for i in manter:
+        r = resumo_import(i, competencia)
+        pct = 100.0 * (r["com"] or 0) / (r["n"] or 1)
+        print(f"   import {i}: {r['n']} linha(s) · {money(r['v']).strip()} · "
+              f"{pct:.0f}% com marca")
+        print(f"      emissões de {str(r['de'])[:10]} a {str(r['ate'])[:10]}")
+    ids = [i for i in presentes if i not in manter]
+    print(f"\nSAI: {len(ids)} importação(ões) — {', '.join(str(i) for i in ids)}\n")
+    if not ids:
+        print("Não há mais nada neste mês. Nada a fazer.")
+        conn.close()
+        sys.exit(0)
 
 if not ids:
     print("Informe o número da importação. As do faturamento detalhado:\n")
@@ -112,6 +174,30 @@ for import_id in ids:
 
 if len(ids) > 1:
     print(f"SOMA: {total_linhas} linha(s) · {money(total_valor)}\n")
+
+if manter:
+    # Mostrar como o mês fica, para conferir contra o relatório do Alfa antes
+    # (na simulação) e depois (quando aplicado) — é a prova de que deu certo.
+    competencia = meses[0]
+    if aplicar:
+        agora = conn.execute(
+            "SELECT COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_sales_detail "
+            "WHERE company_id = ? AND competence = ?",
+            (company_id, competencia)).fetchone()
+        rotulo, linhas_fim, valor_fim = "O mês ficou com", agora["n"], agora["v"]
+    else:
+        rotulo = "O mês ficaria com"
+        linhas_fim = sum(resumo_import(i, competencia)["n"] or 0 for i in manter)
+        valor_fim = sum(float(resumo_import(i, competencia)["v"] or 0) for i in manter)
+    oficial = conn.execute(
+        "SELECT ROUND(SUM(net_value),2) v FROM fact_unit_summary "
+        "WHERE company_id = ? AND competence = ?",
+        (company_id, competencia)).fetchone()["v"] or 0
+    print(f"{rotulo} {linhas_fim} linha(s) · {money(valor_fim).strip()}")
+    if oficial:
+        print(f"Resumo por unidade (oficial): {money(oficial).strip()}   "
+              f"({100 * (float(valor_fim) / oficial - 1):+.0f}%)")
+    print()
 
 if aplicar and total_linhas:
     backend.invalidate_crm_cache(company_id)
