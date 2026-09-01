@@ -5139,6 +5139,37 @@ def import_package(
         result["summaryRowsReplaced"] = summary_rows_replaced
         result["message"] = (f"Resumo de {competence} atualizado — "
                              f"{summary_rows_replaced} linha(s) anterior(es) substituída(s)")
+    # Apagou e não repôs: a importação "deu certo" e a base ficou pior. Foi o que
+    # aconteceu em 01/09/2026, quando um custo x venda entrou na pasta do
+    # consolidado — o mês de janeiro foi apagado, nenhuma linha entrou no lugar,
+    # e o log registrou "sucesso OK". Silêncio nessa hora é o pior resultado
+    # possível: ninguém procura o que não sabe que perdeu.
+    for _tipo, _apagadas in list(rows_replaced_by_type.items()):
+        _tabelas = IMPORT_SCOPE_TABLES.get(_tipo, ())
+        if not _apagadas or not _tabelas:
+            continue
+        _politica = IMPORT_REPLACE_POLICY.get(_tipo, "acrescenta")
+        _restante = 0
+        for _t in _tabelas:
+            if _politica == "base":
+                _restante += int(conn.execute(
+                    f"SELECT COUNT(*) FROM {_t} WHERE company_id = ?",
+                    (company_id,)).fetchone()[0] or 0)
+            else:
+                _restante += int(conn.execute(
+                    f"SELECT COUNT(*) FROM {_t} WHERE company_id = ? AND competence = ?",
+                    (company_id, competence)).fetchone()[0] or 0)
+        if _restante == 0:
+            _rotulo = FILE_TYPE_LABELS.get(_tipo, _tipo)
+            _aviso_vazio = (
+                f"ATENÇÃO: {_apagadas} linha(s) de {_rotulo} de {competence} foram "
+                f"substituídas e NENHUMA entrou no lugar. O arquivo provavelmente não "
+                f"é deste tipo. Reimporte o {_rotulo} correto deste mês."
+            )
+            result["warning"] = ((result.get("warning") + " · ") if result.get("warning")
+                                 else "") + _aviso_vazio
+            print(f"[import] {_aviso_vazio}", flush=True)
+
     if rows_replaced_by_type:
         result["rowsReplacedByType"] = rows_replaced_by_type
         _partes = [f"{FILE_TYPE_LABELS.get(t, t)}: {n} linha(s) "
