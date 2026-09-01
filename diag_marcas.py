@@ -150,6 +150,18 @@ ofi = conn.execute(
     "WHERE company_id = ? AND competence = ?", (company_id, competencia)).fetchone()["v"] or 0
 print(f"   faturamento detalhado : {money(det)}")
 print(f"   resumo por unidade    : {money(ofi)}")
+
+# O resumo tem UMA linha por unidade por mês. Mais de uma quer dizer que a mesma
+# unidade foi contada duas vezes e o faturamento oficial está inflado.
+repetidas = conn.execute(
+    "SELECT unit_name, COUNT(*) n, ROUND(SUM(net_value),2) v FROM fact_unit_summary "
+    "WHERE company_id = ? AND competence = ? GROUP BY unit_name HAVING COUNT(*) > 1 "
+    "ORDER BY unit_name", (company_id, competencia)).fetchall()
+if repetidas:
+    print("   >> RESUMO DUPLICADO: unidade com mais de uma linha no mês")
+    for u in repetidas:
+        print(f"      {u['unit_name']:<14}{u['n']} linha(s)   {money(u['v'])}")
+    print("      Reimporte o custo x venda do mês: agora ele substitui em vez de somar.")
 if ofi:
     print(f"   diferença             : {money(det - ofi)}  ({100 * (det / ofi - 1):+.0f}%)")
     if abs(det - ofi) / ofi > 0.05:

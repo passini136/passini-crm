@@ -4355,6 +4355,7 @@ def import_package(
     import_id = import_cursor.lastrowid
 
     duplicate_rows_skipped = 0
+    summary_rows_replaced = 0
     sales_competences_seen: set[str] = set()
     sales_rows_by_competence: Counter = Counter()
     sales_rows_without_date = 0
@@ -4596,6 +4597,14 @@ def import_package(
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
         elif kind == "custo_vendedor":
+            # O resumo tem UMA linha por vendedor por mês: reimportar o mês
+            # substitui, não soma. Sem isto, subir o custo x venda de novo com o
+            # mês mais adiantado grava a linha nova ao lado da antiga (o valor
+            # mudou, então o row_hash muda e o dedupe não pega) e o faturamento
+            # oficial dobra silenciosamente.
+            summary_rows_replaced += conn.execute(
+                "DELETE FROM fact_vendor_summary WHERE company_id = ? AND competence = ?",
+                (company_id, competence)).rowcount or 0
             for row in rows:
                 seller_name = normalize_whitespace(row.get("VENDEDOR"))
                 payload = {
@@ -4823,6 +4832,11 @@ def import_package(
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
         elif kind == "custo_unidade":
+            # Mesma regra do resumo por vendedor: uma linha por unidade por mês,
+            # então reimportar substitui o mês inteiro.
+            summary_rows_replaced += conn.execute(
+                "DELETE FROM fact_unit_summary WHERE company_id = ? AND competence = ?",
+                (company_id, competence)).rowcount or 0
             for row in rows:
                 unit_name = normalize_unit(row.get("EMPRESA"))
                 payload = {
@@ -4898,6 +4912,11 @@ def import_package(
         "importScope": import_scope,
         "importedFileTypes": sorted(selected_file_types),
     }
+    if summary_rows_replaced:
+        # Dizer que substituiu evita a leitura errada de "importei e não somou".
+        result["summaryRowsReplaced"] = summary_rows_replaced
+        result["message"] = (f"Resumo de {competence} atualizado — "
+                             f"{summary_rows_replaced} linha(s) anterior(es) substituída(s)")
     if catalog_new_total or catalog_updated_total:
         result["catalogNew"] = catalog_new_total
         result["catalogUpdated"] = catalog_updated_total
