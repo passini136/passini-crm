@@ -31,6 +31,10 @@ if not os.environ.get("PASSINI_CRM_DATA"):
 import backend  # noqa: E402
 
 filtro = next((a for a in sys.argv[1:] if not a.startswith("-")), "")
+# O mês corrente está sendo preenchido agora: falta detalhado porque o diário de
+# hoje ainda não entrou, não porque alguém apagou. Cobrá-lo como pendência é
+# alarme falso — e alarme falso ensina a ignorar alarme.
+MES_CORRENTE = backend.today_in_brazil().strftime("%Y-%m")
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
@@ -104,16 +108,19 @@ for m in meses:
             notas.append("INFLADO")
         if linhas and pct_marca < 50:
             notas.append("sem marca")
-    if o and not linhas:
+    if o and not linhas and m != MES_CORRENTE:
         notas.append("só o resumo, sem detalhado")
-    if not o and linhas and not so_devolucao:
+    if not o and linhas and not so_devolucao and m != MES_CORRENTE:
         notas.append("falta o custo x venda para comparar")
         sem_oficial.append(m)
 
-    if not so_devolucao and dif is not None and dif > 15:
-        refazer.append(m)
-    if not so_devolucao and linhas and pct_marca < 50:
-        sem_marca.append(m)
+    # O mês corrente fica fora de todas as listas de pendência: ele está
+    # incompleto por natureza, e vai se completando sozinho a cada importação.
+    if m != MES_CORRENTE:
+        if not so_devolucao and dif is not None and dif > 15:
+            refazer.append(m)
+        if not so_devolucao and linhas and pct_marca < 50:
+            sem_marca.append(m)
 
     # As quatro fontes do mês. "ok" só quando o mês está inteiro.
     tem = {
@@ -126,7 +133,9 @@ for m in meses:
     # reimportado. Antes eu só olhava meses com linha, então exatamente esse
     # ficava de fora do checklist — o buraco não aparecia em lugar nenhum.
     tem_alguma_fonte = any(tem.values())
-    if tem_alguma_fonte and not so_devolucao:
+    if m == MES_CORRENTE:
+        notas.append("mês corrente, em preenchimento")
+    elif tem_alguma_fonte and not so_devolucao:
         faltando = [k for k, v in tem.items() if not v]
         if tem["DET"]:
             if pct_marca < 50:
