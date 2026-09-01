@@ -4429,6 +4429,7 @@ def import_package(
     catalog_updated_total = 0
     stock_rows_total = 0
     stock_units_seen: set[str] = set()
+    stock_units_missing: set[str] = set()
 
     for entry in normalize_upload_entries(files_payload):
         filename = entry["fileName"]
@@ -4775,6 +4776,18 @@ def import_package(
                              "AND updated_at < ?", (company_id, _un, _marca_import))
             stock_rows_total += estoque_linhas
             stock_units_seen.update(unidades_no_arquivo)
+            # O relatório sempre vem com todas as unidades. Unidade que existe na
+            # base e não veio no arquivo fica com o saldo velho, e saldo velho de
+            # estoque manda o vendedor atrás de peça que não existe mais. Não
+            # apago — apagar por ausência é o erro que já custou caro aqui — mas
+            # aviso, porque neste fluxo a ausência significa export incompleto.
+            _unidades_na_base = {
+                r["unit_name"] for r in conn.execute(
+                    "SELECT DISTINCT unit_name FROM item_stock WHERE company_id = ?",
+                    (company_id,)).fetchall()}
+            _faltando = sorted(_unidades_na_base - unidades_no_arquivo)
+            if _faltando:
+                stock_units_missing.update(_faltando)
             print(f"[estoque] {estoque_linhas} linha(s) em "
                   f"{len(unidades_no_arquivo)} unidade(s): {sorted(unidades_no_arquivo)}", flush=True)
         elif kind == "cadastro_itens":
@@ -5000,6 +5013,16 @@ def import_package(
     if stock_rows_total:
         result["stockRows"] = stock_rows_total
         result["stockUnits"] = sorted(stock_units_seen)
+        if stock_units_missing:
+            result["stockUnitsMissing"] = sorted(stock_units_missing)
+            _aviso_estoque = (
+                f"O arquivo não trouxe {', '.join(sorted(stock_units_missing))}. "
+                f"O saldo dessas unidades continua o da importação anterior, e saldo "
+                f"velho leva a oferecer peça que já saiu. Reexporte a posição de "
+                f"estoque com todas as unidades."
+            )
+            result["warning"] = ((result.get("warning") + " · ") if result.get("warning")
+                                 else "") + _aviso_estoque
     clear_table_parse_cache()
     if sales_competences_seen:
         _ordered = sorted(sales_competences_seen)
