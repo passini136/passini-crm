@@ -48,8 +48,19 @@ detalhado = {r["competence"]: r for r in conn.execute(
 oficial = {r["competence"]: float(r["v"] or 0) for r in conn.execute(
     "SELECT competence, ROUND(SUM(net_value),2) v FROM fact_unit_summary "
     "WHERE company_id = ? GROUP BY competence", (company_id,)).fetchall()}
+# Um mês só está completo quando as quatro fontes estão lá. Sem olhar as
+# quatro, "está limpo" vira opinião.
+consolidado = {r["competence"]: int(r["n"] or 0) for r in conn.execute(
+    "SELECT competence, COUNT(*) n FROM crm_client_summary "
+    "WHERE company_id = ? GROUP BY competence", (company_id,)).fetchall()}
+devolucoes = {r["competence"]: float(r["v"] or 0) for r in conn.execute(
+    "SELECT competence, ROUND(SUM(total_value),2) v FROM fact_warranty_returns "
+    "WHERE company_id = ? GROUP BY competence", (company_id,)).fetchall()}
+vendedor_oficial = {r["competence"] for r in conn.execute(
+    "SELECT DISTINCT competence FROM fact_vendor_summary WHERE company_id = ?",
+    (company_id,)).fetchall()}
 
-meses = sorted(set(detalhado) | set(oficial))
+meses = sorted(set(detalhado) | set(oficial) | set(consolidado) | set(devolucoes))
 if filtro:
     meses = [m for m in meses if m.startswith(filtro)]
 if not meses:
@@ -57,12 +68,14 @@ if not meses:
     conn.close()
     sys.exit(0)
 
-print(f"   {'MÊS':<9}{'IMPORTS':>8}{'LINHAS':>9}{'DETALHADO':>16}{'OFICIAL':>16}"
-      f"{'DIF':>7}{'MARCA':>7}   SITUAÇÃO")
+print(f"   {'MÊS':<9}{'IMP':>4}{'LINHAS':>8}{'DETALHADO':>15}{'OFICIAL':>15}"
+      f"{'DIF':>6}{'MARCA':>6}  DET CST CON DEV   SITUAÇÃO")
 
 refazer = []
 sem_marca = []
 sem_oficial = []
+pendencias: dict[str, list[str]] = {}
+prontos = []
 for m in meses:
     d = detalhado.get(m)
     o = oficial.get(m, 0.0)
@@ -102,9 +115,55 @@ for m in meses:
     if not so_devolucao and linhas and pct_marca < 50:
         sem_marca.append(m)
 
+    # As quatro fontes do mês. "ok" só quando o mês está inteiro.
+    tem = {
+        "DET": linhas > 0 and not so_devolucao,
+        "CST": bool(o) and m in vendedor_oficial,
+        "CON": consolidado.get(m, 0) > 0,
+        "DEV": devolucoes.get(m, 0) > 0,
+    }
+    if not so_devolucao and linhas:
+        faltando = [k for k, v in tem.items() if not v]
+        if pct_marca < 50:
+            faltando.append("MARCA")
+        if dif is not None and dif > 15:
+            faltando.append("INFLADO")
+        if faltando:
+            pendencias[m] = faltando
+        else:
+            prontos.append(m)
+    marcadores = " ".join(" ✓ " if tem[k] else " · " for k in ("DET", "CST", "CON", "DEV"))
+
     _dif = f"{dif:+.0f}%" if dif is not None else "  —"
-    print(f"   {m:<9}{imports:>8}{linhas:>9}{valor:>16,.2f}{o:>16,.2f}"
-          f"{_dif:>7}{pct_marca:>6.0f}%   {', '.join(notas)}")
+    print(f"   {m:<9}{imports:>4}{linhas:>8}{valor:>15,.2f}{o:>15,.2f}"
+          f"{_dif:>6}{pct_marca:>5.0f}%  {marcadores}   {', '.join(notas)}")
+
+print("\n   DET faturamento detalhado · CST custo x venda · CON consolidado por cliente"
+      " · DEV devoluções")
+
+print("\nCHECKLIST DA MIGRAÇÃO")
+if prontos:
+    print(f"   Completos ({len(prontos)}): {', '.join(prontos)}")
+if pendencias:
+    for m in sorted(pendencias):
+        falta = pendencias[m]
+        # Refazer é diferente de completar: se falta a marca ou o mês está
+        # inflado, o detalhado precisa ser zerado antes. Se falta só uma fonte,
+        # é importar por cima, sem apagar nada.
+        precisa_zerar = "MARCA" in falta or "INFLADO" in falta
+        rotulo = "REFAZER" if precisa_zerar else "completar"
+        legiveis = {"DET": "faturamento detalhado", "CST": "custo x venda",
+                    "CON": "consolidado por cliente", "DEV": "devoluções",
+                    "MARCA": "marca", "INFLADO": "valor inflado"}
+        print(f"\n   {m}  {rotulo}: falta {', '.join(legiveis.get(f, f) for f in falta)}")
+        if precisa_zerar:
+            print(f"      limpar_import.py --zerar-mes {m} --aplicar")
+            print(f"      e importar: FAT DETALHADO do mês, depois o que mais faltar")
+        else:
+            print(f"      importar {', '.join(legiveis.get(f, f) for f in falta)} "
+                  f"— não precisa zerar nada")
+if not prontos and not pendencias:
+    print("   Nenhum mês com carga de venda.")
 
 print("\nVEREDITO")
 if refazer:
