@@ -507,11 +507,50 @@ IMPORT_SCOPE_TABLES = {
     "cadastro_clientes": ("crm_client_profiles",),
     "faturamento_cliente_consolidado": ("crm_client_summary",),
     "devolucao_garantia": ("fact_warranty_returns",),
-    # Catálogo é base MESTRE, sem competência: nunca apagar por mês.
-    "cadastro_itens": (),
+    # Catálogo é base MESTRE, sem competência: a exportação nova substitui a
+    # anterior inteira, para que item retirado de linha deixe de existir.
+    "cadastro_itens": ("item_catalog",),
     # Estoque é fotografia atual, sem competência: substituído por unidade.
     "posicao_estoque": (),
 }
+# O que cada tipo de arquivo faz com o que já está gravado. A regra é do TIPO,
+# não da escolha de quem importa: marcar "acrescentar" num arquivo que deveria
+# substituir dobra o número sem avisar ninguém.
+#   "base"        — substitui a base inteira (não tem competência)
+#   "competencia" — substitui só o mês importado
+#   "acrescenta"  — soma ao que existe, descartando linha repetida
+IMPORT_REPLACE_POLICY = {
+    # Uma linha por cliente: endereço, telefone, razão social e vendedor mudam,
+    # então a base nova manda.
+    "cadastro_clientes": "base",
+    # Catálogo e estoque são fotografia do momento.
+    "cadastro_itens": "base",
+    "posicao_estoque": "base",
+    # Resumos: uma linha por cliente/vendedor/unidade por mês.
+    "faturamento_cliente_consolidado": "competencia",
+    "custo_vendedor": "competencia",
+    "custo_unidade": "competencia",
+    # Movimento item a item: cada linha é um fato próprio e o histórico só
+    # cresce. A repetição é resolvida pelo row_hash.
+    "faturamento_detalhado": "acrescenta",
+    "devolucao_garantia": "acrescenta",
+}
+IMPORT_REPLACE_LABELS = {
+    "base": "substitui a base inteira",
+    "competencia": "substitui o mês",
+    "acrescenta": "acrescenta ao histórico",
+}
+FILE_TYPE_LABELS = {
+    "cadastro_clientes": "cadastro de clientes",
+    "cadastro_itens": "cadastro de itens",
+    "posicao_estoque": "posição de estoque",
+    "faturamento_cliente_consolidado": "faturamento consolidado por cliente",
+    "custo_vendedor": "custo x venda por vendedor",
+    "custo_unidade": "custo x venda por unidade",
+    "faturamento_detalhado": "faturamento detalhado",
+    "devolucao_garantia": "devolução em garantia",
+}
+
 UPLOAD_FIELD_TYPE_OVERRIDES = {
     "cost_unit_file": "custo_unidade",
     "cost_vendor_file": "custo_vendedor",
@@ -4294,29 +4333,32 @@ def delete_competence_data(
     company_id: int,
     competence: str,
     file_types: set[str] | None = None,
-) -> None:
-    selected_file_types = file_types or set(IMPORT_SCOPE_TABLES)
-    # Cadastro de clientes: base mestre sem competência — substitui TODA a base anterior.
-    if "cadastro_clientes" in selected_file_types:
-        conn.execute("DELETE FROM crm_client_profiles WHERE company_id = ?", (company_id,))
-    # Faturamento consolidado por cliente: competência vem do nome do arquivo — substitui só o mês.
-    if "faturamento_cliente_consolidado" in selected_file_types:
-        conn.execute(
-            "DELETE FROM crm_client_summary WHERE company_id = ? AND competence = ?",
-            (company_id, competence),
-        )
-    target_tables = set()
-    for file_type in selected_file_types:
-        # APPEND-ONLY: competência derivada da data de cada linha e dedupe por row_hash.
-        # Nunca apagar o histórico dessas tabelas.
-        if file_type in {
-            "cadastro_clientes", "faturamento_cliente_consolidado",
-            "faturamento_detalhado", "devolucao_garantia",
-        }:
+) -> dict[str, int]:
+    # Conjunto VAZIO significa "não substitua nada" e é diferente de None, que
+    # significa "não foi informado, use todos". Com `or`, o vazio caía no fallback
+    # e apagava a base inteira justamente quando uma guarda tinha acabado de
+    # decidir que nada devia ser apagado.
+    selected_file_types = set(IMPORT_SCOPE_TABLES) if file_types is None else file_types
+    removidas: dict[str, int] = {}
+    # Quem manda é a IMPORT_REPLACE_POLICY: a regra de cada tipo fica declarada
+    # em um lugar só, em vez de espalhada em condições que se contradizem.
+    for file_type in sorted(selected_file_types):
+        politica = IMPORT_REPLACE_POLICY.get(file_type, "acrescenta")
+        if politica == "acrescenta":
+            # Movimento item a item: competência vem da data de cada linha e a
+            # repetição é resolvida pelo row_hash. Nunca apagar o histórico.
             continue
-        target_tables.update(IMPORT_SCOPE_TABLES.get(file_type, ()))
-    for table in target_tables:
-        conn.execute(f"DELETE FROM {table} WHERE company_id = ? AND competence = ?", (company_id, competence))
+        for table in IMPORT_SCOPE_TABLES.get(file_type, ()):
+            if politica == "base":
+                # Base mestre, sem competência: a exportação nova manda inteira.
+                cur = conn.execute(f"DELETE FROM {table} WHERE company_id = ?", (company_id,))
+            else:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE company_id = ? AND competence = ?",
+                    (company_id, competence))
+            if cur.rowcount and cur.rowcount > 0:
+                removidas[file_type] = removidas.get(file_type, 0) + cur.rowcount
+    return removidas
 
 
 def import_package(
@@ -4336,14 +4378,36 @@ def import_package(
         if item.get("fileType")
     }
     actual_action = import_action or "substituir"
+    rows_replaced_by_type: dict[str, int] = {}
     # Guarda a contagem anterior da base de clientes para detectar exportação incompleta
     clients_before = 0
     if "cadastro_clientes" in selected_file_types:
         clients_before = int(conn.execute(
             "SELECT COUNT(*) FROM crm_client_profiles WHERE company_id = ?", (company_id,)
         ).fetchone()[0] or 0)
+    # Substituir a base inteira do catálogo é irreversível dentro do import: se o
+    # arquivo veio truncado (export interrompido, filtro esquecido), apagar antes
+    # de conferir destrói o que não volta. Então mede primeiro e recusa a troca
+    # quando o arquivo novo é muito menor que a base atual — nesse caso o import
+    # segue como atualização, sem apagar nada.
+    replace_types = set(selected_file_types)
+    catalog_guard_msg = ""
+    if "cadastro_itens" in replace_types:
+        catalogo_atual = int(conn.execute(
+            "SELECT COUNT(*) FROM item_catalog WHERE company_id = ?", (company_id,)
+        ).fetchone()[0] or 0)
+        catalogo_novo = int((preview.get("rowCounts") or {}).get("cadastro_itens") or 0)
+        if catalogo_atual and catalogo_novo < catalogo_atual * 0.7:
+            replace_types.discard("cadastro_itens")
+            catalog_guard_msg = (
+                f"O catálogo enviado tem {catalogo_novo} item(ns) e a base tem "
+                f"{catalogo_atual}. Por segurança NÃO substituí a base: os itens do "
+                f"arquivo foram atualizados e o restante continua lá. Se a redução "
+                f"for real, reexporte o catálogo completo do Alfa."
+            )
+
     if actual_action == "substituir":
-        delete_competence_data(conn, company_id, competence, selected_file_types)
+        rows_replaced_by_type = delete_competence_data(conn, company_id, competence, replace_types)
 
     import_cursor = conn.execute(
         """
@@ -4597,16 +4661,19 @@ def import_package(
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
         elif kind == "custo_vendedor":
-            # O resumo tem UMA linha por vendedor por mês: reimportar o mês
-            # substitui, não soma. Sem isto, subir o custo x venda de novo com o
-            # mês mais adiantado grava a linha nova ao lado da antiga (o valor
-            # mudou, então o row_hash muda e o dedupe não pega) e o faturamento
-            # oficial dobra silenciosamente.
-            summary_rows_replaced += conn.execute(
-                "DELETE FROM fact_vendor_summary WHERE company_id = ? AND competence = ?",
-                (company_id, competence)).rowcount or 0
             for row in rows:
                 seller_name = normalize_whitespace(row.get("VENDEDOR"))
+                # O resumo tem UMA linha por vendedor por mês. Trocar a linha
+                # daquele vendedor vale nos dois modos: em "substituir" o mês já
+                # foi limpo antes, e em "agregar" isto impede que a versão nova
+                # entre ao lado da antiga. Sem isso, reimportar o custo x venda
+                # com o mês mais adiantado dobra o faturamento oficial em
+                # silêncio — o valor mudou, então o row_hash muda e o dedupe por
+                # repetição não pega.
+                summary_rows_replaced += conn.execute(
+                    "DELETE FROM fact_vendor_summary "
+                    "WHERE company_id = ? AND competence = ? AND seller_name = ?",
+                    (company_id, competence, seller_name)).rowcount or 0
                 payload = {
                     "seller": seller_name,
                     "qty_sold": parse_decimal(row.get("QTD VENDIDA")),
@@ -4832,13 +4899,14 @@ def import_package(
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
         elif kind == "custo_unidade":
-            # Mesma regra do resumo por vendedor: uma linha por unidade por mês,
-            # então reimportar substitui o mês inteiro.
-            summary_rows_replaced += conn.execute(
-                "DELETE FROM fact_unit_summary WHERE company_id = ? AND competence = ?",
-                (company_id, competence)).rowcount or 0
             for row in rows:
                 unit_name = normalize_unit(row.get("EMPRESA"))
+                # Mesma regra do resumo por vendedor: uma linha por unidade por
+                # mês, e a linha nova toma o lugar da antiga em vez de somar.
+                summary_rows_replaced += conn.execute(
+                    "DELETE FROM fact_unit_summary "
+                    "WHERE company_id = ? AND competence = ? AND unit_name = ?",
+                    (company_id, competence, unit_name)).rowcount or 0
                 payload = {
                     "unit": unit_name,
                     "qty_sold": parse_decimal(row.get("QTD VENDIDA")),
@@ -4917,6 +4985,15 @@ def import_package(
         result["summaryRowsReplaced"] = summary_rows_replaced
         result["message"] = (f"Resumo de {competence} atualizado — "
                              f"{summary_rows_replaced} linha(s) anterior(es) substituída(s)")
+    if rows_replaced_by_type:
+        result["rowsReplacedByType"] = rows_replaced_by_type
+        _partes = [f"{FILE_TYPE_LABELS.get(t, t)}: {n} linha(s) "
+                   f"({IMPORT_REPLACE_LABELS.get(IMPORT_REPLACE_POLICY.get(t, 'acrescenta'), '')})"
+                   for t, n in sorted(rows_replaced_by_type.items())]
+        result["replacedSummary"] = "Substituído — " + "; ".join(_partes)
+    if catalog_guard_msg:
+        result["warning"] = ((result.get("warning") + " · ") if result.get("warning")
+                             else "") + catalog_guard_msg
     if catalog_new_total or catalog_updated_total:
         result["catalogNew"] = catalog_new_total
         result["catalogUpdated"] = catalog_updated_total
@@ -21359,6 +21436,13 @@ def _auto_import_tick_inner() -> None:
                         _auto_import_log(conn, cfg["folder"], scope, competence,
                                          "erro", "Nenhum usuário Admin/Diretor encontrado.", [f.name for f in files])
                         continue
+                    # A importação automática não pergunta nada a ninguém, então
+                    # manda sempre "substituir" e deixa a IMPORT_REPLACE_POLICY
+                    # decidir por tipo: cadastro de clientes, cadastro de itens e
+                    # posição de estoque trocam a base inteira; consolidado e
+                    # custo x venda trocam o mês; faturamento detalhado e
+                    # devolução em garantia só acrescentam. Na importação manual
+                    # a escolha continua sendo de quem importa.
                     result = import_package(
                         conn, user["company_id"], user["id"],
                         competence, "substituir", scope, preview, files_payload,
