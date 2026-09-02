@@ -15246,7 +15246,18 @@ function meuPlacarView() {
 // O termômetro existe porque ponto sozinho não move ninguém: o que move é saber
 // quanto ele vale. Com a base da faixa de meta, cada ponto tem preço — e o
 // vendedor passa a ver "faltam 8 pontos" como "faltam R$ 15".
+// Mês fechado não aceita "faltam" nem "dá para ganhar": não há mais o que
+// buscar. O texto muda de tempo verbal — do que ainda pode acontecer para o que
+// deixou de acontecer. Promessa em mês encerrado é ruído, e pior, soa como
+// deboche para quem já não pode fazer nada.
+function mesEmAndamento(competencia) {
+  const agora = new Date();
+  const atual = `${agora.getFullYear()}-${String(agora.getMonth() + 1).padStart(2, "0")}`;
+  return competencia >= atual;
+}
+
 function termometroPremiacao(eu, s) {
+  const aberto = mesEmAndamento(s.competence || "");
   const base = s.baseValue || 0;
   const porPonto = base / 100;
   const pontos = eu.points;
@@ -15266,17 +15277,27 @@ function termometroPremiacao(eu, s) {
         <div style="font-size:44px;font-weight:900;line-height:1;color:${
           eu.value > 0 ? "var(--good)" : "var(--muted)"}">${currency(eu.value)}</div>
         <div class="text-small" style="color:var(--muted)">
-          ${number(pontos)} pontos · cada ponto vale <strong>${currency(porPonto)}</strong>
+          ${number(pontos)} pontos${aberto
+            ? ` · cada ponto vale <strong>${currency(porPonto)}</strong>` : " · mês encerrado"}
         </div>
-        ${proximo ? `
+        ${!proximo ? `
+          <div style="margin-top:8px;padding:8px 10px;background:#e6f4ea;border-left:3px solid var(--good)">
+            <div style="font-weight:800;font-size:14px">
+              ${aberto ? "Você está no máximo da premiação."
+                       : "Fechou no máximo da premiação."}</div>
+          </div>`
+        : aberto ? `
           <div style="margin-top:8px;padding:8px 10px;background:#fef7e0;border-left:3px solid #e67e22">
             <div style="font-weight:800;font-size:14px">
               Faltam ${proximo.pts - pontos} ponto(s)</div>
             <div class="text-small">
               para ${escapeHtml(proximo.rotulo)}: <strong>${currency(proximo.valor)}</strong></div>
-          </div>` : `
-          <div style="margin-top:8px;padding:8px 10px;background:#e6f4ea;border-left:3px solid var(--good)">
-            <div style="font-weight:800;font-size:14px">Você está no máximo da premiação.</div>
+          </div>`
+        : `
+          <div style="margin-top:8px;padding:8px 10px;background:var(--surface);border-left:3px solid var(--line)">
+            <div class="text-small">
+              Faltaram ${proximo.pts - pontos} ponto(s) para ${escapeHtml(proximo.rotulo)},
+              que seriam ${currency(proximo.valor)}.</div>
           </div>`}
       </div>
 
@@ -15308,6 +15329,7 @@ function termometroPremiacao(eu, s) {
 // primeiro o que já foi conquistado esconde a oportunidade; ver primeiro o que
 // falta transforma a tela em lista de tarefas com preço em cada uma.
 function missoesDoVendedor(eu, s) {
+  const aberto = mesEmAndamento(s.competence || "");
   const base = s.baseValue || 0;
   const porPonto = base / 100;
   const comFolga = s.indicators.map((i) => ({
@@ -15343,9 +15365,11 @@ function missoesDoVendedor(eu, s) {
           <span class="text-small" style="font-weight:700">
             ${i.semTeto ? `${i.points} pts · sem limite` : `${i.points}/${i.max} pts`}</span>
         </div>
-        ${!conquistado && i.falta > 0 ? `
+        ${!conquistado && i.falta > 0 ? (aberto ? `
           <div class="text-small" style="color:#b9770e;font-weight:700;margin-top:2px">
-            Dá para ganhar mais ${i.falta} ponto(s) — ${currency(i.falta * porPonto)}</div>` : ""}
+            Dá para ganhar mais ${i.falta} ponto(s) — ${currency(i.falta * porPonto)}</div>` : `
+          <div class="text-small" style="color:var(--muted);margin-top:2px">
+            Deixou ${i.falta} ponto(s) na mesa — ${currency(i.falta * porPonto)}</div>`) : ""}
         <div class="text-small" style="color:var(--muted);line-height:1.35;margin-top:2px">
           ${i.missing ? "falta cadastrar/lançar" : escapeHtml(i.detail || "")}</div>
         ${aberto ? `
@@ -15362,11 +15386,15 @@ function missoesDoVendedor(eu, s) {
         <div class="form-card" style="padding:14px 18px">
           <div class="section-title">
             <div>
-              <h3>Ainda dá para buscar</h3>
+              <h3>${aberto ? "Ainda dá para buscar" : "Não pontuou"}</h3>
               <div class="text-small">
-                ${totalNaMesa} ponto(s) na mesa neste mês, o equivalente a
-                <strong>${currency(totalNaMesa * porPonto)}</strong>.
-                Comece pelos de cima, que valem mais.
+                ${aberto
+                  ? `${totalNaMesa} ponto(s) na mesa neste mês, o equivalente a
+                     <strong>${currency(totalNaMesa * porPonto)}</strong>.
+                     Comece pelos de cima, que valem mais.`
+                  : `${totalNaMesa} ponto(s) ficaram na mesa, o equivalente a
+                     <strong>${currency(totalNaMesa * porPonto)}</strong>.
+                     Serve de leitura para o mês seguinte.`}
               </div>
             </div>
           </div>
@@ -15380,7 +15408,8 @@ function missoesDoVendedor(eu, s) {
           <div class="section-title">
             <div>
               <h3>Conquistado</h3>
-              <div class="text-small">${conquistados.length} indicador(es) no máximo. Só manter.</div>
+              <div class="text-small">${conquistados.length} indicador(es) no máximo.
+                ${aberto ? "Só manter." : ""}</div>
             </div>
           </div>
           <div style="display:flex;gap:8px;flex-wrap:wrap">
