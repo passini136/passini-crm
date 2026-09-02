@@ -248,6 +248,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     # Placar reconstruído sobre a cesta real da premiação: 9 indicadores, 150
     # pontos, elegibilidade e valor. A versão antiga tinha 5 componentes com
     # pesos e nota 0–100, que não correspondia a premiação nenhuma.
+    {"id": "meu-placar",     "label": "Meu Placar",         "group": "Equipe"},
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "Equipe"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "Equipe"},
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
@@ -329,7 +330,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
+            "meu-placar", "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "marcas", "devolucoes", "calendario",
         ],
         "data_scope": "proprio",

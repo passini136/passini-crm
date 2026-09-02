@@ -464,13 +464,13 @@ function defaultTabForUser(user) {
   const allowed = allowedTabsForUser(user);
   // Primeira aba disponível seguindo a preferência natural de cada perfil
   const preference = user?.dataScope === "proprio"
-    ? ["crm-agenda", "crm-clientes", "executivo"]
+    ? ["crm-agenda", "meu-placar", "crm-clientes", "executivo"]
     : ["executivo", "crm-agenda", "crm-clientes", "acessos"];
   return preference.find((tab) => allowed.includes(tab)) || allowed[0] || "executivo";
 }
 
 // Telas da campanha de premiação — seguem PLACAR_ENABLED, não o score
-const PLACAR_TABS = ["placar-equipe"];
+const PLACAR_TABS = ["meu-placar", "placar-equipe"];
 
 function allowedTabsForUser(user) {
   if (!user) return ["executivo"];
@@ -4936,7 +4936,7 @@ async function refreshCurrentTab() {
   if (tab === "metas-vendedor") {
     promises.push(loadSellerTargets());
   }
-  if (tab === "placar-equipe") {
+  if (tab === "placar-equipe" || tab === "meu-placar") {
     promises.push(loadAwards(true));
   }
   if (tab === "crm-agenda") {
@@ -15175,7 +15175,88 @@ function scoreIndicatorRow(key, ind) {
   `;
 }
 
+// Placar do vendedor sobre a MESMA apuração do gestor. O endpoint já recorta
+// pelo escopo do usuário: quem tem escopo "próprio" recebe só a si mesmo, então
+// não existe caminho pelo qual o vendedor veja o número do colega.
 function meuPlacarView() {
+  if (!state.awards) {
+    if (!state.ui.loading.awards) loadAwards();
+    return `<div class="loader panel">Carregando seu placar…</div>`;
+  }
+  const d = state.awards;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  const eu = (d.sellers || [])[0] || (d.others || [])[0];
+  if (!eu) {
+    return `<div class="message">Ainda não há faturamento seu neste período.</div>`;
+  }
+  const s = eu.single;
+  const meses = d.allCompetences || [];
+  const f = state.awardFilters || { from: d.from, to: d.to };
+  const rascunho = state.awardPeriodDraft || f;
+  const carregando = Boolean(state.ui.loading.awards);
+  const mudou = periodoAwardsMudou();
+  const falta60 = s ? Math.max(0, (s.minPoints || 60) - eu.points) : 0;
+
+  const seletor = (campo, valor) => `
+    <select onchange="setAwardPeriod('${campo}', this.value)" ${carregando ? "disabled" : ""}
+      style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;font-size:13px">
+      ${meses.map((m) => `<option value="${m}" ${m === valor ? "selected" : ""}>${m}</option>`).join("")}
+    </select>`;
+
+  return `
+    <div class="stack">
+      <div class="form-card">
+        <div class="section-title">
+          <div>
+            <h3>Meu placar</h3>
+            <div class="text-small">Clique no <strong>?</strong> de cada indicador para ver
+              como ganhar ponto nele.</div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="text-small">de</span>${seletor("from", rascunho.from)}
+            <span class="text-small">até</span>${seletor("to", rascunho.to)}
+            <button class="btn ${mudou ? "btn-primary" : "btn-secondary"} btn-sm"
+              ${carregando || !mudou ? "disabled" : ""} onclick="aplicarPeriodoAwards()">
+              ${carregando ? '<span class="girando">↻</span> Apurando…' : "Aplicar"}</button>
+          </div>
+        </div>
+
+        <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+          <div style="text-align:center;min-width:130px">
+            <div style="font-size:38px;font-weight:900;line-height:1">${number(eu.points)}</div>
+            <div class="text-small" style="color:var(--muted)">de ${number(eu.maxPoints)} pontos</div>
+            ${barraPontos(eu.points, eu.maxPoints)}
+          </div>
+          <div style="flex:1;min-width:200px">
+            <div style="font-size:28px;font-weight:900;color:${eu.value > 0 ? "var(--good)" : "var(--muted)"}">
+              ${currency(eu.value)}</div>
+            ${s && s.maxValue ? `
+              <div class="text-small" style="color:var(--muted)">
+                Com a cesta cheia você chega a <strong>${currency(s.maxValue)}</strong>.</div>` : ""}
+            ${falta60 > 0 ? `
+              <div class="text-small" style="color:var(--bad);margin-top:4px">
+                Faltam <strong>${falta60}</strong> ponto(s) para começar a receber.</div>` : ""}
+          </div>
+          ${s ? `
+            <div style="min-width:220px">
+              ${gatilhoMeta("Sua meta", s.goalPct, 90, 105)}
+              ${gatilhoMeta("Sua loja", s.unitAttainment, 95, null)}
+              <div class="text-small" style="color:var(--muted);margin-top:4px">
+                ${escapeHtml(s.eligibilityReason || "")}</div>
+            </div>` : `
+            <div class="text-small" style="color:var(--muted)">
+              Média de ${eu.avgPoints} pontos por mês no período.</div>`}
+        </div>
+      </div>
+
+      ${s ? `
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          ${s.indicators.map(cartaoIndicador).join("")}
+        </div>` : ""}
+    </div>`;
+}
+
+function meuPlacarViewAntigo() {
   if (!roleIsSeller()) return "";
   if (!state.sellerScore) return `<div class="loader panel">Carregando seu placar…</div>`;
   const sc = state.sellerScore;
@@ -15337,6 +15418,7 @@ function topbarTitle() {
     "importacoes":    { title: "Importações",             description: "Gestão de arquivos, pacotes e auditoria de dados." },
     "administracao":  { title: "Administração",           description: "Pendências, cadastros e integridade dos dados." },
     "metas-vendedor": { title: "Metas do Vendedor",       description: "Mix, margem e ligações por vendedor. Valem até você mudar." },
+    "meu-placar":     { title: "Meu Placar",               description: "Seus pontos, seus indicadores e quanto você pode receber no mês." },
     "placar-equipe":  { title: "Placar da Equipe",         description: "Apuração da premiação por vendedor: indicadores, pontos e valor." },
     "configuracoes":  { title: "Configurações",           description: "Metas, score e parâmetros operacionais." },
     "acessos":        { title: "Usuários e Perfis",       description: "Contas de acesso e permissões por perfil." },
@@ -15703,6 +15785,7 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const equipeTabs = [
+    { id: "meu-placar",    title: "Meu Placar",       desc: "Seus pontos e premiação",  icon: "⭐" },
     { id: "placar-equipe", title: "Placar Equipe",    desc: "Apuração da premiação",    icon: "🏆" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
@@ -15857,6 +15940,7 @@ function dashboardView() {
           ${state.activeTab === "importacoes"   ? importacoesView()    : ""}
           ${state.activeTab === "administracao" ? administracaoView()  : ""}
           ${state.activeTab === "metas-vendedor" ? metasVendedorView() : ""}
+          ${state.activeTab === "meu-placar"     ? meuPlacarView()     : ""}
           ${state.activeTab === "placar-equipe"  ? placarEquipeView()  : ""}
           ${state.activeTab === "configuracoes" ? configuracoesView()  : ""}
           ${state.activeTab === "acessos"       ? acessosView()        : ""}
