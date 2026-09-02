@@ -15602,6 +15602,7 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const equipeTabs = [
+    { id: "placar-equipe", title: "Placar Equipe",    desc: "Apuração da premiação",    icon: "🏆" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
       badge: state.meetings?.pendingCount || 0 },
