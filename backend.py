@@ -1244,6 +1244,15 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if sales_columns and stored_returns_purge_version(conn) < SALES_RETURNS_PURGE_VERSION:
         purge_sales_return_rows(conn)
 
+    # As faixas 2 e 3 da margem nasceram depois da tabela. CREATE TABLE IF NOT
+    # EXISTS não acrescenta coluna em tabela existente — só o ALTER faz isso.
+    alvo_colunas = {row["name"] for row in
+                    conn.execute("PRAGMA table_info(seller_targets)").fetchall()}
+    if alvo_colunas:
+        for coluna in ("margin_target_mid", "margin_target_top"):
+            if coluna not in alvo_colunas:
+                conn.execute(f"ALTER TABLE seller_targets ADD COLUMN {coluna} REAL")
+
     prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
     if prospect_columns:
         # A ficha cadastral do cliente pede mais que a prospecção precisava.
@@ -2605,7 +2614,14 @@ def init_db() -> None:
                 company_id INTEGER NOT NULL,
                 seller_name TEXT NOT NULL,
                 mix_target REAL,             -- referências distintas no mês
-                margin_target REAL,          -- margem mínima para pontuar
+                -- Três faixas de margem, porque televendas não é o geral
+                -- deslocado: a régua de 2025 usava 1,41 / 1,46 / 1,53 para a
+                -- matriz tele contra 1,50 / 1,52 / 1,59 do balcão — os degraus
+                -- têm larguras diferentes e derivar um do outro daria números
+                -- que ninguém combinou.
+                margin_target REAL,          -- faixa 1: entra na pontuação
+                margin_target_mid REAL,      -- faixa 2
+                margin_target_top REAL,      -- faixa 3: pontuação cheia
                 calls_target REAL,           -- ligações ativas no mês
                 notes TEXT,
                 updated_by INTEGER,
@@ -11204,9 +11220,13 @@ def suggested_seller_targets(
             "hasTargets": bool(atual),
             "mixTarget": (atual["mix_target"] if atual else None),
             "marginTarget": (atual["margin_target"] if atual else None),
+            "marginTargetMid": (atual["margin_target_mid"] if atual else None),
+            "marginTargetTop": (atual["margin_target_top"] if atual else None),
             "callsTarget": (atual["calls_target"] if atual else None),
             "suggestedMix": mix,
-            "suggestedMargin": DEFAULT_MARGIN_TARGET,
+            "suggestedMargin": 1.41 if tele else 1.50,
+            "suggestedMarginMid": 1.46 if tele else 1.52,
+            "suggestedMarginTop": 1.53 if tele else 1.59,
             "suggestedCalls": DEFAULT_CALLS_TARGET,
         })
     return saida
@@ -11237,17 +11257,21 @@ def save_seller_targets(
         conn.execute(
             """
             INSERT INTO seller_targets (company_id, seller_name, mix_target, margin_target,
+                                        margin_target_mid, margin_target_top,
                                         calls_target, notes, updated_by, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(company_id, seller_name) DO UPDATE SET
                 mix_target = excluded.mix_target,
                 margin_target = excluded.margin_target,
+                margin_target_mid = excluded.margin_target_mid,
+                margin_target_top = excluded.margin_target_top,
                 calls_target = excluded.calls_target,
                 notes = excluded.notes,
                 updated_by = excluded.updated_by,
                 updated_at = excluded.updated_at
             """,
             (company_id, nome, numero("mixTarget"), numero("marginTarget"),
+             numero("marginTargetMid"), numero("marginTargetTop"),
              numero("callsTarget"), normalize_whitespace(item.get("notes")),
              user_id, ts, ts))
         gravadas += 1
@@ -11420,6 +11444,10 @@ def seller_targets_for(
         # Margem não é proporcional ao tempo: é qualidade da venda, não volume.
         "marginTarget": (float(linha["margin_target"])
                          if linha and linha["margin_target"] is not None else None),
+        "marginTargetMid": (float(linha["margin_target_mid"])
+                            if linha and linha["margin_target_mid"] is not None else None),
+        "marginTargetTop": (float(linha["margin_target_top"])
+                            if linha and linha["margin_target_top"] is not None else None),
         "mixTargetFull": (float(linha["mix_target"])
                           if linha and linha["mix_target"] is not None else None),
         "callsTargetFull": (float(linha["calls_target"])
@@ -11555,13 +11583,15 @@ def seller_award_indicators(
         return 0
 
     # A margem tem faixas próprias por vendedor: a régua de televendas é mais
-    # baixa. Quando há meta cadastrada, ela vira a primeira faixa e as outras
-    # duas acompanham o mesmo intervalo da tabela geral.
+    # baixa E com degraus de largura diferente. As três faixas são cadastradas
+    # uma a uma; faixa não informada cai na régua geral da cesta.
     faixas_margem = faixas("margem")
-    if metas["marginTarget"] and faixas_margem:
-        base = faixas_margem[0][0]
-        faixas_margem = [(round(metas["marginTarget"] + (m - base), 2), p)
-                         for m, p in faixas_margem]
+    _cadastradas = [metas["marginTarget"], metas["marginTargetMid"], metas["marginTargetTop"]]
+    if any(v is not None for v in _cadastradas) and faixas_margem:
+        faixas_margem = [
+            (float(_cadastradas[i]) if i < len(_cadastradas) and _cadastradas[i] is not None
+             else minimo, pontos)
+            for i, (minimo, pontos) in enumerate(faixas_margem)]
 
     def contra_meta(valor: float, alvo: float | None) -> float | None:
         """Vira percentual do alvo, para a faixa ser "100% da meta"."""
@@ -11575,8 +11605,8 @@ def seller_award_indicators(
          "points": points_for_band(meta_pct, faixas("meta")), "max": teto("meta"),
          "missing": meta_valor <= 0},
         {"code": "margem", "label": "Margem", "value": margem, "format": "ratio",
-         "detail": (f"régua {metas['marginTarget']:.2f}" if metas["marginTarget"]
-                    else "usando a régua geral"),
+         "detail": ("régua " + " / ".join(f"{m:.2f}" for m, _ in faixas_margem)
+                    if faixas_margem else "sem régua"),
          "points": points_for_band(margem, faixas_margem), "max": teto("margem"),
          "missing": margem is None},
         {"code": "mix", "label": "Itens", "value": mix, "format": "count",

@@ -13505,6 +13505,8 @@ function preencherMetasSugeridas() {
     state.sellerTargetEdits[s.sellerName] = {
       mixTarget: s.suggestedMix ?? "",
       marginTarget: s.suggestedMargin ?? "",
+      marginTargetMid: s.suggestedMarginMid ?? "",
+      marginTargetTop: s.suggestedMarginTop ?? "",
       callsTarget: s.suggestedCalls ?? "",
     };
   });
@@ -13522,6 +13524,8 @@ async function salvarMetasVendedor() {
       sellerName: s.sellerName,
       mixTarget: e.mixTarget !== undefined ? e.mixTarget : s.mixTarget,
       marginTarget: e.marginTarget !== undefined ? e.marginTarget : s.marginTarget,
+      marginTargetMid: e.marginTargetMid !== undefined ? e.marginTargetMid : s.marginTargetMid,
+      marginTargetTop: e.marginTargetTop !== undefined ? e.marginTargetTop : s.marginTargetTop,
       callsTarget: e.callsTarget !== undefined ? e.callsTarget : s.callsTarget,
     };
   }).filter((l) => l.mixTarget != null || l.marginTarget != null || l.callsTarget != null);
@@ -13536,6 +13540,16 @@ async function salvarMetasVendedor() {
   }
 }
 
+// De qual campo da resposta sai o placeholder de cada coluna. Antes eu derivava
+// o nome por manipulação de texto, o que quebrou assim que apareceu "marginTargetMid".
+const SUGESTAO_POR_CAMPO = {
+  mixTarget: "suggestedMix",
+  marginTarget: "suggestedMargin",
+  marginTargetMid: "suggestedMarginMid",
+  marginTargetTop: "suggestedMarginTop",
+  callsTarget: "suggestedCalls",
+};
+
 function metasVendedorView() {
   if (!state.sellerTargets) { loadSellerTargets(); return `<div class="loader panel">Carregando metas…</div>`; }
   const d = state.sellerTargets;
@@ -13548,7 +13562,7 @@ function metasVendedorView() {
     const e = edits[s.sellerName] || {};
     const valor = e[nome] !== undefined ? e[nome] : (s[nome] ?? "");
     return `<input type="text" inputmode="decimal" value="${valor === null ? "" : valor}"
-      placeholder="${s["suggested" + nome.charAt(0).toUpperCase() + nome.slice(1).replace("Target","")] ?? ""}"
+      placeholder="${SUGESTAO_POR_CAMPO[nome] ? (s[SUGESTAO_POR_CAMPO[nome]] ?? "") : ""}"
       oninput="editarMeta('${s.sellerName.replace(/'/g, "\\'")}','${nome}',this.value)"
       style="width:88px;text-align:right;padding:5px 8px;border:1px solid var(--line);
              border-radius:6px;font-size:13px">`;
@@ -13583,7 +13597,9 @@ function metasVendedorView() {
               <tr>
                 <th>Vendedor</th><th>Unidade</th><th>Tipo</th>
                 <th style="text-align:right">Mix (itens)</th>
-                <th style="text-align:right">Margem</th>
+                <th style="text-align:right" title="Margem mínima para começar a pontuar">Margem 1</th>
+                <th style="text-align:right">Margem 2</th>
+                <th style="text-align:right" title="Pontuação cheia">Margem 3</th>
                 <th style="text-align:right">Ligações</th>
                 <th></th>
               </tr>
@@ -13597,6 +13613,8 @@ function metasVendedorView() {
                     s.insideSales ? "televendas" : "balcão"}</span></td>
                   <td style="text-align:right">${campo(s, "mixTarget")}</td>
                   <td style="text-align:right">${campo(s, "marginTarget")}</td>
+                  <td style="text-align:right">${campo(s, "marginTargetMid")}</td>
+                  <td style="text-align:right">${campo(s, "marginTargetTop")}</td>
                   <td style="text-align:right">${campo(s, "callsTarget")}</td>
                   <td>${s.hasTargets
                     ? `<span class="soft-badge">cadastrada</span>`
