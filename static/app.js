@@ -13602,6 +13602,28 @@ async function salvarLancamentos() {
   }
 }
 
+// As duas porcentagens que decidem quem recebe. O documento tem três gatilhos:
+// unidade em 95%, individual em 90% (que só valem juntos) e individual em 105%
+// (que vale sozinho). Mostrar o número sem o gatilho ao lado obriga quem lê a
+// lembrar de cor qual era o corte de cada um.
+function gatilhoMeta(rotulo, valor, corte, corteSozinho) {
+  if (valor === null || valor === undefined) {
+    return `<div><span class="text-small" style="color:var(--muted)">${rotulo}: sem meta</span></div>`;
+  }
+  const passouSozinho = corteSozinho !== null && valor >= corteSozinho;
+  const passou = valor >= corte;
+  const cor = passouSozinho ? "var(--good)" : passou ? "#e67e22" : "var(--bad)";
+  const marca = passouSozinho ? "✓✓" : passou ? "✓" : "✕";
+  return `
+    <div style="display:flex;align-items:baseline;gap:5px">
+      <span class="text-small" style="color:var(--muted)">${rotulo}</span>
+      <strong style="color:${cor};font-size:14px">${valor.toFixed(1)}%</strong>
+      <span style="color:${cor};font-size:11px;font-weight:700">${marca}</span>
+      <span class="text-small" style="color:var(--muted)">
+        (corte ${corte}%${corteSozinho ? ` · sozinho ${corteSozinho}%` : ""})</span>
+    </div>`;
+}
+
 function barraPontos(pontos, maximo) {
   const pct = maximo ? Math.min(100, (100 * pontos) / maximo) : 0;
   const cor = pct >= 66 ? "var(--good)" : pct >= 40 ? "#e67e22" : "var(--bad)";
@@ -13737,13 +13759,16 @@ function placarEquipeView() {
         <div class="form-card" style="padding:14px 18px">
           <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
             <div style="font-size:20px;font-weight:800;color:var(--muted);width:28px">${idx + 1}</div>
-            <div style="flex:1;min-width:200px">
+            <div style="flex:1;min-width:220px">
               <div style="font-weight:800">${escapeHtml(v.sellerName)}</div>
               <div class="text-small" style="color:var(--muted)">
-                ${escapeHtml(v.unitName || "sem unidade")} ·
-                ${v.goalPct !== null ? `${v.goalPct.toFixed(1)}% da meta` : "sem meta"} ·
-                ${currency(v.revenue)}
+                ${escapeHtml(v.unitName || "sem unidade")} · ${currency(v.revenue)}
               </div>
+              ${s ? `
+                <div style="display:flex;gap:14px;margin-top:5px;flex-wrap:wrap">
+                  ${gatilhoMeta("Individual", s.goalPct, 90, 105)}
+                  ${gatilhoMeta("Unidade", s.unitAttainment, 95, null)}
+                </div>` : ""}
             </div>
             <div style="text-align:center">
               <div style="font-size:22px;font-weight:800">${number(v.points)}</div>
@@ -15215,7 +15240,6 @@ function topbarTitle() {
     "configuracoes":  { title: "Configurações",           description: "Metas, score e parâmetros operacionais." },
     "acessos":        { title: "Usuários e Perfis",       description: "Contas de acesso e permissões por perfil." },
     "crm-agenda":     { title: "Missão do Dia",            description: "Sua fila de 5 contatos. 1 oferta + 1 pergunta por cliente." },
-    "placar-equipe":  { title: "Placar da Equipe",        description: "Ranking de vendedores, zonas de premiação e alertas." },
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
     "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
@@ -15578,7 +15602,6 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const equipeTabs = [
-    { id: "placar-equipe", title: "Placar Equipe",    desc: "Ranking e alertas",        icon: "🏆" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
       badge: state.meetings?.pendingCount || 0 },
@@ -15710,7 +15733,6 @@ function dashboardView() {
           ${messageHtml()}
           ${!allowed.includes(state.activeTab) ? `<div class="message">Seu perfil não tem acesso a esta tela.</div>` : ""}
           ${state.activeTab === "crm-agenda"    ? crmAgendaView()      : ""}
-          ${state.activeTab === "placar-equipe" ? placardaEquipeView() : ""}
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
