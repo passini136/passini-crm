@@ -15825,7 +15825,13 @@ function dashboardView() {
   // Telas com período próprio não devem mostrar o seletor de competência: dois
   // filtros de tempo na mesma tela, um deles sem efeito, só geram dúvida sobre
   // qual está valendo. Contatos filtra por data de/até dentro da própria tela.
-  const TELAS_SEM_COMPETENCIA = ["contatos", "reunioes", "visitas", "prospeccao", "administracao", "acessos"];
+  // Placar e Meu Placar têm seletor de/até próprio, porque a apuração aceita
+  // período de vários meses. Metas do Vendedor não tem competência nenhuma: a
+  // meta vale até ser mudada, e um seletor de mês ali sugeriria que ela muda
+  // com o mês.
+  const TELAS_SEM_COMPETENCIA = ["contatos", "reunioes", "visitas", "prospeccao",
+                                 "administracao", "acessos", "importacoes",
+                                 "meu-placar", "placar-equipe", "metas-vendedor"];
   // O vendedor não escolhe unidade nem vendedor (o escopo já força os dele),
   // mas precisa trocar de mês para acompanhar o próprio histórico.
   const sellerFilterBar = sellerRole && !isCrmTab ? `
