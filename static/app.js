@@ -37,7 +37,9 @@ const state = {
   sellerTargetEdits: {},
   awards: null,
   awardFilters: null,
+  awardPeriodDraft: null,
   awardEdits: {},
+  awardTipOpen: null,
   brandFilters: { scope: "", dimension: "" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
@@ -13659,7 +13661,11 @@ function barraPontos(pontos, maximo) {
 }
 
 function cartaoIndicador(i) {
-  const pct = i.max ? (100 * i.points) / i.max : 0;
+  // Extra positivação não tem teto: cada cliente reativado vale 1 ponto e ela
+  // fica fora dos 150. Mostrar "3/9999" seria ruído — e pintar de vermelho
+  // quem trouxe 3 clientes de volta seria pior ainda.
+  const semTeto = i.max >= 1000;
+  const pct = semTeto ? (i.points > 0 ? 100 : 0) : (i.max ? (100 * i.points) / i.max : 0);
   const cor = i.missing ? "var(--muted)" : pct >= 100 ? "var(--good)"
     : pct > 0 ? "#e67e22" : "var(--bad)";
   const v = i.value;
@@ -13669,18 +13675,36 @@ function cartaoIndicador(i) {
     // acrescentava zeros e afastava o número do que está no relatório.
     : i.format === "ratio" ? Number(v).toFixed(2)
     : Number(v).toFixed(0);
+  const aberto = state.awardTipOpen === i.code;
   return `
     <div style="border:1px solid var(--line);border-left:3px solid ${cor};border-radius:0;
                 padding:8px 10px;min-width:150px;flex:1">
-      <div class="text-small" style="color:var(--muted)">${escapeHtml(i.label)}</div>
+      <div style="display:flex;align-items:center;gap:5px">
+        <span class="text-small" style="color:var(--muted);flex:1">${escapeHtml(i.label)}</span>
+        ${i.tip ? `<button type="button" onclick="alternarDicaIndicador('${i.code}')"
+          title="Como ganhar ponto aqui"
+          style="border:1px solid var(--line);background:${aberto ? "var(--accent)" : "#fff"};
+                 color:${aberto ? "#fff" : "var(--muted)"};border-radius:50%;width:18px;height:18px;
+                 line-height:1;font-size:11px;font-weight:800;cursor:pointer;padding:0">?</button>` : ""}
+      </div>
       <div style="display:flex;align-items:baseline;gap:6px">
         <strong style="font-size:16px">${texto}</strong>
         <span class="text-small" style="color:${cor};font-weight:700">
-          ${i.points}/${i.max} pts</span>
+          ${semTeto ? `${i.points} pts · sem limite` : `${i.points}/${i.max} pts`}</span>
       </div>
       <div class="text-small" style="color:var(--muted);line-height:1.35">
         ${i.missing ? "falta cadastrar/lançar" : escapeHtml(i.detail || "")}</div>
+      ${aberto ? `
+        <div class="text-small" style="margin-top:6px;padding:6px 8px;background:#e8f0fe;
+                    color:#0c447c;line-height:1.4">${escapeHtml(i.tip)}</div>` : ""}
     </div>`;
+}
+
+// A dica abre no clique, não no passar do mouse: no celular do vendedor não
+// existe passar o mouse. Uma por vez, para a tela não virar um mural de texto.
+function alternarDicaIndicador(codigo) {
+  state.awardTipOpen = state.awardTipOpen === codigo ? null : codigo;
+  requestRender();
 }
 
 // A folha de impressão é montada dentro da própria página, num container
@@ -13816,9 +13840,12 @@ function placarEquipeView() {
               <div class="text-small" style="color:var(--muted)">de ${number(v.maxPoints)} pts</div>
               ${barraPontos(v.points, v.maxPoints)}
             </div>
-            <div style="text-align:right;min-width:120px">
+            <div style="text-align:right;min-width:140px">
               <div style="font-size:20px;font-weight:800;color:${v.value > 0 ? "var(--good)" : "var(--muted)"}">
                 ${currency(v.value)}</div>
+              ${s && s.maxValue ? `
+                <div class="text-small" style="color:var(--muted)">
+                  pode chegar a <strong>${currency(s.maxValue)}</strong></div>` : ""}
               <div class="text-small" style="color:var(--muted)">
                 ${v.eligibleMonths}/${v.months.length} mês(es) elegível</div>
             </div>

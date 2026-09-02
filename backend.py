@@ -11378,6 +11378,24 @@ AWARD_BASKETS = [
 ]
 
 
+# Como ganhar ponto em cada indicador, em uma frase. O público é o vendedor no
+# balcão entre um atendimento e outro: se precisar ler duas vezes, não serve.
+# Frase curta, verbo no imperativo, sem palavra difícil e sem número que já
+# esteja na tela.
+AWARD_TIPS = {
+    "meta": "Bata sua meta do mês. A partir de 90% já ganha ponto, e em 110% é a pontuação cheia.",
+    "margem": "Segure o desconto. Cada desconto que você dá derruba a margem e tira ponto.",
+    "mix": "Ofereça peças diferentes. Conta quantos tipos de item você vendeu, não quantos pedidos.",
+    "positivacao": "Faça mais clientes da sua carteira comprarem. Vender muito para poucos não pontua aqui.",
+    "devolucoes": "Confira a peça antes de faturar. Peça errada volta e desconta ponto.",
+    "extraPositivacao": "Ligue para quem parou de comprar. Cliente CNPJ que voltar com pedido acima de "
+                        "R$ 999 vale 1 ponto, sem limite.",
+    "ead": "Assista a todos os treinamentos do EAD Passini. É tudo ou nada.",
+    "ligacoes": "Ligue e registre no sistema. Ligação que não foi registrada não conta.",
+    "redes": "Peça para o cliente postar marcando a Passini e você. Cada post vale 1 ponto.",
+}
+
+
 def award_basket_for(competence: str) -> dict[str, Any]:
     """A cesta vigente na competência. Sem vigente, usa a mais recente."""
     comp = valid_competence(competence) or ""
@@ -11729,6 +11747,7 @@ def seller_award_indicators(
     ]
     for ind in indicadores:
         ind["points"] = min(int(ind["points"]), int(ind["max"]))
+        ind["tip"] = AWARD_TIPS.get(ind["code"], "")
 
     return {
         "sellerName": seller_name,
@@ -11770,6 +11789,12 @@ def award_value_for(cesta: dict[str, Any], meta_valor: float, pontos: int) -> di
         # e centavo de arredondamento só gera pergunta.
         "value": float(round(base * pct / 100)),
         "minPoints": regra["minPoints"],
+        # O que dá para ganhar: o teto (150% da base) e o que sai com a cesta
+        # cheia. Ver só o valor de hoje mostra onde a pessoa está; ver o teto
+        # mostra por que vale a pena buscar o próximo ponto.
+        "maxValue": float(round(base * regra["maxPct"] / 100)),
+        "fullValue": float(round(base)),
+        "maxPct": regra["maxPct"],
     }
 
 
