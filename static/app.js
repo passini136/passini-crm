@@ -13334,6 +13334,7 @@ function autoImportPanel() {
   const ai = state.autoImport;
   const folders = ai?.folders || [];
   const logs = ai?.logs || [];
+  const tipos = ai?.types || [];
 
   function statusIcon(s) {
     return s === "sucesso" ? "✅" : s === "erro" ? "❌" : s === "alerta" ? "⚠️" : "⏳";
@@ -13341,7 +13342,8 @@ function autoImportPanel() {
 
   function folderCard(f) {
     const hasPending = f.pendingFiles.length > 0;
-    const icons = { sales: "📊", cost: "💰", crm_clients: "👥", crm_summary: "🧾", crm: "👥" };
+    const icons = { sales: "📊", cost: "💰", crm_clients: "👥", crm_summary: "🧾", crm: "👥",
+                    warranty: "↩️", catalog: "🏷️", stock: "📦" };
     return `
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px 16px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
@@ -13350,7 +13352,8 @@ function autoImportPanel() {
           ${hasPending ? `<span class="soft-badge" style="background:#f39c12;color:#fff">${f.pendingFiles.length} pendente${f.pendingFiles.length > 1 ? "s" : ""}</span>` : `<span class="soft-badge">Vazia</span>`}
         </div>
         <div style="font-size:11px;color:var(--muted);margin-bottom:6px;word-break:break-all">${escapeHtml(f.folder)}/</div>
-        ${f.hint ? `<div style="font-size:11px;color:var(--muted);margin-bottom:6px;line-height:1.4">${escapeHtml(f.hint)}</div>` : ""}
+        ${(f.types || []).map(selosDoTipo).join("")}
+        ${f.hint ? `<div style="font-size:11px;color:var(--muted);margin:6px 0;line-height:1.4">${escapeHtml(f.hint)}</div>` : ""}
         ${hasPending ? `<div style="font-size:12px;color:var(--accent)">${f.pendingFiles.map((n) => `📄 ${escapeHtml(n)}`).join("<br>")}</div>` : ""}
       </div>`;
   }
@@ -13393,12 +13396,86 @@ function autoImportPanel() {
     </div>`;
 }
 
+// Cor por política: substituir apaga o que estava lá, acrescentar não. Quem vai
+// largar um arquivo na pasta precisa saber disso ANTES, não depois.
+const CORES_POLITICA = {
+  base:        { fundo: "#fdecea", texto: "#c0392b", rotulo: "SUBSTITUI TUDO" },
+  competencia: { fundo: "#fef7e0", texto: "#b9770e", rotulo: "SUBSTITUI O MÊS" },
+  acrescenta:  { fundo: "#e6f4ea", texto: "#1e8449", rotulo: "ACRESCENTA" },
+};
+
+function dataBr(iso) {
+  const t = String(iso || "").slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return `${t.slice(8,10)}/${t.slice(5,7)}/${t.slice(0,4)}`;
+  if (/^\d{4}-\d{2}$/.test(String(iso || "").slice(0, 7))) return String(iso).slice(0, 7);
+  return t || "—";
+}
+
+function selosDoTipo(t) {
+  const c = CORES_POLITICA[t.policy] || CORES_POLITICA.acrescenta;
+  const ate = t.dataThrough ? dataBr(t.dataThrough) : "";
+  return `
+    <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin:4px 0">
+      <span style="background:${c.fundo};color:${c.texto};border-radius:10px;padding:2px 8px;
+                   font-size:10px;font-weight:800;letter-spacing:0.03em">${c.rotulo}</span>
+      <span style="font-size:11px;color:var(--muted)">
+        ${escapeHtml(t.label)}${ate ? ` · até <strong>${ate}</strong>` : " · <em>sem dados</em>"}
+      </span>
+    </div>`;
+}
+
+function guiaDeImportacao(tipos) {
+  if (!tipos.length) return "";
+  return `
+    <div class="form-card">
+      <div class="section-title">
+        <div>
+          <h3>O que cada arquivo faz na base</h3>
+          <div class="text-small">
+            Substituir apaga o que já estava e põe o do arquivo no lugar; acrescentar soma ao
+            histórico e descarta linha repetida. A data é a do <strong>dado</strong>, não a do
+            arquivo — importar relatório velho não deixa a base nova.
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th>Arquivo</th><th>O que faz</th><th>Dados até</th>
+              <th>Último mês</th><th style="text-align:right">Linhas</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${tipos.map((t) => {
+              const c = CORES_POLITICA[t.policy] || CORES_POLITICA.acrescenta;
+              const vazio = !t.rows;
+              return `
+                <tr${vazio ? ' style="opacity:0.65"' : ""}>
+                  <td><strong>${escapeHtml(t.label)}</strong></td>
+                  <td><span style="background:${c.fundo};color:${c.texto};border-radius:10px;
+                        padding:2px 8px;font-size:10px;font-weight:800">${c.rotulo}</span>
+                    <span class="text-small" style="color:var(--muted)"> ${escapeHtml(t.policyLabel)}</span></td>
+                  <td>${t.dataThrough ? dataBr(t.dataThrough) : "—"}</td>
+                  <td>${t.lastCompetence || "—"}</td>
+                  <td style="text-align:right">${vazio
+                    ? '<span class="text-small" style="color:var(--bad)">nada importado</span>'
+                    : number(t.rows)}</td>
+                </tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>`;
+}
+
 function importacoesView() {
   if (!state.admin) return `<div class="loader panel">Carregando importações...</div>`;
   if (!state.autoImport) loadAutoImportStatus();
   return `
     <div class="stack">
       ${autoImportPanel()}
+      ${guiaDeImportacao(state.autoImport?.types || [])}
       ${(() => {
         const cov = state.admin?.salesCoverage;
         const fmt = (iso) => { if (!iso) return "—"; const d = String(iso).slice(0, 10).split("-"); return d.length === 3 ? `${d[2]}/${d[1]}/${d[0]}` : iso; };

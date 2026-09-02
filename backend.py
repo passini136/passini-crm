@@ -558,7 +558,9 @@ FILE_TYPE_LABELS = {
     "custo_vendedor": "custo x venda por vendedor",
     "custo_unidade": "custo x venda por unidade",
     "faturamento_detalhado": "faturamento detalhado",
-    "devolucao_garantia": "devolução em garantia",
+    # O nome do tipo ficou de quando só a garantia era importada; hoje o
+    # relatório traz todos os motivos e a garantia é um deles.
+    "devolucao_garantia": "devoluções (comercial e garantia)",
 }
 
 UPLOAD_FIELD_TYPE_OVERRIDES = {
@@ -4241,6 +4243,10 @@ FILE_HEADER_SIGNATURES: list[tuple[str, set[str]]] = [
     # a trava de pasta, que só recusa o que consegue identificar, deixava passar.
     # Um custo x venda na pasta do consolidado entrava COMO consolidado, e como
     # consolidado substitui o mês, apagava o consolidado verdadeiro.
+    # Cadastro de clientes é a substituição mais perigosa do sistema: apaga a
+    # base INTEIRA. Sem assinatura, qualquer arquivo largado naquela pasta
+    # entrava como cadastro e levava todos os clientes junto.
+    ("cadastro_clientes", {"CODIGO", "RAZAO SOCIAL/NOME", "CNPJ/CPF", "VEND. INTERNO"}),
     ("custo_unidade", {"EMPRESA", "QTD VENDIDA", "CUSTO", "VENDA"}),
     ("custo_vendedor", {"VENDEDOR", "QTD VENDIDA", "CUSTO", "VENDA"}),
     ("posicao_estoque", {"BRANCHNAME", "ITEM", "ITEMNAME", "QUANTITY"}),
@@ -5345,6 +5351,57 @@ def data_freshness(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
         "businessDaysBehind": atraso,
         "stale": bool(atraso is not None and atraso >= 2),
     }
+
+
+# Onde cada tipo guarda o que importou, para dizer até quando o dado vai.
+# A data que interessa é a do DADO, não a do arquivo: importar um relatório
+# velho não torna a base nova.
+IMPORT_TYPE_FRESHNESS = {
+    "faturamento_detalhado": ("fact_sales_detail", "MAX(issue_date)", "competence"),
+    "custo_vendedor": ("fact_vendor_summary", "MAX(competence)", "competence"),
+    "custo_unidade": ("fact_unit_summary", "MAX(competence)", "competence"),
+    "faturamento_cliente_consolidado": ("crm_client_summary", "MAX(competence)", "competence"),
+    "devolucao_garantia": ("fact_warranty_returns", "MAX(return_date)", "competence"),
+    "cadastro_clientes": ("crm_client_profiles", "MAX(updated_at)", None),
+    "cadastro_itens": ("item_catalog", "MAX(updated_at)", None),
+    "posicao_estoque": ("item_stock", "MAX(updated_at)", None),
+}
+
+
+def import_type_status(conn: sqlite3.Connection, company_id: int) -> dict[str, dict[str, Any]]:
+    """Para cada tipo de arquivo: o que ele faz e até quando os dados vão.
+
+    Existe para a tela de Importações responder sozinha as três perguntas que
+    aparecem toda vez: este arquivo substitui ou complementa, o que já entrou, e
+    o que falta. Sem isso, a resposta mora na cabeça de quem importa — e some
+    quando essa pessoa sai de férias.
+    """
+    saida: dict[str, dict[str, Any]] = {}
+    for tipo, (tabela, expr_data, coluna_comp) in IMPORT_TYPE_FRESHNESS.items():
+        politica = IMPORT_REPLACE_POLICY.get(tipo, "acrescenta")
+        info: dict[str, Any] = {
+            "fileType": tipo,
+            "label": FILE_TYPE_LABELS.get(tipo, tipo),
+            "policy": politica,
+            "policyLabel": IMPORT_REPLACE_LABELS.get(politica, ""),
+            "dataThrough": "",
+            "lastCompetence": "",
+            "rows": 0,
+        }
+        try:
+            linha = conn.execute(
+                f"SELECT {expr_data} AS ate, COUNT(*) AS n FROM {tabela} WHERE company_id = ?",
+                (company_id,)).fetchone()
+            info["dataThrough"] = normalize_whitespace(linha["ate"] or "")[:10]
+            info["rows"] = int(linha["n"] or 0)
+            if coluna_comp:
+                info["lastCompetence"] = normalize_whitespace(conn.execute(
+                    f"SELECT MAX({coluna_comp}) AS c FROM {tabela} WHERE company_id = ?",
+                    (company_id,)).fetchone()["c"] or "")
+        except sqlite3.Error:
+            pass
+        saida[tipo] = info
+    return saida
 
 
 def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | None]:
@@ -19421,6 +19478,12 @@ class AppHandler(BaseHTTPRequestHandler):
                         }
                         for r in rows
                     ]
+                    with closing(get_connection()) as conn:
+                        tipos_status = import_type_status(conn, user["company_id"])
+                        ultimo_por_pasta = {
+                            r["folder"]: r["ran_at"] for r in conn.execute(
+                                "SELECT folder, MAX(ran_at) AS ran_at FROM auto_import_log "
+                                "WHERE status = 'sucesso' GROUP BY folder").fetchall()}
                     folders_info = []
                     for cfg in AUTO_IMPORT_FOLDERS:
                         p = AUTO_IMPORT_BASE / cfg["folder"]
@@ -19430,16 +19493,23 @@ class AppHandler(BaseHTTPRequestHandler):
                         pending = sorted(
                             f.name for f in ([*p.glob("*.csv"), *p.glob("*.xlsx")] if p.exists() else [])
                         )
+                        # Uma pasta pode exigir mais de um tipo (custo x venda
+                        # tem unidade e vendedor); a orientação vale para todos.
+                        _tipos = sorted(IMPORT_SCOPE_REQUIREMENTS.get(cfg["scope"], set()))
                         folders_info.append({
                             "folder": cfg["folder"], "label": cfg["label"],
                             "scope": cfg["scope"], "path": str(p),
                             "hint": cfg.get("hint", ""),
                             "pendingFiles": pending,
+                            "types": [tipos_status[t] for t in _tipos if t in tipos_status],
+                            "lastRunAt": ultimo_por_pasta.get(cfg["folder"], ""),
                         })
                     self._set_headers(200)
                     self.wfile.write(json_dumps({
                         "logs": logs,
                         "folders": folders_info,
+                        "types": [tipos_status[t] for t in IMPORT_TYPE_FRESHNESS
+                                  if t in tipos_status],
                         "intervalMinutes": AUTO_IMPORT_INTERVAL // 60,
                         "running": _AUTO_IMPORT_RUNNING.is_set(),
                     }))
