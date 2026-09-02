@@ -11812,8 +11812,34 @@ def data_scope_for_user(conn: sqlite3.Connection, user: sqlite3.Row) -> str:
     return "todos"
 
 
+def apply_default_competence(
+    conn: sqlite3.Connection, company_id: int, filtros: dict[str, str | None]
+) -> dict[str, str | None]:
+    """Sem competência no filtro, assume o mês mais recente.
+
+    Consulta sem competência varre TODAS as competências. Enquanto a base tinha
+    poucos meses isso passava; com o ano inteiro carregado, virou 90 segundos
+    por chamada — e são chamadas do login, feitas antes de a tela preencher os
+    filtros. Ou seja, todo mundo pagava esse pedágio ao entrar.
+
+    Assumir o mês mais recente é o que a tela mostra de qualquer forma: o painel
+    já abre na competência mais nova. Quem quer outro período informa, e aí o
+    filtro passa direto por aqui.
+    """
+    if filtros.get("competence_start") or filtros.get("competence_end"):
+        return filtros
+    ultima = crm_latest_competence(conn, company_id)
+    if ultima:
+        filtros["competence_start"] = ultima
+        filtros["competence_end"] = ultima
+    return filtros
+
+
 def scoped_filters_for_user(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, filters: dict[str, str | None]) -> dict[str, str | None]:
-    scoped = dict(filters)
+    # Antes de qualquer recorte de perfil: nenhuma consulta sai daqui sem
+    # competência. Vale para os dois escopos, inclusive o "todos", que retorna
+    # cedo logo abaixo.
+    scoped = apply_default_competence(conn, company_id, dict(filters))
     data_scope = data_scope_for_user(conn, user)
 
     if data_scope == "todos":
