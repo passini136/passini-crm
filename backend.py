@@ -11843,6 +11843,101 @@ def unit_goal_attainment(
     return 100 * realizado / meta
 
 
+# Unidades em implantação: vendedor sem meta individual continua sendo vendedor.
+# Cobrar meta de quem está abrindo praça seria medir o que ainda não existe.
+UNITS_IN_DEPLOYMENT = ("ZONA NORTE",)
+
+
+def classify_seller(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str,
+    tem_meta: bool = False, unidade: str = "",
+) -> dict[str, Any]:
+    """Quem é esta pessoa no mês: vendedor, gerente, outro — e se está ativa.
+
+    Sai nota fiscal no nome de gerente, de conferente, de gente que já saiu da
+    empresa. Nenhum deles é comissionado, e todos poluíam o ranking de
+    vendedores: quem lê a tela precisa comparar vendedor com vendedor.
+
+    O papel vem de people_records, casado por chave normalizada — o mesmo
+    cuidado do resto do sistema, porque o Alfa escreve "(TELEVENDAS)" onde o
+    cadastro escreve o nome puro. Desligamento é o valid_to: quem saiu em junho
+    não aparece na apuração de julho, mas continua na de maio.
+    """
+    inicio, fim = competence_window(competence)
+    chave = person_key(seller_name)
+    curto = short_person_key(seller_name)
+    # O cadastro de pessoas inteiro, lido uma vez por requisição. É tabela
+    # pequena, mas a função roda por vendedor e por mês — reler a cada chamada
+    # é o mesmo padrão que deixou a apuração lenta.
+    pessoas = getattr(conn, "_cache_pessoas", None)
+    if pessoas is None:
+        pessoas = conn.execute(
+            "SELECT person_name, role_classification, base_unit, valid_from, valid_to "
+            "FROM people_records WHERE company_id = ? ORDER BY date(valid_from) DESC",
+            (company_id,)).fetchall()
+        try:
+            conn._cache_pessoas = pessoas
+        except AttributeError:
+            pass
+    da_pessoa = [r for r in pessoas
+                 if person_key(r["person_name"]) == chave
+                 or short_person_key(r["person_name"]) == curto]
+
+    def vigente(r) -> bool:
+        if r["valid_from"] and str(r["valid_from"])[:10] > fim:
+            return False
+        if r["valid_to"] and str(r["valid_to"])[:10] < inicio:
+            return False
+        return True
+
+    # Vigente na competência tem prioridade. Não havendo, fica o mais recente —
+    # que é justamente o registro de quem saiu. Descartar o registro do
+    # desligado fazia a pessoa voltar a ser tratada como vendedora, porque sem
+    # cadastro o papel era deduzido do nome, e "(VENDAS)" continua no nome de
+    # quem já foi embora.
+    registro = next((r for r in da_pessoa if vigente(r)), None)
+    fora_do_periodo = registro is None and bool(da_pessoa)
+    if registro is None and da_pessoa:
+        registro = da_pessoa[0]
+
+    papel = normalize_whitespace(registro["role_classification"]) if registro else ""
+    # Sem cadastro, o sufixo do nome ainda diz muito: "(VENDAS)" e "(TELEVENDAS)"
+    # são vendedores. Melhor deduzir do que tratar todo desconhecido como
+    # vendedor, que era o comportamento anterior.
+    if not papel:
+        papel = infer_role_from_name(seller_name)
+    unidade_final = normalize_unit(
+        (registro["base_unit"] if registro else "") or unidade)
+    em_implantacao = unidade_final in UNITS_IN_DEPLOYMENT
+
+    # Desligado quando o registro dele terminou ANTES desta competência. Também
+    # conta como fora quem só tem registro futuro ou já encerrado — o
+    # `fora_do_periodo` é o que separa "não estava aqui neste mês" de "está
+    # ativo e é vendedor".
+    desligado = bool(fora_do_periodo and registro and registro["valid_to"]
+                     and str(registro["valid_to"])[:10] < inicio)
+    # É vendedor para efeito de indicador quando: o papel diz vendedor, está
+    # ativo, e tem meta — ou está numa unidade em implantação, onde a meta ainda
+    # não existe por decisão da empresa.
+    conta_como_vendedor = (papel == "Vendedor" and not desligado
+                           and (tem_meta or em_implantacao))
+    return {
+        "role": papel,
+        "unitName": unidade_final,
+        "registered": bool(registro),
+        "terminated": desligado,
+        "terminatedAt": (str(registro["valid_to"])[:10]
+                         if registro and registro["valid_to"] else ""),
+        "inDeployment": em_implantacao,
+        "hasGoal": bool(tem_meta),
+        "isSeller": conta_como_vendedor,
+        "reason": ("desligado" if desligado
+                   else "não é vendedor" if papel != "Vendedor"
+                   else "unidade em implantação" if em_implantacao and not tem_meta
+                   else "" if tem_meta else "sem meta individual"),
+    }
+
+
 def team_award_results(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     competence: str = "", competence_end: str = "",
@@ -11887,11 +11982,18 @@ def team_award_results(
                     conn, company_id, unidade, mes)
             r = seller_award_result(conn, company_id, nome, mes,
                                     atingimento_unidade[chave_u])
+            perfil = classify_seller(conn, company_id, nome, mes,
+                                     tem_meta=r["revenueGoal"] > 0, unidade=unidade)
             atual = por_vendedor.setdefault(person_key(nome), {
                 "sellerName": nome, "unitName": unidade, "months": [],
                 "points": 0, "maxPoints": 0, "value": 0.0, "revenue": 0.0,
-                "revenueGoal": 0.0, "eligibleMonths": 0,
+                "revenueGoal": 0.0, "eligibleMonths": 0, "profile": perfil,
             })
+            # Basta ser vendedor em UM mês do período para entrar na lista de
+            # vendedores: quem foi promovido ou desligado no meio não some da
+            # apuração dos meses em que ainda vendia.
+            if perfil["isSeller"]:
+                atual["profile"] = perfil
             atual["sellerName"] = nome
             atual["unitName"] = unidade or atual["unitName"]
             atual["months"].append(r)
@@ -11902,8 +12004,14 @@ def team_award_results(
             atual["revenueGoal"] += r["revenueGoal"]
             atual["eligibleMonths"] += 1 if r["eligible"] else 0
 
-    vendedores = sorted(por_vendedor.values(), key=lambda v: -v["points"])
-    for v in vendedores:
+    # Vendedor com meta primeiro, depois o resto — e dentro de cada grupo, por
+    # pontos. Misturar os dois faria um gerente com uma nota avulsa aparecer
+    # acima de vendedor que trabalhou o mês inteiro.
+    todos = sorted(por_vendedor.values(),
+                   key=lambda v: (not v["profile"]["isSeller"], -v["points"]))
+    vendedores = [v for v in todos if v["profile"]["isSeller"]]
+    outros = [v for v in todos if not v["profile"]["isSeller"]]
+    for v in todos:
         v["value"] = round(v["value"], 2)
         v["revenue"] = round(v["revenue"], 2)
         v["revenueGoal"] = round(v["revenueGoal"], 2)
@@ -11918,11 +12026,17 @@ def team_award_results(
         "from": inicio,
         "to": fim,
         "basket": award_basket_for(fim)["id"],
+        # "sellers" são os vendedores de verdade — é o que a tela mostra por
+        # padrão. "others" existe para não esconder venda: gerente, conferente e
+        # desligado continuam consultáveis, só não disputam o ranking.
         "sellers": vendedores,
+        "others": outros,
         "units": unidades,
         "unitAttainment": {f"{u}|{m}": a for (u, m), a in atingimento_unidade.items()},
         "totals": {
             "sellers": len(vendedores),
+            "others": len(outros),
+            "othersRevenue": round(sum(v["revenue"] for v in outros), 2),
             "points": sum(v["points"] for v in vendedores),
             "value": round(sum(v["value"] for v in vendedores), 2),
             "eligible": sum(1 for v in vendedores if v["eligibleMonths"]),

@@ -13777,7 +13777,10 @@ function placarEquipeView() {
           ${[["Vendedores", number(d.totals?.sellers || 0)],
              ["Elegíveis", number(d.totals?.eligible || 0)],
              ["Pontos somados", number(d.totals?.points || 0)],
-             ["Premiação do período", currency(d.totals?.value || 0)]].map(([r, v]) => `
+             ["Premiação do período", currency(d.totals?.value || 0)],
+             ...((d.others || []).length
+               ? [["Outros com venda", number(d.totals?.others || 0)]] : [])
+            ].map(([r, v]) => `
             <div style="flex:1;min-width:130px;background:var(--surface);border:1px solid var(--line);
                         border-radius:10px;padding:10px 12px">
               <div class="text-small" style="color:var(--muted)">${r}</div>
@@ -13850,6 +13853,39 @@ function placarEquipeView() {
       }).join("")}
       ${!(d.sellers || []).length
         ? `<div class="message">Nenhum vendedor com faturamento no período.</div>` : ""}
+
+      ${(d.others || []).length ? `
+        <div class="form-card" style="padding:14px 18px">
+          <div class="section-title">
+            <div>
+              <h3>Outros com venda no período</h3>
+              <div class="text-small">
+                Saiu nota no nome, mas não disputam a premiação: gerente, quem não é
+                vendedor, quem foi desligado e quem está sem meta individual.
+                Somam ${currency(d.totals?.othersRevenue || 0)}.
+              </div>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>Nome</th><th>Unidade</th><th>Papel</th>
+                <th style="text-align:right">Faturamento</th><th>Por que está aqui</th></tr></thead>
+              <tbody>
+                ${d.others.map((v) => `
+                  <tr>
+                    <td>${escapeHtml(v.sellerName)}</td>
+                    <td>${escapeHtml(v.unitName || "—")}</td>
+                    <td>${escapeHtml(v.profile?.role || "—")}</td>
+                    <td style="text-align:right">${currency(v.revenue)}</td>
+                    <td class="text-small" style="color:var(--muted)">
+                      ${escapeHtml(v.profile?.reason || "")}
+                      ${v.profile?.terminatedAt ? ` em ${escapeHtml(v.profile.terminatedAt)}` : ""}
+                    </td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>` : ""}
     </div>`;
 }
 
