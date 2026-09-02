@@ -13570,6 +13570,10 @@ function setAwardPeriod(campo, valor) {
   if (f.from && f.to && f.from > f.to) {
     state.awardFilters = { from: f.to, to: f.from };
   }
+  // Trocar de período NÃO exige salvar nada. Lançamento é por mês, então o que
+  // estava digitado e não foi salvo pertence ao mês anterior e é descartado —
+  // carregá-lo para o mês novo gravaria ponto no lugar errado.
+  state.awardEdits = {};
   loadAwards();
 }
 
@@ -13732,7 +13736,8 @@ function placarEquipeView() {
             <span class="text-small">de</span>${seletor("from", f.from)}
             <span class="text-small">até</span>${seletor("to", f.to)}
             ${d.canInput && mesUnico
-              ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">Lançar EAD/redes</button>`
+              ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">
+                   Salvar lançamentos</button>`
               : ""}
             <button class="btn btn-secondary btn-sm" onclick="window.print()">⬇ PDF</button>
           </div>

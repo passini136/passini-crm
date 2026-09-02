@@ -11569,6 +11569,25 @@ def seller_award_indicators(
         f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores}) LIMIT 1",
         (company_id, competence, *variantes)).fetchone()
 
+    # EAD se REPETE nos meses seguintes até alguém mudar: o vendedor que
+    # completou os treinamentos continua completo no mês que vem. Sem isso o
+    # gestor relançaria o mesmo número todo mês, e esquecer significaria tirar
+    # 10 pontos de quem não fez nada de errado.
+    #
+    # Redes sociais NÃO herda: postagem acontece num mês específico e repetir o
+    # ponto seria pagar duas vezes pela mesma publicação.
+    ead_valor = manual["ead_points"] if manual else None
+    ead_herdado_de = ""
+    if ead_valor is None:
+        anterior = conn.execute(
+            f"SELECT competence, ead_points FROM award_manual_inputs "
+            f"WHERE company_id = ? AND competence <= ? AND seller_name IN ({marcadores}) "
+            f"AND ead_points IS NOT NULL ORDER BY competence DESC LIMIT 1",
+            (company_id, competence, *variantes)).fetchone()
+        if anterior:
+            ead_valor = anterior["ead_points"]
+            ead_herdado_de = anterior["competence"]
+
     def faixas(codigo: str) -> list[tuple[float, int]]:
         for ind in cesta["indicators"]:
             if ind["code"] == codigo:
@@ -11627,10 +11646,11 @@ def seller_award_indicators(
          "format": "count", "detail": "PJ inativo que voltou comprando acima de R$ 999",
          "points": min(extra, teto("extraPositivacao")), "max": teto("extraPositivacao"),
          "missing": False},
-        {"code": "ead", "label": "EAD", "value": (manual["ead_points"] if manual else None),
-         "format": "points", "detail": "lançamento do gestor",
-         "points": int(manual["ead_points"] or 0) if manual else 0, "max": teto("ead"),
-         "missing": manual is None or manual["ead_points"] is None},
+        {"code": "ead", "label": "EAD", "value": ead_valor, "format": "points",
+         "detail": (f"lançado em {ead_herdado_de}, vale até ser alterado"
+                    if ead_herdado_de else "lançamento do gestor"),
+         "points": int(ead_valor or 0), "max": teto("ead"),
+         "missing": ead_valor is None, "inheritedFrom": ead_herdado_de},
         {"code": "ligacoes", "label": "Ligações ativas", "value": ligacoes, "format": "count",
          "detail": (f"meta {metas['callsTarget']:.0f}"
                     + (f" (proporcional de {metas['callsTargetFull']:.0f} por férias)"
@@ -11638,11 +11658,16 @@ def seller_award_indicators(
                     if metas["callsTarget"] else "sem meta cadastrada"),
          "points": points_for_band(contra_meta(ligacoes, metas["callsTarget"]), faixas("ligacoes")),
          "max": teto("ligacoes"), "missing": metas["callsTarget"] is None},
+        # Redes sociais NÃO é pendência: depende do cliente postar, não do
+        # vendedor entregar. Sem lançamento vale zero, e zero aqui é resultado
+        # legítimo — marcar como "falta lançar" faria o gestor caçar um
+        # lançamento que muitas vezes não existe mesmo.
         {"code": "redes", "label": "Redes sociais",
-         "value": (manual["social_points"] if manual else None), "format": "points",
-         "detail": "lançamento do gestor",
+         "value": (manual["social_points"] if manual and manual["social_points"] is not None
+                   else 0), "format": "points",
+         "detail": "1 ponto por postagem marcando a Passini e o vendedor",
          "points": int(manual["social_points"] or 0) if manual else 0, "max": teto("redes"),
-         "missing": manual is None or manual["social_points"] is None},
+         "missing": False},
     ]
     for ind in indicadores:
         ind["points"] = min(int(ind["points"]), int(ind["max"]))
