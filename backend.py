@@ -19464,7 +19464,6 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 if not self._require_admin_area(user):
                     return
-                _t0 = time.time()
                 try:
                     # Uma conexão só para tudo o que a tela precisa. Abrir duas
                     # não quebrava nada, mas cada uma reserva 16 MB de cache.
@@ -19506,16 +19505,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             "types": [tipos_status[t] for t in _tipos if t in tipos_status],
                             "lastRunAt": ultimo_por_pasta.get(cfg["folder"], ""),
                         })
-                    # Quando a tela demorar, o log diz onde o tempo foi. Sem isso
-                    # sobra palpite, e palpite manda otimizar o lugar errado.
-                    _dt = time.time() - _t0
-                    if _dt > 1.0:
-                        print(f"[auto-import/status] respondeu em {_dt:.1f}s", flush=True)
                     self._set_headers(200)
                     self.wfile.write(json_dumps({
                         "logs": logs,
                         "folders": folders_info,
-                        "elapsedSeconds": round(_dt, 2),
                         "types": [tipos_status[t] for t in IMPORT_TYPE_FRESHNESS
                                   if t in tipos_status],
                         "intervalMinutes": AUTO_IMPORT_INTERVAL // 60,
