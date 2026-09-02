@@ -9658,24 +9658,40 @@ def list_prospects(
     linhas = [prospect_row_to_dict(r) for r in conn.execute(sql, params).fetchall()]
 
     # Último contato e retorno marcado vêm das mesmas tabelas usadas para cliente.
+    #
+    # DUAS consultas para a lista inteira, não duas POR prospect. Do jeito
+    # anterior, 400 prospects viravam 800 idas ao banco e a tela levava 78
+    # segundos — cada consulta era rápida, o custo era a repetição.
+    chaves = [p["clientKey"] for p in linhas if p["clientKey"]]
+    contatos: dict[str, sqlite3.Row] = {}
+    tarefas: dict[str, str] = {}
+    for inicio in range(0, len(chaves), 400):
+        lote = chaves[inicio:inicio + 400]
+        marcadores_lote = ",".join("?" for _ in lote)
+        for r in conn.execute(
+            f"SELECT client_key, MAX(occurred_at) u, COUNT(*) n FROM crm_interactions "
+            f"WHERE company_id = ? AND client_key IN ({marcadores_lote}) GROUP BY client_key",
+            (company_id, *lote)).fetchall():
+            contatos[r["client_key"]] = r
+        for r in conn.execute(
+            f"SELECT client_key, MIN(due_at) d FROM crm_tasks "
+            f"WHERE company_id = ? AND client_key IN ({marcadores_lote}) "
+            f"AND status NOT IN ('CONCLUIDA','CANCELADA') GROUP BY client_key",
+            (company_id, *lote)).fetchall():
+            tarefas[r["client_key"]] = r["d"] or ""
+
+    hoje_local = today_in_brazil()
     for p in linhas:
         chave = p["clientKey"]
-        ultimo = conn.execute(
-            "SELECT MAX(occurred_at) u, COUNT(*) n FROM crm_interactions "
-            "WHERE company_id = ? AND client_key = ?", (company_id, chave),
-        ).fetchone()
-        p["lastContactAt"] = ultimo["u"] or ""
-        p["contactCount"] = int(ultimo["n"] or 0)
-        tarefa = conn.execute(
-            "SELECT MIN(due_at) d FROM crm_tasks WHERE company_id = ? AND client_key = ? "
-            "AND status NOT IN ('CONCLUIDA','CANCELADA')", (company_id, chave),
-        ).fetchone()
-        p["nextTaskAt"] = tarefa["d"] or ""
+        ultimo = contatos.get(chave)
+        p["lastContactAt"] = (ultimo["u"] or "") if ultimo else ""
+        p["contactCount"] = int(ultimo["n"] or 0) if ultimo else 0
+        p["nextTaskAt"] = tarefas.get(chave, "")
         dias = None
         if p["lastContactAt"]:
             dt = parse_datetime_flexible(p["lastContactAt"][:10])
             if dt:
-                dias = (today_in_brazil() - dt.date()).days
+                dias = (hoje_local - dt.date()).days
         p["daysSinceContact"] = dias
     return linhas
 
