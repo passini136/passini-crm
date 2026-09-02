@@ -13544,19 +13544,28 @@ async function salvarMetasVendedor() {
   }
 }
 
+let awardsRequestSeq = 0;
+
 async function loadAwards(silencioso) {
   const f = state.awardFilters || {};
   const q = new URLSearchParams();
   if (f.from) q.set("from", f.from);
   if (f.to) q.set("to", f.to);
+  const meuPedido = ++awardsRequestSeq;
   if (!silencioso) { state.ui.loading.awards = true; requestRender(); }
+  let resposta;
   try {
-    state.awards = await api(`/api/awards?${q.toString()}`);
-    if (!f.from && state.awards.from) {
-      state.awardFilters = { from: state.awards.from, to: state.awards.to };
-    }
+    resposta = await api(`/api/awards?${q.toString()}`);
   } catch (e) {
-    state.awards = { error: e.message, sellers: [] };
+    resposta = { error: e.message, sellers: [] };
+  }
+  // Chegou atrasada: outra apuração saiu depois desta. Aplicar mostraria o
+  // período que o usuário já abandonou — foi o que fazia a tela trocar sozinha
+  // do detalhado para o resumo.
+  if (meuPedido !== awardsRequestSeq) return state.awards;
+  state.awards = resposta;
+  if (!f.from && resposta.from) {
+    state.awardFilters = { from: resposta.from, to: resposta.to };
   }
   state.ui.loading.awards = false;
   requestRender();
