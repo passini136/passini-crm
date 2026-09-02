@@ -13752,6 +13752,21 @@ function placarParaImpressao(d) {
     </div>`;
 }
 
+// Monta a folha fora da árvore do app, imprime e limpa. Deixar o conteúdo lá
+// depois faria o #print-root continuar "não vazio" e a próxima impressão de
+// outra tela sairia com o placar junto.
+function imprimirPlacar() {
+  const alvo = document.getElementById("print-root");
+  if (!alvo || !state.awards) return;
+  alvo.innerHTML = placarParaImpressao(state.awards);
+  const limpar = () => { alvo.innerHTML = ""; window.removeEventListener("afterprint", limpar); };
+  window.addEventListener("afterprint", limpar);
+  window.print();
+  // Navegador que não dispara afterprint (alguns no celular) não pode deixar a
+  // folha pendurada no DOM.
+  setTimeout(limpar, 3000);
+}
+
 function placarEquipeView() {
   if (!state.awards) {
     if (!state.ui.loading.awards) loadAwards();
@@ -13796,7 +13811,7 @@ function placarEquipeView() {
               ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">
                    Salvar lançamentos</button>`
               : ""}
-            <button class="btn btn-secondary btn-sm" onclick="window.print()">⬇ PDF</button>
+            <button class="btn btn-secondary btn-sm" onclick="imprimirPlacar()">⬇ PDF</button>
           </div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -13814,8 +13829,6 @@ function placarEquipeView() {
             </div>`).join("")}
         </div>
       </div>
-
-      ${placarParaImpressao(d)}
 
       ${(d.sellers || []).map((v, idx) => {
         const s = v.single;

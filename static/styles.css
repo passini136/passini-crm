@@ -1505,7 +1505,17 @@ tbody tr:hover {
    e ainda permite "Salvar como PDF" na própria caixa de impressão. */
 .print-area { display: none; }
 
+#print-root { display: none; }
+
 @media print {
+  /* Caminho novo: quando #print-root tem conteúdo, o app inteiro sai do fluxo
+     com display:none — não reserva altura e não gera página em branco. O
+     caminho antigo (visibility) continua valendo para o roteiro de visitas,
+     que monta a folha dentro da própria tela. */
+  body:has(#print-root:not(:empty)) > #app { display: none !important; }
+  #print-root:not(:empty) { display: block !important; visibility: visible !important; }
+  #print-root:not(:empty) * { visibility: visible !important; }
+
   body * { visibility: hidden; }
   .print-area, .print-area * { visibility: visible; }
   .print-area {

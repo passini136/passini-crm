@@ -8,6 +8,13 @@
 </head>
 <body>
   <div id="app"></div>
+  <!--
+    Folha de impressão fora da árvore do app. Ela precisa ser IRMÃ do #app, não
+    filha: escondendo o app com display:none o navegador não reserva altura, e
+    é essa altura reservada que virava dezenas de páginas em branco quando a
+    tela tinha 31 vendedores. Fica vazia até alguém mandar imprimir.
+  -->
+  <div id="print-root"></div>
   <script src="/app.js"></script>
 </body>
 </html>
