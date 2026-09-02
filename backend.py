@@ -11558,33 +11558,43 @@ def seller_award_indicators(
                 f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores}) "
                 f"GROUP BY client_name", (company_id, competence, *variantes)).fetchall()}
         perfis = {r["client_code"]: r for r in conn.execute(
-            f"SELECT client_code, client_name, last_sale_at, document_number "
+            f"SELECT client_code, client_name, document_number "
             f"FROM crm_client_profiles WHERE company_id = ? "
             f"AND internal_seller_name IN ({marcadores})",
             (company_id, *variantes)).fetchall()}
-        inicio_mes = first_day_of_competence(competence)
+
+        # Última competência em que CADA cliente comprou ANTES deste mês, do
+        # histórico de vendas. Não dá para usar o last_sale_at do cadastro: ele
+        # é a fotografia de hoje e já inclui a compra deste mês, então nenhum
+        # cliente apareceria como inativo justamente no mês em que voltou — que
+        # é o caso que o indicador existe para premiar.
+        anterior = shift_competence(competence, -1)
+        retrasado = shift_competence(competence, -2)
+        compraram_antes = {
+            normalize_client_key(r["client_name"])
+            for r in conn.execute(
+                "SELECT DISTINCT client_name FROM fact_sales_detail "
+                "WHERE company_id = ? AND competence IN (?, ?) AND net_value > 0",
+                (company_id, anterior, retrasado)).fetchall()}
+
         for codigo in carteira:
             perfil = perfis.get(codigo)
             if not perfil:
                 continue
-            faturado = nomes_faturados.get(normalize_client_key(perfil["client_name"]), 0.0)
+            chave_cliente = normalize_client_key(perfil["client_name"])
+            faturado = nomes_faturados.get(chave_cliente, 0.0)
             if faturado > 0:
                 positivados += 1
-            # Extra positivação: PJ que estava inativo e voltou comprando acima
-            # de R$ 999 no mês. "Inativo" é a última compra ANTES do mês, mais
-            # velha que o corte de inatividade — olhar o estado de hoje diria
-            # que ninguém estava inativo, já que acabou de comprar.
+            # Extra positivação: PJ da carteira que estava INATIVO e voltou
+            # comprando acima de R$ 999 no mês. Inativo aqui é "sem compra nos
+            # dois meses anteriores" — a tradução da régua de 60 dias do CRM
+            # para a granularidade de competência que o faturamento tem.
             if faturado <= 999:
                 continue
             tipo, _ = person_type_from_document(perfil["document_number"])
             if tipo != "PJ":
                 continue
-            # Inatividade pela mesma régua do CRM (crm_status_from_days), medida
-            # no primeiro dia do mês: hoje o cliente comprou, então olhar o
-            # estado atual diria que ninguém estava inativo.
-            ultima = parse_datetime_flexible(perfil["last_sale_at"])
-            dias_antes = (inicio_mes - ultima.date()).days if ultima else None
-            if crm_status_from_days(dias_antes) == "INATIVO":
+            if chave_cliente not in compraram_antes:
                 extra += 1
     positivacao_pct = (100 * positivados / len(carteira)) if carteira else None
 
@@ -11678,7 +11688,9 @@ def seller_award_indicators(
          "points": points_for_band(devolucao_pct, faixas("devolucoes"), menor_e_melhor=True),
          "max": teto("devolucoes"), "missing": bruto <= 0},
         {"code": "extraPositivacao", "label": "Extra positivação", "value": extra,
-         "format": "count", "detail": "PJ inativo que voltou comprando acima de R$ 999",
+         "format": "count",
+         "detail": (f"PJ da carteira sem compra em {shift_competence(competence, -2)} "
+                    f"e {shift_competence(competence, -1)} que voltou acima de R$ 999"),
          "points": min(extra, teto("extraPositivacao")), "max": teto("extraPositivacao"),
          "missing": False},
         {"code": "ead", "label": "EAD", "value": ead_valor, "format": "points",
