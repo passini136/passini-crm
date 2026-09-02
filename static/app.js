@@ -15221,37 +15221,158 @@ function meuPlacarView() {
           </div>
         </div>
 
-        <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
-          <div style="text-align:center;min-width:130px">
-            <div style="font-size:38px;font-weight:900;line-height:1">${number(eu.points)}</div>
-            <div class="text-small" style="color:var(--muted)">de ${number(eu.maxPoints)} pontos</div>
-            ${barraPontos(eu.points, eu.maxPoints)}
-          </div>
-          <div style="flex:1;min-width:200px">
-            <div style="font-size:28px;font-weight:900;color:${eu.value > 0 ? "var(--good)" : "var(--muted)"}">
-              ${currency(eu.value)}</div>
-            ${s && s.maxValue ? `
-              <div class="text-small" style="color:var(--muted)">
-                Com a cesta cheia você chega a <strong>${currency(s.maxValue)}</strong>.</div>` : ""}
-            ${falta60 > 0 ? `
-              <div class="text-small" style="color:var(--bad);margin-top:4px">
-                Faltam <strong>${falta60}</strong> ponto(s) para começar a receber.</div>` : ""}
-          </div>
-          ${s ? `
-            <div style="min-width:220px">
-              ${gatilhoMeta("Sua meta", s.goalPct, 90, 105)}
-              ${gatilhoMeta("Sua loja", s.unitAttainment, 95, null)}
-              <div class="text-small" style="color:var(--muted);margin-top:4px">
-                ${escapeHtml(s.eligibilityReason || "")}</div>
-            </div>` : `
-            <div class="text-small" style="color:var(--muted)">
-              Média de ${eu.avgPoints} pontos por mês no período.</div>`}
-        </div>
+        ${s ? termometroPremiacao(eu, s) : `
+          <div class="text-small" style="color:var(--muted)">
+            Média de ${eu.avgPoints} pontos por mês no período.</div>`}
       </div>
 
-      ${s ? `
-        <div style="display:flex;gap:8px;flex-wrap:wrap">
-          ${s.indicators.map(cartaoIndicador).join("")}
+      ${s ? missoesDoVendedor(eu, s) : ""}
+    </div>`;
+}
+
+// O termômetro existe porque ponto sozinho não move ninguém: o que move é saber
+// quanto ele vale. Com a base da faixa de meta, cada ponto tem preço — e o
+// vendedor passa a ver "faltam 8 pontos" como "faltam R$ 15".
+function termometroPremiacao(eu, s) {
+  const base = s.baseValue || 0;
+  const porPonto = base / 100;
+  const pontos = eu.points;
+  const min = s.minPoints || 60;
+  const teto = s.maxPct || 150;
+  const marcos = [
+    { pts: min, rotulo: "começa a pagar", valor: base * min / 100 },
+    { pts: 100, rotulo: "premiação cheia", valor: base },
+    { pts: teto, rotulo: "máximo", valor: base * teto / 100 },
+  ];
+  const proximo = marcos.find((m) => pontos < m.pts);
+  const largura = Math.min(100, (100 * pontos) / teto);
+
+  return `
+    <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start">
+      <div style="min-width:180px">
+        <div style="font-size:44px;font-weight:900;line-height:1;color:${
+          eu.value > 0 ? "var(--good)" : "var(--muted)"}">${currency(eu.value)}</div>
+        <div class="text-small" style="color:var(--muted)">
+          ${number(pontos)} pontos · cada ponto vale <strong>${currency(porPonto)}</strong>
+        </div>
+        ${proximo ? `
+          <div style="margin-top:8px;padding:8px 10px;background:#fef7e0;border-left:3px solid #e67e22">
+            <div style="font-weight:800;font-size:14px">
+              Faltam ${proximo.pts - pontos} ponto(s)</div>
+            <div class="text-small">
+              para ${escapeHtml(proximo.rotulo)}: <strong>${currency(proximo.valor)}</strong></div>
+          </div>` : `
+          <div style="margin-top:8px;padding:8px 10px;background:#e6f4ea;border-left:3px solid var(--good)">
+            <div style="font-weight:800;font-size:14px">Você está no máximo da premiação.</div>
+          </div>`}
+      </div>
+
+      <div style="flex:1;min-width:260px">
+        <div style="position:relative;height:26px;background:var(--line);border-radius:13px;overflow:hidden">
+          <div style="width:${largura.toFixed(1)}%;height:100%;background:${
+            pontos >= 100 ? "var(--good)" : pontos >= (s.minPoints || 60) ? "#e67e22" : "var(--bad)"}"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:4px">
+          ${marcos.map((m) => `
+            <div style="text-align:center;flex:1">
+              <div class="text-small" style="font-weight:800;color:${
+                pontos >= m.pts ? "var(--good)" : "var(--muted)"}">
+                ${pontos >= m.pts ? "✓ " : ""}${m.pts} pts</div>
+              <div class="text-small" style="color:var(--muted)">${currency(m.valor)}</div>
+            </div>`).join("")}
+        </div>
+        <div style="margin-top:10px">
+          ${gatilhoMeta("Sua meta", s.goalPct, 90, 105)}
+          ${gatilhoMeta("Sua loja", s.unitAttainment, 95, null)}
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:4px">
+          ${escapeHtml(s.eligibilityReason || "")}</div>
+      </div>
+    </div>`;
+}
+
+// Os indicadores viram missões, ordenadas pelo que ainda dá para buscar. Ver
+// primeiro o que já foi conquistado esconde a oportunidade; ver primeiro o que
+// falta transforma a tela em lista de tarefas com preço em cada uma.
+function missoesDoVendedor(eu, s) {
+  const base = s.baseValue || 0;
+  const porPonto = base / 100;
+  const comFolga = s.indicators.map((i) => ({
+    ...i,
+    semTeto: i.max >= 1000,
+    falta: i.max >= 1000 ? 0 : Math.max(0, i.max - i.points),
+  }));
+  const aBuscar = comFolga.filter((i) => i.falta > 0).sort((a, b) => b.falta - a.falta);
+  const conquistados = comFolga.filter((i) => i.falta === 0);
+
+  const cartao = (i, conquistado) => {
+    const aberto = state.awardTipOpen === i.code;
+    const v = i.value;
+    const texto = v === null || v === undefined ? "—"
+      : i.format === "pct" ? `${Number(v).toFixed(1)}%`
+      : i.format === "ratio" ? Number(v).toFixed(2)
+      : Number(v).toFixed(0);
+    return `
+      <div style="background:#fff;border:1px solid var(--line);border-left:4px solid ${
+        conquistado ? "var(--good)" : i.points > 0 ? "#e67e22" : "var(--bad)"};
+        border-radius:0;padding:10px 12px;min-width:210px;flex:1">
+        <div style="display:flex;align-items:center;gap:6px">
+          <span style="font-size:14px">${conquistado ? "✅" : i.points > 0 ? "🔸" : "⬜"}</span>
+          <strong style="font-size:13px;flex:1">${escapeHtml(i.label)}</strong>
+          ${i.tip ? `<button type="button" onclick="alternarDicaIndicador('${i.code}')"
+            title="Como ganhar ponto aqui"
+            style="border:1px solid var(--line);background:${aberto ? "var(--accent)" : "#fff"};
+                   color:${aberto ? "#fff" : "var(--muted)"};border-radius:50%;width:18px;height:18px;
+                   line-height:1;font-size:11px;font-weight:800;cursor:pointer;padding:0">?</button>` : ""}
+        </div>
+        <div style="display:flex;align-items:baseline;gap:8px;margin-top:4px">
+          <strong style="font-size:19px">${texto}</strong>
+          <span class="text-small" style="font-weight:700">
+            ${i.semTeto ? `${i.points} pts · sem limite` : `${i.points}/${i.max} pts`}</span>
+        </div>
+        ${!conquistado && i.falta > 0 ? `
+          <div class="text-small" style="color:#b9770e;font-weight:700;margin-top:2px">
+            Dá para ganhar mais ${i.falta} ponto(s) — ${currency(i.falta * porPonto)}</div>` : ""}
+        <div class="text-small" style="color:var(--muted);line-height:1.35;margin-top:2px">
+          ${i.missing ? "falta cadastrar/lançar" : escapeHtml(i.detail || "")}</div>
+        ${aberto ? `
+          <div class="text-small" style="margin-top:6px;padding:6px 8px;background:#e8f0fe;
+                      color:#0c447c;line-height:1.4">${escapeHtml(i.tip)}</div>` : ""}
+      </div>`;
+  };
+
+  const totalNaMesa = aBuscar.reduce((soma, i) => soma + i.falta, 0);
+
+  return `
+    <div class="stack">
+      ${aBuscar.length ? `
+        <div class="form-card" style="padding:14px 18px">
+          <div class="section-title">
+            <div>
+              <h3>Ainda dá para buscar</h3>
+              <div class="text-small">
+                ${totalNaMesa} ponto(s) na mesa neste mês, o equivalente a
+                <strong>${currency(totalNaMesa * porPonto)}</strong>.
+                Comece pelos de cima, que valem mais.
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${aBuscar.map((i) => cartao(i, false)).join("")}
+          </div>
+        </div>` : ""}
+
+      ${conquistados.length ? `
+        <div class="form-card" style="padding:14px 18px">
+          <div class="section-title">
+            <div>
+              <h3>Conquistado</h3>
+              <div class="text-small">${conquistados.length} indicador(es) no máximo. Só manter.</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            ${conquistados.map((i) => cartao(i, true)).join("")}
+          </div>
         </div>` : ""}
     </div>`;
 }
