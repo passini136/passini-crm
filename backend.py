@@ -11203,13 +11203,31 @@ def suggested_seller_targets(
         "SELECT * FROM seller_targets WHERE company_id = ?", (company_id,)).fetchall()}
     chaves_com_meta = {person_key(n) for n in atuais}
 
-    vendedores = sorted({
-        normalize_whitespace(r["seller_name"])
-        for r in conn.execute(
-            "SELECT DISTINCT seller_name FROM fact_vendor_summary WHERE company_id = ?"
-            + (" AND competence = ?" if comp else ""),
-            (company_id, comp) if comp else (company_id,)).fetchall()
-        if normalize_whitespace(r["seller_name"])})
+    # A meta é permanente, então a LISTA não pode depender de um mês: quem não
+    # teve linha no custo x venda daquela competência sumia da tela e ficava sem
+    # meta para sempre, sem ninguém perceber. Aqui entram todos os vendedores
+    # dos últimos 12 meses, mais quem já tem meta cadastrada e quem está no
+    # cadastro de pessoas como vendedor ativo.
+    limite = shift_competence(comp, -11) if comp else ""
+    nomes: set[str] = set()
+    for r in conn.execute(
+        "SELECT DISTINCT seller_name FROM fact_vendor_summary WHERE company_id = ?"
+        + (" AND competence >= ?" if limite else ""),
+            (company_id, limite) if limite else (company_id,)).fetchall():
+        if normalize_whitespace(r["seller_name"]):
+            nomes.add(normalize_whitespace(r["seller_name"]))
+    nomes.update(atuais)
+    for r in conn.execute(
+        "SELECT person_name, role_classification, valid_to FROM people_records "
+        "WHERE company_id = ?", (company_id,)).fetchall():
+        nome_pessoa = normalize_whitespace(r["person_name"])
+        if not nome_pessoa or r["valid_to"]:
+            continue
+        if normalize_whitespace(r["role_classification"]) == "Vendedor":
+            # Só entra se ainda não estiver na lista por outra grafia.
+            if not any(person_key(n) == person_key(nome_pessoa) for n in nomes):
+                nomes.add(nome_pessoa)
+    vendedores = sorted(nomes)
 
     saida: list[dict[str, Any]] = []
     for nome in vendedores:

@@ -13665,7 +13665,9 @@ function cartaoIndicador(i) {
   const v = i.value;
   const texto = v === null || v === undefined ? "—"
     : i.format === "pct" ? `${Number(v).toFixed(1)}%`
-    : i.format === "ratio" ? Number(v).toFixed(4)
+    // A margem vem do Alfa com duas casas ("1.62"), então mostrar quatro só
+    // acrescentava zeros e afastava o número do que está no relatório.
+    : i.format === "ratio" ? Number(v).toFixed(2)
     : Number(v).toFixed(0);
   return `
     <div style="border:1px solid var(--line);border-left:3px solid ${cor};border-radius:0;
