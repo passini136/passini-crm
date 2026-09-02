@@ -6606,15 +6606,27 @@ def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str)
     if not chaves:
         return []
 
-    candidatos: list[str] = []
-    for tabela, coluna in SELLER_NAME_SOURCES:
+    # A lista de nomes candidatos é a MESMA para todo mundo: varrer as nove
+    # tabelas uma vez por vendedor custava 279 varreduras numa apuração de 31
+    # vendedores, várias sobre as 250 mil linhas do faturamento. O cache vive na
+    # conexão, que é de uma requisição só — não corre risco de servir nome
+    # velho depois de uma importação.
+    candidatos = getattr(conn, "_cache_nomes_vendedor", None)
+    if candidatos is None:
+        candidatos = []
+        for tabela, coluna in SELLER_NAME_SOURCES:
+            try:
+                linhas = conn.execute(
+                    f"SELECT DISTINCT {coluna} AS nome FROM {tabela} WHERE company_id = ?",
+                    (company_id,)).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
+        candidatos = sorted(set(candidatos))
         try:
-            linhas = conn.execute(
-                f"SELECT DISTINCT {coluna} AS nome FROM {tabela} WHERE company_id = ?",
-                (company_id,)).fetchall()
-        except sqlite3.OperationalError:
-            continue
-        candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
+            conn._cache_nomes_vendedor = candidatos
+        except AttributeError:
+            pass
 
     encontrados = set(informados)
     for nome in candidatos:
@@ -11490,6 +11502,11 @@ def seller_award_indicators(
     liquido = float(oficial["liquido"] or 0)
     bruto = float(oficial["bruto"] or 0)
     devolvido = float(oficial["devolucao"] or 0)
+    # Mesma base da Visão Executiva: a garantia volta para o faturamento antes
+    # de comparar com a meta. Sem isto o vendedor teria um atingimento aqui e
+    # outro no painel, pela mesma venda.
+    garantia = warranty_returns_for(conn, company_id, competence, seller_names=variantes)
+    liquido += garantia
     margem = oficial["margem"]
     # "nan" no relatório do Alfa vira 0: é ausência de venda, não margem ruim.
     margem = float(margem) if margem not in (None, 0) else None
@@ -11778,10 +11795,37 @@ def seller_award_result(
     }
 
 
+def warranty_returns_for(
+    conn: sqlite3.Connection, company_id: int, competence: str,
+    unit_name: str = "", seller_names: list[str] | None = None,
+) -> float:
+    """Devolução em GARANTIA do recorte, que volta para o faturamento."""
+    condicoes = ["company_id = ?", "competence = ?", "reason = ?"]
+    params: list[Any] = [company_id, competence, RETURN_REASON_WARRANTY]
+    if unit_name:
+        condicoes.append("unit_name = ?")
+        params.append(normalize_unit(unit_name))
+    if seller_names is not None:
+        if not seller_names:
+            return 0.0
+        condicoes.append(f"seller_name IN ({', '.join('?' for _ in seller_names)})")
+        params.extend(seller_names)
+    return float(conn.execute(
+        f"SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
+        f"WHERE {' AND '.join(condicoes)}", params).fetchone()["v"] or 0)
+
+
 def unit_goal_attainment(
     conn: sqlite3.Connection, company_id: int, unit_name: str, competence: str
 ) -> float | None:
-    """Atingimento da unidade no mês, na mesma fonte oficial do resultado."""
+    """Atingimento da unidade no mês, na MESMA base que a Visão Executiva.
+
+    O painel devolve a devolução em garantia ao faturamento antes de comparar
+    com a meta — garantia é defeito de peça, não erro de venda. Calcular aqui
+    sem essa devolução dava um atingimento cerca de 1% menor, e a mesma unidade
+    aparecia com dois números diferentes em duas telas. Número que discorda de
+    si mesmo destrói a confiança nas duas telas, não em uma.
+    """
     unidade = normalize_unit(unit_name)
     if not unidade:
         return None
@@ -11793,7 +11837,10 @@ def unit_goal_attainment(
         "SELECT COALESCE(SUM(revenue_goal),0) v FROM goals_unit "
         "WHERE company_id = ? AND competence = ? AND unit_name = ?",
         (company_id, competence, unidade)).fetchone()["v"] or 0)
-    return (100 * realizado / meta) if meta else None
+    if not meta:
+        return None
+    realizado += warranty_returns_for(conn, company_id, competence, unit_name=unidade)
+    return 100 * realizado / meta
 
 
 def team_award_results(
