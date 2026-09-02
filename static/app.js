@@ -13563,18 +13563,32 @@ async function loadAwards(silencioso) {
   return state.awards;
 }
 
+// Escolher o mês e APLICAR são ações separadas. Cada troca de select disparando
+// uma apuração faria três requisições para quem quer olhar um trimestre — e a
+// apuração é cara, porque calcula nove indicadores por vendedor por mês.
 function setAwardPeriod(campo, valor) {
-  state.awardFilters = { ...(state.awardFilters || {}), [campo]: valor };
-  const f = state.awardFilters;
+  const base = state.awardPeriodDraft || state.awardFilters || {};
+  state.awardPeriodDraft = { ...base, [campo]: valor };
+  requestRender();
+}
+
+function periodoAwardsMudou() {
+  const d = state.awardPeriodDraft;
+  const f = state.awardFilters || {};
+  return Boolean(d && (d.from !== f.from || d.to !== f.to));
+}
+
+async function aplicarPeriodoAwards() {
+  const d = state.awardPeriodDraft;
+  if (!d) return;
   // Intervalo invertido não é erro do usuário, é ordem trocada: arruma sozinho.
-  if (f.from && f.to && f.from > f.to) {
-    state.awardFilters = { from: f.to, to: f.from };
-  }
+  state.awardFilters = d.from > d.to ? { from: d.to, to: d.from } : { ...d };
+  state.awardPeriodDraft = null;
   // Trocar de período NÃO exige salvar nada. Lançamento é por mês, então o que
   // estava digitado e não foi salvo pertence ao mês anterior e é descartado —
   // carregá-lo para o mês novo gravaria ponto no lugar errado.
   state.awardEdits = {};
-  loadAwards();
+  await loadAwards();
 }
 
 function editarLancamento(nome, campo, valor) {
@@ -13715,11 +13729,18 @@ function placarEquipeView() {
   const mesUnico = (d.competences || []).length === 1;
   const edits = state.awardEdits || {};
 
+  const rascunho = state.awardPeriodDraft || f;
+  const carregando = Boolean(state.ui.loading.awards);
+  const mudou = periodoAwardsMudou();
   const seletor = (campo, valor) => `
-    <select onchange="setAwardPeriod('${campo}', this.value)"
+    <select onchange="setAwardPeriod('${campo}', this.value)" ${carregando ? "disabled" : ""}
       style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;font-size:13px">
       ${meses.map((m) => `<option value="${m}" ${m === valor ? "selected" : ""}>${m}</option>`).join("")}
     </select>`;
+  const botaoAplicar = `
+    <button class="btn ${mudou ? "btn-primary" : "btn-secondary"} btn-sm"
+      ${carregando || !mudou ? "disabled" : ""} onclick="aplicarPeriodoAwards()">
+      ${carregando ? '<span class="girando">↻</span> Apurando…' : "Aplicar período"}</button>`;
 
   return `
     <div class="stack">
@@ -13733,8 +13754,9 @@ function placarEquipeView() {
             </div>
           </div>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-            <span class="text-small">de</span>${seletor("from", f.from)}
-            <span class="text-small">até</span>${seletor("to", f.to)}
+            <span class="text-small">de</span>${seletor("from", rascunho.from)}
+            <span class="text-small">até</span>${seletor("to", rascunho.to)}
+            ${botaoAplicar}
             ${d.canInput && mesUnico
               ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">
                    Salvar lançamentos</button>`
