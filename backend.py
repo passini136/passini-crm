@@ -245,11 +245,10 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "visitas",        "label": "Visitas",            "group": "Crescer"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "Crescer"},
     # Equipe — motivação e desenvolvimento
-    # Meu Placar e Placar da Equipe saíram do catálogo enquanto a apuração da
-    # premiação é reconstruída. A cesta antiga tem 5 componentes com pesos e
-    # nota 0–100; a premiação real tem 9 indicadores e 150 pontos. Deixá-las
-    # no ar mostraria pontuação sobre dinheiro que nunca foi validada.
-    # Voltam quando a apuração nova estiver conferida contra a planilha.
+    # Placar reconstruído sobre a cesta real da premiação: 9 indicadores, 150
+    # pontos, elegibilidade e valor. A versão antiga tinha 5 componentes com
+    # pesos e nota 0–100, que não correspondia a premiação nenhuma.
+    {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "Equipe"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "Equipe"},
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
@@ -306,7 +305,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "biblioteca", "sem-vendedor",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
@@ -11663,6 +11662,204 @@ def seller_award_indicators(
     }
 
 
+def award_value_for(cesta: dict[str, Any], meta_valor: float, pontos: int) -> dict[str, Any]:
+    """Valor da premiação: faixa da meta define a base, pontos definem quanto dela sai.
+
+    A conversão do documento tem três âncoras — 60 pontos pagam 60%, 100 pagam
+    100%, e acima de 100 chega a 150%. As três caem numa reta em que PONTO É
+    POR CENTO, com piso em 60 e teto em 150. Não inventei escala: é a leitura
+    que faz os três números do documento baterem ao mesmo tempo.
+    """
+    base = 0.0
+    for teto, valor in cesta["awardBase"]:
+        if meta_valor <= teto:
+            base = valor
+            break
+    regra = cesta["payout"]
+    if pontos < regra["minPoints"]:
+        pct = 0.0
+    else:
+        pct = min(float(pontos), regra["maxPct"])
+    return {
+        "baseValue": round(base, 2),
+        "payoutPct": round(pct, 1),
+        "value": round(base * pct / 100, 2),
+        "minPoints": regra["minPoints"],
+    }
+
+
+def seller_award_result(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str,
+    unit_attainment: float | None = None,
+) -> dict[str, Any]:
+    """Apuração completa de um vendedor: indicadores, elegibilidade e valor.
+
+    Duas portas de entrada, como no documento: a da loja (unidade ≥ 95% e
+    individual ≥ 90%) e a individual (≥ 105%, valha o que valer a loja). Quando
+    o vendedor fica de fora, a apuração diz POR QUÊ — sem isso, a conversa vira
+    "o sistema não deixou" e ninguém aprende o que faltou.
+    """
+    apurado = seller_award_indicators(conn, company_id, seller_name, competence)
+    cesta = award_basket_for(competence)
+    regras = cesta["eligibility"]
+    individual = apurado["goalPct"]
+
+    if unit_attainment is None:
+        unidade_nome = seller_unit_name(conn, company_id, seller_name, competence)
+        unit_attainment = unit_goal_attainment(conn, company_id, unidade_nome, competence)
+
+    porta_loja = (individual is not None and unit_attainment is not None
+                  and unit_attainment >= regras["unitMin"]
+                  and individual >= regras["individualWithUnit"])
+    porta_individual = individual is not None and individual >= regras["individualAlone"]
+    elegivel = porta_loja or porta_individual
+
+    if elegivel:
+        motivo = ("pela loja: unidade em "
+                  f"{unit_attainment:.1f}% e individual em {individual:.1f}%"
+                  if porta_loja else
+                  f"pelo individual: {individual:.1f}% da meta, acima de "
+                  f"{regras['individualAlone']:.0f}%")
+    elif individual is None:
+        motivo = "sem meta individual cadastrada para o mês"
+    elif individual < regras["individualWithUnit"]:
+        motivo = (f"individual em {individual:.1f}%, abaixo dos "
+                  f"{regras['individualWithUnit']:.0f}% exigidos")
+    elif unit_attainment is None:
+        motivo = "sem meta da unidade para comparar"
+    else:
+        motivo = (f"unidade em {unit_attainment:.1f}%, abaixo dos "
+                  f"{regras['unitMin']:.0f}% — e o individual de {individual:.1f}% "
+                  f"não alcança os {regras['individualAlone']:.0f}% da porta direta")
+
+    valor = award_value_for(cesta, apurado["revenueGoal"], apurado["points"])
+    if not elegivel:
+        valor = {**valor, "payoutPct": 0.0, "value": 0.0}
+    elif apurado["points"] < valor["minPoints"]:
+        # Elegível e sem receber é a combinação que mais gera dúvida: a porta
+        # abriu pela meta, mas a pontuação da cesta não chegou ao mínimo. Dizer
+        # só "elegível" ao lado de R$ 0,00 parece erro do sistema.
+        motivo = (f"{motivo} — mas {apurado['points']} pontos, abaixo dos "
+                  f"{valor['minPoints']} que começam a pagar")
+
+    return {
+        **apurado,
+        "unitAttainment": round(unit_attainment, 2) if unit_attainment is not None else None,
+        "eligible": elegivel,
+        "eligibilityReason": motivo,
+        "eligibleByUnit": porta_loja,
+        "eligibleByIndividual": porta_individual,
+        **valor,
+    }
+
+
+def unit_goal_attainment(
+    conn: sqlite3.Connection, company_id: int, unit_name: str, competence: str
+) -> float | None:
+    """Atingimento da unidade no mês, na mesma fonte oficial do resultado."""
+    unidade = normalize_unit(unit_name)
+    if not unidade:
+        return None
+    realizado = float(conn.execute(
+        "SELECT COALESCE(SUM(net_value),0) v FROM fact_unit_summary "
+        "WHERE company_id = ? AND competence = ? AND unit_name = ?",
+        (company_id, competence, unidade)).fetchone()["v"] or 0)
+    meta = float(conn.execute(
+        "SELECT COALESCE(SUM(revenue_goal),0) v FROM goals_unit "
+        "WHERE company_id = ? AND competence = ? AND unit_name = ?",
+        (company_id, competence, unidade)).fetchone()["v"] or 0)
+    return (100 * realizado / meta) if meta else None
+
+
+def team_award_results(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    competence: str = "", competence_end: str = "",
+) -> dict[str, Any]:
+    """Apuração da equipe no período, respeitando o recorte do usuário.
+
+    Período de mais de um mês soma os pontos e os valores mês a mês — não
+    apura o intervalo como se fosse um mês só. Meta, positivação e devolução
+    são fenômenos mensais: juntá-los num balaio de trimestre daria um número
+    que não corresponde a nenhuma premiação paga.
+    """
+    fim = valid_competence(competence_end) or valid_competence(competence) \
+        or crm_latest_competence(conn, company_id) or ""
+    inicio = valid_competence(competence) or fim
+    if not fim:
+        return {"competences": [], "sellers": [], "units": [], "totals": {}}
+    meses = [m for m in query_competences(conn, company_id) if inicio <= m <= fim]
+    if not meses:
+        meses = [fim]
+
+    permitidas = crm_allowed_units_for_user(conn, user)
+    escopo = data_scope_for_user(conn, user)
+    eu = seller_identity_for_user(user)
+
+    atingimento_unidade: dict[tuple[str, str], float | None] = {}
+    por_vendedor: dict[str, dict[str, Any]] = {}
+    for mes in meses:
+        mapa = build_seller_unit_map(conn, company_id, mes)
+        nomes = [normalize_whitespace(r["seller_name"]) for r in conn.execute(
+            "SELECT DISTINCT seller_name FROM fact_vendor_summary "
+            "WHERE company_id = ? AND competence = ?", (company_id, mes)).fetchall()
+            if normalize_whitespace(r["seller_name"])]
+        for nome in nomes:
+            unidade = (mapa.get(person_key(nome)) or mapa.get(short_person_key(nome)) or "")
+            if permitidas is not None and unidade and unidade not in permitidas:
+                continue
+            if escopo == "proprio" and person_key(nome) != person_key(eu):
+                continue
+            chave_u = (unidade, mes)
+            if chave_u not in atingimento_unidade:
+                atingimento_unidade[chave_u] = unit_goal_attainment(
+                    conn, company_id, unidade, mes)
+            r = seller_award_result(conn, company_id, nome, mes,
+                                    atingimento_unidade[chave_u])
+            atual = por_vendedor.setdefault(person_key(nome), {
+                "sellerName": nome, "unitName": unidade, "months": [],
+                "points": 0, "maxPoints": 0, "value": 0.0, "revenue": 0.0,
+                "revenueGoal": 0.0, "eligibleMonths": 0,
+            })
+            atual["sellerName"] = nome
+            atual["unitName"] = unidade or atual["unitName"]
+            atual["months"].append(r)
+            atual["points"] += r["points"]
+            atual["maxPoints"] += r["maxPoints"]
+            atual["value"] += r["value"]
+            atual["revenue"] += r["revenue"]
+            atual["revenueGoal"] += r["revenueGoal"]
+            atual["eligibleMonths"] += 1 if r["eligible"] else 0
+
+    vendedores = sorted(por_vendedor.values(), key=lambda v: -v["points"])
+    for v in vendedores:
+        v["value"] = round(v["value"], 2)
+        v["revenue"] = round(v["revenue"], 2)
+        v["revenueGoal"] = round(v["revenueGoal"], 2)
+        v["goalPct"] = round(100 * v["revenue"] / v["revenueGoal"], 2) if v["revenueGoal"] else None
+        v["avgPoints"] = round(v["points"] / len(v["months"]), 1) if v["months"] else 0
+        # No mês único, o detalhe do mês é o que a tela mostra aberto.
+        v["single"] = v["months"][0] if len(v["months"]) == 1 else None
+
+    unidades = sorted({v["unitName"] for v in vendedores if v["unitName"]})
+    return {
+        "competences": meses,
+        "from": inicio,
+        "to": fim,
+        "basket": award_basket_for(fim)["id"],
+        "sellers": vendedores,
+        "units": unidades,
+        "unitAttainment": {f"{u}|{m}": a for (u, m), a in atingimento_unidade.items()},
+        "totals": {
+            "sellers": len(vendedores),
+            "points": sum(v["points"] for v in vendedores),
+            "value": round(sum(v["value"] for v in vendedores), 2),
+            "eligible": sum(1 for v in vendedores if v["eligibleMonths"]),
+        },
+        # Gatilho anual do Vendedor Destaque: soma do ano acima de 900 pontos.
+        "highlightThreshold": 900,
+    }
+
+
 def seller_filter_sql(
     conn: sqlite3.Connection, company_id: int, nome: str,
     coluna: str = "seller_name", maiusculas: bool = False,
@@ -20100,6 +20297,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(_e), "sellers": [], "totalContactsToday": 0, "teamGoal": 0}))
                 return
+            if path == "/api/awards":
+                user = self._require_auth()
+                if not user:
+                    return
+                q = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    res = team_award_results(
+                        conn, user["company_id"], user,
+                        competence=q.get("from", [""])[0] or q.get("competence", [""])[0],
+                        competence_end=q.get("to", [""])[0] or q.get("competence", [""])[0])
+                    res["allCompetences"] = query_competences(conn, user["company_id"])
+                    res["canInput"] = user_can_manage_users(conn, user) or \
+                        data_scope_for_user(conn, user) != "proprio"
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
+                return
             if path == "/api/seller-targets":
                 user = self._require_auth()
                 if not user:
@@ -21656,6 +21869,57 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/awards/manual":
+                user = self._require_auth()
+                if not user:
+                    return
+                if not self._require_admin_area(user):
+                    return
+                corpo = self._read_json() or {}
+                competencia = valid_competence(corpo.get("competence") or "")
+                linhas = corpo.get("sellers") or []
+                if not competencia or not isinstance(linhas, list):
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Informe a competência e a lista."}))
+                    return
+                ts = now_iso()
+                with closing(get_connection()) as conn:
+                    for item in linhas:
+                        nome = normalize_whitespace(item.get("sellerName"))
+                        if not nome:
+                            continue
+
+                        def ponto(campo: str) -> float | None:
+                            bruto = item.get(campo)
+                            if bruto in (None, "", "-"):
+                                return None
+                            try:
+                                return max(0.0, float(str(bruto).replace(",", ".")))
+                            except ValueError:
+                                return None
+                        conn.execute(
+                            """
+                            INSERT INTO award_manual_inputs (company_id, competence, seller_name,
+                                ead_points, social_points, notes, updated_by, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(company_id, competence, seller_name) DO UPDATE SET
+                                ead_points = excluded.ead_points,
+                                social_points = excluded.social_points,
+                                notes = excluded.notes,
+                                updated_by = excluded.updated_by,
+                                updated_at = excluded.updated_at
+                            """,
+                            (user["company_id"], competencia, nome, ponto("eadPoints"),
+                             ponto("socialPoints"), normalize_whitespace(item.get("notes")),
+                             user["id"], ts, ts))
+                    audit_log(conn, user["company_id"], user["id"], "LANCAR",
+                              "award_manual_inputs", competencia, {"linhas": len(linhas)})
+                    conn.commit()
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "saved": len(linhas),
+                    "message": f"Lançamentos de {competencia} gravados."}))
+                return
             if path == "/api/seller-targets/save":
                 user = self._require_auth()
                 if not user:

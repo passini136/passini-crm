@@ -35,6 +35,9 @@ const state = {
   brands: null,
   sellerTargets: null,
   sellerTargetEdits: {},
+  awards: null,
+  awardFilters: null,
+  awardEdits: {},
   brandFilters: { scope: "", dimension: "" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
@@ -89,6 +92,7 @@ const state = {
       leads: false,
       brands: false,
       returns: false,
+      awards: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
@@ -458,13 +462,13 @@ function defaultTabForUser(user) {
   const allowed = allowedTabsForUser(user);
   // Primeira aba disponível seguindo a preferência natural de cada perfil
   const preference = user?.dataScope === "proprio"
-    ? ["crm-agenda", "meu-placar", "crm-clientes", "executivo"]
+    ? ["crm-agenda", "crm-clientes", "executivo"]
     : ["executivo", "crm-agenda", "crm-clientes", "acessos"];
   return preference.find((tab) => allowed.includes(tab)) || allowed[0] || "executivo";
 }
 
 // Telas da campanha de premiação — seguem PLACAR_ENABLED, não o score
-const PLACAR_TABS = ["meu-placar", "placar-equipe"];
+const PLACAR_TABS = ["placar-equipe"];
 
 function allowedTabsForUser(user) {
   if (!user) return ["executivo"];
@@ -473,7 +477,7 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "meu-placar", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "calendario"]);
+    return withoutScore(["crm-agenda", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "calendario"]);
   }
   return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
@@ -4930,6 +4934,9 @@ async function refreshCurrentTab() {
   if (tab === "metas-vendedor") {
     promises.push(loadSellerTargets());
   }
+  if (tab === "placar-equipe") {
+    promises.push(loadAwards(true));
+  }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
   }
@@ -4941,9 +4948,6 @@ async function refreshCurrentTab() {
   }
   if (tab === "crm-tarefas" || tab === "crm-interacao") {
     promises.push(loadCrmData());
-  }
-  if (tab === "placar-equipe" || tab === "meu-placar") {
-    promises.push(loadTeamScore());
   }
   if (tab === "importacoes") {
     promises.push(loadAutoImportStatus(), loadAdmin());
@@ -13540,6 +13544,254 @@ async function salvarMetasVendedor() {
   }
 }
 
+async function loadAwards(silencioso) {
+  const f = state.awardFilters || {};
+  const q = new URLSearchParams();
+  if (f.from) q.set("from", f.from);
+  if (f.to) q.set("to", f.to);
+  if (!silencioso) { state.ui.loading.awards = true; requestRender(); }
+  try {
+    state.awards = await api(`/api/awards?${q.toString()}`);
+    if (!f.from && state.awards.from) {
+      state.awardFilters = { from: state.awards.from, to: state.awards.to };
+    }
+  } catch (e) {
+    state.awards = { error: e.message, sellers: [] };
+  }
+  state.ui.loading.awards = false;
+  requestRender();
+  return state.awards;
+}
+
+function setAwardPeriod(campo, valor) {
+  state.awardFilters = { ...(state.awardFilters || {}), [campo]: valor };
+  const f = state.awardFilters;
+  // Intervalo invertido não é erro do usuário, é ordem trocada: arruma sozinho.
+  if (f.from && f.to && f.from > f.to) {
+    state.awardFilters = { from: f.to, to: f.from };
+  }
+  loadAwards();
+}
+
+function editarLancamento(nome, campo, valor) {
+  state.awardEdits = state.awardEdits || {};
+  state.awardEdits[nome] = { ...(state.awardEdits[nome] || {}), [campo]: valor };
+}
+
+async function salvarLancamentos() {
+  const d = state.awards;
+  const edits = state.awardEdits || {};
+  const nomes = Object.keys(edits);
+  if (!nomes.length) return addMessage("error", "Nada alterado para lançar.");
+  if (d.competences?.length !== 1) {
+    return addMessage("error", "Lançamento é por mês. Escolha um mês só no período.");
+  }
+  try {
+    const r = await api("/api/awards/manual", {
+      method: "POST",
+      body: JSON.stringify({
+        competence: d.competences[0],
+        sellers: nomes.map((n) => ({ sellerName: n, ...edits[n] })),
+      }),
+    });
+    addMessage("success", r.message || "Lançamentos gravados.");
+    state.awardEdits = {};
+    await loadAwards(true);
+  } catch (e) {
+    addMessage("error", "Não foi possível lançar: " + e.message);
+  }
+}
+
+function barraPontos(pontos, maximo) {
+  const pct = maximo ? Math.min(100, (100 * pontos) / maximo) : 0;
+  const cor = pct >= 66 ? "var(--good)" : pct >= 40 ? "#e67e22" : "var(--bad)";
+  return `<div style="background:var(--line);border-radius:6px;height:7px;width:110px;overflow:hidden">
+    <div style="width:${pct.toFixed(0)}%;height:100%;background:${cor}"></div></div>`;
+}
+
+function cartaoIndicador(i) {
+  const pct = i.max ? (100 * i.points) / i.max : 0;
+  const cor = i.missing ? "var(--muted)" : pct >= 100 ? "var(--good)"
+    : pct > 0 ? "#e67e22" : "var(--bad)";
+  const v = i.value;
+  const texto = v === null || v === undefined ? "—"
+    : i.format === "pct" ? `${Number(v).toFixed(1)}%`
+    : i.format === "ratio" ? Number(v).toFixed(4)
+    : Number(v).toFixed(0);
+  return `
+    <div style="border:1px solid var(--line);border-left:3px solid ${cor};border-radius:0;
+                padding:8px 10px;min-width:150px;flex:1">
+      <div class="text-small" style="color:var(--muted)">${escapeHtml(i.label)}</div>
+      <div style="display:flex;align-items:baseline;gap:6px">
+        <strong style="font-size:16px">${texto}</strong>
+        <span class="text-small" style="color:${cor};font-weight:700">
+          ${i.points}/${i.max} pts</span>
+      </div>
+      <div class="text-small" style="color:var(--muted);line-height:1.35">
+        ${i.missing ? "falta cadastrar/lançar" : escapeHtml(i.detail || "")}</div>
+    </div>`;
+}
+
+// A folha de impressão é montada dentro da própria página, num container
+// escondido que o @media print revela. É o mesmo caminho do roteiro de visitas:
+// abrir janela nova esbarra em bloqueador de pop-up e perde o estilo.
+function placarParaImpressao(d) {
+  const f = state.awardFilters || { from: d.from, to: d.to };
+  const periodo = f.from === f.to ? f.from : `${f.from} a ${f.to}`;
+  const linha = (v) => {
+    const s = v.single;
+    const inds = s
+      ? s.indicators.map((i) => `${i.label}: ${i.points}/${i.max}`).join(" · ")
+      : `média de ${v.avgPoints} pontos por mês`;
+    return `
+      <div class="print-client">
+        <div style="display:flex;justify-content:space-between;font-weight:bold">
+          <span>${escapeHtml(v.sellerName)}</span>
+          <span>${number(v.points)} pts · ${currency(v.value)}</span>
+        </div>
+        <div style="font-size:9pt;color:#333;margin:2px 0">
+          ${escapeHtml(v.unitName || "sem unidade")} ·
+          ${v.goalPct !== null ? `${v.goalPct.toFixed(1)}% da meta` : "sem meta"} ·
+          ${currency(v.revenue)}
+          ${s ? ` · ${escapeHtml(s.eligibilityReason || "")}` : ""}
+        </div>
+        <div style="font-size:9pt">${escapeHtml(inds)}</div>
+      </div>`;
+  };
+  const porUnidade = {};
+  (d.sellers || []).forEach((v) => {
+    (porUnidade[v.unitName || "SEM UNIDADE"] ||= []).push(v);
+  });
+  return `
+    <div class="print-area">
+      <div class="print-header">
+        <h1>Apuração da premiação</h1>
+        <div class="sub">Período ${escapeHtml(periodo)} · cesta ${escapeHtml(d.basket || "")} ·
+          ${number(d.totals?.sellers || 0)} vendedor(es) ·
+          ${number(d.totals?.eligible || 0)} elegível(is) ·
+          total ${currency(d.totals?.value || 0)}</div>
+      </div>
+      ${Object.keys(porUnidade).sort().map((un) => `
+        <div class="print-bairro">${escapeHtml(un)}</div>
+        ${porUnidade[un].map(linha).join("")}`).join("")}
+    </div>`;
+}
+
+function placarEquipeView() {
+  if (!state.awards) {
+    if (!state.ui.loading.awards) loadAwards();
+    return `<div class="loader panel">Apurando a premiação…</div>`;
+  }
+  const d = state.awards;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  const f = state.awardFilters || { from: d.from, to: d.to };
+  const meses = d.allCompetences || [];
+  const mesUnico = (d.competences || []).length === 1;
+  const edits = state.awardEdits || {};
+
+  const seletor = (campo, valor) => `
+    <select onchange="setAwardPeriod('${campo}', this.value)"
+      style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;font-size:13px">
+      ${meses.map((m) => `<option value="${m}" ${m === valor ? "selected" : ""}>${m}</option>`).join("")}
+    </select>`;
+
+  return `
+    <div class="stack">
+      <div class="form-card">
+        <div class="section-title">
+          <div>
+            <h3>Apuração da premiação</h3>
+            <div class="text-small">
+              Cesta ${escapeHtml(d.basket || "")} · ${(d.competences || []).length} mês(es) ·
+              pontos e valores são somados mês a mês, porque cada mês tem a sua premiação.
+            </div>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="text-small">de</span>${seletor("from", f.from)}
+            <span class="text-small">até</span>${seletor("to", f.to)}
+            ${d.canInput && mesUnico
+              ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">Lançar EAD/redes</button>`
+              : ""}
+            <button class="btn btn-secondary btn-sm" onclick="window.print()">⬇ PDF</button>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          ${[["Vendedores", number(d.totals?.sellers || 0)],
+             ["Elegíveis", number(d.totals?.eligible || 0)],
+             ["Pontos somados", number(d.totals?.points || 0)],
+             ["Premiação do período", currency(d.totals?.value || 0)]].map(([r, v]) => `
+            <div style="flex:1;min-width:130px;background:var(--surface);border:1px solid var(--line);
+                        border-radius:10px;padding:10px 12px">
+              <div class="text-small" style="color:var(--muted)">${r}</div>
+              <div style="font-size:20px;font-weight:800">${v}</div>
+            </div>`).join("")}
+        </div>
+      </div>
+
+      ${placarParaImpressao(d)}
+
+      ${(d.sellers || []).map((v, idx) => {
+        const s = v.single;
+        const e = edits[v.sellerName] || {};
+        return `
+        <div class="form-card" style="padding:14px 18px">
+          <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+            <div style="font-size:20px;font-weight:800;color:var(--muted);width:28px">${idx + 1}</div>
+            <div style="flex:1;min-width:200px">
+              <div style="font-weight:800">${escapeHtml(v.sellerName)}</div>
+              <div class="text-small" style="color:var(--muted)">
+                ${escapeHtml(v.unitName || "sem unidade")} ·
+                ${v.goalPct !== null ? `${v.goalPct.toFixed(1)}% da meta` : "sem meta"} ·
+                ${currency(v.revenue)}
+              </div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:22px;font-weight:800">${number(v.points)}</div>
+              <div class="text-small" style="color:var(--muted)">de ${number(v.maxPoints)} pts</div>
+              ${barraPontos(v.points, v.maxPoints)}
+            </div>
+            <div style="text-align:right;min-width:120px">
+              <div style="font-size:20px;font-weight:800;color:${v.value > 0 ? "var(--good)" : "var(--muted)"}">
+                ${currency(v.value)}</div>
+              <div class="text-small" style="color:var(--muted)">
+                ${v.eligibleMonths}/${v.months.length} mês(es) elegível</div>
+            </div>
+          </div>
+          ${s ? `
+            <div class="text-small" style="color:var(--muted);margin:8px 0 6px">
+              ${escapeHtml(s.eligibilityReason || "")}</div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              ${s.indicators.map(cartaoIndicador).join("")}
+            </div>
+            ${d.canInput ? `
+              <div style="display:flex;gap:10px;align-items:center;margin-top:10px;
+                          padding-top:10px;border-top:1px solid var(--line)">
+                <span class="text-small" style="color:var(--muted)">Lançar pontos:</span>
+                <label class="text-small">EAD
+                  <input type="text" inputmode="numeric" style="width:60px;margin-left:4px;padding:4px 6px;
+                         border:1px solid var(--line);border-radius:6px"
+                    value="${e.eadPoints ?? (s.indicators.find((x) => x.code === "ead")?.value ?? "")}"
+                    oninput="editarLancamento('${v.sellerName.replace(/'/g, "\\'")}','eadPoints',this.value)"></label>
+                <label class="text-small">Redes
+                  <input type="text" inputmode="numeric" style="width:60px;margin-left:4px;padding:4px 6px;
+                         border:1px solid var(--line);border-radius:6px"
+                    value="${e.socialPoints ?? (s.indicators.find((x) => x.code === "redes")?.value ?? "")}"
+                    oninput="editarLancamento('${v.sellerName.replace(/'/g, "\\'")}','socialPoints',this.value)"></label>
+              </div>` : ""}
+          ` : `
+            <div class="text-small" style="color:var(--muted);margin-top:8px">
+              Média de ${v.avgPoints} pontos por mês.
+              ${v.points >= (d.highlightThreshold || 900)
+                ? `<strong style="color:var(--good)">Acima dos ${d.highlightThreshold} pontos
+                   do gatilho de Vendedor Destaque.</strong>` : ""}
+            </div>`}
+        </div>`;
+      }).join("")}
+      ${!(d.sellers || []).length
+        ? `<div class="message">Nenhum vendedor com faturamento no período.</div>` : ""}
+    </div>`;
+}
+
 // De qual campo da resposta sai o placeholder de cada coluna. Antes eu derivava
 // o nome por manipulação de texto, o que quebrou assim que apareceu "marginTargetMid".
 const SUGESTAO_POR_CAMPO = {
@@ -14959,10 +15211,10 @@ function topbarTitle() {
     "importacoes":    { title: "Importações",             description: "Gestão de arquivos, pacotes e auditoria de dados." },
     "administracao":  { title: "Administração",           description: "Pendências, cadastros e integridade dos dados." },
     "metas-vendedor": { title: "Metas do Vendedor",       description: "Mix, margem e ligações por vendedor. Valem até você mudar." },
+    "placar-equipe":  { title: "Placar da Equipe",         description: "Apuração da premiação por vendedor: indicadores, pontos e valor." },
     "configuracoes":  { title: "Configurações",           description: "Metas, score e parâmetros operacionais." },
     "acessos":        { title: "Usuários e Perfis",       description: "Contas de acesso e permissões por perfil." },
     "crm-agenda":     { title: "Missão do Dia",            description: "Sua fila de 5 contatos. 1 oferta + 1 pergunta por cliente." },
-    "meu-placar":     { title: "Meu Placar",              description: "Seus pontos, indicadores e premiação estimada do mês." },
     "placar-equipe":  { title: "Placar da Equipe",        description: "Ranking de vendedores, zonas de premiação e alertas." },
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
@@ -15326,7 +15578,6 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const equipeTabs = [
-    { id: "meu-placar",    title: "Meu Placar",       desc: "Pontos e premiação",       icon: "⭐" },
     { id: "placar-equipe", title: "Placar Equipe",    desc: "Ranking e alertas",        icon: "🏆" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
@@ -15362,7 +15613,7 @@ function dashboardView() {
 
   const filtersLoading = Boolean(state.ui.loading.filters);
   const dis = filtersLoading ? "disabled" : "";
-  const isCrmTab = state.activeTab.startsWith("crm-") || state.activeTab === "meu-placar" || state.activeTab === "placar-equipe";
+  const isCrmTab = state.activeTab.startsWith("crm-") || state.activeTab === "placar-equipe";
   // Telas com período próprio não devem mostrar o seletor de competência: dois
   // filtros de tempo na mesma tela, um deles sem efeito, só geram dúvida sobre
   // qual está valendo. Contatos filtra por data de/até dentro da própria tela.
@@ -15405,9 +15656,13 @@ function dashboardView() {
     </div>
   `);
 
-  // Score resumido no sidebar para vendedor
-  const sidebarScore = placarEnabled() && roleIsSeller() && state.sellerScore ? `
-    <div style="padding:10px 12px;background:linear-gradient(135deg,#0f3044,#1a5276);border-radius:12px;margin-top:8px;cursor:pointer" onclick="switchTab('meu-placar')">
+  // Score resumido no sidebar para vendedor — DESLIGADO enquanto a apuração da
+  // premiação é reconstruída. Ele mostra a pontuação da cesta antiga (5
+  // componentes, 0–100), que não corresponde à premiação real, e levava para
+  // uma tela que o vendedor não tem mais. Volta quando o placar do vendedor for
+  // refeito sobre os 9 indicadores.
+  const sidebarScore = false && placarEnabled() && roleIsSeller() && state.sellerScore ? `
+    <div style="padding:10px 12px;background:linear-gradient(135deg,#0f3044,#1a5276);border-radius:12px;margin-top:8px;cursor:pointer" onclick="switchTab('placar-equipe')">
       <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em">MEU PLACAR</div>
       <div style="display:flex;align-items:baseline;gap:6px;margin-top:4px">
         <span style="font-size:24px;font-weight:900;color:#fff">${state.sellerScore.totalPoints}</span>
@@ -15455,7 +15710,6 @@ function dashboardView() {
           ${messageHtml()}
           ${!allowed.includes(state.activeTab) ? `<div class="message">Seu perfil não tem acesso a esta tela.</div>` : ""}
           ${state.activeTab === "crm-agenda"    ? crmAgendaView()      : ""}
-          ${state.activeTab === "meu-placar"    ? meuPlacarView()      : ""}
           ${state.activeTab === "placar-equipe" ? placardaEquipeView() : ""}
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
@@ -15479,6 +15733,7 @@ function dashboardView() {
           ${state.activeTab === "importacoes"   ? importacoesView()    : ""}
           ${state.activeTab === "administracao" ? administracaoView()  : ""}
           ${state.activeTab === "metas-vendedor" ? metasVendedorView() : ""}
+          ${state.activeTab === "placar-equipe"  ? placarEquipeView()  : ""}
           ${state.activeTab === "configuracoes" ? configuracoesView()  : ""}
           ${state.activeTab === "acessos"       ? acessosView()        : ""}
         </div>
