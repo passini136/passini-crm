@@ -13509,8 +13509,17 @@ def warm_dashboard_cache(company_id: int | None = None) -> None:
                     traceback.print_exc()
 
                 # A tela envia competenceStart e competenceEnd com o mesmo valor.
-                # Competências recentes sem filtro de unidade.
-                for competence in competences[:8]:
+                #
+                # Só os DOIS meses mais recentes, e as unidades só do mês atual.
+                # Antes eram 8 competências mais 3 × 6 unidades = 26 cálculos.
+                # Isso servia quando o dashboard levava 1 segundo; hoje leva de 5
+                # a 13, então o pré-aquecimento virava 4 minutos de CPU cheia a
+                # cada restart — disputando com quem estava usando o sistema. Foi
+                # o que fez a agenda levar 77s e o Placar dar "Failed to fetch".
+                #
+                # Aquecer é conveniência, não obrigação: mês antigo calcula na
+                # hora em que alguém pedir, o que é raro e custa uma espera só.
+                for competence in competences[:2]:
                     filters = build_filters_from_query({})
                     filters["competence_start"] = competence
                     filters["competence_end"] = competence
@@ -13518,19 +13527,22 @@ def warm_dashboard_cache(company_id: int | None = None) -> None:
                         get_dashboard_data_cached(conn, cid, filters)
                     except Exception:
                         traceback.print_exc()
+                    # Devolve a vez: sem a pausa, o aquecimento segura a CPU do
+                    # começo ao fim e as telas de quem está logado esperam.
+                    time.sleep(0.3)
 
-                # Combinação competência × unidade para as 3 competências mais recentes,
-                # que é o recorte usado no dia a dia.
-                for competence in competences[:3]:
-                    for unit in units:
-                        filters = build_filters_from_query({})
-                        filters["competence_start"] = competence
-                        filters["competence_end"] = competence
-                        filters["unit_name"] = unit
-                        try:
-                            get_dashboard_data_cached(conn, cid, filters)
-                        except Exception:
-                            traceback.print_exc()
+                for unit in units:
+                    if not competences:
+                        break
+                    filters = build_filters_from_query({})
+                    filters["competence_start"] = competences[0]
+                    filters["competence_end"] = competences[0]
+                    filters["unit_name"] = unit
+                    try:
+                        get_dashboard_data_cached(conn, cid, filters)
+                    except Exception:
+                        traceback.print_exc()
+                    time.sleep(0.3)
             print(f"[dashboard] cache pré-aquecido: {len(_dashboard_cache)} combinação(ões) "
                   f"em {time.time() - started:.0f}s")
     except Exception:
