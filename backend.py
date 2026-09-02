@@ -245,8 +245,11 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "visitas",        "label": "Visitas",            "group": "Crescer"},
     {"id": "sem-vendedor",   "label": "Clientes sem Vendedor","group": "Crescer"},
     # Equipe — motivação e desenvolvimento
-    {"id": "meu-placar",     "label": "Meu Placar",         "group": "Equipe"},
-    {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "Equipe"},
+    # Meu Placar e Placar da Equipe saíram do catálogo enquanto a apuração da
+    # premiação é reconstruída. A cesta antiga tem 5 componentes com pesos e
+    # nota 0–100; a premiação real tem 9 indicadores e 150 pontos. Deixá-las
+    # no ar mostraria pontuação sobre dinheiro que nunca foi validada.
+    # Voltam quando a apuração nova estiver conferida contra a planilha.
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "Equipe"},
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
@@ -263,6 +266,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     # Operações
     {"id": "importacoes",    "label": "Importações",        "group": "Operações"},
     {"id": "administracao",  "label": "Administração",      "group": "Operações"},
+    {"id": "metas-vendedor", "label": "Metas do Vendedor",  "group": "Operações"},
     {"id": "configuracoes",  "label": "Configurações",      "group": "Operações"},
     {"id": "acessos",        "label": "Usuários e Perfis",  "group": "Operações"},
 ]
@@ -302,7 +306,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "biblioteca", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
@@ -326,7 +330,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
+            "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "marcas", "devolucoes", "calendario",
         ],
         "data_scope": "proprio",
@@ -1240,11 +1244,6 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if sales_columns and stored_returns_purge_version(conn) < SALES_RETURNS_PURGE_VERSION:
         purge_sales_return_rows(conn)
 
-    _placar = conn.execute(
-        "SELECT value FROM app_meta WHERE key = 'score_screens_hidden_version'").fetchone()
-    if int((_placar["value"] if _placar else 0) or 0) < SCORE_SCREENS_HIDDEN_VERSION:
-        hide_score_screens(conn)
-
     prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
     if prospect_columns:
         # A ficha cadastral do cliente pede mais que a prospecção precisava.
@@ -1540,6 +1539,25 @@ def seed_access_profiles(conn: sqlite3.Connection, company_id: int) -> None:
                 now_iso(),
             ),
         )
+    conn.commit()
+
+    # Telas retiradas do catálogo saem também dos perfis já gravados. Sem isto,
+    # o módulo continuaria na lista de cada perfil como um id morto — invisível
+    # na tela, mas presente no dado e pronto para reaparecer no dia em que
+    # alguém devolvesse a entrada ao catálogo sem saber por que ela saiu.
+    conhecidos = {m["id"] for m in ACCESS_MODULES}
+    for linha in conn.execute(
+            "SELECT id, modules_json FROM access_profiles WHERE company_id = ?",
+            (company_id,)).fetchall():
+        try:
+            modulos = json.loads(linha["modules_json"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        vivos = [m for m in modulos if m in conhecidos]
+        if len(vivos) != len(modulos):
+            conn.execute(
+                "UPDATE access_profiles SET modules_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(vivos, ensure_ascii=False), now_iso(), linha["id"]))
     conn.commit()
 
     # Módulos novos criados depois da primeira execução não entram pelo INSERT OR IGNORE
@@ -3916,44 +3934,6 @@ def purge_sales_return_rows(conn: sqlite3.Connection) -> int:
         (str(SALES_RETURNS_PURGE_VERSION),))
     conn.commit()
     return total
-
-
-# Telas do placar retiradas de circulação enquanto a apuração da premiação é
-# reconstruída. A cesta antiga tem 5 componentes com pesos e nota 0–100; a
-# premiação real tem 9 indicadores e 150 pontos. Mostrar pontuação sobre
-# dinheiro que nunca foi validada é pior do que não mostrar nada.
-SCORE_SCREENS_HIDDEN_VERSION = 1
-SCORE_SCREENS = ("meu-placar", "placar-equipe")
-
-
-def hide_score_screens(conn: sqlite3.Connection) -> int:
-    """Tira Meu Placar e Placar da Equipe de todos os perfis, uma única vez.
-
-    Roda uma vez só, com marca em app_meta: se o gestor reativar a tela depois,
-    a migração não desfaz a escolha dele no próximo boot.
-    """
-    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
-    alterados = 0
-    for linha in conn.execute(
-            "SELECT id, modules_json FROM access_profiles").fetchall():
-        try:
-            modulos = json.loads(linha["modules_json"] or "[]")
-        except json.JSONDecodeError:
-            continue
-        restantes = [m for m in modulos if m not in SCORE_SCREENS]
-        if len(restantes) != len(modulos):
-            conn.execute("UPDATE access_profiles SET modules_json = ? WHERE id = ?",
-                         (json.dumps(restantes, ensure_ascii=False), linha["id"]))
-            alterados += 1
-    conn.execute(
-        "INSERT INTO app_meta (key, value) VALUES ('score_screens_hidden_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (str(SCORE_SCREENS_HIDDEN_VERSION),))
-    conn.commit()
-    if alterados:
-        print(f"[placar] telas de placar retiradas de {alterados} perfil(is) "
-              f"enquanto a apuração da premiação é refeita", flush=True)
-    return alterados
 
 
 def backup_database(conn: sqlite3.Connection, motivo: str = "manutencao") -> Path | None:
@@ -11136,6 +11116,121 @@ def official_row_for_seller(
     else:
         somada["margin_value"] = 0.0
     return somada
+
+
+# Meta de MIX (referências distintas no mês) do documento de premiação 2026.
+# A MATRIZ tem duas: televendas e balcão. A Zona Norte entrou com o mesmo número
+# da Zona Sul, que é a antiga Porto Alegre do documento.
+MIX_TARGET_BY_UNIT = {
+    ("MATRIZ", True): 650,      # televendas
+    ("MATRIZ", False): 900,     # balcão
+    ("LAJEADO", False): 1000,
+    ("PELOTAS", False): 850,
+    ("ZONA SUL", False): 900,
+    ("ZONA NORTE", False): 900,
+    ("XANGRILA", False): 750,
+}
+DEFAULT_CALLS_TARGET = 60       # ligações ativas mensais, documento 2026
+DEFAULT_MARGIN_TARGET = 1.50    # televendas costuma ser menor; ajustar por vendedor
+
+
+def is_inside_sales(seller_name: str) -> bool:
+    """Televendas x balcão sai do sufixo do nome, que é como o Alfa distingue."""
+    return "TELEVENDA" in normalize_upper(strip_accents(seller_name or ""))
+
+
+def suggested_seller_targets(
+    conn: sqlite3.Connection, company_id: int, competence: str = ""
+) -> list[dict[str, Any]]:
+    """Metas propostas para cada vendedor, a partir da unidade e do tipo de venda.
+
+    Serve para o gestor não digitar 29 linhas na mão: a tela mostra a proposta e
+    ele altera o que for diferente. Proposta não é cadastro — nada pontua até
+    alguém salvar, porque meta é decisão de gestão, não de fórmula.
+    """
+    comp = valid_competence(competence) or crm_latest_competence(conn, company_id) or ""
+    mapa = build_seller_unit_map(conn, company_id, comp) if comp else {}
+    atuais = {r["seller_name"]: r for r in conn.execute(
+        "SELECT * FROM seller_targets WHERE company_id = ?", (company_id,)).fetchall()}
+    chaves_com_meta = {person_key(n) for n in atuais}
+
+    vendedores = sorted({
+        normalize_whitespace(r["seller_name"])
+        for r in conn.execute(
+            "SELECT DISTINCT seller_name FROM fact_vendor_summary WHERE company_id = ?"
+            + (" AND competence = ?" if comp else ""),
+            (company_id, comp) if comp else (company_id,)).fetchall()
+        if normalize_whitespace(r["seller_name"])})
+
+    saida: list[dict[str, Any]] = []
+    for nome in vendedores:
+        unidade = (mapa.get(person_key(nome)) or mapa.get(short_person_key(nome)) or "")
+        tele = is_inside_sales(nome)
+        mix = MIX_TARGET_BY_UNIT.get((unidade, tele))
+        if mix is None and unidade:
+            mix = MIX_TARGET_BY_UNIT.get((unidade, False))
+        atual = atuais.get(nome)
+        if atual is None:
+            for n, linha in atuais.items():
+                if person_key(n) == person_key(nome):
+                    atual = linha
+                    break
+        saida.append({
+            "sellerName": nome,
+            "unitName": unidade,
+            "insideSales": tele,
+            "hasTargets": bool(atual),
+            "mixTarget": (atual["mix_target"] if atual else None),
+            "marginTarget": (atual["margin_target"] if atual else None),
+            "callsTarget": (atual["calls_target"] if atual else None),
+            "suggestedMix": mix,
+            "suggestedMargin": DEFAULT_MARGIN_TARGET,
+            "suggestedCalls": DEFAULT_CALLS_TARGET,
+        })
+    return saida
+
+
+def save_seller_targets(
+    conn: sqlite3.Connection, company_id: int, user_id: int | None,
+    linhas: list[dict[str, Any]],
+) -> int:
+    """Grava as metas. Campo vazio APAGA a meta — e sem meta o indicador não
+    pontua, que é o comportamento pedido."""
+    ts = now_iso()
+    gravadas = 0
+    for item in linhas:
+        nome = normalize_whitespace(item.get("sellerName"))
+        if not nome:
+            continue
+
+        def numero(campo: str) -> float | None:
+            bruto = item.get(campo)
+            if bruto in (None, "", "-"):
+                return None
+            try:
+                return float(str(bruto).replace(",", "."))
+            except ValueError:
+                return None
+
+        conn.execute(
+            """
+            INSERT INTO seller_targets (company_id, seller_name, mix_target, margin_target,
+                                        calls_target, notes, updated_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(company_id, seller_name) DO UPDATE SET
+                mix_target = excluded.mix_target,
+                margin_target = excluded.margin_target,
+                calls_target = excluded.calls_target,
+                notes = excluded.notes,
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at
+            """,
+            (company_id, nome, numero("mixTarget"), numero("marginTarget"),
+             numero("callsTarget"), normalize_whitespace(item.get("notes")),
+             user_id, ts, ts))
+        gravadas += 1
+    conn.commit()
+    return gravadas
 
 
 def seller_working_ratio(
@@ -19663,6 +19758,24 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(_e), "sellers": [], "totalContactsToday": 0, "teamGoal": 0}))
                 return
+            if path == "/api/seller-targets":
+                user = self._require_auth()
+                if not user:
+                    return
+                if not self._require_admin_area(user):
+                    return
+                q = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    linhas = suggested_seller_targets(
+                        conn, user["company_id"], q.get("competence", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "sellers": linhas,
+                    "units": CANONICAL_UNITS,
+                    "defaults": {"calls": DEFAULT_CALLS_TARGET,
+                                 "margin": DEFAULT_MARGIN_TARGET},
+                }))
+                return
             if path == "/api/auto-import/status":
                 user = self._require_auth()
                 if not user:
@@ -21201,6 +21314,30 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nenhum arquivo enviado"}))
                     return
+            if path == "/api/seller-targets/save":
+                user = self._require_auth()
+                if not user:
+                    return
+                if not self._require_admin_area(user):
+                    return
+                corpo = self._read_json() or {}
+                linhas = corpo.get("sellers") or []
+                if not isinstance(linhas, list):
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Formato inválido."}))
+                    return
+                with closing(get_connection()) as conn:
+                    gravadas = save_seller_targets(
+                        conn, user["company_id"], user["id"], linhas)
+                    audit_log(conn, user["company_id"], user["id"], "SALVAR",
+                              "seller_targets", "", {"linhas": gravadas})
+                    conn.commit()
+                    invalidate_crm_cache(user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "saved": gravadas,
+                    "message": f"{gravadas} meta(s) de vendedor gravada(s)."}))
+                return
             if path == "/api/kpi-thresholds/save":
                 user = self._require_auth()
                 if not user or not self._require_user_management(user):

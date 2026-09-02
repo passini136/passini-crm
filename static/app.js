@@ -33,6 +33,8 @@ const state = {
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
   brands: null,
+  sellerTargets: null,
+  sellerTargetEdits: {},
   brandFilters: { scope: "", dimension: "" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
@@ -4924,6 +4926,9 @@ async function refreshCurrentTab() {
   }
   if (tab === "devolucoes") {
     promises.push(loadReturns(true));
+  }
+  if (tab === "metas-vendedor") {
+    promises.push(loadSellerTargets());
   }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
@@ -13469,6 +13474,141 @@ function guiaDeImportacao(tipos) {
     </div>`;
 }
 
+async function loadSellerTargets() {
+  const mes = state.filters.competenceEnd || state.filters.competenceStart || "";
+  try {
+    state.sellerTargets = await api(`/api/seller-targets?competence=${encodeURIComponent(mes)}`);
+  } catch (e) {
+    state.sellerTargets = { error: e.message, sellers: [] };
+  }
+  state.sellerTargetEdits = {};
+  requestRender();
+  return state.sellerTargets;
+}
+
+function editarMeta(nome, campo, valor) {
+  state.sellerTargetEdits = state.sellerTargetEdits || {};
+  const atual = state.sellerTargetEdits[nome] || {};
+  atual[campo] = valor;
+  state.sellerTargetEdits[nome] = atual;
+  // Sem requestRender: repintar a cada tecla tiraria o foco do campo.
+}
+
+function preencherMetasSugeridas() {
+  const d = state.sellerTargets;
+  if (!d?.sellers) return;
+  state.sellerTargetEdits = state.sellerTargetEdits || {};
+  // Só preenche quem está vazio. Meta já cadastrada é decisão tomada — a
+  // sugestão não passa por cima dela.
+  d.sellers.forEach((s) => {
+    if (s.hasTargets) return;
+    state.sellerTargetEdits[s.sellerName] = {
+      mixTarget: s.suggestedMix ?? "",
+      marginTarget: s.suggestedMargin ?? "",
+      callsTarget: s.suggestedCalls ?? "",
+    };
+  });
+  requestRender();
+  addMessage("success", "Sugestões preenchidas. Ajuste o que for diferente e salve.");
+}
+
+async function salvarMetasVendedor() {
+  const d = state.sellerTargets;
+  if (!d?.sellers) return;
+  const edits = state.sellerTargetEdits || {};
+  const linhas = d.sellers.map((s) => {
+    const e = edits[s.sellerName] || {};
+    return {
+      sellerName: s.sellerName,
+      mixTarget: e.mixTarget !== undefined ? e.mixTarget : s.mixTarget,
+      marginTarget: e.marginTarget !== undefined ? e.marginTarget : s.marginTarget,
+      callsTarget: e.callsTarget !== undefined ? e.callsTarget : s.callsTarget,
+    };
+  }).filter((l) => l.mixTarget != null || l.marginTarget != null || l.callsTarget != null);
+  if (!linhas.length) return addMessage("error", "Nenhuma meta preenchida para salvar.");
+  try {
+    const r = await api("/api/seller-targets/save", {
+      method: "POST", body: JSON.stringify({ sellers: linhas }) });
+    addMessage("success", r.message || "Metas salvas.");
+    await loadSellerTargets();
+  } catch (e) {
+    addMessage("error", "Não foi possível salvar: " + e.message);
+  }
+}
+
+function metasVendedorView() {
+  if (!state.sellerTargets) { loadSellerTargets(); return `<div class="loader panel">Carregando metas…</div>`; }
+  const d = state.sellerTargets;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  const edits = state.sellerTargetEdits || {};
+  const sellers = d.sellers || [];
+  const semMeta = sellers.filter((s) => !s.hasTargets).length;
+
+  const campo = (s, nome, passo) => {
+    const e = edits[s.sellerName] || {};
+    const valor = e[nome] !== undefined ? e[nome] : (s[nome] ?? "");
+    return `<input type="text" inputmode="decimal" value="${valor === null ? "" : valor}"
+      placeholder="${s["suggested" + nome.charAt(0).toUpperCase() + nome.slice(1).replace("Target","")] ?? ""}"
+      oninput="editarMeta('${s.sellerName.replace(/'/g, "\\'")}','${nome}',this.value)"
+      style="width:88px;text-align:right;padding:5px 8px;border:1px solid var(--line);
+             border-radius:6px;font-size:13px">`;
+  };
+
+  return `
+    <div class="stack">
+      <div class="form-card">
+        <div class="section-title">
+          <div>
+            <h3>Metas por vendedor</h3>
+            <div class="text-small">
+              Valem até você mudar — não precisa cadastrar todo mês. Em mês de férias,
+              <strong>mix e ligações</strong> são reduzidos na proporção dos dias úteis
+              trabalhados; a <strong>margem</strong> não muda, porque é qualidade da venda
+              e não volume. <strong>Campo vazio significa sem meta, e sem meta o indicador
+              não pontua.</strong>
+            </div>
+          </div>
+          <div style="display:flex;gap:8px">
+            <button class="btn btn-secondary btn-sm" onclick="preencherMetasSugeridas()">
+              Preencher sugestões</button>
+            <button class="btn btn-primary btn-sm" onclick="salvarMetasVendedor()">Salvar</button>
+          </div>
+        </div>
+        ${semMeta ? `<div class="message" style="margin-bottom:10px">
+          ${semMeta} vendedor(es) ainda sem meta cadastrada. Enquanto estiverem assim,
+          eles não pontuam em mix, margem nem ligações.</div>` : ""}
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Vendedor</th><th>Unidade</th><th>Tipo</th>
+                <th style="text-align:right">Mix (itens)</th>
+                <th style="text-align:right">Margem</th>
+                <th style="text-align:right">Ligações</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${sellers.map((s) => `
+                <tr>
+                  <td><strong>${escapeHtml(s.sellerName)}</strong></td>
+                  <td>${escapeHtml(s.unitName || "—")}</td>
+                  <td><span class="text-small" style="color:var(--muted)">${
+                    s.insideSales ? "televendas" : "balcão"}</span></td>
+                  <td style="text-align:right">${campo(s, "mixTarget")}</td>
+                  <td style="text-align:right">${campo(s, "marginTarget")}</td>
+                  <td style="text-align:right">${campo(s, "callsTarget")}</td>
+                  <td>${s.hasTargets
+                    ? `<span class="soft-badge">cadastrada</span>`
+                    : `<span class="soft-badge" style="background:#fdecea;color:#c0392b">sem meta</span>`}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+}
+
 function importacoesView() {
   if (!state.admin) return `<div class="loader panel">Carregando importações...</div>`;
   if (!state.autoImport) loadAutoImportStatus();
@@ -14800,6 +14940,7 @@ function topbarTitle() {
     "calendario":     { title: "Calendário Comercial",    description: "Feriados, dias úteis e distribuição mensal." },
     "importacoes":    { title: "Importações",             description: "Gestão de arquivos, pacotes e auditoria de dados." },
     "administracao":  { title: "Administração",           description: "Pendências, cadastros e integridade dos dados." },
+    "metas-vendedor": { title: "Metas do Vendedor",       description: "Mix, margem e ligações por vendedor. Valem até você mudar." },
     "configuracoes":  { title: "Configurações",           description: "Metas, score e parâmetros operacionais." },
     "acessos":        { title: "Usuários e Perfis",       description: "Contas de acesso e permissões por perfil." },
     "crm-agenda":     { title: "Missão do Dia",            description: "Sua fila de 5 contatos. 1 oferta + 1 pergunta por cliente." },
@@ -15195,6 +15336,7 @@ function dashboardView() {
 
   const opsTabs = [
     { id: "importacoes",   title: "Importações",    desc: "Arquivos e auditoria",    icon: "📥" },
+    { id: "metas-vendedor", title: "Metas",         desc: "Mix, margem e ligações", icon: "🎯" },
     { id: "administracao", title: "Administração",  desc: "Pendências e cadastros",  icon: "⚙️" },
     { id: "configuracoes", title: "Configurações",  desc: "Metas e parâmetros",      icon: "🔧" },
     { id: "acessos",       title: "Usuários e Perfis", desc: "Contas e permissões",  icon: "🔑" },
@@ -15318,6 +15460,7 @@ function dashboardView() {
           ${state.activeTab === "calendario"    ? calendarView()       : ""}
           ${state.activeTab === "importacoes"   ? importacoesView()    : ""}
           ${state.activeTab === "administracao" ? administracaoView()  : ""}
+          ${state.activeTab === "metas-vendedor" ? metasVendedorView() : ""}
           ${state.activeTab === "configuracoes" ? configuracoesView()  : ""}
           ${state.activeTab === "acessos"       ? acessosView()        : ""}
         </div>
