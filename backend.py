@@ -2578,6 +2578,28 @@ def init_db() -> None:
             -- metas diferentes dentro da mesma unidade — e o documento da
             -- premiação já trata MATRIZ TELE e MATRIZ BALCÃO como coisas
             -- distintas.
+            -- Indicadores que o sistema NÃO tem como apurar: EAD e redes
+            -- sociais. Entram por lançamento do gestor, com rastro de quem
+            -- lançou e quando — são pontos que viram dinheiro, e dinheiro sem
+            -- rastro vira discussão.
+            CREATE TABLE IF NOT EXISTS award_manual_inputs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                competence TEXT NOT NULL,
+                seller_name TEXT NOT NULL,
+                ead_points REAL,
+                social_points REAL,
+                notes TEXT,
+                updated_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, competence, seller_name),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_award_manual_lookup
+                ON award_manual_inputs(company_id, competence);
+
             CREATE TABLE IF NOT EXISTS seller_targets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -11233,6 +11255,95 @@ def save_seller_targets(
     return gravadas
 
 
+# ─── Cesta de indicadores da premiação ──────────────────────────────────────
+#
+# A regra fica declarada como DADO, não espalhada em ifs: é ela que decide
+# dinheiro, e precisa ser lida por quem não programa. Cada cesta tem vigência,
+# porque a de 2025 difere da de 2026 e a apuração de um mês antigo tem que
+# continuar reproduzível.
+#
+# "faixas" são pares (mínimo, pontos), da menor para a maior. Vale a última
+# faixa cujo mínimo o valor alcança.
+AWARD_BASKETS = [
+    {
+        "id": "2026",
+        "validFrom": "2026-01",
+        "validTo": None,
+        "maxPoints": 150,
+        "indicators": [
+            {"code": "meta", "label": "Meta de venda", "max": 50, "unit": "pct",
+             "bands": [(90, 5), (95, 15), (100, 30), (110, 50)]},
+            {"code": "margem", "label": "Margem", "max": 20, "unit": "ratio",
+             "bands": [(1.50, 5), (1.52, 10), (1.59, 20)], "perSellerTarget": True},
+            {"code": "mix", "label": "Itens", "max": 10, "unit": "count",
+             "bands": [(100, 10)], "againstTarget": True},
+            {"code": "positivacao", "label": "Positivação", "max": 20, "unit": "pct",
+             "bands": [(50, 10), (85, 20)]},
+            {"code": "devolucoes", "label": "Devoluções", "max": 10, "unit": "pctMenor",
+             "bands": [(4.5, 10)]},
+            {"code": "extraPositivacao", "label": "Extra positivação", "max": 10,
+             "unit": "countDireto"},
+            {"code": "ead", "label": "EAD", "max": 10, "unit": "manual"},
+            {"code": "ligacoes", "label": "Ligações ativas", "max": 10, "unit": "count",
+             "bands": [(100, 10)], "againstTarget": True},
+            {"code": "redes", "label": "Redes sociais", "max": 10, "unit": "manual"},
+        ],
+        "eligibility": {"unitMin": 95.0, "individualWithUnit": 90.0, "individualAlone": 105.0},
+        "awardBase": [(159999.99, 185.0), (309999.99, 380.0), (float("inf"), 530.0)],
+        "payout": {"minPoints": 60, "fullPoints": 100, "maxPct": 150.0},
+    },
+    {
+        "id": "2025",
+        "validFrom": "2025-01",
+        "validTo": "2025-12",
+        "maxPoints": 150,
+        "indicators": [
+            {"code": "meta", "label": "Meta de venda", "max": 50, "unit": "pct",
+             "bands": [(90, 5), (95, 15), (100, 30), (110, 50)]},
+            {"code": "margem", "label": "Margem", "max": 20, "unit": "ratio",
+             "bands": [(1.47, 5), (1.52, 10), (1.59, 20)], "perSellerTarget": True},
+            {"code": "mix", "label": "Itens", "max": 15, "unit": "count",
+             "bands": [(100, 15)], "againstTarget": True},
+            {"code": "positivacao", "label": "Positivação", "max": 25, "unit": "pct",
+             "bands": [(50, 15), (85, 25)]},
+            {"code": "devolucoes", "label": "Devoluções", "max": 10, "unit": "pctMenor",
+             "bands": [(5.0, 10)]},
+            {"code": "extraPositivacao", "label": "Extra positivação", "max": 9999,
+             "unit": "countDireto"},
+            {"code": "ead", "label": "EAD", "max": 10, "unit": "manual"},
+            {"code": "ligacoes", "label": "Ligações ativas", "max": 10, "unit": "count",
+             "bands": [(100, 10)], "againstTarget": True},
+            {"code": "redes", "label": "Redes sociais", "max": 10, "unit": "manual"},
+        ],
+        "eligibility": {"unitMin": 95.0, "individualWithUnit": 90.0, "individualAlone": 105.0},
+        "awardBase": [(159999.99, 185.0), (309999.99, 380.0), (float("inf"), 530.0)],
+        "payout": {"minPoints": 60, "fullPoints": 100, "maxPct": 150.0},
+    },
+]
+
+
+def award_basket_for(competence: str) -> dict[str, Any]:
+    """A cesta vigente na competência. Sem vigente, usa a mais recente."""
+    comp = valid_competence(competence) or ""
+    for cesta in AWARD_BASKETS:
+        if comp and cesta["validFrom"] <= comp and (
+                cesta["validTo"] is None or comp <= cesta["validTo"]):
+            return cesta
+    return AWARD_BASKETS[0]
+
+
+def points_for_band(valor: float | None, faixas: list[tuple[float, int]],
+                    menor_e_melhor: bool = False) -> int:
+    """Pontos da faixa alcançada. Sem valor apurado, zero — e quem chama
+    distingue "não atingiu" de "não tem como apurar"."""
+    if valor is None or not faixas:
+        return 0
+    if menor_e_melhor:
+        # Devoluções: pontua quem fica ABAIXO do teto.
+        return max((p for teto, p in faixas if valor <= teto), default=0)
+    return max((p for minimo, p in faixas if valor >= minimo), default=0)
+
+
 def seller_working_ratio(
     conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str
 ) -> tuple[float, int, int]:
@@ -11318,6 +11429,207 @@ def seller_targets_for(
         "monthDays": uteis_total,
         "onVacation": proporcao < 1.0,
         "hasTargets": bool(linha),
+    }
+
+
+def seller_award_indicators(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str,
+) -> dict[str, Any]:
+    """Apura os nove indicadores da premiação de um vendedor no mês.
+
+    Cada indicador devolve o VALOR apurado, a fonte e os PONTOS. O valor
+    importa tanto quanto o ponto: o vendedor precisa poder conferir de onde saiu
+    o número, senão a premiação vira caixa-preta e toda discordância vira
+    discussão sem dado.
+
+    Fontes por indicador:
+      meta, margem, devoluções  → custo x venda (fonte oficial de resultado)
+      mix                       → faturamento detalhado (referências distintas)
+      positivação, extra        → cadastro de clientes + faturamento detalhado
+      ligações                  → interações do CRM
+      EAD, redes                → lançamento manual do gestor
+    """
+    cesta = award_basket_for(competence)
+    variantes = seller_name_variants(conn, company_id, seller_name) or [seller_name]
+    marcadores = ",".join("?" for _ in variantes)
+    metas = seller_targets_for(conn, company_id, seller_name, competence)
+
+    oficial = conn.execute(
+        f"SELECT COALESCE(SUM(net_value),0) liquido, COALESCE(SUM(sale_value),0) bruto, "
+        f"       COALESCE(SUM(return_value),0) devolucao, AVG(margin_value) margem "
+        f"FROM fact_vendor_summary WHERE company_id = ? AND competence = ? "
+        f"AND seller_name IN ({marcadores})",
+        (company_id, competence, *variantes)).fetchone()
+    liquido = float(oficial["liquido"] or 0)
+    bruto = float(oficial["bruto"] or 0)
+    devolvido = float(oficial["devolucao"] or 0)
+    margem = oficial["margem"]
+    # "nan" no relatório do Alfa vira 0: é ausência de venda, não margem ruim.
+    margem = float(margem) if margem not in (None, 0) else None
+
+    _metas = entries_for_person(
+        {r["seller_name"]: r for r in conn.execute(
+            "SELECT seller_name, revenue_goal FROM goals_seller "
+            "WHERE company_id = ? AND competence = ?", (company_id, competence)).fetchall()},
+        seller_name)
+    meta_valor = float(_metas[0]["revenue_goal"] or 0) if _metas else 0.0
+    meta_pct = (100 * liquido / meta_valor) if meta_valor else None
+
+    mix = int(conn.execute(
+        f"SELECT COUNT(DISTINCT sku_key) n FROM fact_sales_detail "
+        f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores}) "
+        f"AND TRIM(COALESCE(sku_key,'')) <> ''",
+        (company_id, competence, *variantes)).fetchone()["n"] or 0)
+
+    carteira = [r["client_code"] for r in conn.execute(
+        f"SELECT client_code FROM crm_client_profiles WHERE company_id = ? "
+        f"AND internal_seller_name IN ({marcadores}) "
+        f"AND TRIM(COALESCE(client_code,'')) <> ''",
+        (company_id, *variantes)).fetchall()]
+    positivados = 0
+    extra = 0
+    if carteira:
+        nomes_faturados = {
+            normalize_client_key(r["client_name"]): float(r["v"] or 0)
+            for r in conn.execute(
+                f"SELECT client_name, SUM(net_value) v FROM fact_sales_detail "
+                f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores}) "
+                f"GROUP BY client_name", (company_id, competence, *variantes)).fetchall()}
+        perfis = {r["client_code"]: r for r in conn.execute(
+            f"SELECT client_code, client_name, last_sale_at, document_number "
+            f"FROM crm_client_profiles WHERE company_id = ? "
+            f"AND internal_seller_name IN ({marcadores})",
+            (company_id, *variantes)).fetchall()}
+        inicio_mes = first_day_of_competence(competence)
+        for codigo in carteira:
+            perfil = perfis.get(codigo)
+            if not perfil:
+                continue
+            faturado = nomes_faturados.get(normalize_client_key(perfil["client_name"]), 0.0)
+            if faturado > 0:
+                positivados += 1
+            # Extra positivação: PJ que estava inativo e voltou comprando acima
+            # de R$ 999 no mês. "Inativo" é a última compra ANTES do mês, mais
+            # velha que o corte de inatividade — olhar o estado de hoje diria
+            # que ninguém estava inativo, já que acabou de comprar.
+            if faturado <= 999:
+                continue
+            tipo, _ = person_type_from_document(perfil["document_number"])
+            if tipo != "PJ":
+                continue
+            # Inatividade pela mesma régua do CRM (crm_status_from_days), medida
+            # no primeiro dia do mês: hoje o cliente comprou, então olhar o
+            # estado atual diria que ninguém estava inativo.
+            ultima = parse_datetime_flexible(perfil["last_sale_at"])
+            dias_antes = (inicio_mes - ultima.date()).days if ultima else None
+            if crm_status_from_days(dias_antes) == "INATIVO":
+                extra += 1
+    positivacao_pct = (100 * positivados / len(carteira)) if carteira else None
+
+    devolucao_pct = (100 * devolvido / bruto) if bruto else None
+
+    inicio = first_day_of_competence(competence).isoformat()
+    fim = last_day_of_competence(competence).isoformat()
+    ligacoes = int(conn.execute(
+        f"SELECT COUNT(*) n FROM crm_interactions WHERE company_id = ? "
+        f"AND contact_type_code = 'LIGACAO' AND initiative = 'ATIVO' "
+        f"AND seller_name IN ({marcadores}) "
+        f"AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)",
+        (company_id, *variantes, inicio, fim)).fetchone()["n"] or 0)
+
+    manual = conn.execute(
+        f"SELECT ead_points, social_points FROM award_manual_inputs "
+        f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marcadores}) LIMIT 1",
+        (company_id, competence, *variantes)).fetchone()
+
+    def faixas(codigo: str) -> list[tuple[float, int]]:
+        for ind in cesta["indicators"]:
+            if ind["code"] == codigo:
+                return ind.get("bands") or []
+        return []
+
+    def teto(codigo: str) -> int:
+        for ind in cesta["indicators"]:
+            if ind["code"] == codigo:
+                return int(ind["max"])
+        return 0
+
+    # A margem tem faixas próprias por vendedor: a régua de televendas é mais
+    # baixa. Quando há meta cadastrada, ela vira a primeira faixa e as outras
+    # duas acompanham o mesmo intervalo da tabela geral.
+    faixas_margem = faixas("margem")
+    if metas["marginTarget"] and faixas_margem:
+        base = faixas_margem[0][0]
+        faixas_margem = [(round(metas["marginTarget"] + (m - base), 2), p)
+                         for m, p in faixas_margem]
+
+    def contra_meta(valor: float, alvo: float | None) -> float | None:
+        """Vira percentual do alvo, para a faixa ser "100% da meta"."""
+        if not alvo:
+            return None
+        return 100 * valor / alvo
+
+    indicadores = [
+        {"code": "meta", "label": "Meta de venda", "value": meta_pct, "format": "pct",
+         "detail": f"{brl(liquido)} de {brl(meta_valor)}" if meta_valor else "sem meta cadastrada",
+         "points": points_for_band(meta_pct, faixas("meta")), "max": teto("meta"),
+         "missing": meta_valor <= 0},
+        {"code": "margem", "label": "Margem", "value": margem, "format": "ratio",
+         "detail": (f"régua {metas['marginTarget']:.2f}" if metas["marginTarget"]
+                    else "usando a régua geral"),
+         "points": points_for_band(margem, faixas_margem), "max": teto("margem"),
+         "missing": margem is None},
+        {"code": "mix", "label": "Itens", "value": mix, "format": "count",
+         "detail": (f"meta {metas['mixTarget']:.0f}"
+                    + (f" (proporcional de {metas['mixTargetFull']:.0f} por férias)"
+                       if metas["onVacation"] and metas["mixTargetFull"] else "")
+                    if metas["mixTarget"] else "sem meta cadastrada"),
+         "points": points_for_band(contra_meta(mix, metas["mixTarget"]), faixas("mix")),
+         "max": teto("mix"), "missing": metas["mixTarget"] is None},
+        {"code": "positivacao", "label": "Positivação", "value": positivacao_pct,
+         "format": "pct", "detail": f"{positivados} de {len(carteira)} clientes da carteira",
+         "points": points_for_band(positivacao_pct, faixas("positivacao")),
+         "max": teto("positivacao"), "missing": not carteira},
+        {"code": "devolucoes", "label": "Devoluções", "value": devolucao_pct, "format": "pct",
+         "detail": f"{brl(devolvido)} sobre {brl(bruto)}",
+         "points": points_for_band(devolucao_pct, faixas("devolucoes"), menor_e_melhor=True),
+         "max": teto("devolucoes"), "missing": bruto <= 0},
+        {"code": "extraPositivacao", "label": "Extra positivação", "value": extra,
+         "format": "count", "detail": "PJ inativo que voltou comprando acima de R$ 999",
+         "points": min(extra, teto("extraPositivacao")), "max": teto("extraPositivacao"),
+         "missing": False},
+        {"code": "ead", "label": "EAD", "value": (manual["ead_points"] if manual else None),
+         "format": "points", "detail": "lançamento do gestor",
+         "points": int(manual["ead_points"] or 0) if manual else 0, "max": teto("ead"),
+         "missing": manual is None or manual["ead_points"] is None},
+        {"code": "ligacoes", "label": "Ligações ativas", "value": ligacoes, "format": "count",
+         "detail": (f"meta {metas['callsTarget']:.0f}"
+                    + (f" (proporcional de {metas['callsTargetFull']:.0f} por férias)"
+                       if metas["onVacation"] and metas["callsTargetFull"] else "")
+                    if metas["callsTarget"] else "sem meta cadastrada"),
+         "points": points_for_band(contra_meta(ligacoes, metas["callsTarget"]), faixas("ligacoes")),
+         "max": teto("ligacoes"), "missing": metas["callsTarget"] is None},
+        {"code": "redes", "label": "Redes sociais",
+         "value": (manual["social_points"] if manual else None), "format": "points",
+         "detail": "lançamento do gestor",
+         "points": int(manual["social_points"] or 0) if manual else 0, "max": teto("redes"),
+         "missing": manual is None or manual["social_points"] is None},
+    ]
+    for ind in indicadores:
+        ind["points"] = min(int(ind["points"]), int(ind["max"]))
+
+    return {
+        "sellerName": seller_name,
+        "competence": competence,
+        "basket": cesta["id"],
+        "indicators": indicadores,
+        "points": sum(i["points"] for i in indicadores),
+        "maxPoints": cesta["maxPoints"],
+        "revenue": round(liquido, 2),
+        "revenueGoal": round(meta_valor, 2),
+        "goalPct": round(meta_pct, 2) if meta_pct is not None else None,
+        "targets": metas,
+        "pendingInputs": [i["code"] for i in indicadores if i["missing"]],
     }
 
 
