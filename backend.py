@@ -11328,13 +11328,16 @@ AWARD_BASKETS = [
              "bands": [(90, 5), (95, 15), (100, 30), (110, 50)]},
             {"code": "margem", "label": "Margem", "max": 20, "unit": "ratio",
              "bands": [(1.50, 5), (1.52, 10), (1.59, 20)], "perSellerTarget": True},
-            {"code": "mix", "label": "Itens", "max": 10, "unit": "count",
-             "bands": [(100, 10)], "againstTarget": True},
-            {"code": "positivacao", "label": "Positivação", "max": 20, "unit": "pct",
-             "bands": [(50, 10), (85, 20)]},
+            {"code": "mix", "label": "Itens", "max": 15, "unit": "count",
+             "bands": [(100, 15)], "againstTarget": True},
+            {"code": "positivacao", "label": "Positivação", "max": 25, "unit": "pct",
+             "bands": [(50, 15), (85, 25)]},
             {"code": "devolucoes", "label": "Devoluções", "max": 10, "unit": "pctMenor",
              "bands": [(4.5, 10)]},
-            {"code": "extraPositivacao", "label": "Extra positivação", "max": 10,
+            # Sem limite e FORA dos 150: cada PJ reativado vale 1 ponto, e o
+            # vendedor que trouxer 12 de volta leva 12. É o único indicador que
+            # não tem teto, porque reativar cliente não tem por que ter teto.
+            {"code": "extraPositivacao", "label": "Extra positivação", "max": 9999,
              "unit": "countDireto"},
             {"code": "ead", "label": "EAD", "max": 10, "unit": "manual"},
             {"code": "ligacoes", "label": "Ligações ativas", "max": 10, "unit": "count",
@@ -11378,11 +11381,19 @@ AWARD_BASKETS = [
 def award_basket_for(competence: str) -> dict[str, Any]:
     """A cesta vigente na competência. Sem vigente, usa a mais recente."""
     comp = valid_competence(competence) or ""
+    escolhida = AWARD_BASKETS[0]
     for cesta in AWARD_BASKETS:
         if comp and cesta["validFrom"] <= comp and (
                 cesta["validTo"] is None or comp <= cesta["validTo"]):
-            return cesta
-    return AWARD_BASKETS[0]
+            escolhida = cesta
+            break
+    # O teto sai da SOMA dos indicadores, não de um número escrito à parte.
+    # Mudar a pontuação de um indicador e esquecer de acertar o total faria a
+    # tela mostrar "80 de 150" quando o máximo real é outro — e ninguém
+    # perceberia, porque os dois números parecem igualmente plausíveis.
+    escolhida["maxPoints"] = sum(int(i["max"]) for i in escolhida["indicators"]
+                                 if int(i["max"]) < 1000)
+    return escolhida
 
 
 def points_for_band(valor: float | None, faixas: list[tuple[float, int]],
@@ -11755,7 +11766,9 @@ def award_value_for(cesta: dict[str, Any], meta_valor: float, pontos: int) -> di
     return {
         "baseValue": round(base, 2),
         "payoutPct": round(pct, 1),
-        "value": round(base * pct / 100, 2),
+        # Premiação sai em reais inteiros: é valor que vai para o contracheque,
+        # e centavo de arredondamento só gera pergunta.
+        "value": float(round(base * pct / 100)),
         "minPoints": regra["minPoints"],
     }
 
