@@ -1240,6 +1240,11 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if sales_columns and stored_returns_purge_version(conn) < SALES_RETURNS_PURGE_VERSION:
         purge_sales_return_rows(conn)
 
+    _placar = conn.execute(
+        "SELECT value FROM app_meta WHERE key = 'score_screens_hidden_version'").fetchone()
+    if int((_placar["value"] if _placar else 0) or 0) < SCORE_SCREENS_HIDDEN_VERSION:
+        hide_score_screens(conn)
+
     prospect_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospects)").fetchall()}
     if prospect_columns:
         # A ficha cadastral do cliente pede mais que a prospecção precisava.
@@ -2545,6 +2550,36 @@ def init_db() -> None:
                 UNIQUE(company_id, person_name, start_date, end_date),
                 FOREIGN KEY (company_id) REFERENCES companies(id)
             );
+
+            -- Metas do vendedor que NÃO mudam todo mês: mix de itens e margem.
+            -- Diferente de goals_seller, que é por competência: aqui vale a
+            -- última definida até alguém mudar. Cadastrar 30 vendedores por mês
+            -- só para repetir o mesmo número seria trabalho sem informação.
+            --
+            -- São por VENDEDOR, não por unidade, porque televendas e balcão têm
+            -- metas diferentes dentro da mesma unidade — e o documento da
+            -- premiação já trata MATRIZ TELE e MATRIZ BALCÃO como coisas
+            -- distintas.
+            CREATE TABLE IF NOT EXISTS seller_targets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                seller_name TEXT NOT NULL,
+                mix_target REAL,             -- referências distintas no mês
+                margin_target REAL,          -- margem mínima para pontuar
+                calls_target REAL,           -- ligações ativas no mês
+                notes TEXT,
+                updated_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                UNIQUE(company_id, seller_name),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            -- Férias reduzem a meta na proporção dos dias trabalhados. Sem isto,
+            -- quem tirou 15 dias competiria com quem trabalhou o mês inteiro
+            -- usando a mesma régua de mix e de ligações.
+            CREATE INDEX IF NOT EXISTS idx_seller_targets_lookup
+                ON seller_targets(company_id, seller_name);
 
             CREATE TABLE IF NOT EXISTS score_configs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3881,6 +3916,44 @@ def purge_sales_return_rows(conn: sqlite3.Connection) -> int:
         (str(SALES_RETURNS_PURGE_VERSION),))
     conn.commit()
     return total
+
+
+# Telas do placar retiradas de circulação enquanto a apuração da premiação é
+# reconstruída. A cesta antiga tem 5 componentes com pesos e nota 0–100; a
+# premiação real tem 9 indicadores e 150 pontos. Mostrar pontuação sobre
+# dinheiro que nunca foi validada é pior do que não mostrar nada.
+SCORE_SCREENS_HIDDEN_VERSION = 1
+SCORE_SCREENS = ("meu-placar", "placar-equipe")
+
+
+def hide_score_screens(conn: sqlite3.Connection) -> int:
+    """Tira Meu Placar e Placar da Equipe de todos os perfis, uma única vez.
+
+    Roda uma vez só, com marca em app_meta: se o gestor reativar a tela depois,
+    a migração não desfaz a escolha dele no próximo boot.
+    """
+    conn.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT)")
+    alterados = 0
+    for linha in conn.execute(
+            "SELECT id, modules_json FROM access_profiles").fetchall():
+        try:
+            modulos = json.loads(linha["modules_json"] or "[]")
+        except json.JSONDecodeError:
+            continue
+        restantes = [m for m in modulos if m not in SCORE_SCREENS]
+        if len(restantes) != len(modulos):
+            conn.execute("UPDATE access_profiles SET modules_json = ? WHERE id = ?",
+                         (json.dumps(restantes, ensure_ascii=False), linha["id"]))
+            alterados += 1
+    conn.execute(
+        "INSERT INTO app_meta (key, value) VALUES ('score_screens_hidden_version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (str(SCORE_SCREENS_HIDDEN_VERSION),))
+    conn.commit()
+    if alterados:
+        print(f"[placar] telas de placar retiradas de {alterados} perfil(is) "
+              f"enquanto a apuração da premiação é refeita", flush=True)
+    return alterados
 
 
 def backup_database(conn: sqlite3.Connection, motivo: str = "manutencao") -> Path | None:
@@ -6490,6 +6563,8 @@ SELLER_NAME_SOURCES = (
     ("crm_interactions", "seller_name"),
     ("crm_client_profiles", "internal_seller_name"),
     ("fact_warranty_returns", "seller_name"),
+    ("seller_targets", "seller_name"),
+    ("goals_seller", "seller_name"),
     ("people_records", "person_name"),
 )
 
@@ -11061,6 +11136,94 @@ def official_row_for_seller(
     else:
         somada["margin_value"] = 0.0
     return somada
+
+
+def seller_working_ratio(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str
+) -> tuple[float, int, int]:
+    """Fração do mês em que o vendedor esteve disponível, em DIAS ÚTEIS.
+
+    Devolve (proporção, dias úteis trabalhados, dias úteis do mês).
+
+    Férias reduzem a meta na mesma proporção. Sem isso, quem tirou 15 dias
+    disputaria mix e ligações com a régua de quem trabalhou o mês inteiro — e a
+    saída prática seria ninguém tirar férias em mês de premiação.
+
+    Conta em dias ÚTEIS porque é neles que se vende: férias que pegam dois fins
+    de semana não deveriam valer o mesmo que férias em dias de trabalho.
+    """
+    try:
+        inicio = first_day_of_competence(competence)
+        fim = last_day_of_competence(competence)
+    except (ValueError, AttributeError):
+        return 1.0, 0, 0
+    uteis = [d for d in daterange(inicio, fim) if d.weekday() < 5]
+    total = len(uteis)
+    if not total:
+        return 1.0, 0, 0
+    variantes = seller_name_variants(conn, company_id, seller_name) or [seller_name]
+    chaves = {person_key(v) for v in variantes}
+    de_ferias: set[date] = set()
+    for f in conn.execute(
+        "SELECT person_name, start_date, end_date FROM vacations WHERE company_id = ?",
+            (company_id,)).fetchall():
+        if person_key(f["person_name"]) not in chaves:
+            continue
+        d0 = parse_datetime_flexible(f["start_date"])
+        d1 = parse_datetime_flexible(f["end_date"])
+        if not d0 or not d1:
+            continue
+        for d in daterange(max(d0.date(), inicio), min(d1.date(), fim)):
+            if d.weekday() < 5:
+                de_ferias.add(d)
+    trabalhados = total - len(de_ferias)
+    return (max(trabalhados, 0) / total), max(trabalhados, 0), total
+
+
+def seller_targets_for(
+    conn: sqlite3.Connection, company_id: int, seller_name: str, competence: str
+) -> dict[str, Any]:
+    """Metas de mix, margem e ligações do vendedor, já com o ajuste de férias.
+
+    Mix e ligações são de esforço e escalam com o tempo disponível. A MARGEM
+    não: vender com margem boa em 10 dias é tão exigente quanto em 22, então
+    ela fica intacta.
+
+    Sem meta cadastrada o indicador NÃO pontua — devolve None em vez de zero,
+    para a tela poder dizer "falta cadastrar" em vez de "tirou zero".
+    """
+    linha = None
+    for variante in (seller_name_variants(conn, company_id, seller_name) or [seller_name]):
+        linha = conn.execute(
+            "SELECT * FROM seller_targets WHERE company_id = ? AND seller_name = ?",
+            (company_id, variante)).fetchone()
+        if linha:
+            break
+    proporcao, uteis_trab, uteis_total = seller_working_ratio(
+        conn, company_id, seller_name, competence)
+
+    def proporcional(valor: Any) -> float | None:
+        if valor is None or valor == "":
+            return None
+        return round(float(valor) * proporcao, 0)
+
+    return {
+        "sellerName": seller_name,
+        "mixTarget": proporcional(linha["mix_target"]) if linha else None,
+        "callsTarget": proporcional(linha["calls_target"]) if linha else None,
+        # Margem não é proporcional ao tempo: é qualidade da venda, não volume.
+        "marginTarget": (float(linha["margin_target"])
+                         if linha and linha["margin_target"] is not None else None),
+        "mixTargetFull": (float(linha["mix_target"])
+                          if linha and linha["mix_target"] is not None else None),
+        "callsTargetFull": (float(linha["calls_target"])
+                            if linha and linha["calls_target"] is not None else None),
+        "workingRatio": round(proporcao, 4),
+        "workingDays": uteis_trab,
+        "monthDays": uteis_total,
+        "onVacation": proporcao < 1.0,
+        "hasTargets": bool(linha),
+    }
 
 
 def seller_filter_sql(
