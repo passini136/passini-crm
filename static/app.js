@@ -4922,7 +4922,11 @@ function botaoAtualizar(chave, chamada, opcoes = {}) {
 
 async function refreshCurrentTab() {
   const tab = state.activeTab;
-  const promises = [];
+  // O selo "dados até XX · N dias úteis atrás" vem de /api/options, carregado
+  // uma vez no login. Sem recarregá-lo, o Atualizar trazia números novos e
+  // deixava o selo dizendo que o dado era velho — a tela se contradizia, e o
+  // aviso perdia a credibilidade justo quando estava certo.
+  const promises = [loadOptions()];
   // Dados gerais sempre recarregados
   if (["executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario"].includes(tab)) {
     promises.push(loadDashboard());
