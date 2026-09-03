@@ -15261,13 +15261,15 @@ function termometroPremiacao(eu, s) {
   const base = s.baseValue || 0;
   const porPonto = base / 100;
   const pontos = eu.points;
-  const min = s.minPoints || 60;
   const teto = s.maxPct || 150;
+  // Não há piso de pontos: o portão é bater a meta de venda. Os marcos são
+  // referências de valor, não degraus de liberação.
   const marcos = [
-    { pts: min, rotulo: "começa a pagar", valor: base * min / 100 },
+    { pts: 60, rotulo: "60% da premiação", valor: base * 0.6 },
     { pts: 100, rotulo: "premiação cheia", valor: base },
     { pts: teto, rotulo: "máximo", valor: base * teto / 100 },
   ];
+  const metaPontuou = (s.indicators || []).some((i) => i.code === "meta" && i.points > 0);
   const proximo = marcos.find((m) => pontos < m.pts);
   const largura = Math.min(100, (100 * pontos) / teto);
 
@@ -15280,7 +15282,16 @@ function termometroPremiacao(eu, s) {
           ${number(pontos)} pontos${aberto
             ? ` · cada ponto vale <strong>${currency(porPonto)}</strong>` : " · mês encerrado"}
         </div>
-        ${!proximo ? `
+        ${!metaPontuou ? `
+          <div style="margin-top:8px;padding:8px 10px;background:#fdecea;border-left:3px solid var(--bad)">
+            <div style="font-weight:800;font-size:14px">
+              ${aberto ? "Bata sua meta de venda" : "Não bateu a meta de venda"}</div>
+            <div class="text-small">
+              ${aberto
+                ? "A premiação só abre a partir de 90% da meta. Os outros pontos não valem sem isso."
+                : "Sem pontuar na meta, os outros indicadores não geram premiação."}</div>
+          </div>`
+        : !proximo ? `
           <div style="margin-top:8px;padding:8px 10px;background:#e6f4ea;border-left:3px solid var(--good)">
             <div style="font-weight:800;font-size:14px">
               ${aberto ? "Você está no máximo da premiação."

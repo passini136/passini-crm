@@ -11347,7 +11347,8 @@ AWARD_BASKETS = [
         ],
         "eligibility": {"unitMin": 95.0, "individualWithUnit": 90.0, "individualAlone": 105.0},
         "awardBase": [(159999.99, 185.0), (309999.99, 380.0), (float("inf"), 530.0)],
-        "payout": {"minPoints": 60, "fullPoints": 100, "maxPct": 150.0},
+        # Sem piso de pontos: o portão é o indicador de meta de venda pontuar.
+        "payout": {"minPoints": 0, "fullPoints": 100, "maxPct": 150.0},
     },
     {
         "id": "2025",
@@ -11374,7 +11375,8 @@ AWARD_BASKETS = [
         ],
         "eligibility": {"unitMin": 95.0, "individualWithUnit": 90.0, "individualAlone": 105.0},
         "awardBase": [(159999.99, 185.0), (309999.99, 380.0), (float("inf"), 530.0)],
-        "payout": {"minPoints": 60, "fullPoints": 100, "maxPct": 150.0},
+        # Sem piso de pontos: o portão é o indicador de meta de venda pontuar.
+        "payout": {"minPoints": 0, "fullPoints": 100, "maxPct": 150.0},
     },
 ]
 
@@ -11779,10 +11781,11 @@ def award_value_for(cesta: dict[str, Any], meta_valor: float, pontos: int) -> di
             base = valor
             break
     regra = cesta["payout"]
-    if pontos < regra["minPoints"]:
-        pct = 0.0
-    else:
-        pct = min(float(pontos), regra["maxPct"])
+    # NÃO existe piso de pontos. O portão é pontuar no indicador de META DE
+    # VENDA — quem passa por ele recebe conforme a pontuação, seja ela qual for.
+    # Os "60 pontos = 60%" do documento são um ponto da reta, não um mínimo:
+    # ponto é por cento, com teto em 150%.
+    pct = min(float(pontos), regra["maxPct"])
     return {
         "baseValue": round(base, 2),
         "payoutPct": round(pct, 1),
@@ -11843,15 +11846,23 @@ def seller_award_result(
                   f"{regras['unitMin']:.0f}% — e o individual de {individual:.1f}% "
                   f"não alcança os {regras['individualAlone']:.0f}% da porta direta")
 
+    # O portão da premiação é o indicador de META DE VENDA ter pontuado. Sem
+    # bater a meta não há premiação, por mais pontos que venham dos outros
+    # indicadores — vender é o trabalho, o resto é como se vende.
+    pontos_meta = next((i["points"] for i in apurado["indicators"]
+                        if i["code"] == "meta"), 0)
+    if pontos_meta <= 0:
+        elegivel = False
+        if apurado["revenueGoal"] <= 0:
+            motivo = "sem meta individual cadastrada para o mês"
+        else:
+            motivo = (f"não pontuou na meta de venda "
+                      f"({individual:.1f}% do objetivo)" if individual is not None
+                      else "não pontuou na meta de venda")
+
     valor = award_value_for(cesta, apurado["revenueGoal"], apurado["points"])
     if not elegivel:
         valor = {**valor, "payoutPct": 0.0, "value": 0.0}
-    elif apurado["points"] < valor["minPoints"]:
-        # Elegível e sem receber é a combinação que mais gera dúvida: a porta
-        # abriu pela meta, mas a pontuação da cesta não chegou ao mínimo. Dizer
-        # só "elegível" ao lado de R$ 0,00 parece erro do sistema.
-        motivo = (f"{motivo} — mas {apurado['points']} pontos, abaixo dos "
-                  f"{valor['minPoints']} que começam a pagar")
 
     return {
         **apurado,
