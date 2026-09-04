@@ -1329,6 +1329,14 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
     if meeting_columns and "visibility" not in meeting_columns:
         conn.execute("ALTER TABLE meetings ADD COLUMN visibility TEXT NOT NULL DEFAULT 'UNIDADE'")
 
+    # Nem todo material de treinamento é arquivo. Vídeo de fornecedor, pasta no
+    # Drive, planilha online: o conteúdo mora fora e só o endereço vem para cá.
+    # Quando link_url está preenchido, stored_name fica vazio e nada foi gravado
+    # em disco — quem apaga precisa olhar essa coluna antes de procurar o arquivo.
+    attach_columns = {row["name"] for row in conn.execute("PRAGMA table_info(meeting_attachments)").fetchall()}
+    if attach_columns and "link_url" not in attach_columns:
+        conn.execute("ALTER TABLE meeting_attachments ADD COLUMN link_url TEXT")
+
     # Tarefa deixou de ser só follow-up de cliente: agora também é direcionamento
     # do gestor, com ou sem cliente vinculado. Precisa saber de onde veio e quem
     # mandou — sem isso o vendedor recebe tarefa sem contexto.
@@ -2064,6 +2072,7 @@ def init_db() -> None:
                 size_bytes INTEGER NOT NULL DEFAULT 0,
                 uploaded_by_user_id INTEGER,
                 created_at TEXT NOT NULL,
+                link_url TEXT,          -- preenchido = material externo, sem arquivo em disco
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
 
@@ -5935,6 +5944,11 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
     # para o gerente no mês que vem — justamente quando ele mais precisa
     # aparecer, que é na primeira semana.
     inicio, fim = competence_window(competence)
+    # O corte de admissão é o mais recente entre o fim da competência e HOJE.
+    # Só o fim da competência escondia quem entrou depois dela: com dados até
+    # agosto, um vendedor admitido em setembro não aparecia na lista de presença
+    # de nenhuma reunião de setembro — justo o mês em que ele mais participa.
+    corte_admissao = max(fim, today_in_brazil().isoformat())
     allowed = crm_allowed_units_for_user(conn, user)
     rows = conn.execute(
         """
@@ -5945,7 +5959,7 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
           AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))
         ORDER BY person_name
         """,
-        (company_id, fim, inicio),
+        (company_id, corte_admissao, inicio),
     ).fetchall()
     vistos: set[str] = set()
     pessoas: list[dict[str, Any]] = []
@@ -6076,6 +6090,7 @@ def load_meeting(conn: sqlite3.Connection, company_id: int, meeting_id: int) -> 
             "sizeBytes": int(a["size_bytes"] or 0),
             "contentType": a["content_type"] or "",
             "createdAt": a["created_at"],
+            "linkUrl": (a["link_url"] or "") if "link_url" in a.keys() else "",
         }
         for a in conn.execute(
             "SELECT * FROM meeting_attachments WHERE meeting_id = ? ORDER BY id", (meeting_id,)
@@ -6439,6 +6454,51 @@ def save_meeting_attachment(
     return {"attachmentId": int(cursor.lastrowid), "fileName": nome_limpo, "sizeBytes": len(content)}
 
 
+def save_meeting_attachment_link(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    meeting_id: int, url: str, label: str = "",
+) -> dict[str, Any]:
+    """Guarda um endereço externo como material da ata.
+
+    Não baixa nada e não valida se o link responde: o destino costuma ser uma
+    pasta corporativa que só abre logado, e uma checagem daqui diria "quebrado"
+    para link bom. Quem abre é a pessoa, no navegador dela.
+    """
+    if not user_can_manage_meetings(conn, user):
+        raise PermissionError("Apenas gestão anexa material.")
+    if not conn.execute(
+        "SELECT 1 FROM meetings WHERE company_id = ? AND id = ?", (company_id, meeting_id)
+    ).fetchone():
+        raise ValueError("Ata não encontrada.")
+
+    endereco = normalize_whitespace(url)
+    if not endereco.lower().startswith(("http://", "https://")):
+        raise ValueError("O link precisa começar com http:// ou https://.")
+    if len(endereco) > 2000:
+        raise ValueError("Link longo demais.")
+
+    nome = normalize_whitespace(label)
+    if not nome:
+        # Sem apelido, o host já diz mais para quem lê a ata do que a URL inteira.
+        try:
+            nome = urlparse(endereco).hostname or endereco
+        except ValueError:
+            nome = endereco
+    nome = nome[:180]
+
+    cursor = conn.execute(
+        """
+        INSERT INTO meeting_attachments
+            (meeting_id, file_name, stored_name, content_type, size_bytes,
+             uploaded_by_user_id, created_at, link_url)
+        VALUES (?,?,'','text/uri-list',0,?,?,?)
+        """,
+        (meeting_id, nome, user["id"], now_iso(), endereco),
+    )
+    conn.commit()
+    return {"attachmentId": int(cursor.lastrowid), "fileName": nome, "linkUrl": endereco}
+
+
 def delete_meeting_attachment(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, attachment_id: int
 ) -> None:
@@ -6454,9 +6514,12 @@ def delete_meeting_attachment(
     ).fetchone()
     if not row:
         raise ValueError("Anexo não encontrado.")
-    caminho = meeting_files_dir() / row["stored_name"]
-    if caminho.exists():
-        caminho.unlink()
+    # Link não tem arquivo em disco: stored_name vazio viraria o próprio diretório
+    # de anexos, e unlink() num diretório derruba a remoção inteira.
+    if row["stored_name"]:
+        caminho = meeting_files_dir() / row["stored_name"]
+        if caminho.exists():
+            caminho.unlink()
     conn.execute("DELETE FROM meeting_attachments WHERE id = ?", (attachment_id,))
     conn.commit()
 
@@ -6467,7 +6530,8 @@ def delete_meeting(
     if not user_can_manage_meetings(conn, user):
         raise PermissionError("Apenas gestão exclui atas.")
     for row in conn.execute(
-        "SELECT stored_name FROM meeting_attachments WHERE meeting_id = ?", (meeting_id,)
+        "SELECT stored_name FROM meeting_attachments WHERE meeting_id = ? AND stored_name <> ''",
+        (meeting_id,),
     ).fetchall():
         caminho = meeting_files_dir() / row["stored_name"]
         if caminho.exists():
@@ -20956,6 +21020,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Anexo não encontrado."}))
                     return
+                if not row["stored_name"]:
+                    # Material por link não passa pelo servidor. Sem esta guarda,
+                    # stored_name vazio apontaria para a própria pasta de anexos.
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Este material é um link — abra pelo endereço."}))
+                    return
                 caminho = meeting_files_dir() / row["stored_name"]
                 if not caminho.exists():
                     self._set_headers(404)
@@ -22697,6 +22767,30 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, "attachments": salvos}))
+                return
+            if path == "/api/meetings/attachment/link":
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        salvo = save_meeting_attachment_link(
+                            conn, user["company_id"], user,
+                            int(payload.get("meetingId") or 0),
+                            str(payload.get("url") or ""),
+                            str(payload.get("label") or ""),
+                        )
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, **salvo}))
                 return
             if path == "/api/meetings/attachment/delete":
                 user = self._require_auth()

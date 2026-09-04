@@ -460,6 +460,105 @@ function addMessage(type, text) {
   }, delay);
 }
 
+/* ─── Guarda das telas sobrepostas ───────────────────────────────────────────
+ *
+ * Um gerente escreveu vinte minutos de ata, o dedo escorregou três pixels para
+ * fora do painel e o texto sumiu sem aviso. Clicar fora é atalho de quem está
+ * lendo, não de quem está escrevendo: enquanto a pessoa não digitou nada, ele
+ * continua fechando na hora; a partir do primeiro caractere ele passa a
+ * perguntar, e quando a tela sabe salvar rascunho, oferece isso primeiro.
+ *
+ * O rastreio é global de propósito. Amarrar "sujo" a cada modal exigiria
+ * lembrar de todos — e o modal esquecido seria justamente o que perde o texto.
+ */
+let modalTemTextoNovo = false;
+
+function limparModalSujo() { modalTemTextoNovo = false; }
+
+/** Para trabalho que não passa por campo de texto — marcar presentes, por ex. */
+function marcarModalSujo() { modalTemTextoNovo = true; }
+
+function algumModalAberto() {
+  return Boolean(document.querySelector(".client-drawer-overlay.open, .crm-modal-backdrop"));
+}
+
+["input", "change"].forEach((evento) => {
+  document.addEventListener(evento, (ev) => {
+    // Arquivo não é texto digitado: o próprio upload já avisa o que aconteceu.
+    if (ev.target && ev.target.type === "file") return;
+    if (algumModalAberto()) modalTemTextoNovo = true;
+  }, true);
+});
+
+/**
+ * Fecha a sobreposição pedindo confirmação se houver algo digitado.
+ *
+ * @param {Function} fechar  O que fazer para fechar de verdade.
+ * @param {Object}  [opcoes] titulo, texto, rascunhoLabel e rascunho (async).
+ */
+function fecharComGuarda(fechar, opcoes) {
+  const o = opcoes || {};
+  if (!modalTemTextoNovo) { limparModalSujo(); fechar(); return; }
+  state.fechamentoPendente = {
+    titulo: o.titulo || "Fechar sem salvar?",
+    texto: o.texto || "Há informação digitada aqui que ainda não foi salva. "
+      + "Se fechar agora, ela se perde.",
+    rascunhoLabel: o.rascunhoLabel || "Salvar rascunho e fechar",
+    rascunho: o.rascunho || null,
+    fechar,
+  };
+  requestRender();
+}
+
+function continuarEditando() {
+  state.fechamentoPendente = null;
+  requestRender();
+}
+
+function descartarEFechar() {
+  const c = state.fechamentoPendente;
+  state.fechamentoPendente = null;
+  limparModalSujo();
+  if (c) c.fechar();
+  requestRender();
+}
+
+async function salvarRascunhoEFechar() {
+  const c = state.fechamentoPendente;
+  if (!c || !c.rascunho) return;
+  state.fechamentoPendente = null;
+  requestRender();
+  try {
+    const r = await c.rascunho();
+    if (r === false) return;          // salvou não; o modal fica aberto com o texto
+    limparModalSujo();
+    c.fechar();
+  } catch (e) {
+    addMessage("error", e.message || "Não consegui salvar o rascunho.");
+  }
+  requestRender();
+}
+
+/** Diálogo de confirmação. Não fecha por clique fora — seria o mesmo defeito. */
+function confirmacaoFechamentoModal() {
+  const c = state.fechamentoPendente;
+  if (!c) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" style="z-index:150">
+      <div class="panel modal-panel" style="max-width:460px;margin:16vh auto;padding:24px">
+        <h3 style="margin:0">${escapeHtml(c.titulo)}</h3>
+        <div class="text-small" style="margin-top:10px;line-height:1.6">${escapeHtml(c.texto)}</div>
+        <div class="actions" style="margin-top:20px">
+          <button class="btn btn-primary" onclick="continuarEditando()">Continuar editando</button>
+          ${c.rascunho
+            ? `<button class="btn btn-secondary" onclick="salvarRascunhoEFechar()">${escapeHtml(c.rascunhoLabel)}</button>`
+            : ""}
+          <button class="btn btn-ghost" onclick="descartarEFechar()">Descartar e fechar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 function defaultTabForUser(user) {
   const allowed = allowedTabsForUser(user);
   // Primeira aba disponível seguindo a preferência natural de cada perfil
@@ -2041,7 +2140,7 @@ function configFaseModal() {
   const unidades = (state.options.units || []).length ? state.options.units : (d.units || []);
   const competencias = state.options.competences || [];
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharConfigFase()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharConfigFase)">
       <div class="panel modal-panel" style="max-width:600px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>🚧 Fase da unidade</h3>
@@ -2098,7 +2197,7 @@ function metasAtividadeModal() {
   const unidades = (state.options.units || []).length ? state.options.units : (d.units || []);
   const competencias = state.options.competences || [];
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharMetasAtividade()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharMetasAtividade)">
       <div class="panel modal-panel" style="max-width:620px;margin:7vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>🎯 Metas de atividade</h3>
@@ -3380,7 +3479,7 @@ function pedidoCadastroModal() {
   if (!p) return "";
   const texto = textoPedidoCadastro(p);
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharPedidoCadastro()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharPedidoCadastro)">
       <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px"
            onclick="event.stopPropagation()">
         <div class="section-title">
@@ -3632,7 +3731,7 @@ function prospectEditorModal() {
   const p = state.prospectEditor;
   const d = state.prospects || {};
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharProspectEditor()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharProspectEditor)">
       <div class="panel modal-panel" data-keep-scroll="prospect-editor"
            style="max-width:720px;margin:5vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -4119,7 +4218,7 @@ function helpEditorModal() {
   if (!h) return "";
   const a = state.assistant || {};
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharHelpEditor()" style="z-index:95">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharHelpEditor)" style="z-index:95">
       <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${h.type === "tip" ? (h.id ? "Editar dica" : "Nova dica") : (h.id ? "Editar dúvida" : "Nova dúvida no FAQ")}</h3></div>
@@ -4574,7 +4673,7 @@ function clientesDoVendedorModal() {
     </button>`;
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharClientesDoVendedor()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharClientesDoVendedor)">
       <div class="panel modal-panel" style="max-width:1000px;margin:5vh auto;padding:22px;
                   max-height:90vh;overflow:auto" onclick="event.stopPropagation()">
         <div class="section-title">
@@ -7513,7 +7612,7 @@ function conciliacaoModal() {
   if (!r) return "";
   const c = r.found;
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharConciliacao()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharConciliacao)">
       <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -7738,7 +7837,7 @@ function copyFallbackModal() {
   const cf = state.crm.copyFallback;
   if (!cf) return "";
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="closeCopyFallback()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(closeCopyFallback)">
       <div class="panel modal-panel" style="max-width:640px;margin:8vh auto;padding:20px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${escapeHtml(cf.title)}</h3>
@@ -7885,7 +7984,7 @@ function assignTaskModal() {
   const demais = vendedores.filter((v) => !v.preferred);
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="closeAssignTaskModal()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(closeAssignTaskModal)">
       <div class="panel modal-panel" style="max-width:520px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -8093,7 +8192,7 @@ function receptiveModal() {
   const r = state.crm.receptive;
   if (!r) return "";
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="closeReceptiveModal()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(closeReceptiveModal)">
       <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -8140,7 +8239,7 @@ function scheduleContactModal() {
   const hoje = dateInDays(0);
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="closeScheduleContactModal()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(closeScheduleContactModal)">
       <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -8303,6 +8402,23 @@ async function editarAta(meetingId) {
 
 function fecharAtaEditor() { state.meetingEditor = null; requestRender(); }
 
+/**
+ * Clique fora do painel da ata.
+ *
+ * Aqui a saída pelo rascunho existe de verdade — a ata já nasce salvável sem
+ * publicar. Quem clicou fora sem querer não precisa escolher entre perder o
+ * texto e notificar a equipe com a ata pela metade.
+ */
+function fecharAtaEditorPorFora() {
+  fecharComGuarda(fecharAtaEditor, {
+    titulo: "Fechar a ata sem salvar?",
+    texto: "O que você escreveu ainda não foi gravado. Posso salvar como rascunho — "
+      + "a equipe não é notificada, e você volta nele quando quiser.",
+    rascunhoLabel: "Salvar rascunho e fechar",
+    rascunho: () => salvarAta(false),
+  });
+}
+
 function togglePresente(personKey) {
   const e = state.meetingEditor;
   if (!e) return;
@@ -8317,6 +8433,9 @@ function togglePresente(personKey) {
   } else {
     e.participants.push({ personName: pessoa.personName, personKey: pessoa.personKey, unitName: pessoa.unitName });
   }
+  // Montar a lista de presença é trabalho, mesmo sem digitar nada. Sem isto,
+  // marcar trinta pessoas e clicar fora fechava a tela sem perguntar.
+  marcarModalSujo();
   requestRender();
 }
 
@@ -8330,6 +8449,7 @@ function marcarTodosPresentes(unidade) {
       e.participants.push({ personName: p.personName, personKey: p.personKey, unitName: p.unitName });
     }
   });
+  marcarModalSujo();
   requestRender();
 }
 
@@ -8341,10 +8461,17 @@ function limparPresentes() {
   requestRender();
 }
 
+/**
+ * Grava a ata. Devolve true/false para quem precisa saber se pode fechar a
+ * tela em cima — o fechamento com rascunho só solta o texto se ele foi gravado.
+ */
 async function salvarAta(depoisPublicar) {
   const e = state.meetingEditor;
-  if (!e) return;
-  if (!e.title.trim()) { addMessage("error", "Informe o assunto."); return; }
+  if (!e) return false;
+  if (!e.title.trim()) {
+    addMessage("error", "Informe o assunto antes de salvar — é o que identifica a ata na lista.");
+    return false;
+  }
   e.saving = true; requestRender();
   try {
     const r = await api("/api/meetings/save", {
@@ -8367,8 +8494,11 @@ async function salvarAta(depoisPublicar) {
       addMessage("success", "Rascunho salvo.");
     }
     await loadMeetings(true);
+    limparModalSujo();
+    return true;
   } catch (err) {
     addMessage("error", err.message);
+    return false;
   } finally {
     if (state.meetingEditor) state.meetingEditor.saving = false;
     requestRender();
@@ -8388,16 +8518,25 @@ async function excluirAta(meetingId) {
 
 // ─── Anexos ─────────────────────────────────────────────────────────────────
 
+/**
+ * O anexo precisa de uma ata gravada para se pendurar.
+ *
+ * Antes a tela recusava o arquivo com um aviso de 4 segundos no topo, enquanto
+ * a pessoa olhava o rodapé do formulário: para ela, clicar em anexar não fazia
+ * nada. Agora a tela salva o rascunho sozinha e segue. Se o rascunho não puder
+ * ser salvo — falta o assunto — aí sim ela diz o que falta.
+ */
 async function enviarAnexos(input) {
   const e = state.meetingEditor;
   if (!e || !input.files?.length) return;
   if (!e.id) {
-    addMessage("warn", "Salve o rascunho antes de anexar — o arquivo precisa de uma ata para ficar vinculado.");
-    input.value = "";
-    return;
+    addMessage("info", "Salvando o rascunho para pendurar o anexo…");
+    const salvou = await salvarAta(false);
+    if (!salvou || !state.meetingEditor?.id) { input.value = ""; return; }
   }
+  const atual = state.meetingEditor;
   const form = new FormData();
-  form.append("meetingId", String(e.id));
+  form.append("meetingId", String(atual.id));
   Array.from(input.files).forEach((f) => form.append("files", f));
   try {
     const resp = await fetch("/api/meetings/attachment/upload", {
@@ -8405,8 +8544,8 @@ async function enviarAnexos(input) {
     });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || "Falha ao anexar.");
-    e.attachments = [...(e.attachments || []), ...(data.attachments || []).map((a) => ({
-      id: a.attachmentId, fileName: a.fileName, sizeBytes: a.sizeBytes,
+    atual.attachments = [...(atual.attachments || []), ...(data.attachments || []).map((a) => ({
+      id: a.attachmentId, fileName: a.fileName, sizeBytes: a.sizeBytes, linkUrl: "",
     }))];
     addMessage("success", `${data.attachments.length} arquivo(s) anexado(s).`);
   } catch (err) {
@@ -8415,6 +8554,52 @@ async function enviarAnexos(input) {
     input.value = "";
     requestRender();
   }
+}
+
+/**
+ * Anexo por link: vídeo, pasta compartilhada, planilha online.
+ *
+ * Nem todo material de treinamento é arquivo. Obrigar a baixar um vídeo de
+ * 300 MB para reanexá-lo aqui é pedir para o material ficar de fora da ata.
+ */
+async function anexarLink() {
+  const e = state.meetingEditor;
+  if (!e) return;
+  const url = normalizarLink(e.novoLinkUrl || "");
+  if (!url) { addMessage("error", "Cole o endereço do link (começando com http:// ou https://)."); return; }
+  if (!e.id) {
+    addMessage("info", "Salvando o rascunho para guardar o link…");
+    const salvou = await salvarAta(false);
+    if (!salvou || !state.meetingEditor?.id) return;
+  }
+  const atual = state.meetingEditor;
+  try {
+    const r = await api("/api/meetings/attachment/link", {
+      method: "POST",
+      body: JSON.stringify({
+        meetingId: atual.id, url, label: (atual.novoLinkLabel || "").trim(),
+      }),
+    });
+    atual.attachments = [...(atual.attachments || []), {
+      id: r.attachmentId, fileName: r.fileName, sizeBytes: 0, linkUrl: r.linkUrl,
+    }];
+    atual.novoLinkUrl = "";
+    atual.novoLinkLabel = "";
+    addMessage("success", "Link guardado na ata.");
+  } catch (err) {
+    addMessage("error", err.message);
+  } finally {
+    requestRender();
+  }
+}
+
+/** Aceita "drive.google.com/..." colado sem esquema — o caso mais comum. */
+function normalizarLink(valor) {
+  const v = String(valor || "").trim();
+  if (!v) return "";
+  if (/^https?:\/\//i.test(v)) return v;
+  if (/^[\w.-]+\.[a-z]{2,}(\/|$)/i.test(v)) return "https://" + v;
+  return "";
 }
 
 async function removerAnexo(attachmentId) {
@@ -8435,6 +8620,11 @@ const ANEXO_VISUALIZAVEL = [".pdf", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".
 function anexoPodeAbrir(nome) {
   const n = String(nome || "").toLowerCase();
   return ANEXO_VISUALIZAVEL.some((ext) => n.endsWith(ext));
+}
+
+/** Só o domínio, para a pessoa ver para onde o link leva antes de clicar. */
+function dominioDoLink(url) {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch (e) { return "link"; }
 }
 
 /**
@@ -8547,7 +8737,7 @@ function pedidoVisitaModal() {
   const p = state.visitRequestEditor;
   if (!p) return "";
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharPedidoVisita()" style="z-index:60">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharPedidoVisita)" style="z-index:60">
       <div class="panel modal-panel" style="max-width:560px;margin:10vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>🙋 Pedir visita do gerente</h3>
@@ -8808,7 +8998,7 @@ function ataEditorModal() {
   const maxMb = state.meetings?.maxAttachmentMb || 15;
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharAtaEditor()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharAtaEditorPorFora()">
       <div class="panel modal-panel" data-keep-scroll="ata-editor"
            style="max-width:900px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -8930,18 +9120,37 @@ function ataEditorModal() {
 
         <div class="subtle-card padded-card" style="margin-top:8px">
           <div class="section-title">
-            <div><h3>Anexos</h3>
-              <div class="text-small">Até ${maxMb} MB por arquivo · PDF, Office, imagens e ZIP</div></div>
+            <div><h3>Anexos e links</h3>
+              <div class="text-small">Arquivo até ${maxMb} MB (PDF, Office, imagens, ZIP) ou o endereço de um vídeo ou pasta online</div></div>
           </div>
           <input type="file" multiple onchange="enviarAnexos(this)" style="margin-top:8px" />
+
+          <div style="display:grid;grid-template-columns:2fr 1fr auto;gap:8px;align-items:end;margin-top:10px">
+            <div class="field" style="margin:0"><label>Link</label>
+              <input value="${escapeHtml(e.novoLinkUrl || "")}"
+                oninput="state.meetingEditor.novoLinkUrl=this.value"
+                onkeydown="if(event.key==='Enter'){event.preventDefault();anexarLink();}"
+                placeholder="https://… vídeo, Drive, planilha online" /></div>
+            <div class="field" style="margin:0"><label>Como chamar</label>
+              <input value="${escapeHtml(e.novoLinkLabel || "")}"
+                oninput="state.meetingEditor.novoLinkLabel=this.value"
+                onkeydown="if(event.key==='Enter'){event.preventDefault();anexarLink();}"
+                placeholder="Opcional" /></div>
+            <button class="btn btn-secondary" type="button" onclick="anexarLink()">Adicionar link</button>
+          </div>
+
           <div class="stack" style="margin-top:8px">
             ${(e.attachments || []).map((a) => `
               <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
                           font-size:12px;padding:6px 10px;background:#f8f9fa;border-radius:6px">
-                <span>📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted)">${fileSizeLabel(a.sizeBytes)}</span></span>
+                <span>${a.linkUrl
+                  ? `🔗 ${escapeHtml(a.fileName)} <span style="color:var(--muted)">${escapeHtml(dominioDoLink(a.linkUrl))}</span>`
+                  : `📎 ${escapeHtml(a.fileName)} <span style="color:var(--muted)">${fileSizeLabel(a.sizeBytes)}</span>`}</span>
                 <span style="display:flex;gap:6px">
-                  ${anexoPodeAbrir(a.fileName)
-                    ? `<button class="btn btn-ghost btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : ""}
+                  ${a.linkUrl
+                    ? `<a class="btn btn-ghost btn-sm" href="${escapeHtml(a.linkUrl)}" target="_blank" rel="noopener noreferrer">Abrir</a>`
+                    : (anexoPodeAbrir(a.fileName)
+                        ? `<button class="btn btn-ghost btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : "")}
                   <button class="btn btn-ghost btn-sm" onclick="removerAnexo(${a.id})">Remover</button>
                 </span>
               </div>`).join("") || '<div class="text-small" style="color:var(--muted)">Nenhum anexo.</div>'}
@@ -8979,7 +9188,7 @@ function ataDetalheModal() {
     </div>` : "";
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharAta()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharAta)">
       <div class="panel modal-panel" data-keep-scroll="ata-detalhe"
            style="max-width:820px;margin:4vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -9005,17 +9214,23 @@ function ataDetalheModal() {
         ${(m.attachments || []).length ? `
           <div class="subtle-card padded-card" style="margin-top:12px">
             <div class="section-title"><div><h3>📎 Material</h3>
-              <div class="text-small">${m.attachments.length} arquivo(s) desta ${m.kind === "TREINAMENTO" ? "capacitação" : "reunião"}</div></div></div>
+              <div class="text-small">${m.attachments.length} item(ns) desta ${m.kind === "TREINAMENTO" ? "capacitação" : "reunião"}</div></div></div>
             <div class="stack" style="margin-top:8px">
               ${m.attachments.map((a) => `
                 <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;
                             font-size:13px;padding:8px 10px;background:#f8f9fa;border-radius:6px">
-                  <span style="font-weight:600">📎 ${escapeHtml(a.fileName)}
-                    <span style="color:var(--muted);font-weight:400">${fileSizeLabel(a.sizeBytes)}</span></span>
+                  <span style="font-weight:600">${a.linkUrl
+                    ? `🔗 ${escapeHtml(a.fileName)}
+                       <span style="color:var(--muted);font-weight:400">${escapeHtml(dominioDoLink(a.linkUrl))}</span>`
+                    : `📎 ${escapeHtml(a.fileName)}
+                       <span style="color:var(--muted);font-weight:400">${fileSizeLabel(a.sizeBytes)}</span>`}</span>
                   <span style="display:flex;gap:6px">
-                    ${anexoPodeAbrir(a.fileName)
-                      ? `<button class="btn btn-secondary btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : ""}
-                    <button class="btn btn-ghost btn-sm" onclick="baixarAnexo(${a.id}, '${jsAttr(a.fileName)}')">Baixar</button>
+                    ${a.linkUrl
+                      ? `<a class="btn btn-secondary btn-sm" href="${escapeHtml(a.linkUrl)}"
+                            target="_blank" rel="noopener noreferrer">Abrir link</a>`
+                      : `${anexoPodeAbrir(a.fileName)
+                            ? `<button class="btn btn-secondary btn-sm" onclick="abrirAnexo(${a.id})">Abrir</button>` : ""}
+                         <button class="btn btn-ghost btn-sm" onclick="baixarAnexo(${a.id}, '${jsAttr(a.fileName)}')">Baixar</button>`}
                   </span>
                 </div>`).join("")}
             </div>
@@ -9611,7 +9826,7 @@ function registroEditorModal() {
   const cfg = noteKindCfg(n.kind);
   const pessoas = state.feedback?.people || [];
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharRegistro()" style="z-index:60">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharRegistro)" style="z-index:60">
       <div class="panel modal-panel" style="max-width:620px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${n.id ? "Editar" : "Novo"} registro de acompanhamento</h3>
@@ -10323,7 +10538,7 @@ function visitaEditorModal() {
   const v = state.visitEditor;
   const realizada = v.status === "REALIZADA";
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharVisitaEditor()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharVisitaEditor)">
       <div class="panel modal-panel" data-keep-scroll="visita-editor"
            style="max-width:720px;margin:5vh auto;padding:22px;max-height:90vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -10637,7 +10852,7 @@ function feedbackEditorModal() {
   ];
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharFeedbackEditor()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharFeedbackEditor)">
       <div class="panel modal-panel" data-keep-scroll="feedback-editor"
            style="max-width:1000px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -10808,7 +11023,7 @@ function feedbackDetalheModal() {
     </div>` : "";
 
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharFeedbackDetalhe()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharFeedbackDetalhe)">
       <div class="panel modal-panel" data-keep-scroll="feedback-detalhe"
            style="max-width:900px;margin:3vh auto;padding:22px;max-height:92vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -10917,7 +11132,7 @@ function feedbackDetalheModal() {
 function pdiEditorModal() {
   const p = state.pdiEditor;
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharPdiEditor()" style="z-index:60">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharPdiEditor)" style="z-index:60">
       <div class="panel modal-panel" style="max-width:560px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>${p.id ? "Atualizar" : "Novo"} ponto de desenvolvimento</h3>
@@ -11402,7 +11617,7 @@ function apoioModal() {
   if (!a) return "";
   const c = a.client;
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharApoio()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharApoio)">
       <div class="panel modal-panel" style="max-width:600px;margin:6vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div>
@@ -11627,7 +11842,7 @@ function coberturaModal() {
   const opcoes = (valor) => vendedores.map((v) =>
     `<option value="${escapeHtml(v)}" ${valor === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("");
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharCobertura()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharCobertura)">
       <div class="panel modal-panel" style="max-width:520px;margin:8vh auto;padding:22px" onclick="event.stopPropagation()">
         <div class="section-title">
           <div><h3>🤝 Autorizar cobertura</h3>
@@ -12074,7 +12289,7 @@ function clientDrawerView() {
   const client = detail?.summary || {};
   const profile = detail?.profile || {};
   return `
-    <div class="client-drawer-overlay ${state.ui.clientDrawerOpen ? "open" : ""}" onclick="closeClientDrawer()">
+    <div class="client-drawer-overlay ${state.ui.clientDrawerOpen ? "open" : ""}" onclick="fecharComGuarda(closeClientDrawer)">
       <aside class="client-drawer ${state.ui.clientDrawerOpen ? "open" : ""}" onclick="event.stopPropagation()">
         <div class="client-drawer-header">
           <div>
@@ -12513,7 +12728,7 @@ function novaTarefaModal() {
   const vendedores = pessoas.filter((p) => p.role === "Vendedor");
   const eu = state.tasks?.myName || "";
   return `
-    <div class="client-drawer-overlay open modal-dim" onclick="fecharNovaTarefa()">
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharNovaTarefa)">
       <div class="panel modal-panel" data-keep-scroll="nova-tarefa"
            style="max-width:660px;margin:6vh auto;padding:22px;max-height:88vh;overflow:auto"
            onclick="event.stopPropagation()">
@@ -12777,7 +12992,7 @@ function crmModalView() {
   if (!modal) return "";
   if (modal.type === "CONTACT_UPDATE") {
     return `
-      <div class="crm-modal-backdrop" onclick="closeCrmModal()">
+      <div class="crm-modal-backdrop" onclick="fecharComGuarda(closeCrmModal)">
         <div class="crm-modal" onclick="event.stopPropagation()">
           <div class="section-title">
             <div>
@@ -12802,7 +13017,7 @@ function crmModalView() {
   }
   if (modal.type === "AGENDA_ACTION") {
     return `
-      <div class="crm-modal-backdrop" onclick="closeCrmModal()">
+      <div class="crm-modal-backdrop" onclick="fecharComGuarda(closeCrmModal)">
         <div class="crm-modal" onclick="event.stopPropagation()">
           <div class="section-title">
             <div>
@@ -12832,7 +13047,7 @@ function crmModalView() {
   }
   if (modal.type === "TASK_RESCHEDULE") {
     return `
-      <div class="crm-modal-backdrop" onclick="closeCrmModal()">
+      <div class="crm-modal-backdrop" onclick="fecharComGuarda(closeCrmModal)">
         <div class="crm-modal" onclick="event.stopPropagation()">
           <div class="section-title">
             <div>
@@ -16163,7 +16378,13 @@ function render() {
   const drawerEl = document.querySelector(".client-drawer");
   const drawerScroll = drawerEl ? drawerEl.scrollTop : 0;
 
-  app.innerHTML = state.user ? dashboardView() : loginView();
+  app.innerHTML = (state.user ? dashboardView() : loginView())
+    + confirmacaoFechamentoModal();
+
+  // Sem nenhuma sobreposição na tela não há texto pendente para proteger. O
+  // reset acontece aqui, e não em cada fecharX(), porque são mais de vinte —
+  // e o esquecido seria o que passaria a perguntar sem motivo.
+  if (!algumModalAberto()) limparModalSujo();
 
   if (drawerScroll > 0) {
     const newDrawer = document.querySelector(".client-drawer");

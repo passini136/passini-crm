@@ -838,6 +838,7 @@ tbody tr:hover {
 .toast-stack .message.success { background: #e6f4ea; }
 .toast-stack .message.error   { background: #fce8e6; }
 .toast-stack .message.warn    { background: #fef7e0; color: #b06000; }
+.toast-stack .message.info    { background: #e8f0fe; color: #1a5276; }
 
 .message.success {
   background: rgba(47, 158, 125, 0.12);
