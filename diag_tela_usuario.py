@@ -54,11 +54,18 @@ if todos:
             escopo_u = backend.data_scope_for_user(conn, u)
             backend.crm_scoped_filters_for_user(
                 conn, company_id, u, backend.build_filters_from_query({}))
-            pessoas = backend.task_assignable_people(conn, company_id, u)
-            backend.task_visible_sellers(conn, company_id, u)
+            # O endpoint só monta a lista de pessoas para quem pode criar tarefa.
+            # Chamar a função direto para todo mundo faria o relatório dizer que
+            # um vendedor "enxerga 51 pessoas" — número que ele nunca recebe, e
+            # que faz parecer vazamento de permissão onde não há.
+            pode_criar = escopo_u != "proprio"
+            pessoas = backend.task_assignable_people(conn, company_id, u) if pode_criar else []
+            visiveis = backend.task_visible_sellers(conn, company_id, u)
             backend.crm_task_counters(conn, company_id, u)
             backend.list_meeting_people(conn, company_id, u)
-            resultado = f"✔ ok · {len(pessoas)} pessoa(s) visível(is)"
+            quantos = "todas" if visiveis is None else str(len(visiveis))
+            resultado = (f"✔ ok · tarefas de {quantos} vendedor(es)"
+                         + (f" · monta lista de {len(pessoas)}" if pode_criar else ""))
         except Exception as exc:
             problemas += 1
             escopo_u = "?"
