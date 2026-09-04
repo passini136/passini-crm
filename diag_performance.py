@@ -101,7 +101,7 @@ for u in conn.execute(
         lambda: backend.crm_summary_for_user(conn, company_id, u, filtros))
     # No servidor cada requisição abre a sua conexão, e o cache de praça morre
     # com ela. Reproduzir isso aqui evita medir um ganho que o usuário não tem.
-    conn._cache_praca = {}
+    backend.limpar_cache_conexao(conn)
     _consultas[0] = 0
     _, t_lista = cronometrar(
         lambda: backend.list_crm_clients(conn, company_id, filtros, 50, stats={}))

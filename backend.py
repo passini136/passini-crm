@@ -1504,10 +1504,32 @@ def json_dumps(data: Any) -> bytes:
     return json.dumps(_json_sanitize(data), ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
+class ConexaoPassini(sqlite3.Connection):
+    """Conexão que aceita guardar cache em atributo.
+
+    `sqlite3.Connection` puro NÃO aceita atributo novo: `conn._cache_x = {}`
+    levanta AttributeError. O código tinha dois caches por requisição
+    (`_cache_nomes_vendedor`, `_cache_pessoas`) com a atribuição dentro de um
+    `try/except AttributeError: pass` — então a exceção era engolida, o cache
+    nunca gravava, e as duas funções reconsultavam o banco a cada chamada
+    parecendo otimizadas. Herdar traz o __dict__ e faz os caches existirem.
+
+    O escopo é a requisição: cada uma abre e fecha a sua conexão, então não há
+    risco de servir dado velho depois de uma importação.
+    """
+
+
+def limpar_cache_conexao(conn: sqlite3.Connection) -> None:
+    """Esvazia os caches de requisição. Para medição, que precisa simular frio."""
+    for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas"):
+        if hasattr(conn, atributo):
+            delattr(conn, atributo)
+
+
 def get_connection() -> sqlite3.Connection:
     ensure_dirs()
     migrate_legacy_db_if_needed()
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH, timeout=30, factory=ConexaoPassini)
     conn.row_factory = sqlite3.Row
     # PRAGMAs seguros por conexão (sem escrita no DB)
     conn.execute("PRAGMA cache_size=-16000")   # 16 MB page cache por conexão
@@ -6763,10 +6785,7 @@ def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str)
                 continue
             candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
         candidatos = sorted(set(candidatos))
-        try:
-            conn._cache_nomes_vendedor = candidatos
-        except AttributeError:
-            pass
+        conn._cache_nomes_vendedor = candidatos
 
     encontrados = set(informados)
     for nome in candidatos:
@@ -12096,10 +12115,7 @@ def classify_seller(
             "SELECT person_name, role_classification, base_unit, valid_from, valid_to "
             "FROM people_records WHERE company_id = ? ORDER BY date(valid_from) DESC",
             (company_id,)).fetchall()
-        try:
-            conn._cache_pessoas = pessoas
-        except AttributeError:
-            pass
+        conn._cache_pessoas = pessoas
     da_pessoa = [r for r in pessoas
                  if person_key(r["person_name"]) == chave
                  or short_person_key(r["person_name"]) == curto]
