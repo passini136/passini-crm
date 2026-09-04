@@ -28,13 +28,47 @@ if not os.environ.get("PASSINI_CRM_DATA"):
 
 import backend  # noqa: E402
 
+todos = "--todos" in sys.argv
 procurado = " ".join(a for a in sys.argv[1:] if not a.startswith("-")).strip()
-if not procurado:
-    print("Informe o login. Ex.: diag_tela_usuario.py RONI")
+if not procurado and not todos:
+    print("Informe o login (diag_tela_usuario.py RONI) ou use --todos para varrer todo mundo.")
     raise SystemExit(1)
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
+
+if todos:
+    # Varredura de permissão. A maioria dos defeitos deste sistema aparece só
+    # para quem tem escopo restrito — testar com a conta da diretoria, que vê
+    # tudo, não exercita nenhum dos filtros. Aqui roda o caminho de permissão
+    # de CADA conta ativa, de graça: são as chamadas baratas, sem os relatórios
+    # pesados. Se uma linha marcar ✘, aquele perfil está com a tela quebrada.
+    print("VARREDURA — caminho de permissão de cada conta ativa\n")
+    print(f"  {'LOGIN':<16}{'PERFIL':<16}{'ESCOPO':<22}RESULTADO")
+    problemas = 0
+    for u in conn.execute(
+        "SELECT * FROM users WHERE company_id = ? AND COALESCE(is_active,1) = 1 ORDER BY username",
+        (company_id,),
+    ).fetchall():
+        try:
+            escopo_u = backend.data_scope_for_user(conn, u)
+            backend.crm_scoped_filters_for_user(
+                conn, company_id, u, backend.build_filters_from_query({}))
+            pessoas = backend.task_assignable_people(conn, company_id, u)
+            backend.task_visible_sellers(conn, company_id, u)
+            backend.crm_task_counters(conn, company_id, u)
+            backend.list_meeting_people(conn, company_id, u)
+            resultado = f"✔ ok · {len(pessoas)} pessoa(s) visível(is)"
+        except Exception as exc:
+            problemas += 1
+            escopo_u = "?"
+            resultado = f"✘ {type(exc).__name__}: {exc}"
+        print(f"  {u['username'][:15]:<16}{(u['role'] or '')[:15]:<16}{str(escopo_u)[:21]:<22}{resultado}")
+    print(f"\n  {problemas} conta(s) com problema.")
+    if not problemas:
+        print("  Todo perfil monta as telas. Diferença entre perfis costuma ser aqui.")
+    conn.close()
+    raise SystemExit(0)
 user = conn.execute(
     "SELECT * FROM users WHERE company_id = ? AND UPPER(username) = ?",
     (company_id, procurado.upper()),

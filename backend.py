@@ -6006,7 +6006,11 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
         if not chave or chave in vistos:
             continue
         unidades = linked_units_for_user(u)
-        if allowed is not None and not (set(unidades) & allowed):
+        # `allowed` é LISTA (crm_allowed_units_for_user), não conjunto. Cruzar
+        # sem converter levanta TypeError, e como só usuário restrito chega
+        # aqui, a quebra atingia todo gerente e nenhum diretor — o tipo de falha
+        # que passa despercebida em teste feito com conta de diretoria.
+        if allowed is not None and not (set(unidades) & set(allowed)):
             continue
         vistos.add(chave)
         pessoas.append({
