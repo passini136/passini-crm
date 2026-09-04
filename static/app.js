@@ -837,9 +837,16 @@ async function loadCrmData() {
     // Guarda o payload inteiro: a tela de Tarefas depende dos contadores,
     // da lista de pessoas e dos catálogos que vêm junto.
     state.tasks = tasks;
+    state.crm.loadError = "";
     if (state.crm.selectedClientKey) {
       await openCrmClient(state.crm.selectedClientKey, false, false);
     }
+  } catch (erro) {
+    // Sem este catch a exceção subia sem dono e a Carteira ficava em
+    // "Carregando clientes CRM…" para sempre — a tela não sabia distinguir
+    // "ainda vem" de "quebrou". F5 repetia o mesmo silêncio.
+    state.crm.loadError = erro.message || "Falha ao carregar os dados do CRM.";
+    addMessage("error", state.crm.loadError);
   } finally {
     setLoading("crmSummary", false);
     setLoading("crmAgenda", false);
@@ -11973,7 +11980,27 @@ function buscaSemResultadoVendedor(rows) {
 }
 
 function crmClientsView() {
-  if (!state.crm.summary) return `<div class="loader panel">Carregando clientes CRM...</div>`;
+  if (!state.crm.summary) {
+    // Distinguir as duas situações importa: "carregando" pede paciência,
+    // "falhou" pede ação. Mostrar a primeira quando é a segunda faz a pessoa
+    // esperar por algo que não vem.
+    if (state.crm.loadError) {
+      return `
+        <div class="panel padded-card">
+          <h3 style="margin:0">Não consegui carregar a carteira</h3>
+          <div class="text-small" style="margin-top:8px;line-height:1.6">
+            ${escapeHtml(state.crm.loadError)}
+          </div>
+          <div class="text-small" style="margin-top:8px;color:var(--muted)">
+            Se repetir, avise a diretoria com o horário — o servidor guarda o detalhe do erro.
+          </div>
+          <div class="actions" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="loadCrmData()">Tentar de novo</button>
+          </div>
+        </div>`;
+    }
+    return `<div class="loader panel">Carregando clientes CRM...</div>`;
+  }
   const rows = filteredCrmClients();
   const blocoCobertura = coberturaChips() + coberturaGestaoCard();
 
