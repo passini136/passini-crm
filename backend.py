@@ -5984,6 +5984,42 @@ def list_meeting_people(conn: sqlite3.Connection, company_id: int, user: sqlite3
             # receber a pendência. Sem isso a falha é silenciosa.
             "hasLogin": resolve_user_for_person(conn, company_id, nome) is not None,
         })
+
+    # Segunda fonte: quem tem login no CRM mas não está no cadastro de pessoas.
+    #
+    # O cadastro de pessoas vem do ERP e lista a folha comercial. Gerente e
+    # diretor muitas vezes não estão lá — e são justamente quem conduz a
+    # reunião. O Roni, gerente da Zona Norte, não aparecia na própria lista de
+    # presença da reunião que ele mesmo registrava. Quem tem conta ativa no CRM
+    # trabalha aqui e pode ser marcado presente; a unidade sai do vínculo da
+    # conta, que é a informação que o cadastro de acessos já exige.
+    for u in conn.execute(
+        "SELECT id, username, full_name, linked_person_name, linked_units_json, role "
+        "FROM users WHERE company_id = ? AND COALESCE(is_active, 1) = 1 "
+        "ORDER BY COALESCE(NULLIF(linked_person_name,''), full_name, username)",
+        (company_id,),
+    ).fetchall():
+        nome = normalize_whitespace(u["linked_person_name"] or u["full_name"] or "")
+        if not nome:
+            continue                      # conta técnica, sem pessoa por trás
+        chave = person_key(nome)
+        if not chave or chave in vistos:
+            continue
+        unidades = linked_units_for_user(u)
+        if allowed is not None and not (set(unidades) & allowed):
+            continue
+        vistos.add(chave)
+        pessoas.append({
+            "personName": nome,
+            "personKey": chave,
+            # Gerente costuma responder por mais de uma unidade. A primeira serve
+            # para agrupar o botão "Toda <unidade>"; o vínculo completo fica na dica.
+            "unitName": unidades[0] if unidades else "",
+            "role": normalize_whitespace(u["role"]) or "Outros",
+            "hasLogin": True,
+        })
+
+    pessoas.sort(key=lambda p: p["personName"])
     return pessoas
 
 

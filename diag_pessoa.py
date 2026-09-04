@@ -70,11 +70,24 @@ for procurado in procurados:
         print("     e reimporte o cadastro de pessoas se a pessoa foi incluída depois.")
         # Talvez exista só como usuário de login, sem cadastro de pessoa.
         usuarios = conn.execute(
-            "SELECT name, role FROM users WHERE company_id = ? AND UPPER(name) LIKE ?",
-            (company_id, f"%{procurado}%"),
+            "SELECT username, full_name, linked_person_name, linked_units_json, role, "
+            "       COALESCE(is_active,1) ativo "
+            "FROM users WHERE company_id = ? AND ("
+            "     UPPER(COALESCE(username,'')) LIKE ?"
+            "  OR UPPER(COALESCE(full_name,'')) LIKE ?"
+            "  OR UPPER(COALESCE(linked_person_name,'')) LIKE ?)",
+            (company_id, f"%{procurado}%", f"%{procurado}%", f"%{procurado}%"),
         ).fetchall()
         for u in usuarios:
-            print(f"     Existe como LOGIN: {u['name']} ({u['role']}) — falta o cadastro de pessoa.")
+            unidades = ", ".join(backend.normalize_unit_list(u["linked_units_json"])) or "(nenhuma)"
+            print(f"     Existe como LOGIN: {u['username']} · {u['full_name'] or '(sem nome)'} "
+                  f"· {u['role']} · {'ativo' if u['ativo'] else 'INATIVO'}")
+            print(f"        vinculado a....: {u['linked_person_name'] or '(ninguém)'}")
+            print(f"        unidades.......: {unidades}")
+            print("        >> Entra na lista pela segunda fonte (contas ativas do CRM),")
+            print("           desde que tenha nome vinculado ou nome completo preenchido.")
+        if not usuarios:
+            print("     Também não existe como login. Nome escrito de outro jeito?")
         print()
         continue
 
@@ -114,5 +127,28 @@ for procurado in procurados:
             print("     >> Deveria aparecer para a diretoria. Se não aparece,")
             print("        o usuário que abriu a tela é gerente e não enxerga essa unidade.")
     print()
+
+# ── Prova final: a lista que a tela realmente monta ──────────────────────────
+print("═" * 78)
+print("  LISTA REAL DE PRESENTES (como a tela monta, pelos olhos da diretoria)")
+print("═" * 78)
+gestor = conn.execute(
+    "SELECT * FROM users WHERE company_id = ? AND COALESCE(is_active,1) = 1 "
+    "ORDER BY CASE role WHEN 'Administrador' THEN 0 WHEN 'Diretor' THEN 1 ELSE 2 END LIMIT 1",
+    (company_id,),
+).fetchone()
+if not gestor:
+    print("  Nenhum usuário ativo para simular.")
+else:
+    lista = backend.list_meeting_people(conn, company_id, gestor)
+    print(f"  Simulando como {gestor['username']} ({gestor['role']}) · {len(lista)} pessoa(s)\n")
+    for procurado in procurados:
+        achou = [p for p in lista if procurado in backend.normalize_upper(p["personName"])]
+        if achou:
+            for p in achou:
+                print(f"  ✔ {p['personName']:<38}{p['unitName'] or '(sem unidade)':<16}"
+                      f"{p['role']}{'' if p['hasLogin'] else '  (sem login)'}")
+        else:
+            print(f"  ✘ {procurado} continua fora da lista.")
 
 conn.close()
