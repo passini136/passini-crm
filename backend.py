@@ -8506,7 +8506,7 @@ def save_visit(
     audit_log(conn, company_id, user["id"], "salvar", "visits", str(novo_id),
               {"cliente": client_key, "tipo": tipo, "status": status})
     conn.commit()
-    invalidate_crm_cache(company_id)
+    invalidate_activity_caches(company_id)
     if status == "REALIZADA":
         measure_visit_effect(conn, company_id, novo_id)
     return {"visitId": novo_id, "taskId": tarefa_id}
@@ -9029,7 +9029,7 @@ def create_crm_tasks(
     audit_log(conn, company_id, user["id"], "criar", "crm_tasks", client_key or "-",
               {"titulo": titulo, "destinos": len(criados), "origem": "direcionamento"})
     conn.commit()
-    invalidate_crm_cache(company_id)
+    invalidate_activity_caches(company_id)
     return {"created": len(criados), "tasks": criados}
 
 
@@ -13653,6 +13653,7 @@ def crm_client_rows_for_scope(
 
 
 def invalidate_crm_cache(company_id: int | None = None) -> None:
+    """Derruba tudo, inclusive a base de clientes. Use quando o CADASTRO mudar."""
     with _crm_base_cache_lock:
         if company_id is None:
             _crm_base_cache.clear()
@@ -13660,6 +13661,22 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
             for k in list(_crm_base_cache.keys()):
                 if k[0] == company_id:
                     del _crm_base_cache[k]
+    invalidate_dashboard_cache(company_id)
+    invalidate_calendar_cache(company_id)
+
+
+def invalidate_activity_caches(company_id: int | None = None) -> None:
+    """Derruba os caches de ATIVIDADE, preservando a base de clientes.
+
+    Visita e tarefa gravam em `visits` e `crm_tasks` — nenhuma das tabelas de
+    que a carteira é construída (cadastro, resumo, faturamento, interações).
+    Elas chamavam a invalidação completa, e com isso cada visita registrada
+    obrigava o próximo usuário a esperar a base inteira ser remontada: doze
+    segundos de castigo por alguém ter feito o trabalho dele.
+
+    Se um dia a visita passar a alterar cliente (status, carteira, último
+    contato), volte a chamar invalidate_crm_cache aqui.
+    """
     invalidate_dashboard_cache(company_id)
     invalidate_calendar_cache(company_id)
 
@@ -13739,6 +13756,20 @@ def warm_dashboard_cache(company_id: int | None = None) -> None:
                     ).fetchall()
                     if r["unit_name"]
                 ]
+                # A carteira vem PRIMEIRO: é uma construção só, agora que a
+                # unidade deixou de fazer parte da chave, e destrava as telas de
+                # CRM de todo mundo — gerente, vendedor e diretoria. Sem isto,
+                # quem chegasse primeiro depois do restart pagava doze segundos
+                # sozinho, e era quase sempre o gerente abrindo a Carteira.
+                try:
+                    inicio_carteira = time.time()
+                    linhas = crm_base_client_rows_cached(conn, cid, build_filters_from_query({}))
+                    print(f"[aquecimento] carteira: {len(linhas)} clientes em "
+                          f"{time.time() - inicio_carteira:.1f}s", flush=True)
+                except Exception:
+                    traceback.print_exc()
+                time.sleep(0.3)
+
                 # Visão padrão (sem competência escolhida = mais recente)
                 try:
                     get_dashboard_data_cached(conn, cid, build_filters_from_query({}))
