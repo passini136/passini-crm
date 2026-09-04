@@ -31,7 +31,18 @@ import backend  # noqa: E402
 
 conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
-print(f"Banco: {backend.DB_PATH}\n")
+print(f"Banco: {backend.DB_PATH}")
+
+# O índice novo nasce no boot do serviço, não aqui. Sem ele o número medido é o
+# antigo, e a conclusão seria de que a correção não funcionou.
+indices = {r["name"] for r in conn.execute(
+    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='fact_sales_detail'")}
+if "idx_sales_company_city_competence" not in indices:
+    print("\n  ⚠ O índice por cidade ainda não existe.")
+    print("    Reinicie o serviço (sudo systemctl restart passini-crm) e rode de novo,")
+    print("    senão a medição sai com o desempenho antigo.\n")
+else:
+    print("Índice por cidade: presente\n")
 
 
 def cronometrar(funcao):
@@ -67,7 +78,14 @@ else:
 
 # ── 3. Cada gestor, com a base quente ────────────────────────────────────────
 print("3) CADA GESTOR, COM A BASE QUENTE")
-print(f"   {'LOGIN':<16}{'UNIDADE':<16}{'CLIENTES':>9}{'CARTEIRA':>10}{'RESUMO':>9}{'LISTA':>9}")
+print(f"   {'LOGIN':<16}{'UNIDADE':<16}{'CLIENTES':>9}{'CARTEIRA':>10}{'RESUMO':>9}{'LISTA':>9}{'CONSULTAS':>11}")
+
+# Contador de consultas: o tempo diz QUE está lento, a contagem diz POR QUE.
+# Uma tela que dispara 200 consultas para mostrar 50 linhas tem problema de
+# desenho, não de índice — e as duas coisas pedem correções diferentes.
+_consultas = [0]
+conn.set_trace_callback(lambda _sql: _consultas.__setitem__(0, _consultas[0] + 1))
+
 fatias: dict[str, set] = {}
 for u in conn.execute(
     "SELECT * FROM users WHERE company_id = ? AND COALESCE(is_active,1)=1 "
@@ -81,12 +99,17 @@ for u in conn.execute(
         lambda: backend.crm_client_rows_for_scope(conn, company_id, filtros))
     _, t_resumo = cronometrar(
         lambda: backend.crm_summary_for_user(conn, company_id, u, filtros))
+    # No servidor cada requisição abre a sua conexão, e o cache de praça morre
+    # com ela. Reproduzir isso aqui evita medir um ganho que o usuário não tem.
+    conn._cache_praca = {}
+    _consultas[0] = 0
     _, t_lista = cronometrar(
         lambda: backend.list_crm_clients(conn, company_id, filtros, 50, stats={}))
+    consultas = _consultas[0]
     fatias[u["username"]] = {r["clientKey"] for r in linhas}
     alerta = "  << LENTO" if max(t_resumo, t_lista) > 2 else ""
     print(f"   {u['username'][:15]:<16}{unidade[:15]:<16}{len(linhas):>9}"
-          f"{t_carteira:>9.2f}s{t_resumo:>8.2f}s{t_lista:>8.2f}s{alerta}")
+          f"{t_carteira:>9.2f}s{t_resumo:>8.2f}s{t_lista:>8.2f}s{consultas:>11}{alerta}")
 
 # ── 4. O recorte continua correto? ───────────────────────────────────────────
 print("\n4) CONFERÊNCIA DO RECORTE (a base virou compartilhada — as fatias mudaram?)")

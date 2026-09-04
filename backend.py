@@ -2825,6 +2825,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_sales_company_seller_issue
                 ON fact_sales_detail(company_id, seller_name, issue_date);
 
+            -- Itens que giram na praça (sugestão de oportunidade). Sem este índice
+            -- a consulta varria o faturamento inteiro, uma vez por cliente da
+            -- página: 50 varreduras completas para montar uma tela de 50 linhas,
+            -- e cinco segundos fixos que não dependiam do tamanho da carteira.
+            CREATE INDEX IF NOT EXISTS idx_sales_company_city_competence
+                ON fact_sales_detail(company_id, city_name, competence);
+
             CREATE INDEX IF NOT EXISTS idx_vendor_summary_company_competence_seller
                 ON fact_vendor_summary(company_id, competence, seller_name);
 
@@ -13810,6 +13817,50 @@ OFFER_MAX_SUGGESTIONS = 5
 OFFER_HISTORY_DISPLAY_LIMIT = 25
 
 
+def peer_items_for_city(
+    conn: sqlite3.Connection, company_id: int, city_key: str, latest: str
+) -> list[dict[str, Any]]:
+    """Itens que giram numa praça, calculados UMA vez por cidade na requisição.
+
+    Antes esta consulta rodava por cliente. Os 50 clientes de uma página do
+    gerente vêm de meia dúzia de cidades, então o mesmo resultado era
+    recalculado dezenas de vezes — e essa repetição era o custo fixo de cinco
+    segundos que aparecia igual para uma carteira de 2 mil e para uma de 100 mil.
+
+    O cliente não é mais excluído no SQL. Ele era, e isso obrigava uma consulta
+    por cliente; quem chama já descarta o que o cliente comprou, com uma lista
+    mais completa do que este filtro tinha.
+    """
+    cache = getattr(conn, "_cache_praca", None)
+    if cache is None:
+        cache = conn._cache_praca = {}
+    chave = (company_id, city_key, latest)
+    if chave in cache:
+        return cache[chave]
+    ITEM_EXPR = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+    linhas = [
+        dict(r) for r in conn.execute(
+            f"""
+            SELECT {ITEM_EXPR} AS item_code,
+                   MAX(NULLIF(gtin_value, '')) AS gtin,
+                   COUNT(DISTINCT client_name) AS clientes,
+                   SUM(net_value) AS total
+            FROM fact_sales_detail
+            WHERE company_id = ? AND city_name = ? AND net_value > 0
+              AND competence >= ?
+            GROUP BY item_code
+            HAVING clientes >= ?
+            ORDER BY clientes DESC, total DESC
+            LIMIT 40
+            """,
+            (company_id, city_key,
+             shift_competence(latest, -(OFFER_PEER_WINDOW_MONTHS - 1)), OFFER_PEER_MIN_CLIENTS),
+        ).fetchall()
+    ]
+    cache[chave] = linhas
+    return linhas
+
+
 def crm_get_offer_suggestions(
     conn: sqlite3.Connection, company_id: int, client_name: str, city_name: str | None = None
 ) -> dict[str, Any]:
@@ -13923,23 +13974,7 @@ def crm_get_offer_suggestions(
     # Oportunidade: itens girando na praça que este cliente nunca comprou
     opportunity: list[dict[str, Any]] = []
     if city_name:
-        peer_rows = conn.execute(
-            f"""
-            SELECT {ITEM_EXPR} AS item_code,
-                   MAX(NULLIF(gtin_value, '')) AS gtin,
-                   COUNT(DISTINCT client_name) AS clientes,
-                   SUM(net_value) AS total
-            FROM fact_sales_detail
-            WHERE company_id = ? AND city_name = ? AND client_name <> ? AND net_value > 0
-              AND competence >= ?
-            GROUP BY item_code
-            HAVING clientes >= ?
-            ORDER BY clientes DESC, total DESC
-            LIMIT 40
-            """,
-            (company_id, normalize_upper(city_name), client_name,
-             shift_competence(latest, -(OFFER_PEER_WINDOW_MONTHS - 1)), OFFER_PEER_MIN_CLIENTS),
-        ).fetchall()
+        peer_rows = peer_items_for_city(conn, company_id, normalize_upper(city_name), latest)
         for r in peer_rows:
             if r["item_code"] in all_client_items:
                 continue
