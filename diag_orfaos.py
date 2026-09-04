@@ -107,13 +107,38 @@ por_cidade: dict[str, list] = defaultdict(list)
 for r, _dias in ativos_recentes:
     por_cidade[backend.normalize_upper(r.get("cityName")) or "(sem cidade)"].append(r)
 if ativos_recentes:
+    # Balcão x oficina decide se isto é problema. Consumidor final que passou na
+    # loja não pertence a carteira de vendedor nenhum — cadastro magro nele é o
+    # esperado, não um defeito. Oficina (PJ) sem unidade é cliente de verdade
+    # que ninguém está trabalhando.
+    pj = [r for r, _d in ativos_recentes if str(r.get("personType") or "").upper() == "PJ"]
+    pf = [r for r, _d in ativos_recentes if str(r.get("personType") or "").upper() == "PF"]
+    indef = len(ativos_recentes) - len(pj) - len(pf)
     print(f"   {len(ativos_recentes)} cliente(s) compraram nos últimos 60 dias e não")
-    print("   aparecem na carteira de nenhum gerente. Por cidade:")
+    print("   aparecem na carteira de nenhum gerente:")
+    print(f"      {len(pj):>5}  PJ — oficina/empresa   << estes seriam carteira perdida")
+    print(f"      {len(pf):>5}  PF — consumidor final  (balcão; carteira não se aplica)")
+    if indef:
+        print(f"      {indef:>5}  tipo indefinido (sem documento no cadastro)")
+
+    print("\n   Por cidade:")
     for cidade, itens in sorted(por_cidade.items(), key=lambda kv: -len(kv[1]))[:15]:
         valor = sum(float(x.get("currentRevenue") or 0) for x in itens)
         print(f"      {len(itens):>5}  {cidade[:28]:<30}{backend.brl(valor)}")
-    print("\n   Mapear essas cidades (ou vincular o vendedor interno) devolve")
-    print("   cliente ativo para a carteira de alguém.")
+
+    if pj:
+        print(f"\n   >> {len(pj)} PJ ativo(s) sem unidade. Vale vincular o vendedor")
+        print("      interno no cadastro — é o primeiro degrau da cascata e resolve")
+        print("      sem depender de mapear cidade.")
+        print(f"\n   {'CÓDIGO':<12}{'CLIENTE':<42}{'CIDADE':<20}ÚLT. COMPRA")
+        for r in pj[:30]:
+            print(f"   {str(r.get('clientKey'))[:11]:<12}"
+                  f"{str(r.get('clientName'))[:41]:<42}"
+                  f"{str(r.get('cityName') or '—')[:19]:<20}"
+                  f"{str(r.get('lastPurchaseAt') or '—')[:10]}")
+    else:
+        print("\n   Nenhum PJ entre eles: é tudo consumidor de balcão, que por")
+        print("   definição não entra em carteira. Nada a corrigir.")
 else:
     print("   Nenhum órfão comprou nos últimos 60 dias — é base histórica parada,")
     print("   e não carteira viva escondida. Não há urgência.")
