@@ -4663,6 +4663,109 @@ function baixarClientesDoVendedor(formato) {
   downloadFile(`/api/crm/seller-clients.${formato}?${q.toString()}`);
 }
 
+// ─── Ticket médio por semana ────────────────────────────────────────────────
+//
+// O card mostra o ticket do mês fechado. Esse número esconde a pergunta que
+// interessa na conversa com o vendedor: está subindo ou caindo? R$ 276 de
+// média pode ser quatro semanas estáveis ou uma semana boa carregando três
+// ruins — e as duas situações pedem conversas diferentes.
+
+async function abrirTicketSemanal(vendedor) {
+  state.ticketTimeline = { loading: true, sellerName: vendedor, weeks: [] };
+  requestRender();
+  try {
+    const r = await api(`/api/sellers/ticket-timeline?seller=${encodeURIComponent(vendedor || "")}`);
+    state.ticketTimeline = { ...r, loading: false };
+  } catch (e) {
+    state.ticketTimeline = { error: e.message, loading: false, sellerName: vendedor, weeks: [] };
+  }
+  requestRender();
+}
+
+function fecharTicketSemanal() {
+  state.ticketTimeline = null;
+  requestRender();
+}
+
+function ticketSemanalModal() {
+  const d = state.ticketTimeline;
+  if (!d) return "";
+  const semanas = d.weeks || [];
+  const maior = Math.max(...semanas.map((s) => Number(s.ticket) || 0), 1);
+  const media = Number(d.averageTicket || 0);
+  // Barras em SVG, sem biblioteca. São doze pontos — carregar um motor de
+  // gráfico para isso pesaria mais que o dado.
+  const L = 44;          // largura de cada coluna
+  const A = 150;         // altura útil do desenho
+  const largura = Math.max(semanas.length * L, 100);
+  const linhaMedia = media > 0 ? A - (media / maior) * A : null;
+
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharTicketSemanal)">
+      <div class="panel modal-panel" style="max-width:760px;margin:8vh auto;padding:22px"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div>
+            <h3>Ticket médio por semana</h3>
+            <div class="text-small">${escapeHtml(d.sellerName || "")}</div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharTicketSemanal()">Fechar</button>
+        </div>
+
+        ${d.loading ? '<div class="loader panel">Carregando…</div>' : ""}
+        ${d.error ? `<div class="message error">${escapeHtml(d.error)}</div>` : ""}
+
+        ${!d.loading && !d.error && semanas.length ? `
+          <div style="display:flex;gap:18px;margin:14px 0 6px">
+            <div><div class="eyebrow">MÉDIA DAS 12 SEMANAS</div>
+              <strong style="font-size:20px">${currency(media)}</strong></div>
+            <div><div class="eyebrow">MELHOR SEMANA</div>
+              <strong style="font-size:20px">${currency(d.bestTicket)}</strong></div>
+            <div><div class="eyebrow">SEMANAS COM VENDA</div>
+              <strong style="font-size:20px">${d.weeksWithSales} de ${semanas.length}</strong></div>
+          </div>
+
+          <div style="overflow-x:auto;padding-top:8px">
+            <svg width="${largura}" height="${A + 46}" role="img"
+                 aria-label="Ticket médio semanal de ${escapeHtml(d.sellerName || "")}">
+              ${linhaMedia !== null ? `
+                <line x1="0" y1="${linhaMedia}" x2="${largura}" y2="${linhaMedia}"
+                      stroke="var(--muted)" stroke-dasharray="4 4" stroke-width="1" />` : ""}
+              ${semanas.map((s, i) => {
+                const v = Number(s.ticket) || 0;
+                const h = v > 0 ? Math.max((v / maior) * A, 2) : 0;
+                const x = i * L + 6;
+                const cor = s.current ? "var(--accent)" : (v >= media && v > 0 ? "#2f9e7d" : "#9bb0bd");
+                return `
+                  <g>
+                    <title>${escapeHtml(s.label)} a ${escapeHtml((s.weekEnd || "").slice(8, 10))}/${escapeHtml((s.weekEnd || "").slice(5, 7))} · ${currency(s.revenue)} · ${s.clients} cliente(s)</title>
+                    ${h ? `<rect x="${x}" y="${A - h}" width="${L - 12}" height="${h}" rx="3" fill="${cor}" />`
+                        : `<rect x="${x}" y="${A - 2}" width="${L - 12}" height="2" rx="1" fill="#dde5ea" />`}
+                    <text x="${x + (L - 12) / 2}" y="${A - h - 5}" text-anchor="middle"
+                          font-size="9" fill="var(--muted)">${v ? Math.round(v) : ""}</text>
+                    <text x="${x + (L - 12) / 2}" y="${A + 16}" text-anchor="middle"
+                          font-size="9" fill="var(--muted)">${escapeHtml(s.label)}</text>
+                    <text x="${x + (L - 12) / 2}" y="${A + 30}" text-anchor="middle"
+                          font-size="9" fill="${s.clients ? "var(--muted)" : "#c0392b"}">${s.clients || "—"}</text>
+                  </g>`;
+              }).join("")}
+            </svg>
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:4px">
+            Cada coluna é uma semana (segunda a domingo). O número de cima é o ticket;
+            o de baixo, quantos clientes compraram. A linha tracejada é a média.
+            Semana sem venda aparece vazia — de propósito.
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.5">
+            ⚠ ${escapeHtml(d.source || "")}
+          </div>` : ""}
+
+        ${!d.loading && !d.error && !semanas.length
+          ? '<div class="message">Sem faturamento detalhado nas últimas 12 semanas para este vendedor.</div>' : ""}
+      </div>
+    </div>`;
+}
+
 function clientesDoVendedorModal() {
   const d = state.sellerClients;
   if (!d) return "";
@@ -5378,6 +5481,10 @@ function vendedoresView() {
                   <span>Dev. ${pct(returnPct)}</span>
                   <span>Desc. ${pct(discountPct)}</span>
                   <span>Ticket/peca ${currency(row.ticketPerPiece || 0)}</span>
+                  <button type="button" class="link-num"
+                    title="Ver o ticket médio dele semana a semana, nas últimas 12"
+                    onclick="abrirTicketSemanal('${jsAttr(row.sellerName)}')"
+                    >📈 ticket/semana</button>
                 </div>
               </article>
             `;
@@ -16378,6 +16485,7 @@ function dashboardView() {
       ${scheduleContactModal()}
       ${conciliacaoModal()}
       ${clientesDoVendedorModal()}
+      ${ticketSemanalModal()}
       ${apoioModal()}
       ${coberturaModal()}
       ${receptiveModal()}

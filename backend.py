@@ -12319,6 +12319,88 @@ def seller_filter_sql(
     return f"{coluna} IN ({', '.join('?' for _ in valores)})", valores
 
 
+TICKET_TIMELINE_WEEKS = 12
+
+
+def seller_ticket_timeline(
+    conn: sqlite3.Connection, company_id: int, seller_name: str,
+    weeks: int = TICKET_TIMELINE_WEEKS,
+) -> dict[str, Any]:
+    """Ticket médio semanal do vendedor: líquido ÷ clientes atendidos na semana.
+
+    Mesma conta do card do mês, só que por semana — assim a linha do tempo
+    responde a pergunta que o card não responde: o ticket está subindo ou
+    caindo? Um mês fechado em R$ 276 pode ser quatro semanas estáveis ou uma
+    semana boa carregando três ruins, e as duas situações pedem conversas
+    diferentes com o vendedor.
+
+    FONTE: faturamento detalhado, que é o único com data de emissão — o custo x
+    venda é mensal e não tem como abrir por semana. Por isso o total daqui pode
+    divergir alguns por cento do número oficial do card, que deduz devolução.
+    A linha serve para ler TENDÊNCIA, não para apurar meta nem comissão.
+    """
+    nome = normalize_whitespace(seller_name)
+    if not nome:
+        return {"sellerName": "", "weeks": []}
+
+    # Segunda-feira da semana de N semanas atrás. Cortar por semana cheia evita
+    # a primeira barra nascer com dois dias e parecer despencada.
+    hoje = today_in_brazil()
+    segunda_atual = hoje - timedelta(days=hoje.weekday())
+    inicio = (segunda_atual - timedelta(weeks=weeks - 1)).isoformat()
+
+    condicao, valores = seller_filter_sql(conn, company_id, nome)
+    linhas = conn.execute(
+        f"""
+        SELECT date(issue_date, 'weekday 0', '-6 days') AS semana,
+               ROUND(SUM(net_value), 2) AS liquido,
+               COUNT(DISTINCT client_name) AS clientes,
+               COUNT(*) AS itens
+        FROM fact_sales_detail
+        WHERE company_id = ? AND {condicao}
+          AND date(issue_date) >= date(?)
+          AND net_value > 0
+        GROUP BY semana
+        ORDER BY semana
+        """,
+        (company_id, *valores, inicio),
+    ).fetchall()
+
+    por_semana = {r["semana"]: r for r in linhas}
+    pontos: list[dict[str, Any]] = []
+    for i in range(weeks):
+        segunda = segunda_atual - timedelta(weeks=weeks - 1 - i)
+        chave = segunda.isoformat()
+        r = por_semana.get(chave)
+        liquido = float(r["liquido"] or 0) if r else 0.0
+        clientes = int(r["clientes"] or 0) if r else 0
+        pontos.append({
+            "weekStart": chave,
+            "weekEnd": (segunda + timedelta(days=6)).isoformat(),
+            "label": segunda.strftime("%d/%m"),
+            "revenue": round(liquido, 2),
+            "clients": clientes,
+            # Semana sem venda devolve ticket 0, não None: o gráfico mostra o
+            # vazio como vazio. Esconder a semana ruim encurtaria a régua e
+            # faria a linha parecer melhor do que foi.
+            "ticket": round(liquido / clientes, 2) if clientes else 0.0,
+            "items": int(r["itens"] or 0) if r else 0,
+            "current": segunda == segunda_atual,
+        })
+
+    com_venda = [p for p in pontos if p["clients"]]
+    media = (sum(p["ticket"] for p in com_venda) / len(com_venda)) if com_venda else 0.0
+    return {
+        "sellerName": nome,
+        "weeks": pontos,
+        "averageTicket": round(media, 2),
+        "bestTicket": round(max((p["ticket"] for p in pontos), default=0.0), 2),
+        "weeksWithSales": len(com_venda),
+        "source": "Faturamento detalhado (data de emissão). Serve para tendência; "
+                  "meta e comissão saem do custo x venda.",
+    }
+
+
 def sellers_of_unit(
     conn: sqlite3.Connection, company_id: int, competence: str, unidade: str | None
 ) -> list[str] | None:
@@ -21885,6 +21967,28 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado}))
+                return
+            if path == "/api/sellers/ticket-timeline":
+                user = self._require_auth()
+                if not user:
+                    return
+                q = parse_qs(parsed.query)
+                pedido = normalize_whitespace(q.get("seller", [""])[0])
+                with closing(get_connection()) as conn:
+                    # Vendedor só vê a própria linha, sempre. Aceitar o nome que
+                    # vem na URL sem checar deixaria qualquer um ler o ticket do
+                    # colega trocando um parâmetro no endereço.
+                    if data_scope_for_user(conn, user) == "proprio":
+                        alvo = seller_identity_for_user(user)
+                    else:
+                        alvo = pedido
+                    if not alvo:
+                        self._set_headers(400)
+                        self.wfile.write(json_dumps({"error": "Informe o vendedor."}))
+                        return
+                    res = seller_ticket_timeline(conn, user["company_id"], alvo)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
                 return
             if path == "/api/brands":
                 user = self._require_auth()
