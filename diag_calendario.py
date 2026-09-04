@@ -90,16 +90,26 @@ print(f"\n   {uteis} dias úteis nesta conta")
 # ── 3. O que o sistema devolve ───────────────────────────────────────────────
 print("\n3) O QUE O SISTEMA CALCULA")
 cal = backend.get_business_calendar(conn, company_id, competencia, include_current_day=False)
-print(f"   businessDays........: {cal.get('businessDays')}")
-print(f"   elapsedBusinessDays.: {cal.get('elapsedBusinessDays')}")
-print(f"   remainingBusinessDays: {cal.get('remainingBusinessDays')}")
-print(f"   feriados vistos.....: {len(cal.get('holidays') or [])}")
+# Os nomes dos campos são conferidos contra o dicionário de verdade. Chutar
+# nome de campo devolve None em silêncio, e None passa por "divergência" —
+# o diagnóstico acusaria o sistema por um erro dele mesmo.
+esperados = ["totalWorkingDays", "elapsedWorkingDays", "remainingWorkingDays",
+             "referenceToday", "effectiveToday"]
+faltando = [c for c in esperados if c not in cal]
+if faltando:
+    print(f"   ⚠ Campo(s) que este script esperava e não existem mais: {', '.join(faltando)}")
+    print(f"     Campos disponíveis: {', '.join(sorted(cal))}")
+for campo in esperados:
+    if campo in cal:
+        print(f"   {campo:<22}: {cal[campo]}")
+print(f"   {'feriados vistos':<22}: {len(cal.get('holidays') or [])}")
 for h in (cal.get("holidays") or []):
     print(f"      {h['date']}  {h['name']}")
 
 print("\n4) LEITURA")
-if cal.get("businessDays") != uteis:
-    print(f"   >> DIVERGÊNCIA: a conta dia a dia dá {uteis}, o sistema devolve {cal.get('businessDays')}.")
+calculado = cal.get("totalWorkingDays")
+if calculado != uteis:
+    print(f"   >> DIVERGÊNCIA: a conta dia a dia dá {uteis}, o sistema devolve {calculado}.")
     print("      Quase sempre é cache: reinicie o serviço e rode de novo.")
 else:
     total_dias = _cal.monthrange(d0.year, d0.month)[1]
