@@ -1521,7 +1521,8 @@ class ConexaoPassini(sqlite3.Connection):
 
 def limpar_cache_conexao(conn: sqlite3.Connection) -> None:
     """Esvazia os caches de requisição. Para medição, que precisa simular frio."""
-    for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas"):
+    for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas",
+                     "_cache_competencias"):
         if hasattr(conn, atributo):
             delattr(conn, atributo)
 
@@ -5290,6 +5291,10 @@ def import_package(
         print(f"[prospeccao] reconciliação após importação falhou: {exc}", flush=True)
     # Dados mudaram: derruba caches derivados (dashboard e CRM)
     invalidate_crm_cache(company_id)
+    # E os caches DESTA conexão, que sobrevivem ao invalidate acima. A importação
+    # acabou de gravar um mês novo; sem limpar, o resto desta mesma requisição
+    # ainda enxergaria a lista de competências de antes do arquivo entrar.
+    limpar_cache_conexao(conn)
     result: dict[str, Any] = {
         "importId": import_id,
         "duplicateRowsSkipped": duplicate_rows_skipped,
@@ -5455,6 +5460,16 @@ def import_package(
 
 
 def query_competences(conn: sqlite3.Connection, company_id: int) -> list[str]:
+    # Cache de requisição. A consulta faz UNION de três tabelas de fatos para
+    # achar os meses distintos, e funções pequenas a chamam de dentro de laços:
+    # a sugestão de oferta pedia a competência mais recente uma vez POR CLIENTE
+    # da página, e cada pedido varria o faturamento inteiro. A lista de meses só
+    # muda numa importação, que abre outra conexão.
+    cache = getattr(conn, "_cache_competencias", None)
+    if cache is None:
+        cache = conn._cache_competencias = {}
+    if company_id in cache:
+        return cache[company_id]
     rows = conn.execute(
         """
         SELECT competence FROM (
@@ -5468,7 +5483,8 @@ def query_competences(conn: sqlite3.Connection, company_id: int) -> list[str]:
         """,
         (company_id, company_id, company_id),
     ).fetchall()
-    return [row["competence"] for row in rows]
+    cache[company_id] = [row["competence"] for row in rows]
+    return cache[company_id]
 
 
 def data_freshness(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]:
@@ -13861,6 +13877,76 @@ OFFER_MAX_SUGGESTIONS = 5
 OFFER_HISTORY_DISPLAY_LIMIT = 25
 
 
+def prefetch_offer_context(
+    conn: sqlite3.Connection, company_id: int, client_names: list[str], latest: str
+) -> dict[str, Any]:
+    """Histórico de itens da PÁGINA inteira, em três consultas.
+
+    A sugestão de oferta precisa de três coisas por cliente: o que ele comprava
+    na janela de recompra, o que comprou no mês corrente e tudo que já comprou
+    algum dia. Perguntar isso cliente a cliente dava 150 consultas para montar
+    50 linhas. Aqui as mesmas três perguntas são feitas uma vez, para todos.
+    """
+    vazio: dict[str, Any] = {"historico": {}, "atuais": {}, "jaComprou": {}}
+    nomes = [n for n in dict.fromkeys(client_names) if n]
+    if not nomes:
+        return vazio
+    if len(nomes) > 400:
+        # Teto de parâmetros do SQLite. Quebra em lotes e junta os mapas.
+        junto = {"historico": {}, "atuais": {}, "jaComprou": {}}
+        for inicio in range(0, len(nomes), 400):
+            parte = prefetch_offer_context(conn, company_id, nomes[inicio:inicio + 400], latest)
+            for chave in junto:
+                junto[chave].update(parte[chave])
+        return junto
+
+    marcadores = ",".join("?" for _ in nomes)
+    ITEM_EXPR = "COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, ''), 'ITEM')"
+    inicio_recompra = shift_competence(latest, -(OFFER_REPURCHASE_WINDOW_MONTHS - 1))
+
+    historico: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in conn.execute(
+        f"""
+        SELECT client_name,
+               {ITEM_EXPR} AS item_code,
+               MAX(NULLIF(gtin_value, '')) AS gtin,
+               COUNT(DISTINCT competence) AS meses,
+               SUM(net_value) AS total,
+               SUM(quantity) AS qtd,
+               MAX(competence) AS ultima_competencia
+        FROM fact_sales_detail
+        WHERE company_id = ? AND client_name IN ({marcadores})
+          AND competence <> ? AND competence >= ? AND net_value > 0
+        GROUP BY client_name, item_code
+        ORDER BY meses DESC, total DESC
+        """,
+        (company_id, *nomes, latest, inicio_recompra),
+    ).fetchall():
+        # O LIMIT por cliente vira corte em Python: no SQL ele valeria para o
+        # conjunto todo e daria 25 itens para a página inteira, não por cliente.
+        lista = historico[r["client_name"]]
+        if len(lista) < OFFER_HISTORY_DISPLAY_LIMIT:
+            lista.append(dict(r))
+
+    atuais: dict[str, set[str]] = defaultdict(set)
+    for r in conn.execute(
+        f"SELECT DISTINCT client_name, {ITEM_EXPR} AS item_code FROM fact_sales_detail "
+        f"WHERE company_id = ? AND client_name IN ({marcadores}) AND competence = ?",
+        (company_id, *nomes, latest),
+    ).fetchall():
+        atuais[r["client_name"]].add(r["item_code"])
+
+    ja_comprou: dict[str, set[str]] = defaultdict(set)
+    for r in conn.execute(
+        f"SELECT DISTINCT client_name, {ITEM_EXPR} AS item_code FROM fact_sales_detail "
+        f"WHERE company_id = ? AND client_name IN ({marcadores}) AND net_value > 0",
+        (company_id, *nomes),
+    ).fetchall():
+        ja_comprou[r["client_name"]].add(r["item_code"])
+
+    return {"historico": dict(historico), "atuais": dict(atuais), "jaComprou": dict(ja_comprou)}
+
+
 def peer_items_for_city(
     conn: sqlite3.Connection, company_id: int, city_key: str, latest: str
 ) -> list[dict[str, Any]]:
@@ -13906,7 +13992,8 @@ def peer_items_for_city(
 
 
 def crm_get_offer_suggestions(
-    conn: sqlite3.Connection, company_id: int, client_name: str, city_name: str | None = None
+    conn: sqlite3.Connection, company_id: int, client_name: str, city_name: str | None = None,
+    contexto: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Sugestões de oferta com contexto para o vendedor conseguir abordar.
 
@@ -13939,46 +14026,53 @@ def crm_get_offer_suggestions(
     # Este recorte serve para MONTAR A LISTA DE RECOMPRA — nunca para decidir se o
     # cliente já comprou um item.
     inicio_recompra = shift_competence(latest, -(OFFER_REPURCHASE_WINDOW_MONTHS - 1))
-    history = conn.execute(
-        f"""
-        SELECT {ITEM_EXPR} AS item_code,
-               MAX(NULLIF(gtin_value, '')) AS gtin,
-               COUNT(DISTINCT competence) AS meses,
-               SUM(net_value) AS total,
-               SUM(quantity) AS qtd,
-               MAX(competence) AS ultima_competencia
-        FROM fact_sales_detail
-        WHERE company_id = ? AND client_name = ? AND competence <> ?
-          AND competence >= ? AND net_value > 0
-        GROUP BY item_code
-        ORDER BY meses DESC, total DESC
-        LIMIT {OFFER_HISTORY_DISPLAY_LIMIT}
-        """,
-        (company_id, client_name, latest, inicio_recompra),
-    ).fetchall()
-
-    current_items = {
-        r["item_code"]
-        for r in conn.execute(
-            f"SELECT DISTINCT {ITEM_EXPR} AS item_code FROM fact_sales_detail "
-            "WHERE company_id = ? AND client_name = ? AND competence = ?",
-            (company_id, client_name, latest),
+    if contexto is not None:
+        # Página inteira já buscada de uma vez (ver prefetch_offer_context).
+        history = contexto["historico"].get(client_name, [])
+        current_items = contexto["atuais"].get(client_name, set())
+        # Tudo que o cliente já comprou, sem janela e SEM LIMITE. É esta lista — e
+        # não o histórico exibido — que impede anunciar como novidade um item que
+        # ele já levou.
+        all_client_items = contexto["jaComprou"].get(client_name, set()) | current_items
+    else:
+        history = conn.execute(
+            f"""
+            SELECT {ITEM_EXPR} AS item_code,
+                   MAX(NULLIF(gtin_value, '')) AS gtin,
+                   COUNT(DISTINCT competence) AS meses,
+                   SUM(net_value) AS total,
+                   SUM(quantity) AS qtd,
+                   MAX(competence) AS ultima_competencia
+            FROM fact_sales_detail
+            WHERE company_id = ? AND client_name = ? AND competence <> ?
+              AND competence >= ? AND net_value > 0
+            GROUP BY item_code
+            ORDER BY meses DESC, total DESC
+            LIMIT {OFFER_HISTORY_DISPLAY_LIMIT}
+            """,
+            (company_id, client_name, latest, inicio_recompra),
         ).fetchall()
-    }
 
-    # Tudo que o cliente já comprou, sem janela e SEM LIMITE. É esta lista — e não
-    # o histórico exibido — que impede anunciar como novidade um item que ele já
-    # levou. O bug anterior: o histórico vinha com LIMIT 25 ordenado por valor, e
-    # um item barato comprado uma vez ficava de fora, virando "nunca pediu".
-    ever_bought_rows = conn.execute(
-        f"""
-        SELECT DISTINCT {ITEM_EXPR} AS item_code
-        FROM fact_sales_detail
-        WHERE company_id = ? AND client_name = ? AND net_value > 0
-        """,
-        (company_id, client_name),
-    ).fetchall()
-    all_client_items = {r["item_code"] for r in ever_bought_rows} | current_items
+        current_items = {
+            r["item_code"]
+            for r in conn.execute(
+                f"SELECT DISTINCT {ITEM_EXPR} AS item_code FROM fact_sales_detail "
+                "WHERE company_id = ? AND client_name = ? AND competence = ?",
+                (company_id, client_name, latest),
+            ).fetchall()
+        }
+
+        # O bug anterior: o histórico vinha com LIMIT 25 ordenado por valor, e um
+        # item barato comprado uma vez ficava de fora, virando "nunca pediu".
+        ever_bought_rows = conn.execute(
+            f"""
+            SELECT DISTINCT {ITEM_EXPR} AS item_code
+            FROM fact_sales_detail
+            WHERE company_id = ? AND client_name = ? AND net_value > 0
+            """,
+            (company_id, client_name),
+        ).fetchall()
+        all_client_items = {r["item_code"] for r in ever_bought_rows} | current_items
     client_has_history = bool(all_client_items)
 
     def months_since(competence: str | None) -> int | None:
@@ -14108,9 +14202,14 @@ def crm_attach_context(
     enriched: list[dict[str, Any]] = []
     # Carrega a biblioteca uma vez só quando os scripts forem necessários
     library = list_content_library(conn, company_id) if with_scripts else []
+    # Histórico de itens da página inteira, de uma vez. Antes eram três consultas
+    # por cliente — 150 para montar 50 linhas.
+    latest = crm_latest_competence(conn, company_id)
+    contexto = (prefetch_offer_context(
+        conn, company_id, [s["clientName"] for s in summaries], latest) if latest else None)
     for summary in summaries:
         offers = crm_get_offer_suggestions(
-            conn, company_id, summary["clientName"], summary.get("cityName")
+            conn, company_id, summary["clientName"], summary.get("cityName"), contexto
         )
         questions = crm_generate_questions(summary)
         summary["primaryReason"] = crm_reason_message(summary, summary["primaryReasonCode"])
