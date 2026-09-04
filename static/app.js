@@ -4671,11 +4671,11 @@ function baixarClientesDoVendedor(formato) {
 // ruins — e as duas situações pedem conversas diferentes.
 
 async function abrirTicketSemanal(vendedor) {
-  state.ticketTimeline = { loading: true, sellerName: vendedor, weeks: [] };
+  state.ticketTimeline = { loading: true, sellerName: vendedor, weeks: [], view: "geral" };
   requestRender();
   try {
     const r = await api(`/api/sellers/ticket-timeline?seller=${encodeURIComponent(vendedor || "")}`);
-    state.ticketTimeline = { ...r, loading: false };
+    state.ticketTimeline = { ...r, loading: false, view: "geral" };
   } catch (e) {
     state.ticketTimeline = { error: e.message, loading: false, sellerName: vendedor, weeks: [] };
   }
@@ -4687,12 +4687,31 @@ function fecharTicketSemanal() {
   requestRender();
 }
 
+/** Troca a série do gráfico. Os dados já vieram — não refaz requisição. */
+function verTicketSerie(serie) {
+  if (state.ticketTimeline) state.ticketTimeline.view = serie;
+  requestRender();
+}
+
+const TICKET_SERIES = [
+  { id: "geral", label: "Geral", cor: "#2f9e7d" },
+  { id: "pj", label: "PJ · oficina", cor: "#1f6feb" },
+  { id: "pf", label: "PF · balcão", cor: "#e67e22" },
+];
+
 function ticketSemanalModal() {
   const d = state.ticketTimeline;
   if (!d) return "";
   const semanas = d.weeks || [];
-  const maior = Math.max(...semanas.map((s) => Number(s.ticket) || 0), 1);
-  const media = Number(d.averageTicket || 0);
+  const serie = d.view || "geral";
+  const cfg = TICKET_SERIES.find((s) => s.id === serie) || TICKET_SERIES[0];
+  const resumo = (d.summary || {})[serie] || {};
+  // Cada série tem a própria escala. Fixar a régua no geral achataria o PJ,
+  // que é a leitura mais importante — a oficina é quem tem carteira.
+  const valorDa = (s) => Number((s[serie] || s).ticket) || 0;
+  const clientesDa = (s) => Number((s[serie] || s).clients) || 0;
+  const maior = Math.max(...semanas.map(valorDa), 1);
+  const media = Number(resumo.averageTicket || 0);
   // Barras em SVG, sem biblioteca. São doze pontos — carregar um motor de
   // gráfico para isso pesaria mais que o dado.
   const L = 44;          // largura de cada coluna
@@ -4716,13 +4735,29 @@ function ticketSemanalModal() {
         ${d.error ? `<div class="message error">${escapeHtml(d.error)}</div>` : ""}
 
         ${!d.loading && !d.error && semanas.length ? `
+          <div style="display:flex;gap:6px;margin-top:14px;flex-wrap:wrap">
+            ${TICKET_SERIES.map((s) => {
+              const r = (d.summary || {})[s.id] || {};
+              const on = s.id === serie;
+              return `
+                <button type="button" onclick="verTicketSerie('${s.id}')"
+                  style="border:1px solid ${on ? s.cor : "var(--line)"};
+                         background:${on ? s.cor : "#fff"};color:${on ? "#fff" : "var(--text)"};
+                         border-radius:14px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer">
+                  ${s.label} · ${currency(r.averageTicket || 0)}
+                </button>`;
+            }).join("")}
+          </div>
+
           <div style="display:flex;gap:18px;margin:14px 0 6px">
             <div><div class="eyebrow">MÉDIA DAS 12 SEMANAS</div>
               <strong style="font-size:20px">${currency(media)}</strong></div>
             <div><div class="eyebrow">MELHOR SEMANA</div>
-              <strong style="font-size:20px">${currency(d.bestTicket)}</strong></div>
+              <strong style="font-size:20px">${currency(resumo.bestTicket || 0)}</strong></div>
             <div><div class="eyebrow">SEMANAS COM VENDA</div>
-              <strong style="font-size:20px">${d.weeksWithSales} de ${semanas.length}</strong></div>
+              <strong style="font-size:20px">${resumo.weeksWithSales || 0} de ${semanas.length}</strong></div>
+            <div><div class="eyebrow">FATURADO NO PERÍODO</div>
+              <strong style="font-size:20px">${currency(resumo.revenue || 0)}</strong></div>
           </div>
 
           <div style="overflow-x:auto;padding-top:8px">
@@ -4732,13 +4767,15 @@ function ticketSemanalModal() {
                 <line x1="0" y1="${linhaMedia}" x2="${largura}" y2="${linhaMedia}"
                       stroke="var(--muted)" stroke-dasharray="4 4" stroke-width="1" />` : ""}
               ${semanas.map((s, i) => {
-                const v = Number(s.ticket) || 0;
+                const v = valorDa(s);
+                const cli = clientesDa(s);
                 const h = v > 0 ? Math.max((v / maior) * A, 2) : 0;
                 const x = i * L + 6;
-                const cor = s.current ? "var(--accent)" : (v >= media && v > 0 ? "#2f9e7d" : "#9bb0bd");
+                const cor = s.current ? "var(--accent)" : (v >= media && v > 0 ? cfg.cor : "#9bb0bd");
+                const dados = s[serie] || s;
                 return `
                   <g>
-                    <title>${escapeHtml(s.label)} a ${escapeHtml((s.weekEnd || "").slice(8, 10))}/${escapeHtml((s.weekEnd || "").slice(5, 7))} · ${currency(s.revenue)} · ${s.clients} cliente(s)</title>
+                    <title>${escapeHtml(s.label)} a ${escapeHtml((s.weekEnd || "").slice(8, 10))}/${escapeHtml((s.weekEnd || "").slice(5, 7))} · ${cfg.label} · ${currency(dados.revenue)} · ${cli} cliente(s)</title>
                     ${h ? `<rect x="${x}" y="${A - h}" width="${L - 12}" height="${h}" rx="3" fill="${cor}" />`
                         : `<rect x="${x}" y="${A - 2}" width="${L - 12}" height="2" rx="1" fill="#dde5ea" />`}
                     <text x="${x + (L - 12) / 2}" y="${A - h - 5}" text-anchor="middle"
@@ -4746,7 +4783,7 @@ function ticketSemanalModal() {
                     <text x="${x + (L - 12) / 2}" y="${A + 16}" text-anchor="middle"
                           font-size="9" fill="var(--muted)">${escapeHtml(s.label)}</text>
                     <text x="${x + (L - 12) / 2}" y="${A + 30}" text-anchor="middle"
-                          font-size="9" fill="${s.clients ? "var(--muted)" : "#c0392b"}">${s.clients || "—"}</text>
+                          font-size="9" fill="${cli ? "var(--muted)" : "#c0392b"}">${cli || "—"}</text>
                   </g>`;
               }).join("")}
             </svg>
@@ -4755,6 +4792,13 @@ function ticketSemanalModal() {
             Cada coluna é uma semana (segunda a domingo). O número de cima é o ticket;
             o de baixo, quantos clientes compraram. A linha tracejada é a média.
             Semana sem venda aparece vazia — de propósito.
+          </div>
+          <div class="text-small" style="margin-top:10px;line-height:1.6">
+            <strong>PJ é oficina, PF é balcão.</strong> Separar importa porque são vendas
+            diferentes: uma semana de muito balcão derruba o ticket geral sem que a venda
+            para oficina tenha piorado. Olhando junto, você corrigiria o vendedor pelo
+            motivo errado. Cada aba tem a própria régua — não compare a altura das barras
+            entre elas, compare os números.
           </div>
           <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.5">
             ⚠ Compare semana com semana, não com o ticket do card. Lá o cliente

@@ -1522,7 +1522,7 @@ class ConexaoPassini(sqlite3.Connection):
 def limpar_cache_conexao(conn: sqlite3.Connection) -> None:
     """Esvazia os caches de requisição. Para medição, que precisa simular frio."""
     for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas",
-                     "_cache_competencias"):
+                     "_cache_competencias", "_cache_tipo_pessoa"):
         if hasattr(conn, atributo):
             delattr(conn, atributo)
 
@@ -12349,56 +12349,132 @@ def seller_ticket_timeline(
     segunda_atual = hoje - timedelta(days=hoje.weekday())
     inicio = (segunda_atual - timedelta(weeks=weeks - 1)).isoformat()
 
+    # Agrupa por semana E por cliente, porque o tipo de pessoa não existe no
+    # faturamento — ele vem do documento no cadastro. Uma linha por cliente por
+    # semana é pouca coisa (doze semanas de uma carteira dão alguns milhares) e
+    # evita uma segunda consulta só para separar PF de PJ.
     condicao, valores = seller_filter_sql(conn, company_id, nome)
     linhas = conn.execute(
         f"""
         SELECT date(issue_date, 'weekday 0', '-6 days') AS semana,
+               client_name,
                ROUND(SUM(net_value), 2) AS liquido,
-               COUNT(DISTINCT client_name) AS clientes,
                COUNT(*) AS itens
         FROM fact_sales_detail
         WHERE company_id = ? AND {condicao}
           AND date(issue_date) >= date(?)
           AND net_value > 0
-        GROUP BY semana
-        ORDER BY semana
+        GROUP BY semana, client_name
         """,
         (company_id, *valores, inicio),
     ).fetchall()
 
-    por_semana = {r["semana"]: r for r in linhas}
-    pontos: list[dict[str, Any]] = []
-    for i in range(weeks):
-        segunda = segunda_atual - timedelta(weeks=weeks - 1 - i)
-        chave = segunda.isoformat()
-        r = por_semana.get(chave)
-        liquido = float(r["liquido"] or 0) if r else 0.0
-        clientes = int(r["clientes"] or 0) if r else 0
-        pontos.append({
-            "weekStart": chave,
-            "weekEnd": (segunda + timedelta(days=6)).isoformat(),
-            "label": segunda.strftime("%d/%m"),
+    tipos = client_person_type_map(conn, company_id)
+
+    # Três baldes por semana. PF é balcão/consumidor, PJ é oficina: misturados,
+    # o ticket médio some no meio-termo e não descreve nenhum dos dois. Uma
+    # semana de muito balcão derruba a média sem que a venda para oficina tenha
+    # piorado — e é essa leitura errada que a separação evita.
+    baldes: dict[str, dict[str, dict[str, float]]] = {}
+    for r in linhas:
+        semana = r["semana"]
+        tipo = tipos.get(normalize_client_key(r["client_name"])) or "PF"
+        alvo = baldes.setdefault(semana, {
+            "geral": {"liquido": 0.0, "clientes": 0, "itens": 0},
+            "pj": {"liquido": 0.0, "clientes": 0, "itens": 0},
+            "pf": {"liquido": 0.0, "clientes": 0, "itens": 0},
+        })
+        liquido = float(r["liquido"] or 0)
+        itens = int(r["itens"] or 0)
+        for chave in ("geral", "pj" if tipo == "PJ" else "pf"):
+            alvo[chave]["liquido"] += liquido
+            alvo[chave]["clientes"] += 1
+            alvo[chave]["itens"] += itens
+
+    def serie(dados: dict[str, float]) -> dict[str, Any]:
+        clientes = int(dados["clientes"])
+        liquido = float(dados["liquido"])
+        return {
             "revenue": round(liquido, 2),
             "clients": clientes,
             # Semana sem venda devolve ticket 0, não None: o gráfico mostra o
             # vazio como vazio. Esconder a semana ruim encurtaria a régua e
             # faria a linha parecer melhor do que foi.
             "ticket": round(liquido / clientes, 2) if clientes else 0.0,
-            "items": int(r["itens"] or 0) if r else 0,
-            "current": segunda == segunda_atual,
-        })
+            "items": int(dados["itens"]),
+        }
 
-    com_venda = [p for p in pontos if p["clients"]]
-    media = (sum(p["ticket"] for p in com_venda) / len(com_venda)) if com_venda else 0.0
+    vazio = {"liquido": 0.0, "clientes": 0, "itens": 0}
+    pontos: list[dict[str, Any]] = []
+    for i in range(weeks):
+        segunda = segunda_atual - timedelta(weeks=weeks - 1 - i)
+        chave = segunda.isoformat()
+        b = baldes.get(chave, {"geral": vazio, "pj": vazio, "pf": vazio})
+        ponto = {
+            "weekStart": chave,
+            "weekEnd": (segunda + timedelta(days=6)).isoformat(),
+            "label": segunda.strftime("%d/%m"),
+            "current": segunda == segunda_atual,
+        }
+        for serie_nome in ("geral", "pj", "pf"):
+            ponto[serie_nome] = serie(b.get(serie_nome, vazio))
+        # Campos antigos, no nível de cima, para o geral: quem já lia
+        # ponto["ticket"] continua lendo.
+        ponto.update(ponto["geral"])
+        pontos.append(ponto)
+
+    def resumo(serie_nome: str) -> dict[str, Any]:
+        com_venda = [p[serie_nome] for p in pontos if p[serie_nome]["clients"]]
+        media = (sum(p["ticket"] for p in com_venda) / len(com_venda)) if com_venda else 0.0
+        return {
+            "averageTicket": round(media, 2),
+            "bestTicket": round(max((p[serie_nome]["ticket"] for p in pontos), default=0.0), 2),
+            "weeksWithSales": len(com_venda),
+            "revenue": round(sum(p[serie_nome]["revenue"] for p in pontos), 2),
+        }
+
+    resumos = {s: resumo(s) for s in ("geral", "pj", "pf")}
     return {
         "sellerName": nome,
         "weeks": pontos,
-        "averageTicket": round(media, 2),
-        "bestTicket": round(max((p["ticket"] for p in pontos), default=0.0), 2),
-        "weeksWithSales": len(com_venda),
+        "summary": resumos,
+        # Mantidos no topo para não quebrar quem já lia o geral.
+        "averageTicket": resumos["geral"]["averageTicket"],
+        "bestTicket": resumos["geral"]["bestTicket"],
+        "weeksWithSales": resumos["geral"]["weeksWithSales"],
         "source": "Faturamento detalhado (data de emissão). Serve para tendência; "
                   "meta e comissão saem do custo x venda.",
     }
+
+
+def client_person_type_map(conn: sqlite3.Connection, company_id: int) -> dict[str, str]:
+    """Chave normalizada do cliente → PF ou PJ, pelo documento do cadastro.
+
+    Cache de requisição: o mapa é a base inteira e mais de uma tela precisa
+    dele. Sem documento, cai na heurística do nome — a mesma cascata que a
+    carteira usa, para os dois lugares não classificarem o mesmo cliente de
+    formas diferentes.
+    """
+    cache = getattr(conn, "_cache_tipo_pessoa", None)
+    if cache is None:
+        cache = conn._cache_tipo_pessoa = {}
+    if company_id in cache:
+        return cache[company_id]
+    mapa: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT client_name, document_number FROM crm_client_profiles WHERE company_id = ?",
+        (company_id,),
+    ).fetchall():
+        chave = normalize_client_key(r["client_name"])
+        if not chave:
+            continue
+        tipo, _ = person_type_from_document(r["document_number"])
+        if not tipo:
+            tipo, _, _ = infer_person_type_from_name(r["client_name"])
+        if tipo:
+            mapa[chave] = tipo
+    cache[company_id] = mapa
+    return mapa
 
 
 def sellers_of_unit(

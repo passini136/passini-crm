@@ -62,16 +62,32 @@ for nome in vendedores:
     print("═" * 78)
     print(f"  {nome}   ({seg * 1000:.0f} ms)")
     print("═" * 78)
-    print(f"  {'SEMANA':<14}{'LÍQUIDO':>14}{'CLIENTES':>10}{'TICKET':>12}")
+    print(f"  {'SEMANA':<16}{'GERAL':>21}{'PJ · OFICINA':>21}{'PF · BALCÃO':>21}")
+    print(f"  {'':<16}{'ticket  (cli)':>21}{'ticket  (cli)':>21}{'ticket  (cli)':>21}")
     for s in semanas:
         marca = " <<" if s["current"] else ""
+        celulas = "".join(
+            f"{backend.brl(s[k]['ticket']):>14}{('(' + str(s[k]['clients']) + ')'):>7}"
+            for k in ("geral", "pj", "pf"))
         print(f"  {s['weekStart'][8:10]}/{s['weekStart'][5:7]} a "
-              f"{s['weekEnd'][8:10]}/{s['weekEnd'][5:7]}"
-              f"{backend.brl(s['revenue']):>14}{s['clients']:>10}"
-              f"{backend.brl(s['ticket']):>12}{marca}")
-    print(f"\n  média {backend.brl(dados['averageTicket'])} · "
-          f"melhor {backend.brl(dados['bestTicket'])} · "
-          f"{dados['weeksWithSales']} de {len(semanas)} semanas com venda")
+              f"{s['weekEnd'][8:10]}/{s['weekEnd'][5:7]}  {celulas}{marca}")
+
+    print()
+    for k, rotulo in (("geral", "GERAL"), ("pj", "PJ · oficina"), ("pf", "PF · balcão")):
+        r = dados["summary"][k]
+        print(f"  {rotulo:<14} média {backend.brl(r['averageTicket'])} · "
+              f"melhor {backend.brl(r['bestTicket'])} · "
+              f"faturado {backend.brl(r['revenue'])} · "
+              f"{r['weeksWithSales']}/{len(semanas)} semanas")
+
+    # PJ + PF tem de dar o geral. Se não der, algum cliente ficou de fora da
+    # classificação e está sumindo de uma das abas sem sumir do total.
+    soma = round(dados["summary"]["pj"]["revenue"] + dados["summary"]["pf"]["revenue"], 2)
+    if abs(soma - dados["summary"]["geral"]["revenue"]) > 0.01:
+        print(f"\n  >> PJ + PF = {backend.brl(soma)} mas o geral é "
+              f"{backend.brl(dados['summary']['geral']['revenue'])}. Cliente sem classificação.")
+    else:
+        print("\n  PJ + PF fecha com o geral.")
 
     # ── Reconciliação: as semanas somam o mesmo que o período inteiro? ────────
     if semanas:
