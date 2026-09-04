@@ -4757,6 +4757,9 @@ function ticketSemanalModal() {
             Semana sem venda aparece vazia — de propósito.
           </div>
           <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.5">
+            ⚠ Compare semana com semana, não com o ticket do card. Lá o cliente
+            conta uma vez no mês inteiro; aqui ele conta em cada semana em que
+            comprou, então o número é naturalmente menor. São réguas diferentes.<br>
             ⚠ ${escapeHtml(d.source || "")}
           </div>` : ""}
 
