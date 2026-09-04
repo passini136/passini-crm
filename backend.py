@@ -12369,7 +12369,8 @@ def seller_ticket_timeline(
         (company_id, *valores, inicio),
     ).fetchall()
 
-    tipos = client_person_type_map(conn, company_id)
+    tipos = client_person_type_map(
+        conn, company_id, [r["client_name"] for r in linhas])
 
     # Três baldes por semana. PF é balcão/consumidor, PJ é oficina: misturados,
     # o ticket médio some no meio-termo e não descreve nenhum dos dois. Uma
@@ -12447,34 +12448,44 @@ def seller_ticket_timeline(
     }
 
 
-def client_person_type_map(conn: sqlite3.Connection, company_id: int) -> dict[str, str]:
-    """Chave normalizada do cliente → PF ou PJ, pelo documento do cadastro.
+def client_person_type_map(
+    conn: sqlite3.Connection, company_id: int, client_names: list[str]
+) -> dict[str, str]:
+    """Chave normalizada do cliente → PF ou PJ, só para os nomes pedidos.
 
-    Cache de requisição: o mapa é a base inteira e mais de uma tela precisa
-    dele. Sem documento, cai na heurística do nome — a mesma cascata que a
-    carteira usa, para os dois lugares não classificarem o mesmo cliente de
-    formas diferentes.
+    Recebe a lista de propósito. Classificar a base inteira para usar duzentos
+    clientes custava dez vezes mais que a consulta que originou a pergunta —
+    o mesmo padrão que deixava a carteira lenta. Sem documento, cai na
+    heurística do nome, a mesma cascata que a carteira usa: os dois lugares
+    precisam classificar o mesmo cliente do mesmo jeito.
+
+    O resultado acumula num cache de requisição, então dois vendedores na mesma
+    requisição não reclassificam o cliente que compartilham.
     """
     cache = getattr(conn, "_cache_tipo_pessoa", None)
     if cache is None:
         cache = conn._cache_tipo_pessoa = {}
-    if company_id in cache:
-        return cache[company_id]
-    mapa: dict[str, str] = {}
-    for r in conn.execute(
-        "SELECT client_name, document_number FROM crm_client_profiles WHERE company_id = ?",
-        (company_id,),
-    ).fetchall():
-        chave = normalize_client_key(r["client_name"])
-        if not chave:
-            continue
-        tipo, _ = person_type_from_document(r["document_number"])
-        if not tipo:
-            tipo, _, _ = infer_person_type_from_name(r["client_name"])
-        if tipo:
-            mapa[chave] = tipo
-    cache[company_id] = mapa
-    return mapa
+
+    pendentes = [n for n in dict.fromkeys(client_names)
+                 if n and (company_id, normalize_client_key(n)) not in cache]
+    for inicio in range(0, len(pendentes), 400):
+        lote = pendentes[inicio:inicio + 400]
+        marcadores = ",".join("?" for _ in lote)
+        achados = {
+            r["client_name"]: r["document_number"]
+            for r in conn.execute(
+                f"SELECT client_name, document_number FROM crm_client_profiles "
+                f"WHERE company_id = ? AND client_name IN ({marcadores})",
+                (company_id, *lote),
+            ).fetchall()
+        }
+        for nome in lote:
+            tipo, _ = person_type_from_document(achados.get(nome))
+            if not tipo:
+                tipo, _, _ = infer_person_type_from_name(nome)
+            cache[(company_id, normalize_client_key(nome))] = tipo or "PF"
+
+    return {chave: tipo for (cid, chave), tipo in cache.items() if cid == company_id}
 
 
 def sellers_of_unit(
