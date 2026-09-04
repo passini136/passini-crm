@@ -151,4 +151,24 @@ else:
         else:
             print(f"  ✘ {procurado} continua fora da lista.")
 
+    # A lista tem duas fontes (cadastro de pessoas e contas do CRM) e deduplica
+    # por chave de nome completo. Se a conta está vinculada a um nome escrito
+    # diferente do cadastro — "ADAILTON FRAGA" x "ADAILTON MARIANO FRAGA" — as
+    # chaves não batem e a MESMA pessoa aparece duas vezes para marcar presente.
+    # Aí a ata registra duas presenças e uma delas nunca dá ciência.
+    print("\n  Conferindo pessoa repetida por nome escrito de dois jeitos:")
+    por_curta: dict[str, list[str]] = {}
+    for p in lista:
+        curta = backend.short_person_key(p["personName"])
+        if curta:
+            por_curta.setdefault(curta, []).append(p["personName"])
+    repetidos = {k: v for k, v in por_curta.items() if len(v) > 1}
+    if repetidos:
+        for nomes in repetidos.values():
+            print(f"     >> {' / '.join(nomes)}")
+        print("     Alinhe o 'vinculado a' da conta com o nome do cadastro de pessoas,")
+        print("     em Administração → Acessos.")
+    else:
+        print("     Nenhuma. Cada pessoa aparece uma vez só.")
+
 conn.close()
