@@ -587,6 +587,12 @@ UPLOAD_FIELD_TYPE_OVERRIDES = {
     "files": None,
 }
 
+# Feriados que zeram o dia útil: a lista significa "a Passini não vende", então
+# entra o feriado que a empresa de fato para. 20/11 (Consciência Negra, nacional
+# pela Lei 14.759/2023) foi confirmado pelo Felipe em 04/09/2026.
+#
+# Mexer aqui muda dia útil, e dia útil muda meta diária, ritmo esperado e
+# proporcional de férias. Conferir com diag_calendario.py antes de dar por certo.
 NATIONAL_AND_RS_HOLIDAYS = {
     2025: [
         ("2025-01-01", "Confraternização Universal"),
@@ -596,10 +602,12 @@ NATIONAL_AND_RS_HOLIDAYS = {
         ("2025-04-21", "Tiradentes"),
         ("2025-05-01", "Dia do Trabalho"),
         ("2025-06-19", "Corpus Christi"),
+        ("2025-09-07", "Independência do Brasil"),
         ("2025-09-20", "Revolução Farroupilha"),
         ("2025-10-12", "Nossa Senhora Aparecida"),
         ("2025-11-02", "Finados"),
         ("2025-11-15", "Proclamação da República"),
+        ("2025-11-20", "Consciência Negra"),
         ("2025-12-25", "Natal"),
     ],
     2026: [
@@ -610,10 +618,12 @@ NATIONAL_AND_RS_HOLIDAYS = {
         ("2026-04-21", "Tiradentes"),
         ("2026-05-01", "Dia do Trabalho"),
         ("2026-06-04", "Corpus Christi"),
+        ("2026-09-07", "Independência do Brasil"),
         ("2026-09-20", "Revolução Farroupilha"),
         ("2026-10-12", "Nossa Senhora Aparecida"),
         ("2026-11-02", "Finados"),
         ("2026-11-15", "Proclamação da República"),
+        ("2026-11-20", "Consciência Negra"),
         ("2026-12-25", "Natal"),
     ],
 }
@@ -2931,19 +2941,37 @@ def init_db() -> None:
 
 
 def seed_holidays(conn: sqlite3.Connection, company_id: int) -> None:
-    existing = conn.execute("SELECT COUNT(*) AS total FROM holidays WHERE company_id = ?", (company_id,)).fetchone()["total"]
-    if existing:
-        return
-    for year, rows in NATIONAL_AND_RS_HOLIDAYS.items():
+    """Garante os feriados da lista oficial, inclusive em base já existente.
+
+    Antes desistia na primeira linha encontrada ("já semeado"). O efeito era que
+    qualquer feriado ADICIONADO à lista depois nunca chegava a quem já usava o
+    sistema: a Independência (07/09) faltava desde o começo, e setembro contava
+    22 dias úteis em vez de 21 — inflando a meta diária de toda a equipe.
+
+    O UNIQUE(company_id, holiday_date, holiday_name) torna isto idempotente.
+    Contrapartida a conhecer: feriado da lista oficial que tenha sido excluído
+    de propósito volta no próximo boot. Feriado só da Passini não é afetado,
+    porque não está na lista.
+    """
+    incluidos: list[str] = []
+    for _year, rows in NATIONAL_AND_RS_HOLIDAYS.items():
         for holiday_date, holiday_name in rows:
-            conn.execute(
+            cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO holidays (company_id, holiday_date, holiday_name, scope, created_at)
                 VALUES (?, ?, ?, 'NACIONAL_RS', ?)
                 """,
                 (company_id, holiday_date, holiday_name, now_iso()),
             )
+            if cursor.rowcount:
+                incluidos.append(f"{holiday_date} {holiday_name}")
     conn.commit()
+    if incluidos:
+        # Sai no log porque muda dia útil, e dia útil muda meta proporcional.
+        # Uma alteração dessas não pode acontecer em silêncio.
+        print(f"[feriados] {len(incluidos)} incluído(s): {', '.join(incluidos)}", flush=True)
+        invalidate_calendar_cache(company_id)
+        invalidate_dashboard_cache(company_id)
 
 
 def infer_role_from_name(person_name: str) -> str:
@@ -18206,13 +18234,24 @@ def save_json_payload(conn: sqlite3.Connection, company_id: int, user_id: int, t
             created += 1
     elif table_name == "holidays":
         for row in rows:
+            # A data PRECISA ser normalizada. O calendário compara com
+            # date.isoformat(), então "07/09/2026" entra no banco, aparece na
+            # lista da tela e nunca casa com nenhum dia — o feriado fica
+            # cadastrado e sem efeito, que é o pior dos dois mundos. Férias já
+            # normalizava; feriado não, e a assimetria não tinha razão.
+            _hd = parse_datetime_flexible(row.get("holiday_date"))
+            if not _hd:
+                raise ValueError(
+                    f"Data de feriado não reconhecida: {row.get('holiday_date')!r}. "
+                    "Use o formato 2026-09-07.")
             conn.execute(
                 """
                 INSERT OR REPLACE INTO holidays
                     (company_id, holiday_date, holiday_name, scope, created_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (company_id, row["holiday_date"], row["holiday_name"], row.get("scope", "NACIONAL_RS"), now_iso()),
+                (company_id, _hd.strftime("%Y-%m-%d"), normalize_whitespace(row["holiday_name"]),
+                 row.get("scope", "NACIONAL_RS"), now_iso()),
             )
             created += 1
     elif table_name == "goals_seller":
