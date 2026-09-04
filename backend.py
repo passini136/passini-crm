@@ -10305,6 +10305,8 @@ def inactive_clients_for_unit(
         if permitidas:
             unidade_alvo = permitidas[0]
 
+    # Sem o recorte de escopo aqui de propósito: o laço abaixo filtra por
+    # `unidade_alvo`, que já é a unidade do usuário e sobrevive a base completa.
     linhas = crm_base_client_rows_cached(conn, company_id, filtros)
     termo = normalize_upper(strip_accents(busca))
     eu = person_key(seller_identity_for_user(user))
@@ -13227,6 +13229,20 @@ def crm_base_client_scope_query(
 def crm_base_client_rows(
     conn: sqlite3.Connection, company_id: int, filters: dict[str, str | None]
 ) -> list[dict[str, Any]]:
+    # Cronômetro por etapa. Sem ele, "a carteira está lenta" não vira ação: as
+    # seis etapas abaixo custam coisas muito diferentes, e otimizar a errada
+    # gasta o dia sem mover o relógio. Só imprime quando passa de 2s, para não
+    # poluir o log no caminho normal (que é cache).
+    _t: list[tuple[str, float]] = []
+    _marco = time.time()
+
+    def _etapa(nome: str) -> None:
+        nonlocal _marco
+        agora = time.time()
+        _t.append((nome, agora - _marco))
+        _marco = agora
+
+    _inicio_total = _marco
     scope_query, params, current_competence = crm_base_client_scope_query(conn, company_id, filters)
     if not scope_query or not current_competence:
         return []
@@ -13237,12 +13253,21 @@ def crm_base_client_rows(
     previous_competences = [c1, c2, c3]
 
     aggregate_rows = conn.execute(scope_query, params).fetchall()
+    _etapa("cadastro")
 
     # Precarrega os três mapas de unidade em uma query cada (evita N+1)
     city_unit_map = build_city_unit_map(conn, company_id, c0)
     seller_unit_map = build_seller_unit_map(conn, company_id, c0)
     territory_map = build_territory_map(conn, company_id, c0)
-    unit_filter = normalize_unit(filters.get("unit_name"))
+    _etapa("mapas")
+    # A UNIDADE NÃO FILTRA AQUI — de propósito, e isso é o coração da performance.
+    #
+    # Filtrar por unidade dentro da construção obrigava cada gerente a reconstruir
+    # a base inteira (100 mil clientes) para ficar com a fatia dele, e seis
+    # unidades mais a diretoria eram sete construções quase idênticas. Como a
+    # unidade é recorte puro — não altera nenhum valor calculado, só decide quem
+    # entra na lista — ela virou filtro de saída em crm_client_rows_for_scope().
+    # Assim todo mundo compartilha UMA construção em cache.
 
     # Agrega fact_sales_detail por cliente no SQL — evita iterar milhares de linhas no Python
     detail_rows = conn.execute(
@@ -13262,6 +13287,7 @@ def crm_base_client_rows(
         """,
         [c1, c2, c3, c0, company_id, c0, c1, c2, c3],
     ).fetchall()
+    _etapa("faturamento")
 
     # Receita c0 scoped por vendedor — query separada para não contaminar c1/c2/c3 (sem filtro de vendedor)
     seller_name_for_c0 = normalize_upper(filters.get("seller_name"))
@@ -13291,6 +13317,7 @@ def crm_base_client_rows(
         (company_id,),
     ).fetchall()
     interaction_map = {row["client_key"]: row["last_interaction_at"] for row in interaction_rows}
+    _etapa("interacoes")
 
     # Constrói mapa de métricas por cliente já agregado (uma entrada por nome único)
     detail_metrics: dict[str, dict[str, Any]] = {}
@@ -13356,6 +13383,7 @@ def crm_base_client_rows(
         # Maior receita no mês corrente; empate resolve pela compra mais recente
         candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
         revenue_owner_by_name[name_key] = candidates[0][2]
+    _etapa("duplicados")
 
     client_rows: list[dict[str, Any]] = []
     for row in aggregate_rows:
@@ -13415,8 +13443,6 @@ def crm_base_client_rows(
         resolved_unit_name = unit_for_client_row(
             row["assigned_seller"], row["city_name"], row["neighborhood"],
             seller_unit_map, territory_map, city_unit_map)
-        if unit_filter and normalize_unit(resolved_unit_name) != unit_filter:
-            continue
         priorities: list[str] = []
         if status_code == "INATIVO":
             priorities.append("REATIVACAO_INATIVO")
@@ -13499,6 +13525,11 @@ def crm_base_client_rows(
                 "secondaryReasonCodes": secondary_reasons,
             }
         )
+    _etapa("montagem")
+    total = time.time() - _inicio_total
+    if total > 2:
+        detalhe = " · ".join(f"{nome} {seg:.1f}s" for nome, seg in _t if seg >= 0.1)
+        print(f"[carteira] {total:.1f}s para {len(client_rows)} clientes  ({detalhe})", flush=True)
     return client_rows
 
 
@@ -13509,10 +13540,13 @@ _CRM_CACHE_TTL = 90  # segundos
 
 
 def _crm_cache_key(company_id: int, filters: dict) -> tuple:
+    # Sem unit_name: a construção não conhece mais unidade (ver crm_base_client_rows),
+    # então os seis gerentes e a diretoria dividem a MESMA entrada de cache em vez
+    # de manterem sete cópias quase iguais de 100 mil clientes.
+    # O vendedor continua no key: ele muda os valores calculados, não só o recorte.
     return (
         company_id,
         normalize_whitespace(filters.get("seller_name")) or "",
-        normalize_whitespace(filters.get("unit_name")) or "",
         normalize_whitespace(filters.get("competenceEnd") or filters.get("competence")) or "",
     )
 
@@ -13528,6 +13562,27 @@ def crm_base_client_rows_cached(conn: sqlite3.Connection, company_id: int, filte
     with _crm_base_cache_lock:
         _crm_base_cache[key] = (now, result)
     return result
+
+
+def crm_client_rows_for_scope(
+    conn: sqlite3.Connection, company_id: int, filters: dict,
+    copiar: bool = False,
+) -> list[dict[str, Any]]:
+    """A carteira que ESTE usuário enxerga: base compartilhada, recorte na saída.
+
+    A construção da base ignora unidade e fica em cache uma vez só; o recorte
+    por unidade acontece aqui, sobre dicionários já prontos — trabalho de
+    milissegundos contra os segundos de reconstruir tudo.
+
+    `copiar=True` para quem vai ESCREVER nas linhas. As linhas vêm do cache e
+    são compartilhadas entre requisições: anotar direto nelas faz o marcador de
+    um usuário reaparecer na tela de outro.
+    """
+    rows = crm_base_client_rows_cached(conn, company_id, filters)
+    unidade = normalize_unit(filters.get("unit_name"))
+    if unidade:
+        rows = [r for r in rows if normalize_unit(r.get("unitName")) == unidade]
+    return [dict(r) for r in rows] if copiar else rows
 
 
 def invalidate_crm_cache(company_id: int | None = None) -> None:
@@ -14101,7 +14156,9 @@ def list_crm_clients(
     stats: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     seller_name = normalize_whitespace(filters.get("seller_name"))
-    rows = crm_base_client_rows_cached(conn, company_id, filters)
+    # copiar=True: o laço abaixo grava agendaAction e lastActiveContactAt em cada
+    # linha, e elas vêm do cache compartilhado.
+    rows = crm_client_rows_for_scope(conn, company_id, filters, copiar=True)
     action_map = crm_agenda_action_map(conn, company_id, seller_name) if seller_name else {}
     # ── Clientes já contactados hoje ──────────────────────────────────────────
     # Três correções aplicadas aqui, todas causa de o cliente não sair da fila:
@@ -14894,7 +14951,7 @@ def crm_summary_for_user(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, filters: dict[str, str | None]
 ) -> dict[str, Any]:
     seller_name = normalize_whitespace(filters.get("seller_name")) or seller_identity_for_user(user)
-    base_clients = crm_base_client_rows_cached(conn, company_id, filters)
+    base_clients = crm_client_rows_for_scope(conn, company_id, filters)
     today_str = date.today().isoformat()  # "2026-06-02" — funciona com ambos separadores T e espaço
     contacts_today = conn.execute(
         """
@@ -19947,7 +20004,7 @@ def compute_manager_mission(
       - coverageGap: cliente parou de comprar E ninguém o contatou há dias
       - highValueDrop: cliente Diamante/Ouro comprando menos
     """
-    rows = crm_base_client_rows_cached(conn, company_id, filters)
+    rows = crm_client_rows_for_scope(conn, company_id, filters)
     today = date.today()
 
     def days_since(value: Any) -> int | None:
