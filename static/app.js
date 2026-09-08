@@ -7088,6 +7088,12 @@ function crmAgendaView() {
           <div>
             <div style="font-size:12px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px">${escapeHtml(s.sellerName.split(" ")[0])}</div>
             <div style="font-size:10px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:110px">${escapeHtml(s.sellerName.split(" ").slice(1,3).join(" "))}</div>
+            ${s.inDeployment && !s.hasRevenueGoal ? `
+              <div title="Unidade em implantação: ainda sem meta de faturamento. A ligação é o indicador que existe."
+                   style="display:inline-block;margin-top:4px;font-size:9px;font-weight:700;
+                          background:#e8f0fe;color:#1a5276;border-radius:8px;padding:1px 6px">
+                IMPLANTAÇÃO
+              </div>` : ""}
           </div>
           <div style="text-align:right">
             <div style="font-size:22px;font-weight:800;color:${color};line-height:1">${s.contactsToday}</div>

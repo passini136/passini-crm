@@ -20499,6 +20499,45 @@ def compute_team_activity_today(
         (company_id, competence),
     ).fetchall()
 
+    # SEGUNDA FONTE: vendedor de unidade em implantação, que ainda não tem meta.
+    #
+    # A lista acima sai só de goals_seller, então quem não tem meta não existia
+    # para este painel — a Zona Norte inteira ficava invisível para o gerente e
+    # para a diretoria. E é justamente onde o acompanhamento importa mais: sem
+    # meta de faturamento, a ligação registrada é o único sinal de que a equipe
+    # nova está trabalhando.
+    #
+    # O recorte vem de unit_phases (fase IMPLANTACAO), não de uma lista de nomes
+    # no código: a próxima filial nova entra sozinha, pelo cadastro.
+    unidades_implantacao = {
+        normalize_unit(r["unit_name"])
+        for r in conn.execute(
+            "SELECT unit_name FROM unit_phases WHERE company_id = ? AND phase = 'IMPLANTACAO'",
+            (company_id,),
+        ).fetchall()
+        if normalize_unit(r["unit_name"])
+    }
+    sem_meta: list[dict[str, str]] = []
+    if unidades_implantacao:
+        ja_listados = {person_key(normalize_whitespace(r["seller_name"])) for r in seller_rows}
+        for r in conn.execute(
+            "SELECT person_name, base_unit, role_classification FROM people_records "
+            "WHERE company_id = ? AND date(valid_from) <= date(?) "
+            "  AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?)) "
+            "ORDER BY person_name",
+            (company_id, date.today().isoformat(), comp_target),
+        ).fetchall():
+            nome = normalize_whitespace(r["person_name"])
+            unidade_pessoa = normalize_unit(r["base_unit"])
+            if not nome or unidade_pessoa not in unidades_implantacao:
+                continue
+            if "VENDEDOR" not in normalize_upper(r["role_classification"] or ""):
+                continue
+            if person_key(nome) in ja_listados:
+                continue
+            ja_listados.add(person_key(nome))
+            sem_meta.append({"seller_name": nome, "base_unit": unidade_pessoa})
+
     seller_unit_map: dict[str, str] = {}
     for r in conn.execute(
         "SELECT person_name, base_unit FROM people_records WHERE company_id = ? AND date(valid_from) <= date(?) AND (valid_to IS NULL OR date(valid_to) >= date(?)) ORDER BY valid_from DESC",
@@ -20515,7 +20554,7 @@ def compute_team_activity_today(
     overdue_map = {normalize_whitespace(r["seller_name"]): int(r["overdue"]) for r in tasks_rows}
 
     results = []
-    for row in seller_rows:
+    for row in list(seller_rows) + sem_meta:
         seller_name = normalize_whitespace(row["seller_name"])
         if not seller_name:
             continue
@@ -20533,6 +20572,12 @@ def compute_team_activity_today(
             "openTasks": open_map.get(seller_name, 0),
             "lastInteractionAt": last_interaction_map.get(seller_name),
             "dailyGoal": DAILY_CONTACT_GOAL,
+            # A tela precisa distinguir: zero ligação de quem tem meta é falha;
+            # de quem está em implantação é o primeiro número que ele tem.
+            # Sem a marca, o gerente cobraria os dois do mesmo jeito.
+            "inDeployment": unit in unidades_implantacao,
+            "hasRevenueGoal": unit not in unidades_implantacao or any(
+                normalize_whitespace(g["seller_name"]) == seller_name for g in seller_rows),
         })
 
     # Quem não trabalhou aparece primeiro — é onde o gerente precisa agir
