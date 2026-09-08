@@ -10493,8 +10493,20 @@ def _receita_linha_apos(linhas: list[str], rotulo: str) -> str:
     return ""
 
 
+RECEITA_PDF_MAX_BYTES = 12 * 1024 * 1024
+RECEITA_PDF_MAX_PAGES = 4
+
+
 def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
-    """Extrai os dados do comprovante do CNPJ em PDF."""
+    """Extrai os dados do comprovante do CNPJ em PDF.
+
+    Tudo aqui é limitado de propósito. A extração com layout é cara, e um PDF
+    digitalizado de trinta páginas prendia o leitor por minutos: a tela ficava
+    em "Lendo…" sem fim, porque o navegador esperava uma resposta que demorava
+    mais que a paciência de qualquer um. O comprovante da Receita tem uma ou
+    duas páginas — o que passa muito disso é outro documento, e é melhor dizer
+    isso rápido do que tentar ler.
+    """
     try:
         import pdfplumber
     except ImportError as exc:
@@ -10502,10 +10514,27 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
             "O leitor de PDF não está instalado no servidor. "
             "Rode: pip install pdfplumber") from exc
 
+    if not content:
+        raise ValueError("Arquivo vazio.")
+    if len(content) > RECEITA_PDF_MAX_BYTES:
+        limite = RECEITA_PDF_MAX_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"Arquivo de {len(content) / 1024 / 1024:.1f} MB, acima do limite de {limite} MB. "
+            "O comprovante da Receita tem poucos KB — este parece ser um documento "
+            "digitalizado ou uma foto.")
+    if not content.lstrip()[:5].startswith(b"%PDF"):
+        raise ValueError("Este arquivo não é um PDF. Envie o comprovante de inscrição "
+                         "gerado pela Receita (pode ser impresso como PDF pelo navegador).")
+
+    inicio = time.time()
     try:
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             if not pdf.pages:
                 raise ValueError("PDF vazio.")
+            if len(pdf.pages) > RECEITA_PDF_MAX_PAGES:
+                raise ValueError(
+                    f"PDF com {len(pdf.pages)} páginas. O comprovante da Receita tem "
+                    "uma ou duas — confira se enviou o arquivo certo.")
             # Impresso pelo navegador, o comprovante costuma sair em 2 páginas.
             # Ler só a primeira funcionava por sorte; juntar todas é o certo.
             texto = "\n".join((pg.extract_text(layout=True) or "") for pg in pdf.pages)
@@ -10516,6 +10545,18 @@ def parse_receita_cnpj_pdf(content: bytes) -> dict[str, Any]:
         # só quer saber que mandou o arquivo errado.
         raise ValueError("Não consegui ler este arquivo como PDF. "
                          "Envie o comprovante de inscrição gerado pela Receita.") from exc
+
+    demorou = time.time() - inicio
+    if demorou > 3:
+        # Aparece no log junto do [req]: se voltar a demorar, já se sabe onde.
+        print(f"[receita] leitura do PDF levou {demorou:.1f}s "
+              f"({len(content) / 1024:.0f} KB)", flush=True)
+
+    if not normalize_whitespace(texto):
+        raise ValueError(
+            "Este PDF não tem texto — parece ser digitalizado ou uma foto. "
+            "Baixe o comprovante direto do site da Receita, ou imprima a página "
+            "como PDF pelo navegador.")
 
     linhas = [l.rstrip() for l in texto.split("\n")]
     # Impresso pelo navegador, o título sai com espaçamento variável
@@ -20760,6 +20801,14 @@ def compute_portfolio_summary_by_seller(
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    # Prazo por operação de socket. Sem ele, uma conexão que para no meio —
+    # celular que perdeu sinal enquanto subia o comprovante, aba fechada durante
+    # um download — segura uma thread do servidor indefinidamente. Uma sozinha
+    # não incomoda; acumuladas ao longo de semanas, comem o servidor sem deixar
+    # rastro nenhum no log. Não limita o tempo de CÁLCULO: vale para ler e
+    # escrever no socket, então relatório demorado continua passando.
+    timeout = 120
+
     server_version = "PassiniDashboard/1.0"
 
     def log_message(self, format: str, *args) -> None:

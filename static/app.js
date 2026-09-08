@@ -426,15 +426,38 @@ function crmPurchaseBadge(value) {
     : '<span class="status-tag bad">Sem compra</span>';
 }
 
+/**
+ * @param {Object} [options.timeoutMs] Desiste depois deste tempo.
+ *
+ * Sem prazo, `fetch` espera para sempre: se a resposta não vier — servidor
+ * ocupado, conexão que caiu sem avisar, leitura pesada demais — a tela fica
+ * num "carregando" eterno e a única saída é recarregar a página. O prazo é
+ * opcional de propósito: só quem tem tela travando em cima da espera pede.
+ */
 async function api(path, options = {}) {
-  const response = await fetch(path, {
-    credentials: "same-origin",
-    ...options,
-    headers: {
-      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
-      ...(options.headers || {}),
-    },
-  });
+  const { timeoutMs, ...resto } = options;
+  const controle = timeoutMs ? new AbortController() : null;
+  const alarme = controle ? setTimeout(() => controle.abort(), timeoutMs) : null;
+  let response;
+  try {
+    response = await fetch(path, {
+      credentials: "same-origin",
+      ...(controle ? { signal: controle.signal } : {}),
+      ...resto,
+      headers: {
+        ...(resto.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+        ...(resto.headers || {}),
+      },
+    });
+  } catch (erro) {
+    if (erro.name === "AbortError") {
+      throw new Error(`O servidor não respondeu em ${Math.round(timeoutMs / 1000)}s. `
+        + "Tente de novo; se repetir, avise a diretoria com o horário.");
+    }
+    throw erro;
+  } finally {
+    if (alarme) clearTimeout(alarme);
+  }
   const contentType = response.headers.get("Content-Type") || "";
   if (!response.ok) {
     if (contentType.includes("application/json")) {
@@ -3530,9 +3553,18 @@ async function importarComprovanteReceita(input) {
   if (!p) return;
   p.importando = true; p.error = ""; requestRender();
   try {
+    // Checagem antes de subir: o vendedor está no celular, muitas vezes em rede
+    // ruim, e mandar 30 MB de foto para o servidor recusar é perder o tempo dele
+    // duas vezes — na subida e na espera.
+    if (arquivo.size > 12 * 1024 * 1024) {
+      throw new Error(`Arquivo de ${(arquivo.size / 1024 / 1024).toFixed(1)} MB, grande demais. `
+        + "O comprovante da Receita tem poucos KB — este parece ser uma foto ou "
+        + "documento digitalizado. Baixe o PDF direto do site da Receita.");
+    }
     const form = new FormData();
     form.append("receita", arquivo, arquivo.name);
-    const r = await api("/api/prospects/receita", { method: "POST", body: form });
+    const r = await api("/api/prospects/receita",
+                        { method: "POST", body: form, timeoutMs: 60000 });
     const d = r.data || {};
     // Só preenche o que veio; o que a pessoa já digitou não é sobrescrito por
     // vazio. Campo em branco no comprovante não pode apagar trabalho feito.
