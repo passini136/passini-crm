@@ -102,17 +102,25 @@ for vendedor in d["sellers"]:
     nunca = sum(1 for s in sug if s["status"] == "NUNCA")
     parou = sum(1 for s in sug if s["status"] == "PAROU")
     assinaturas[vendedor] = tuple(s["ref"] for s in sug)
-    print(f"\n   {vendedor}  —  {len(sug)} sugestão(ões) · {nunca} nunca vendeu · {parou} parou")
+    da_empresa = sum(1 for s in sug if s.get("source") == "EMPRESA")
+    complemento = f" · {da_empresa} da reserva da empresa" if da_empresa else ""
+    print(f"\n   {vendedor}  —  {len(sug)} sugestão(ões) · {nunca} nunca vendeu"
+          f" · {parou} parou{complemento}")
     for s in sug[:6]:
         etiqueta = "nunca vendeu" if s["status"] == "NUNCA" else "PAROU de vender"
         loja = "" if s["inStock"] is None else ("" if s["inStock"] else " · SEM SALDO")
+        fonte = " · [empresa]" if s.get("source") == "EMPRESA" else ""
         print(f"      {s['ref'][:14]:<16}{s['brand'][:12]:<14}{s['line'][:16]:<18}"
-              f"{s['clients']:>4} cli · {backend.brl(s['unitPrice']):>10} · {etiqueta}{loja}")
+              f"{s['clients']:>4} cli · {backend.brl(s['unitPrice']):>10} · {etiqueta}{loja}{fonte}")
 
 # ── 3. As listas são diferentes entre si? ────────────────────────────────────
 print("\n3) AS LISTAS SÃO PERSONALIZADAS?")
 unicas = len(set(assinaturas.values()))
 print(f"   {unicas} lista(s) distinta(s) para {len(assinaturas)} vendedor(es)")
+curtas = [v for v, s in assinaturas.items() if len(s) < backend.MIX_TOP_PER_SELLER]
+if curtas:
+    print(f"   {len(curtas)} vendedor(es) com lista incompleta — nem a unidade nem a")
+    print("   reserva da empresa tiveram item elegível com saldo na loja.")
 if unicas <= 1 and len(assinaturas) > 1:
     print("   >> TODOS recebem a mesma lista. O cálculo não está olhando o que cada")
     print("      um vende — a sugestão vira cartaz, não orientação.")

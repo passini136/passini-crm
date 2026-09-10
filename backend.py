@@ -14538,9 +14538,23 @@ def mix_opportunities(
     # que muitas oficinas diferentes compram é fácil de oferecer; peça que uma
     # só compra em volume é contrato, não isca. E oferecer o que não tem na
     # loja é mandar o vendedor prometer o que não pode entregar.
-    pool = sorted((i for i in da_unidade.values() if elegivel(i)),
-                  key=lambda i: (i["ref"] not in com_saldo if com_saldo else False,
-                                 -i["clients"], -i["quantity"]))
+    def ordenar(itens):
+        return sorted(itens, key=lambda i: (i["ref"] not in com_saldo if com_saldo else False,
+                                            -i["clients"], -i["quantity"]))
+
+    pool = ordenar(i for i in da_unidade.values() if elegivel(i))
+
+    # RESERVA da empresa, para unidade sem histórico próprio.
+    #
+    # Zona Norte tem 8 itens-isca e um vendedor recebeu UMA sugestão: a unidade
+    # é implantação, ainda não tem mix para aprender com ele mesmo. A lista
+    # feita para ensinar mix ficava vazia justo para quem mais precisa.
+    #
+    # A reserva só entra se o item tiver saldo na loja: sugerir o que a Matriz
+    # vende e a filial não tem é conversa de compra, não de venda — e é o
+    # gerente que decide comprar, não o vendedor que decide oferecer.
+    reserva = ordenar(i for i in de_fora.values()
+                      if elegivel(i) and (not com_saldo or i["ref"] in com_saldo))
 
     # ── Só quem é vendedor de verdade ────────────────────────────────────────
     # Sai nota no nome de gerente, de diretor e de conferente. Sugerir a eles o
@@ -14577,17 +14591,24 @@ def mix_opportunities(
     for vendedor in sorted(vendedores_da_unidade):
         recentes = vendidos_por_vendedor.get(vendedor, set())
         historico = ja_vendeu_algum_dia.get(vendedor, set())
-        sugestoes = []
-        for item in pool:
-            if item["ref"] in recentes:
-                continue
-            dado = apresenta(item)
-            # Nunca vendeu e parou de vender pedem conversas diferentes: uma é
-            # novidade, a outra é resgate. Misturar as duas tira a força das duas.
-            dado["status"] = "PAROU" if item["ref"] in historico else "NUNCA"
-            sugestoes.append(dado)
-            if len(sugestoes) >= MIX_TOP_PER_SELLER:
-                break
+        sugestoes: list[dict[str, Any]] = []
+        vistos: set[str] = set()
+        # A unidade primeiro; a reserva da empresa só completa o que faltar.
+        # Assim quem tem mix próprio aprende com a própria praça, e quem não tem
+        # aprende com a casa em vez de ficar sem nada.
+        for origem, fonte in (("UNIDADE", pool), ("EMPRESA", reserva)):
+            for item in fonte:
+                if len(sugestoes) >= MIX_TOP_PER_SELLER:
+                    break
+                if item["ref"] in recentes or item["ref"] in vistos:
+                    continue
+                vistos.add(item["ref"])
+                dado = apresenta(item)
+                # Nunca vendeu e parou de vender pedem conversas diferentes: uma
+                # é novidade, a outra é resgate. Misturar tira a força das duas.
+                dado["status"] = "PAROU" if item["ref"] in historico else "NUNCA"
+                dado["source"] = origem
+                sugestoes.append(dado)
         por_vendedor[vendedor] = sugestoes
 
     # ── O que outras unidades vendem e esta não ──────────────────────────────
