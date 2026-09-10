@@ -14609,6 +14609,15 @@ def mix_opportunities(
                 dado["status"] = "PAROU" if item["ref"] in historico else "NUNCA"
                 dado["source"] = origem
                 sugestoes.append(dado)
+        # Sem saldo vai para o FIM da lista inteira, cruzando as duas fontes.
+        #
+        # Ordenar unidade e reserva em separado e concatenar deixava um item
+        # local de 3 clientes SEM SALDO na frente de um item da empresa com 246
+        # clientes e estoque na loja. A primeira linha da tela é a única que
+        # muitos vão ler; ela não pode ser a que o vendedor não consegue vender.
+        # O sort do Python é estável, então "unidade antes da reserva" se mantém
+        # dentro de cada grupo.
+        sugestoes.sort(key=lambda x: x["inStock"] is False)
         por_vendedor[vendedor] = sugestoes
 
     # ── O que outras unidades vendem e esta não ──────────────────────────────
