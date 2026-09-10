@@ -14373,6 +14373,201 @@ def line_repurchase_for_clients(
     return dict(saida)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Oportunidade de MIX: o que a unidade vende e o vendedor não
+#
+# A ideia é a peça-isca: item de giro alto e preço acessível, que muita oficina
+# compra e que abre conversa. O vendedor que não oferece uma dessas não está
+# perdendo uma venda grande — está deixando de ter motivo para ligar.
+# ─────────────────────────────────────────────────────────────────────────────
+
+MIX_WINDOW_MONTHS = 3
+MIX_MIN_CLIENTS = 3          # item que só um cliente compra não é padrão da praça
+MIX_TOP_PER_SELLER = 10
+
+
+def unit_item_stock_refs(conn: sqlite3.Connection, company_id: int, unit_name: str) -> set[str]:
+    """Referências (chave do faturamento) com saldo nesta unidade.
+
+    O estoque é indexado pelo código INTERNO e o faturamento pela referência do
+    fabricante; a ponte é o catálogo. Sugerir o que não tem na loja é mandar o
+    vendedor prometer o que não pode entregar.
+    """
+    unidade = normalize_unit(unit_name)
+    if not unidade:
+        return set()
+    cache = getattr(conn, "_cache_estoque_ref", None)
+    if cache is None:
+        cache = conn._cache_estoque_ref = {}
+    if (company_id, unidade) in cache:
+        return cache[(company_id, unidade)]
+    refs = {
+        normalize_upper(r["ref"])
+        for r in conn.execute(
+            """
+            SELECT UPPER(TRIM(ic.manufacturer_ref)) AS ref
+            FROM item_stock s
+            JOIN item_catalog ic
+              ON ic.company_id = s.company_id AND ic.item_code = s.item_code
+            WHERE s.company_id = ? AND s.unit_name = ? AND s.quantity > 0
+              AND TRIM(COALESCE(ic.manufacturer_ref, '')) <> ''
+            """,
+            (company_id, unidade),
+        ).fetchall()
+        if normalize_upper(r["ref"])
+    }
+    cache[(company_id, unidade)] = refs
+    return refs
+
+
+def mix_opportunities(
+    conn: sqlite3.Connection, company_id: int, unit_name: str,
+    months: int = MIX_WINDOW_MONTHS,
+) -> dict[str, Any]:
+    """Itens-isca da unidade, o que cada vendedor não oferece, e o que a unidade não vende.
+
+    Três recortes do MESMO cálculo — construir separado daria três respostas
+    que discordam entre si na primeira divergência de régua.
+    """
+    unidade = normalize_unit(unit_name)
+    competencias = query_competences(conn, company_id)[:months]
+    if not competencias or not unidade:
+        return {"unitName": unidade, "items": [], "bySeller": {}, "unitGap": [], "sellers": []}
+    marcadores = ",".join("?" for _ in competencias)
+
+    mapa_unidade = build_seller_unit_map(conn, company_id, competencias[0])
+
+    def unidade_do(nome: str) -> str:
+        return (mapa_unidade.get(person_key(nome))
+                or mapa_unidade.get(short_person_key(nome)) or "")
+
+    linhas = conn.execute(
+        f"""
+        {CATALOGO_AGRUPADO_SQL}
+        SELECT f.seller_name                              AS vendedor,
+               UPPER(TRIM(f.sku_key))                     AS ref,
+               UPPER(TRIM(COALESCE(f.brand_name, '')))    AS marca,
+               UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               SUM(f.quantity)                            AS qtd,
+               SUM(f.net_value)                           AS valor,
+               COUNT(DISTINCT f.client_name)              AS clientes
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.competence IN ({marcadores})
+          AND f.net_value > 0 AND TRIM(COALESCE(f.sku_key, '')) <> ''
+        GROUP BY vendedor, ref, marca, linha
+        """,
+        (company_id, company_id, *competencias),
+    ).fetchall()
+
+    # Consolida por item: da unidade, do resto da empresa, e por vendedor.
+    da_unidade: dict[str, dict[str, Any]] = {}
+    de_fora: dict[str, dict[str, Any]] = {}
+    vendidos_por_vendedor: dict[str, set[str]] = defaultdict(set)
+    vendedores_da_unidade: set[str] = set()
+
+    for r in linhas:
+        vendedor = normalize_whitespace(r["vendedor"])
+        ref = r["ref"]
+        if not ref:
+            continue
+        na_unidade = unidade_do(vendedor) == unidade
+        if na_unidade:
+            vendedores_da_unidade.add(vendedor)
+            vendidos_por_vendedor[vendedor].add(ref)
+        alvo = da_unidade if na_unidade else de_fora
+        item = alvo.setdefault(ref, {
+            "ref": ref, "brand": r["marca"], "line": r["linha"] or "SEM LINHA",
+            "quantity": 0.0, "revenue": 0.0, "clients": 0, "sellers": set(),
+        })
+        item["quantity"] += float(r["qtd"] or 0)
+        item["revenue"] += float(r["valor"] or 0)
+        item["clients"] += int(r["clientes"] or 0)
+        item["sellers"].add(vendedor)
+
+    def preco_medio(item: dict[str, Any]) -> float:
+        return item["revenue"] / item["quantity"] if item["quantity"] else 0.0
+
+    # Preço médio POR LINHA, para a régua de "ticket baixo" ser justa: óleo e
+    # embreagem têm patamares diferentes, e um teto fixo em reais reprovaria
+    # toda a embreagem e aprovaria todo o óleo, sem dizer nada sobre nenhum.
+    soma_linha: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+    for item in list(da_unidade.values()) + list(de_fora.values()):
+        soma_linha[item["line"]][0] += item["revenue"]
+        soma_linha[item["line"]][1] += item["quantity"]
+    media_da_linha = {k: (v[0] / v[1] if v[1] else 0.0) for k, v in soma_linha.items()}
+
+    com_saldo = unit_item_stock_refs(conn, company_id, unidade)
+
+    def elegivel(item: dict[str, Any]) -> bool:
+        if item["clients"] < MIX_MIN_CLIENTS:
+            return False
+        media = media_da_linha.get(item["line"], 0.0)
+        return bool(media) and preco_medio(item) < media
+
+    def apresenta(item: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ref": item["ref"], "brand": item["brand"], "line": item["line"],
+            "quantity": round(item["quantity"], 0),
+            "revenue": round(item["revenue"], 2),
+            "unitPrice": round(preco_medio(item), 2),
+            "linePrice": round(media_da_linha.get(item["line"], 0.0), 2),
+            "clients": item["clients"],
+            "sellerCount": len(item["sellers"]),
+            "inStock": item["ref"] in com_saldo if com_saldo else None,
+        }
+
+    # Ranking por FREQUÊNCIA antes de quantidade: peça que muitas oficinas
+    # diferentes compram é fácil de oferecer; peça que uma só compra em volume
+    # é contrato, não isca.
+    pool = sorted((i for i in da_unidade.values() if elegivel(i)),
+                  key=lambda i: (-i["clients"], -i["quantity"]))
+
+    # ── Por vendedor: o que a unidade vende e ele não ────────────────────────
+    ja_vendeu_algum_dia: dict[str, set[str]] = defaultdict(set)
+    if vendedores_da_unidade:
+        nomes = sorted(vendedores_da_unidade)
+        marc_v = ",".join("?" for _ in nomes)
+        for r in conn.execute(
+            f"SELECT DISTINCT seller_name, UPPER(TRIM(sku_key)) ref FROM fact_sales_detail "
+            f"WHERE company_id = ? AND net_value > 0 AND seller_name IN ({marc_v})",
+            (company_id, *nomes),
+        ).fetchall():
+            ja_vendeu_algum_dia[normalize_whitespace(r["seller_name"])].add(r["ref"])
+
+    por_vendedor: dict[str, list[dict[str, Any]]] = {}
+    for vendedor in sorted(vendedores_da_unidade):
+        recentes = vendidos_por_vendedor.get(vendedor, set())
+        historico = ja_vendeu_algum_dia.get(vendedor, set())
+        sugestoes = []
+        for item in pool:
+            if item["ref"] in recentes:
+                continue
+            dado = apresenta(item)
+            # Nunca vendeu e parou de vender pedem conversas diferentes: uma é
+            # novidade, a outra é resgate. Misturar as duas tira a força das duas.
+            dado["status"] = "PAROU" if item["ref"] in historico else "NUNCA"
+            sugestoes.append(dado)
+            if len(sugestoes) >= MIX_TOP_PER_SELLER:
+                break
+        por_vendedor[vendedor] = sugestoes
+
+    # ── O que outras unidades vendem e esta não ──────────────────────────────
+    refs_da_unidade = set(da_unidade)
+    lacuna = sorted((i for i in de_fora.values()
+                     if elegivel(i) and i["ref"] not in refs_da_unidade),
+                    key=lambda i: (-i["clients"], -i["quantity"]))[:MIX_TOP_PER_SELLER * 3]
+
+    return {
+        "unitName": unidade,
+        "window": competencias,
+        "items": [apresenta(i) for i in pool[:MIX_TOP_PER_SELLER * 3]],
+        "bySeller": por_vendedor,
+        "unitGap": [apresenta(i) for i in lacuna],
+        "sellers": sorted(vendedores_da_unidade),
+    }
+
+
 def line_repurchase_opportunities(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     filters: dict[str, str | None], limit: int = 40,
