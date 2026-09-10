@@ -14546,17 +14546,18 @@ def mix_opportunities(
     # Sai nota no nome de gerente, de diretor e de conferente. Sugerir a eles o
     # que "deixaram de vender" é ruído com cara de orientação — e o diretor
     # recebendo lista de óleo para oferecer tira a seriedade da ferramenta.
-    metas = {
-        normalize_whitespace(r["seller_name"])
-        for r in conn.execute(
-            "SELECT DISTINCT seller_name FROM goals_seller WHERE company_id = ? AND competence = ?",
-            (company_id, competencias[0])).fetchall()
-    }
+    #
+    # O critério é a FUNÇÃO, não o `isSeller` do classify_seller. Aquele campo
+    # foi feito para a premiação, onde "sem meta individual" exclui de propósito.
+    # Aqui isso seria o contrário do certo: vendedor sem meta continua vendendo,
+    # e a Zona Norte INTEIRA está sem meta por ser implantação — ninguém de lá
+    # receberia sugestão, justamente quem mais precisa. Desligado sai, porque
+    # sugerir trabalho a quem não está mais na casa não tem para quem ir.
     reais = set()
     for nome in vendedores_da_unidade:
         perfil = classify_seller(conn, company_id, nome, competencias[0],
-                                 tem_meta=nome in metas, unidade=unidade)
-        if perfil.get("isSeller"):
+                                 tem_meta=True, unidade=unidade)
+        if perfil.get("role") == "Vendedor" and not perfil.get("terminated"):
             reais.add(nome)
     vendedores_da_unidade = reais
 

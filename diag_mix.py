@@ -58,9 +58,6 @@ competencias = backend.query_competences(conn, company_id)[:backend.MIX_WINDOW_M
 if competencias:
     mapa = backend.build_seller_unit_map(conn, company_id, competencias[0])
     marc = ",".join("?" for _ in competencias)
-    metas = {backend.normalize_whitespace(r["seller_name"]) for r in conn.execute(
-        "SELECT DISTINCT seller_name FROM goals_seller WHERE company_id = ? AND competence = ?",
-        (company_id, competencias[0])).fetchall()}
     faturaram = {backend.normalize_whitespace(r["seller_name"]) for r in conn.execute(
         f"SELECT DISTINCT seller_name FROM fact_sales_detail "
         f"WHERE company_id = ? AND competence IN ({marc}) AND net_value > 0",
@@ -71,8 +68,11 @@ if competencias:
         if u != d["unitName"] or nome in d["sellers"]:
             continue
         perfil = backend.classify_seller(conn, company_id, nome, competencias[0],
-                                         tem_meta=nome in metas, unidade=d["unitName"])
-        fora.append((nome, perfil.get("reason") or perfil.get("role") or "—"))
+                                         tem_meta=True, unidade=d["unitName"])
+        motivo = ("desligado em " + (perfil.get("terminatedAt") or "?")
+                  if perfil.get("terminated")
+                  else f"função é '{perfil.get('role') or '—'}', não Vendedor")
+        fora.append((nome, motivo))
     if fora:
         print(f"QUEM FATUROU NA UNIDADE E FICOU DE FORA ({len(fora)}):")
         for nome, motivo in fora:
