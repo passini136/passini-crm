@@ -14302,9 +14302,14 @@ def line_repurchase_for_clients(
         # Agrupa a rajada: pedidos do mesmo serviço viram uma ocasião de compra.
         # Cada ocasião guarda INÍCIO e FIM, e os dois são usados para coisas
         # diferentes — misturar os dois fazia a sugestão disparar cedo demais.
+        # A janela conta do INÍCIO da ocasião, nunca do último pedido dela.
+        # Comparando com o último, a rajada encadeia: quem compra a cada quatro
+        # dias por três semanas virava UMA ocasião de vinte dias, e o "vale"
+        # somava três semanas de compra como se fosse um pedido só. O vendedor
+        # ligaria esperando R$ 1.766 onde o pedido típico é R$ 400.
         ocasioes: list[list[Any]] = []   # [inicio, fim, valor]
         for dia, valor in eventos:
-            if ocasioes and (dia - ocasioes[-1][1]).days <= LINE_REPURCHASE_BURST_DAYS:
+            if ocasioes and (dia - ocasioes[-1][0]).days <= LINE_REPURCHASE_BURST_DAYS:
                 ocasioes[-1][1] = dia
                 ocasioes[-1][2] += valor
             else:
