@@ -1522,7 +1522,7 @@ class ConexaoPassini(sqlite3.Connection):
 def limpar_cache_conexao(conn: sqlite3.Connection) -> None:
     """Esvazia os caches de requisição. Para medição, que precisa simular frio."""
     for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas",
-                     "_cache_competencias", "_cache_tipo_pessoa"):
+                     "_cache_competencias", "_cache_tipo_pessoa", "_cache_estoque_linha"):
         if hasattr(conn, atributo):
             delattr(conn, atributo)
 
@@ -14152,6 +14152,169 @@ OFFER_MAX_SUGGESTIONS = 5
 # cliente já comprou — foi exatamente esse erro que fez um item comprado ser
 # anunciado como "nunca pediu".
 OFFER_HISTORY_DISPLAY_LIMIT = 25
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Recompra por LINHA de produto
+#
+# A sugestão por item já existia e é granular demais para conversa: são 57 mil
+# códigos, e o mecânico não pensa em "34048MM", pensa em "óleo". Por linha a
+# frase vira "compra ÓLEO a cada 32 dias, faz 51" — que é um motivo para ligar
+# hoje, não uma informação.
+#
+# Óleo é 18% do faturamento com 514 clientes e filtro alcança 547: são as duas
+# linhas de intervalo mais previsível da casa, porque troca tem quilometragem.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Menos de 3 compras não dá intervalo confiável: com duas datas existe UM
+# intervalo, e um intervalo é coincidência, não padrão.
+LINE_REPURCHASE_MIN_PURCHASES = 3
+# Só vira sugestão depois de passar 25% além do intervalo dele. Sem essa folga,
+# o alerta dispara no dia seguinte ao esperado e o vendedor aprende a ignorar.
+LINE_REPURCHASE_GRACE = 1.25
+# Intervalo acima disso é compra esporádica, não recompra. Cobrar quem compra
+# de seis em seis meses como se estivesse atrasado queima a credibilidade.
+LINE_REPURCHASE_MAX_INTERVAL_DAYS = 120
+LINE_REPURCHASE_HISTORY_MONTHS = 12
+LINE_REPURCHASE_MAX_PER_CLIENT = 3
+
+
+def line_stock_for_unit(
+    conn: sqlite3.Connection, company_id: int, unit_name: str
+) -> dict[str, dict[str, float]]:
+    """Quanto tem de cada LINHA na loja desta unidade.
+
+    Existe para a sugestão não mandar o vendedor atrás de peça que não está na
+    praça dele. Prometer e não entregar custa mais que não sugerir: o cliente
+    liga para o concorrente e volta sabendo que a Passini não tinha.
+
+    O estoque casa com o catálogo pelo código INTERNO (item_code) — caminho
+    diferente do faturamento, que casa por referência do fabricante. Ver
+    CATALOGO_AGRUPADO_SQL para o porquê.
+    """
+    unidade = normalize_unit(unit_name)
+    if not unidade:
+        return {}
+    cache = getattr(conn, "_cache_estoque_linha", None)
+    if cache is None:
+        cache = conn._cache_estoque_linha = {}
+    chave = (company_id, unidade)
+    if chave in cache:
+        return cache[chave]
+    mapa = {
+        normalize_upper(r["linha"]): {
+            "items": int(r["itens"] or 0),
+            "quantity": float(r["qtd"] or 0.0),
+        }
+        for r in conn.execute(
+            """
+            SELECT UPPER(TRIM(ic.item_subgroup)) AS linha,
+                   COUNT(*)            AS itens,
+                   SUM(s.quantity)     AS qtd
+            FROM item_stock s
+            JOIN item_catalog ic
+              ON ic.company_id = s.company_id AND ic.item_code = s.item_code
+            WHERE s.company_id = ? AND s.unit_name = ? AND s.quantity > 0
+              AND TRIM(COALESCE(ic.item_subgroup, '')) <> ''
+            GROUP BY linha
+            """,
+            (company_id, unidade),
+        ).fetchall()
+        if normalize_upper(r["linha"])
+    }
+    cache[chave] = mapa
+    return mapa
+
+
+def line_repurchase_for_clients(
+    conn: sqlite3.Connection, company_id: int, client_names: list[str],
+    unit_name: str = "", hoje: date | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Linhas que cada cliente comprava com regularidade e está atrasado.
+
+    Uma consulta para a PÁGINA inteira, não uma por cliente — o padrão que já
+    derrubou a carteira e a sugestão de oferta neste sistema.
+
+    O intervalo é o de CADA cliente em CADA linha, não uma média da casa: uma
+    oficina que troca óleo a cada 20 dias e outra a cada 60 estão ambas em dia,
+    e uma régua única acusaria a segunda todo mês.
+    """
+    nomes = [n for n in dict.fromkeys(normalize_whitespace(c) for c in client_names) if n]
+    if not nomes:
+        return {}
+    if len(nomes) > 400:
+        junto: dict[str, list[dict[str, Any]]] = {}
+        for inicio in range(0, len(nomes), 400):
+            junto.update(line_repurchase_for_clients(
+                conn, company_id, nomes[inicio:inicio + 400], unit_name, hoje))
+        return junto
+
+    referencia = hoje or today_in_brazil()
+    desde = (referencia - timedelta(days=LINE_REPURCHASE_HISTORY_MONTHS * 31)).isoformat()
+    marcadores = ",".join("?" for _ in nomes)
+    compras: dict[tuple[str, str], list[tuple[date, float]]] = defaultdict(list)
+    for r in conn.execute(
+        f"""
+        {CATALOGO_AGRUPADO_SQL}
+        SELECT f.client_name                AS cliente,
+               UPPER(TRIM(c.item_subgroup)) AS linha,
+               date(f.issue_date)           AS dia,
+               ROUND(SUM(f.net_value), 2)   AS valor
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.client_name IN ({marcadores})
+          AND f.net_value > 0 AND date(f.issue_date) >= date(?)
+          AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
+        GROUP BY cliente, linha, dia
+        ORDER BY dia
+        """,
+        (company_id, company_id, *nomes, desde),
+    ).fetchall():
+        try:
+            dia = date.fromisoformat(r["dia"])
+        except (TypeError, ValueError):
+            continue
+        compras[(r["cliente"], r["linha"])].append((dia, float(r["valor"] or 0)))
+
+    estoque = line_stock_for_unit(conn, company_id, unit_name) if unit_name else {}
+    saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (cliente, linha), eventos in compras.items():
+        if len(eventos) < LINE_REPURCHASE_MIN_PURCHASES:
+            continue
+        datas = [d for d, _v in eventos]
+        intervalos = [(datas[i] - datas[i - 1]).days for i in range(1, len(datas))]
+        intervalos = [i for i in intervalos if i > 0]
+        if not intervalos:
+            continue
+        medio = sum(intervalos) / len(intervalos)
+        if medio > LINE_REPURCHASE_MAX_INTERVAL_DAYS:
+            continue
+        atraso_desde = (referencia - datas[-1]).days
+        if atraso_desde <= medio * LINE_REPURCHASE_GRACE:
+            continue
+        na_loja = estoque.get(linha) if estoque else None
+        saida[cliente].append({
+            "line": linha,
+            "intervalDays": int(round(medio)),
+            "daysSinceLast": atraso_desde,
+            "overdueDays": int(round(atraso_desde - medio)),
+            "lastPurchaseAt": datas[-1].isoformat(),
+            "purchases": len(eventos),
+            "averageValue": round(sum(v for _d, v in eventos) / len(eventos), 2),
+            # None = não sabemos (unidade não informada). 0 = sabemos que não tem.
+            # A tela precisa distinguir: "sem saldo" é motivo para não sugerir;
+            # "não sei" não é.
+            "stockItems": None if na_loja is None else na_loja["items"],
+            "stockQuantity": None if na_loja is None else round(na_loja["quantity"], 0),
+        })
+
+    for cliente in saida:
+        # Maior atraso proporcional primeiro: quem estourou o dobro do intervalo
+        # dele é mais urgente que quem estourou 30% — mesmo que o segundo tenha
+        # mais dias corridos de atraso.
+        saida[cliente].sort(
+            key=lambda x: (-(x["daysSinceLast"] / max(x["intervalDays"], 1)), -x["averageValue"]))
+        del saida[cliente][LINE_REPURCHASE_MAX_PER_CLIENT:]
+    return dict(saida)
 
 
 def prefetch_offer_context(
