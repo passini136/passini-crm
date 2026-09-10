@@ -41,8 +41,10 @@ print(f"Banco: {backend.DB_PATH}")
 print(f"Hoje: {hoje.isoformat()}  ·  unidade: {unidade or '(sem cruzar estoque)'}\n")
 
 print("Régua em uso:")
-print(f"   mínimo de compras..: {backend.LINE_REPURCHASE_MIN_PURCHASES}")
-print(f"   folga sobre o prazo: {backend.LINE_REPURCHASE_GRACE:.2f}x")
+print(f"   rajada.............: compras em até {backend.LINE_REPURCHASE_BURST_DAYS} dias contam como 1 ocasião")
+print(f"   mínimo de ocasiões.: {backend.LINE_REPURCHASE_MIN_OCCASIONS}")
+print(f"   intervalo típico...: mediana · folga de {backend.LINE_REPURCHASE_GRACE:.2f}x")
+print(f"   atraso mínimo......: {backend.LINE_REPURCHASE_MIN_OVERDUE_DAYS} dias")
 print(f"   intervalo máximo...: {backend.LINE_REPURCHASE_MAX_INTERVAL_DAYS} dias")
 print(f"   histórico..........: {backend.LINE_REPURCHASE_HISTORY_MONTHS} meses\n")
 
@@ -61,7 +63,21 @@ sugestoes = backend.line_repurchase_for_clients(conn, company_id, clientes, unid
 seg = time.time() - inicio
 total_sug = sum(len(v) for v in sugestoes.values())
 print(f"1) VOLUME  ·  {len(clientes)} clientes analisados em {seg:.2f}s")
-print(f"   {len(sugestoes)} cliente(s) com alguma linha vencida · {total_sug} sugestão(ões)")
+pct_clientes = 100 * len(sugestoes) / len(clientes) if clientes else 0
+print(f"   {len(sugestoes)} cliente(s) com alguma linha vencida ({pct_clientes:.0f}%)"
+      f" · {total_sug} sugestão(ões)")
+valor = sum(s["averageValue"] for v in sugestoes.values() for s in v)
+print(f"   {backend.brl(valor)} em jogo, somando o valor típico de cada ocasião perdida")
+# Se quase todo cliente é sinalizado, não há sinal: é ruído com cara de alerta,
+# e o vendedor aprende a rolar a tela sem ler.
+if pct_clientes > 60:
+    print(f"\n   >> {pct_clientes:.0f}% dos clientes sinalizados é ALTO DEMAIS para ser útil.")
+    print("      Aperte a régua antes de levar isso para a tela.")
+elif pct_clientes > 35:
+    print(f"\n   >> {pct_clientes:.0f}% é muito, mas defensável se a ordenação por valor")
+    print("      colocar as boas no topo. Confira a seção 3.")
+else:
+    print(f"\n   {pct_clientes:.0f}% dos clientes com alguma linha vencida — dá para trabalhar.")
 if not sugestoes:
     print("\n   Nenhuma sugestão. Régua apertada demais, ou histórico curto.")
     conn.close()
@@ -73,9 +89,9 @@ cont = Counter(s["line"] for v in sugestoes.values() for s in v)
 com_saldo = sem_saldo = sem_saber = 0
 for v in sugestoes.values():
     for s in v:
-        if s["stockItems"] is None:
+        if s["inStock"] is None:
             sem_saber += 1
-        elif s["stockItems"] > 0:
+        elif s["inStock"]:
             com_saldo += 1
         else:
             sem_saldo += 1
@@ -97,12 +113,13 @@ for cliente, itens in sugestoes.items():
     mostrados += 1
     print(f"\n   {cliente}")
     for s in itens:
-        saldo = ("estoque não cruzado" if s["stockItems"] is None
-                 else (f"{int(s['stockQuantity'])} peça(s) em {s['stockItems']} código(s)"
-                       if s["stockItems"] else "SEM SALDO NA LOJA"))
+        saldo = ("estoque não cruzado" if s["inStock"] is None
+                 else (f"tem na loja ({s['stockItems']} código/s)"
+                       if s["inStock"] else "SEM SALDO NA LOJA"))
         print(f"      {s['line'][:24]:<26}compra a cada {s['intervalDays']:>3}d · "
               f"faz {s['daysSinceLast']:>3}d (atraso {s['overdueDays']:>3}d) · "
-              f"{s['purchases']} compras · média {backend.brl(s['averageValue'])}")
+              f"{s['occasions']} ocasiões ({s['purchases']} pedidos) · "
+              f"vale {backend.brl(s['averageValue'])}")
         print(f"      {'':<26}última {s['lastPurchaseAt']} · {saldo}")
         # As datas cruas, para conferir o intervalo na mão
         datas = [r["dia"] for r in conn.execute(

@@ -14165,14 +14165,24 @@ OFFER_HISTORY_DISPLAY_LIMIT = 25
 # linhas de intervalo mais previsível da casa, porque troca tem quilometragem.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Menos de 3 compras não dá intervalo confiável: com duas datas existe UM
-# intervalo, e um intervalo é coincidência, não padrão.
-LINE_REPURCHASE_MIN_PURCHASES = 3
-# Só vira sugestão depois de passar 25% além do intervalo dele. Sem essa folga,
-# o alerta dispara no dia seguinte ao esperado e o vendedor aprende a ignorar.
+# RAJADA. Oficina não compra em ritmo constante: entra um carro, ela pede as
+# peças ao longo de dois ou três dias, e depois para. Medido em 10/09/2026, a
+# primeira régua tratava cada pedido como um ciclo e concluía "compra LÂMPADA a
+# cada 5 dias" a partir de 27/05, 05/06, 06/06 e 11/06 — três pedidos de um
+# mesmo serviço. O resultado: 293 de 300 clientes "atrasados", ou seja, ruído.
+# Compras dentro desta janela contam como UMA ocasião.
+LINE_REPURCHASE_BURST_DAYS = 7
+# Ocasiões, não compras: com duas existe um intervalo, e um intervalo é
+# coincidência. Três ocasiões é o mínimo para falar em padrão.
+LINE_REPURCHASE_MIN_OCCASIONS = 3
+# MEDIANA, não média: uma única compra fora de época distorce a média e não
+# mexe na mediana. O que interessa é o intervalo típico, não o aritmético.
+# Só vira sugestão depois de passar 25% além dele.
 LINE_REPURCHASE_GRACE = 1.25
+# Atraso pequeno não é motivo de ligação, mesmo em linha de giro rápido.
+LINE_REPURCHASE_MIN_OVERDUE_DAYS = 15
 # Intervalo acima disso é compra esporádica, não recompra. Cobrar quem compra
-# de seis em seis meses como se estivesse atrasado queima a credibilidade.
+# de quatro em quatro meses como se estivesse atrasado queima a credibilidade.
 LINE_REPURCHASE_MAX_INTERVAL_DAYS = 120
 LINE_REPURCHASE_HISTORY_MONTHS = 12
 LINE_REPURCHASE_MAX_PER_CLIENT = 3
@@ -14278,41 +14288,52 @@ def line_repurchase_for_clients(
     estoque = line_stock_for_unit(conn, company_id, unit_name) if unit_name else {}
     saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for (cliente, linha), eventos in compras.items():
-        if len(eventos) < LINE_REPURCHASE_MIN_PURCHASES:
+        eventos.sort()
+        # Agrupa a rajada: pedidos do mesmo serviço viram uma ocasião de compra.
+        ocasioes: list[tuple[date, float]] = []
+        for dia, valor in eventos:
+            if ocasioes and (dia - ocasioes[-1][0]).days <= LINE_REPURCHASE_BURST_DAYS:
+                ocasioes[-1] = (ocasioes[-1][0], ocasioes[-1][1] + valor)
+            else:
+                ocasioes.append((dia, valor))
+        if len(ocasioes) < LINE_REPURCHASE_MIN_OCCASIONS:
             continue
-        datas = [d for d, _v in eventos]
-        intervalos = [(datas[i] - datas[i - 1]).days for i in range(1, len(datas))]
-        intervalos = [i for i in intervalos if i > 0]
-        if not intervalos:
-            continue
-        medio = sum(intervalos) / len(intervalos)
-        if medio > LINE_REPURCHASE_MAX_INTERVAL_DAYS:
+        datas = [d for d, _v in ocasioes]
+        intervalos = sorted((datas[i] - datas[i - 1]).days for i in range(1, len(datas)))
+        meio = len(intervalos) // 2
+        tipico = (intervalos[meio] if len(intervalos) % 2
+                  else (intervalos[meio - 1] + intervalos[meio]) / 2)
+        if not tipico or tipico > LINE_REPURCHASE_MAX_INTERVAL_DAYS:
             continue
         atraso_desde = (referencia - datas[-1]).days
-        if atraso_desde <= medio * LINE_REPURCHASE_GRACE:
+        if atraso_desde <= tipico * LINE_REPURCHASE_GRACE:
+            continue
+        if atraso_desde - tipico < LINE_REPURCHASE_MIN_OVERDUE_DAYS:
             continue
         na_loja = estoque.get(linha) if estoque else None
         saida[cliente].append({
             "line": linha,
-            "intervalDays": int(round(medio)),
+            "intervalDays": int(round(tipico)),
             "daysSinceLast": atraso_desde,
-            "overdueDays": int(round(atraso_desde - medio)),
+            "overdueDays": int(round(atraso_desde - tipico)),
             "lastPurchaseAt": datas[-1].isoformat(),
+            "occasions": len(ocasioes),
             "purchases": len(eventos),
-            "averageValue": round(sum(v for _d, v in eventos) / len(eventos), 2),
+            # Valor por OCASIÃO: é o que uma ligação bem-sucedida traz de volta.
+            "averageValue": round(sum(v for _d, v in ocasioes) / len(ocasioes), 2),
             # None = não sabemos (unidade não informada). 0 = sabemos que não tem.
             # A tela precisa distinguir: "sem saldo" é motivo para não sugerir;
             # "não sei" não é.
+            "inStock": None if na_loja is None else na_loja["items"] > 0,
             "stockItems": None if na_loja is None else na_loja["items"],
-            "stockQuantity": None if na_loja is None else round(na_loja["quantity"], 0),
         })
 
     for cliente in saida:
-        # Maior atraso proporcional primeiro: quem estourou o dobro do intervalo
-        # dele é mais urgente que quem estourou 30% — mesmo que o segundo tenha
-        # mais dias corridos de atraso.
-        saida[cliente].sort(
-            key=lambda x: (-(x["daysSinceLast"] / max(x["intervalDays"], 1)), -x["averageValue"]))
+        # Ordena por DINHEIRO. Todas as linhas da lista já estão atrasadas, então
+        # a pergunta que sobra é qual ligação vale mais — não qual está atrasada
+        # há mais tempo. Sem saldo na loja desce para o fim: sugerir o que não
+        # tem é mandar o vendedor prometer o que não pode entregar.
+        saida[cliente].sort(key=lambda x: (x["inStock"] is False, -x["averageValue"]))
         del saida[cliente][LINE_REPURCHASE_MAX_PER_CLIENT:]
     return dict(saida)
 
