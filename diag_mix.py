@@ -48,7 +48,36 @@ print(f"Unidade: {d['unitName']}  ·  janela: {', '.join(d['window'])}  ·  {seg
 print("Régua:")
 print(f"   mínimo de clientes distintos: {backend.MIX_MIN_CLIENTS}")
 print("   ticket: preço unitário do item ABAIXO da média da linha dele")
+print("   descarta: referência sem 3 caracteres úteis, e item sem linha no catálogo")
+print("   só vendedor de verdade (classify_seller)")
 print(f"   top por vendedor: {backend.MIX_TOP_PER_SELLER}\n")
+
+# Quem faturou na unidade mas NÃO entrou na lista, e por quê. Sem isto, um
+# vendedor real descartado por engano some sem deixar rastro.
+competencias = backend.query_competences(conn, company_id)[:backend.MIX_WINDOW_MONTHS]
+if competencias:
+    mapa = backend.build_seller_unit_map(conn, company_id, competencias[0])
+    marc = ",".join("?" for _ in competencias)
+    metas = {backend.normalize_whitespace(r["seller_name"]) for r in conn.execute(
+        "SELECT DISTINCT seller_name FROM goals_seller WHERE company_id = ? AND competence = ?",
+        (company_id, competencias[0])).fetchall()}
+    faturaram = {backend.normalize_whitespace(r["seller_name"]) for r in conn.execute(
+        f"SELECT DISTINCT seller_name FROM fact_sales_detail "
+        f"WHERE company_id = ? AND competence IN ({marc}) AND net_value > 0",
+        (company_id, *competencias)).fetchall()}
+    fora = []
+    for nome in sorted(faturaram):
+        u = (mapa.get(backend.person_key(nome)) or mapa.get(backend.short_person_key(nome)) or "")
+        if u != d["unitName"] or nome in d["sellers"]:
+            continue
+        perfil = backend.classify_seller(conn, company_id, nome, competencias[0],
+                                         tem_meta=nome in metas, unidade=d["unitName"])
+        fora.append((nome, perfil.get("reason") or perfil.get("role") or "—"))
+    if fora:
+        print(f"QUEM FATUROU NA UNIDADE E FICOU DE FORA ({len(fora)}):")
+        for nome, motivo in fora:
+            print(f"   {nome[:38]:<40}{motivo}")
+        print("   Confira: se algum destes é vendedor de verdade, o cadastro está errado.\n")
 
 if not d["items"]:
     print("Nenhum item elegível. Confira se a unidade tem vendedores mapeados.")

@@ -14386,6 +14386,18 @@ MIX_MIN_CLIENTS = 3          # item que só um cliente compra não é padrão da
 MIX_TOP_PER_SELLER = 10
 
 
+def mix_referencia_utilizavel(ref: str) -> bool:
+    """Descarta referência que não identifica peça nenhuma.
+
+    O faturamento traz "." como código em venda avulsa — e ele lidera o ranking
+    com 188 clientes, porque TODO mundo "compra ponto". Mandar o vendedor
+    oferecer "." destrói a confiança na lista inteira: basta um item absurdo no
+    topo para o resto virar suspeito.
+    """
+    limpo = re.sub(r"[^0-9A-Za-z]", "", ref or "")
+    return len(limpo) >= 3
+
+
 def unit_item_stock_refs(conn: sqlite3.Connection, company_id: int, unit_name: str) -> set[str]:
     """Referências (chave do faturamento) com saldo nesta unidade.
 
@@ -14469,7 +14481,12 @@ def mix_opportunities(
     for r in linhas:
         vendedor = normalize_whitespace(r["vendedor"])
         ref = r["ref"]
-        if not ref:
+        if not ref or not mix_referencia_utilizavel(ref):
+            continue
+        # Item sem linha no catálogo fica de fora: a régua de ticket compara com
+        # a média da LINHA, e sem linha ele cairia num balaio "SEM LINHA" onde
+        # rebite concorre com óleo. Comparação sem sentido aprova item errado.
+        if not (r["linha"] or "").strip():
             continue
         na_unidade = unidade_do(vendedor) == unidade
         if na_unidade:
@@ -14477,7 +14494,7 @@ def mix_opportunities(
             vendidos_por_vendedor[vendedor].add(ref)
         alvo = da_unidade if na_unidade else de_fora
         item = alvo.setdefault(ref, {
-            "ref": ref, "brand": r["marca"], "line": r["linha"] or "SEM LINHA",
+            "ref": ref, "brand": r["marca"], "line": r["linha"],
             "quantity": 0.0, "revenue": 0.0, "clients": 0, "sellers": set(),
         })
         item["quantity"] += float(r["qtd"] or 0)
@@ -14517,11 +14534,31 @@ def mix_opportunities(
             "inStock": item["ref"] in com_saldo if com_saldo else None,
         }
 
-    # Ranking por FREQUÊNCIA antes de quantidade: peça que muitas oficinas
-    # diferentes compram é fácil de oferecer; peça que uma só compra em volume
-    # é contrato, não isca.
+    # Ranking: sem saldo desce, depois FREQUÊNCIA e só então quantidade. Peça
+    # que muitas oficinas diferentes compram é fácil de oferecer; peça que uma
+    # só compra em volume é contrato, não isca. E oferecer o que não tem na
+    # loja é mandar o vendedor prometer o que não pode entregar.
     pool = sorted((i for i in da_unidade.values() if elegivel(i)),
-                  key=lambda i: (-i["clients"], -i["quantity"]))
+                  key=lambda i: (i["ref"] not in com_saldo if com_saldo else False,
+                                 -i["clients"], -i["quantity"]))
+
+    # ── Só quem é vendedor de verdade ────────────────────────────────────────
+    # Sai nota no nome de gerente, de diretor e de conferente. Sugerir a eles o
+    # que "deixaram de vender" é ruído com cara de orientação — e o diretor
+    # recebendo lista de óleo para oferecer tira a seriedade da ferramenta.
+    metas = {
+        normalize_whitespace(r["seller_name"])
+        for r in conn.execute(
+            "SELECT DISTINCT seller_name FROM goals_seller WHERE company_id = ? AND competence = ?",
+            (company_id, competencias[0])).fetchall()
+    }
+    reais = set()
+    for nome in vendedores_da_unidade:
+        perfil = classify_seller(conn, company_id, nome, competencias[0],
+                                 tem_meta=nome in metas, unidade=unidade)
+        if perfil.get("isSeller"):
+            reais.add(nome)
+    vendedores_da_unidade = reais
 
     # ── Por vendedor: o que a unidade vende e ele não ────────────────────────
     ja_vendeu_algum_dia: dict[str, set[str]] = defaultdict(set)
