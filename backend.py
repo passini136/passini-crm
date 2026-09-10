@@ -14373,6 +14373,57 @@ def line_repurchase_for_clients(
     return dict(saida)
 
 
+def line_repurchase_opportunities(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    filters: dict[str, str | None], limit: int = 40,
+) -> dict[str, Any]:
+    """As maiores recompras vencidas do escopo, para cobrança e roteiro.
+
+    Só a MELHOR linha de cada cliente entra: a lista serve para escolher quem
+    procurar, e três linhas do mesmo cliente empurrariam outros clientes para
+    fora da tela sem acrescentar decisão.
+    """
+    linhas = crm_client_rows_for_scope(conn, company_id, filters)
+    unidade = normalize_unit(filters.get("unit_name"))
+    # Só cliente com carteira definida: sugerir para cliente sem dono é criar
+    # tarefa que ninguém assume.
+    nomes = [r["clientName"] for r in linhas if r.get("clientName")]
+    por_cliente = line_repurchase_for_clients(conn, company_id, nomes, unidade)
+    dono = {r["clientName"]: r for r in linhas}
+
+    itens: list[dict[str, Any]] = []
+    for cliente, sugestoes in por_cliente.items():
+        if not sugestoes:
+            continue
+        melhor = sugestoes[0]
+        ficha = dono.get(cliente) or {}
+        itens.append({
+            **melhor,
+            "clientKey": ficha.get("clientKey"),
+            "clientName": cliente,
+            "cityName": ficha.get("cityName"),
+            "unitName": ficha.get("unitName"),
+            "assignedSeller": ficha.get("assignedSeller") or "Sem vendedor",
+            "statusCode": ficha.get("statusCode"),
+            "otherLines": len(sugestoes) - 1,
+        })
+    itens.sort(key=lambda x: -x["score"])
+    total = sum(i["averageValue"] for i in itens)
+    por_vendedor: dict[str, dict[str, Any]] = {}
+    for i in itens:
+        alvo = por_vendedor.setdefault(
+            i["assignedSeller"], {"sellerName": i["assignedSeller"], "clients": 0, "value": 0.0})
+        alvo["clients"] += 1
+        alvo["value"] = round(alvo["value"] + i["averageValue"], 2)
+    return {
+        "rows": itens[:limit],
+        "totalClients": len(itens),
+        "totalValue": round(total, 2),
+        "bySeller": sorted(por_vendedor.values(), key=lambda x: -x["value"]),
+        "unitName": unidade,
+    }
+
+
 def prefetch_offer_context(
     conn: sqlite3.Connection, company_id: int, client_names: list[str], latest: str
 ) -> dict[str, Any]:
@@ -14698,6 +14749,15 @@ def crm_attach_context(
     enriched: list[dict[str, Any]] = []
     # Carrega a biblioteca uma vez só quando os scripts forem necessários
     library = list_content_library(conn, company_id) if with_scripts else []
+    # Recompra por linha da página inteira, numa consulta. O saldo é resolvido
+    # depois, pela unidade de CADA cliente: uma página do diretor mistura
+    # unidades, e o saldo de Xangri-lá não vale para o cliente de Pelotas.
+    recompra = line_repurchase_for_clients(
+        conn, company_id, [s["clientName"] for s in summaries])
+    for linhas_cliente in recompra.values():
+        for item in linhas_cliente:
+            item["inStock"] = None
+            item["stockItems"] = None
     # Histórico de itens da página inteira, de uma vez. Antes eram três consultas
     # por cliente — 150 para montar 50 linhas.
     latest = crm_latest_competence(conn, company_id)
@@ -14718,6 +14778,16 @@ def crm_attach_context(
         summary["questionSecondary"] = questions["secondary"]
         summary["situationCode"] = crm_situation_for_client(summary)
         summary["nextAction"] = crm_next_action(summary)
+        # Recompra por linha, com o saldo da unidade DESTE cliente.
+        sugestoes_linha = [dict(x) for x in recompra.get(summary["clientName"], [])]
+        estoque_unidade = line_stock_for_unit(conn, company_id, summary.get("unitName") or "")
+        for item in sugestoes_linha:
+            na_loja = estoque_unidade.get(item["line"]) if estoque_unidade else None
+            item["inStock"] = None if na_loja is None else na_loja["items"] > 0
+            item["stockItems"] = None if na_loja is None else na_loja["items"]
+        sugestoes_linha.sort(key=lambda x: (x["inStock"] is False, -x["score"]))
+        summary["lineRepurchase"] = sugestoes_linha
+        summary["topLineRepurchase"] = sugestoes_linha[0] if sugestoes_linha else None
         if with_scripts:
             ctx = content_context_for_client(summary, seller_name)
             situation = summary["situationCode"]
@@ -22403,6 +22473,18 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado}))
+                return
+            if path == "/api/crm/line-opportunities":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    filtros = crm_scoped_filters_for_user(
+                        conn, user["company_id"], user, build_filters_from_query(query))
+                    res = line_repurchase_opportunities(conn, user["company_id"], user, filtros)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
                 return
             if path == "/api/sellers/ticket-timeline":
                 user = self._require_auth()

@@ -7230,6 +7230,7 @@ function crmAgendaView() {
 
       <!-- Risco na carteira: onde a gestão precisa agir -->
       ${managerRiskBlocks()}
+      ${oportunidadesRecompraBloco()}
 
       <!-- Tarefas -->
       <div class="grid-2 crm-grid">
@@ -7322,6 +7323,93 @@ function averageBreakdown(item) {
         Base: faturamento total do cliente nos 3 meses anteriores a ${escapeHtml(competenceShort(basis.currentCompetence))},
         somando todos os vendedores.
       </div>
+    </div>`;
+}
+
+/* ─── Oportunidades de recompra da unidade (visão do gerente) ────────────────
+ *
+ * Carregada por clique, não junto da tela. O cálculo varre um ano de compras de
+ * toda a carteira; pendurar isso na abertura da Missão do Dia faria o vendedor
+ * pagar por um relatório que é do gerente.
+ */
+async function loadLineOpportunities() {
+  state.crm.lineOpportunities = { loading: true, rows: [] };
+  requestRender();
+  try {
+    state.crm.lineOpportunities = {
+      ...(await api(`/api/crm/line-opportunities?${buildQuery()}`)), loading: false };
+  } catch (e) {
+    state.crm.lineOpportunities = { error: e.message, loading: false, rows: [] };
+  }
+  requestRender();
+}
+
+function oportunidadesRecompraBloco() {
+  const d = state.crm.lineOpportunities;
+  if (!d) {
+    return `
+      <div class="panel padded-card">
+        <div class="section-title">
+          <div><h3>🔁 Recompra vencida da unidade</h3>
+            <div class="text-small">Clientes que compravam uma linha com regularidade e pararam.</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="loadLineOpportunities()">Calcular</button>
+        </div>
+      </div>`;
+  }
+  if (d.loading) return '<div class="loader panel">Calculando a recompra da carteira…</div>';
+  if (d.error) return `<div class="panel padded-card"><div class="message error">${escapeHtml(d.error)}</div></div>`;
+  const linhas = d.rows || [];
+  return `
+    <div class="panel padded-card">
+      <div class="section-title">
+        <div><h3>🔁 Recompra vencida da unidade</h3>
+          <div class="text-small">
+            ${d.totalClients} cliente(s) · ${currency(d.totalValue)} somando o pedido típico de cada um
+          </div></div>
+        <button class="btn btn-ghost btn-sm" onclick="loadLineOpportunities()">Recalcular</button>
+      </div>
+
+      ${(d.bySeller || []).length ? `
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0">
+          ${d.bySeller.slice(0, 8).map((s) => `
+            <span class="soft-badge" style="font-size:11px">
+              ${escapeHtml(s.sellerName)}: ${s.clients} · ${currency(s.value)}
+            </span>`).join("")}
+        </div>` : ""}
+
+      ${linhas.length ? `
+        <div class="table-wrap" style="margin-top:8px">
+          <table>
+            <thead><tr>
+              <th>Cliente</th><th>Vendedor</th><th>Linha</th>
+              <th style="text-align:right">Pedido típico</th>
+              <th style="text-align:right">A cada</th>
+              <th style="text-align:right">Parado há</th>
+              <th>Loja</th><th></th>
+            </tr></thead>
+            <tbody>
+              ${linhas.map((r) => `
+                <tr>
+                  <td><strong>${escapeHtml(r.clientName)}</strong>
+                    <div class="text-small">${escapeHtml(r.cityName || "—")}</div></td>
+                  <td class="text-small">${escapeHtml(r.assignedSeller)}</td>
+                  <td>${escapeHtml(r.line)}
+                    ${r.otherLines ? `<div class="text-small">+${r.otherLines} outra(s)</div>` : ""}</td>
+                  <td style="text-align:right;font-weight:700">${currency(r.averageValue)}</td>
+                  <td style="text-align:right">${r.intervalDays}d</td>
+                  <td style="text-align:right;color:var(--bad);font-weight:700">${r.daysSinceLast}d</td>
+                  <td class="text-small" style="color:${r.inStock === false ? "var(--bad)" : "var(--good)"}">
+                    ${r.inStock === false ? "sem saldo" : (r.inStock ? "tem" : "—")}</td>
+                  <td><button class="btn btn-ghost btn-sm"
+                        onclick="openCrmClient('${jsAttr(r.clientKey)}', false)">Ficha</button></td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Ordenado por oportunidade — valor do pedido pesado pelo tempo parado. Só a
+          linha mais forte de cada cliente aparece, para a lista servir de roteiro.
+        </div>` : '<div class="message" style="margin-top:10px">Nenhuma recompra vencida no escopo.</div>'}
     </div>`;
 }
 
@@ -7450,6 +7538,7 @@ function clientActionPanel(client) {
   }
 
   const offers = [...repurchase.slice(0, 3), ...opportunity.slice(0, 2)];
+  const linhas = client.lineRepurchase || [];
 
   return `
     <div class="subtle-card padded-card">
@@ -7457,6 +7546,32 @@ function clientActionPanel(client) {
         <div><h3>O que fazer agora</h3>
         <div class="text-small">Ação sugerida com base no histórico deste cliente.</div></div>
       </div>
+
+      ${linhas.length ? `
+        <div style="border:1px solid #2e7d32;border-radius:8px;padding:10px 12px;margin-bottom:12px;background:#f1f8f2">
+          <div style="font-size:10px;font-weight:800;color:#2e7d32;letter-spacing:0.08em;margin-bottom:6px">
+            🔁 LINHA VENCIDA — ele comprava e parou
+          </div>
+          ${linhas.map((l) => `
+            <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;
+                        padding:6px 0;border-top:1px solid rgba(46,125,50,0.15)">
+              <div style="min-width:0">
+                <strong style="font-size:13px">${escapeHtml(l.line)}</strong>
+                <div class="text-small" style="color:var(--muted)">
+                  comprava a cada ${l.intervalDays} dias · faz ${l.daysSinceLast}
+                  · última em ${dataBr(l.lastPurchaseAt)}
+                  · ${l.occasions} compras no período
+                </div>
+              </div>
+              <div style="text-align:right;white-space:nowrap">
+                <strong style="font-size:13px">${currency(l.averageValue)}</strong>
+                <div class="text-small" style="color:${l.inStock === false ? "#c0392b" : "var(--muted)"}">
+                  ${l.inStock === false ? "sem saldo na loja"
+                    : (l.inStock ? "tem na loja" : "pedido típico")}
+                </div>
+              </div>
+            </div>`).join("")}
+        </div>` : ""}
 
       <div style="background:#0f3044;color:#fff;border-radius:8px;padding:12px 14px;margin-bottom:12px">
         <div style="font-size:10px;font-weight:800;color:#f4c25f;letter-spacing:0.08em;margin-bottom:4px">PRÓXIMA AÇÃO</div>
@@ -11674,6 +11789,29 @@ function itemPurchaseLine(item) {
     </div>`;
 }
 
+/**
+ * A linha vencida, em UMA frase, no card do vendedor.
+ *
+ * Só a melhor das três. O card é lido de relance, no meio de outros quatro, e
+ * três sugestões viram parágrafo — parágrafo não se lê às pressas. As outras
+ * ficam na ficha, onde ele já parou para trabalhar o cliente.
+ */
+function linhaVencidaLinha(item) {
+  const l = item.topLineRepurchase;
+  if (!l) return "";
+  const semSaldo = l.inStock === false;
+  const saldo = semSaldo ? " · sem saldo" : (l.inStock ? " · tem na loja" : "");
+  return `
+    <div title="Comprava a cada ${l.intervalDays} dias · ${l.occasions} compras no período · última em ${dataBr(l.lastPurchaseAt)}"
+         style="display:flex;justify-content:space-between;gap:8px;align-items:center;
+                background:${semSaldo ? "#fdf2f2" : "#f1f8f2"};
+                border-left:3px solid ${semSaldo ? "#c0392b" : "#2e7d32"};
+                border-radius:4px;padding:5px 8px;margin-bottom:8px;font-size:12px">
+      <span><strong>${escapeHtml(l.line)}</strong> vencido há ${l.overdueDays}d${saldo}</span>
+      <strong style="white-space:nowrap">${currency(l.averageValue)}</strong>
+    </div>`;
+}
+
 function sellerClientCard(item) {
   const classBadge = { DIAMANTE: "💎", OURO: "🥇", PRATA: "🥈", BRONZE: "🥉" }[item.classCode] || "⚪";
   const hasPurchase = Number(item.currentRevenue || 0) > 0;
@@ -11688,6 +11826,7 @@ function sellerClientCard(item) {
       </div>
       ${revenueTrendLine(item)}
       ${itemPurchaseLine(item)}
+      ${linhaVencidaLinha(item)}
       <div style="display:flex;gap:8px;font-size:12px;color:var(--muted);margin-bottom:10px">
         <span>📞 ${escapeHtml(item.phone || "Sem tel.")}</span>
         <span style="color:${hasPurchase ? "var(--good)" : "#e67e22"}">${hasPurchase ? "✅ Comprou" : "○ Sem compra"}</span>
