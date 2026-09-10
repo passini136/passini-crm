@@ -12576,22 +12576,44 @@ BRAND_DIMENSION_IDS = {d["id"] for d in BRAND_DIMENSIONS}
 #
 # NULLIF(TRIM(...),'') no MIN: entre um item com linha preenchida e outro sem,
 # fica o preenchido — MIN ignora nulo, e vazio venceria a ordenação.
-CATALOGO_AGRUPADO_SQL = """
-        WITH catalogo AS (
-            SELECT UPPER(TRIM(manufacturer_ref))            AS ref,
-                   UPPER(TRIM(COALESCE(brand_name, '')))    AS marca,
-                   MIN(NULLIF(TRIM(item_subgroup), ''))     AS item_subgroup,
-                   MIN(NULLIF(TRIM(item_group), ''))        AS item_group
-            FROM item_catalog
-            WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref, '')) <> ''
-            GROUP BY ref, marca
-        )
-"""
+# O agrupamento virou TABELA TEMPORÁRIA, montada uma vez por conexão.
+#
+# Como CTE, ele reagrupava os 57 mil itens do catálogo a CADA consulta. Passava
+# despercebido numa chamada só; na lista do gerente, que quebra a carteira em
+# lotes de 400 clientes, virava 252 reagrupamentos — e a lista da diretoria
+# levou 94,8s. É o mesmo padrão de "recalcula tudo para usar um pedaço" que já
+# apareceu na carteira, na sugestão de oferta e no tipo de pessoa.
+#
+# Escopo de requisição, como os outros caches de conexão: a importação abre
+# outra conexão, então não há risco de servir catálogo velho.
+CATALOGO_AGRUPADO_SQL = ""   # mantido vazio: quem chama usa ensure_catalogo_temp
 CATALOGO_JOIN_SQL = """
-            LEFT JOIN catalogo c
+            LEFT JOIN catalogo_linha c
               ON c.ref = UPPER(TRIM(f.sku_key))
              AND c.marca = UPPER(TRIM(COALESCE(f.brand_name, '')))
 """
+
+
+def ensure_catalogo_temp(conn: sqlite3.Connection, company_id: int) -> None:
+    """Monta catalogo_linha na conexão, se ainda não existir."""
+    if getattr(conn, "_catalogo_temp", None) == company_id:
+        return
+    conn.execute("DROP TABLE IF EXISTS temp.catalogo_linha")
+    conn.execute(
+        """
+        CREATE TEMP TABLE catalogo_linha AS
+        SELECT UPPER(TRIM(manufacturer_ref))            AS ref,
+               UPPER(TRIM(COALESCE(brand_name, '')))    AS marca,
+               MIN(NULLIF(TRIM(item_subgroup), ''))     AS item_subgroup,
+               MIN(NULLIF(TRIM(item_group), ''))        AS item_group
+        FROM item_catalog
+        WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref, '')) <> ''
+        GROUP BY ref, marca
+        """,
+        (company_id,),
+    )
+    conn.execute("CREATE INDEX temp.idx_catalogo_linha ON catalogo_linha(ref, marca)")
+    conn._catalogo_temp = company_id
 
 _DIMENSION_EXPR = {
     "marca": "f.brand_name",
@@ -12605,10 +12627,11 @@ def brand_ranking_rows(
     vendedores: list[str] | None = None, dimensao: str = "marca",
 ) -> dict[str, dict[str, Any]]:
     """Ranking cru de uma competência, indexado pela dimensão escolhida."""
+    ensure_catalogo_temp(conn, company_id)
     coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
     onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
     # O company_id do catálogo agrupado vem PRIMEIRO: a CTE é lida antes do resto.
-    params: list[Any] = [company_id, company_id, competence]
+    params: list[Any] = [company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
@@ -12653,9 +12676,10 @@ def brand_seller_breakdown(
     vendedor continuam exatos: o DISTINCT é calculado dentro de cada par
     (marca, vendedor), que é justamente o recorte exibido.
     """
+    ensure_catalogo_temp(conn, company_id)
     coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
     onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
-    params: list[Any] = [company_id, company_id, competence]
+    params: list[Any] = [company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
@@ -14270,6 +14294,7 @@ def line_repurchase_for_clients(
                 conn, company_id, nomes[inicio:inicio + 400], unit_name, hoje))
         return junto
 
+    ensure_catalogo_temp(conn, company_id)
     referencia = hoje or today_in_brazil()
     desde = (referencia - timedelta(days=LINE_REPURCHASE_HISTORY_MONTHS * 31)).isoformat()
     marcadores = ",".join("?" for _ in nomes)
@@ -14289,7 +14314,7 @@ def line_repurchase_for_clients(
         GROUP BY cliente, linha, dia
         ORDER BY dia
         """,
-        (company_id, company_id, *nomes, desde),
+        (company_id, *nomes, desde),
     ).fetchall():
         try:
             dia = date.fromisoformat(r["dia"])
@@ -14465,6 +14490,7 @@ def sales_debut_novelties(
     item ausente por esse tempo e que agora vende é novidade na prática, mesmo
     que o cadastro seja antigo.
     """
+    ensure_catalogo_temp(conn, company_id)
     corte = (today_in_brazil() - timedelta(days=days)).isoformat()
     unidade = normalize_unit(unit_name)
 
@@ -14486,7 +14512,7 @@ def sales_debut_novelties(
         GROUP BY ref, marca
         HAVING estreia >= ?
         """,
-        (company_id, company_id, corte),
+        (company_id, corte),
     ).fetchall()
 
     com_saldo = unit_item_stock_refs(conn, company_id, unidade) if unidade else set()
@@ -14543,7 +14569,7 @@ def sales_debut_novelties(
                 HAVING estreia >= ?
                 ORDER BY valor DESC
                 """,
-                (company_id, company_id, corte)).fetchall()
+                (company_id, corte)).fetchall()
         ]
 
     return {
@@ -14606,6 +14632,7 @@ def mix_opportunities(
     Três recortes do MESMO cálculo — construir separado daria três respostas
     que discordam entre si na primeira divergência de régua.
     """
+    ensure_catalogo_temp(conn, company_id)
     unidade = normalize_unit(unit_name)
     competencias = query_competences(conn, company_id)[:months]
     if not competencias or not unidade:
@@ -14634,7 +14661,7 @@ def mix_opportunities(
           AND f.net_value > 0 AND TRIM(COALESCE(f.sku_key, '')) <> ''
         GROUP BY vendedor, ref, marca, linha
         """,
-        (company_id, company_id, *competencias),
+        (company_id, *competencias),
     ).fetchall()
 
     # Consolida por item: da unidade, do resto da empresa, e por vendedor.
@@ -14852,9 +14879,24 @@ def line_repurchase_opportunities(
     """
     linhas = crm_client_rows_for_scope(conn, company_id, filters)
     unidade = normalize_unit(filters.get("unit_name"))
-    # Só cliente com carteira definida: sugerir para cliente sem dono é criar
-    # tarefa que ninguém assume.
-    nomes = [r["clientName"] for r in linhas if r.get("clientName")]
+    # Só quem comprou no último ano entra na conta.
+    #
+    # Sem este corte, a diretoria mandava 100.963 nomes para o cálculo — em
+    # lotes de 400, são 252 consultas — e a lista levava 94,8s para devolver
+    # 1.436 clientes. Quem não compra há mais de um ano não tem "linha
+    # atrasada": ele está inativo, e disso já cuida o alerta de inatividade.
+    # Recompra é sobre quem ainda é cliente e parou UMA linha.
+    limite = (today_in_brazil() - timedelta(days=365)).isoformat()
+    ativos = {
+        normalize_client_key(r["client_name"])
+        for r in conn.execute(
+            "SELECT DISTINCT client_name FROM fact_sales_detail "
+            "WHERE company_id = ? AND net_value > 0 AND date(issue_date) >= date(?)",
+            (company_id, limite)).fetchall()
+        if r["client_name"]
+    }
+    nomes = [r["clientName"] for r in linhas
+             if r.get("clientName") and normalize_client_key(r["clientName"]) in ativos]
     por_cliente = line_repurchase_for_clients(conn, company_id, nomes, unidade)
     dono = {r["clientName"]: r for r in linhas}
 
