@@ -66,18 +66,36 @@ print(f"1) VOLUME  ·  {len(clientes)} clientes analisados em {seg:.2f}s")
 pct_clientes = 100 * len(sugestoes) / len(clientes) if clientes else 0
 print(f"   {len(sugestoes)} cliente(s) com alguma linha vencida ({pct_clientes:.0f}%)"
       f" · {total_sug} sugestão(ões)")
+print("   Esse percentual alto é ESPERADO e não é o que decide se serve: cliente")
+print("   ativo compra quinze linhas, sempre uma escapa. O vendedor vê 5 clientes")
+print("   por dia, não 300 — o que importa é a força da MELHOR sugestão de cada um.")
+
+# ── A melhor sugestão de cada cliente ────────────────────────────────────────
+melhores = sorted((v[0] for v in sugestoes.values() if v), key=lambda x: -x["score"])
+if melhores:
+    def corte(p):
+        return melhores[min(int(p * len(melhores)), len(melhores) - 1)]
+    print(f"\n   FORÇA DA MELHOR SUGESTÃO POR CLIENTE ({len(melhores)} clientes)")
+    print(f"      top 10%....: score {corte(0.10)['score']:>9.0f} · "
+          f"vale {backend.brl(corte(0.10)['averageValue'])}")
+    print(f"      mediana....: score {corte(0.50)['score']:>9.0f} · "
+          f"vale {backend.brl(corte(0.50)['averageValue'])}")
+    print(f"      pior 10%...: score {corte(0.90)['score']:>9.0f} · "
+          f"vale {backend.brl(corte(0.90)['averageValue'])}")
+    acima_100 = sum(1 for m in melhores if m["averageValue"] >= 100)
+    print(f"\n      {acima_100} de {len(melhores)} clientes ({100 * acima_100 / len(melhores):.0f}%)"
+          f" têm a melhor linha valendo R$ 100 ou mais.")
+    print("      Essas são as que merecem virar frase na tela do vendedor.")
+
+    print("\n   AS 10 MAIORES OPORTUNIDADES (é isto que o gerente deve ver)")
+    print(f"      {'CLIENTE':<34}{'LINHA':<16}{'VALE':>12}{'A CADA':>8}{'FAZ':>7}")
+    porcliente = {c: v[0] for c, v in sugestoes.items() if v}
+    for cliente, s in sorted(porcliente.items(), key=lambda kv: -kv[1]["score"])[:10]:
+        print(f"      {cliente[:33]:<34}{s['line'][:15]:<16}"
+              f"{backend.brl(s['averageValue']):>12}{s['intervalDays']:>7}d{s['daysSinceLast']:>6}d")
+
 valor = sum(s["averageValue"] for v in sugestoes.values() for s in v)
-print(f"   {backend.brl(valor)} em jogo, somando o valor típico de cada ocasião perdida")
-# Se quase todo cliente é sinalizado, não há sinal: é ruído com cara de alerta,
-# e o vendedor aprende a rolar a tela sem ler.
-if pct_clientes > 60:
-    print(f"\n   >> {pct_clientes:.0f}% dos clientes sinalizados é ALTO DEMAIS para ser útil.")
-    print("      Aperte a régua antes de levar isso para a tela.")
-elif pct_clientes > 35:
-    print(f"\n   >> {pct_clientes:.0f}% é muito, mas defensável se a ordenação por valor")
-    print("      colocar as boas no topo. Confira a seção 3.")
-else:
-    print(f"\n   {pct_clientes:.0f}% dos clientes com alguma linha vencida — dá para trabalhar.")
+print(f"\n   {backend.brl(valor)} em jogo, somando o valor típico de cada ocasião perdida")
 if not sugestoes:
     print("\n   Nenhuma sugestão. Régua apertada demais, ou histórico curto.")
     conn.close()

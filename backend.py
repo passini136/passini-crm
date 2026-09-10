@@ -14175,9 +14175,19 @@ LINE_REPURCHASE_BURST_DAYS = 7
 # Ocasiões, não compras: com duas existe um intervalo, e um intervalo é
 # coincidência. Três ocasiões é o mínimo para falar em padrão.
 LINE_REPURCHASE_MIN_OCCASIONS = 3
-# MEDIANA, não média: uma única compra fora de época distorce a média e não
-# mexe na mediana. O que interessa é o intervalo típico, não o aritmético.
-# Só vira sugestão depois de passar 25% além dele.
+# PERCENTIL 70 dos intervalos, não média nem mediana.
+#
+# A mediana ainda subestima cliente irregular. Caso real (GIACOMO, BALANCA):
+# intervalos de 43, 15, 125, 9 e 13 dias — mediana 15, como se comprasse a cada
+# duas semanas, quando na verdade alterna rajada e sumiço. Com 15 dias de régua,
+# ele vira "atrasado" 35 dias depois de comprar, o que não é verdade.
+#
+# O percentil 70 responde outra pergunta, que é a certa: qual prazo cobre a
+# maioria das vezes em que ele voltou? Erra para o lado conservador — avisa
+# mais tarde e com mais razão. Alerta cedo demais o vendedor aprende a ignorar;
+# alerta tarde ainda dá tempo de ligar.
+LINE_REPURCHASE_PERCENTILE = 0.70
+# Só vira sugestão depois de passar 25% além do prazo dele.
 LINE_REPURCHASE_GRACE = 1.25
 # Atraso pequeno não é motivo de ligação, mesmo em linha de giro rápido.
 LINE_REPURCHASE_MIN_OVERDUE_DAYS = 15
@@ -14300,9 +14310,8 @@ def line_repurchase_for_clients(
             continue
         datas = [d for d, _v in ocasioes]
         intervalos = sorted((datas[i] - datas[i - 1]).days for i in range(1, len(datas)))
-        meio = len(intervalos) // 2
-        tipico = (intervalos[meio] if len(intervalos) % 2
-                  else (intervalos[meio - 1] + intervalos[meio]) / 2)
+        posicao = int(round(LINE_REPURCHASE_PERCENTILE * (len(intervalos) - 1)))
+        tipico = intervalos[posicao]
         if not tipico or tipico > LINE_REPURCHASE_MAX_INTERVAL_DAYS:
             continue
         atraso_desde = (referencia - datas[-1]).days
@@ -14311,6 +14320,18 @@ def line_repurchase_for_clients(
         if atraso_desde - tipico < LINE_REPURCHASE_MIN_OVERDUE_DAYS:
             continue
         na_loja = estoque.get(linha) if estoque else None
+        valor_ocasiao = sum(v for _d, v in ocasioes) / len(ocasioes)
+        # SCORE: dinheiro em jogo pesado pela urgência, com teto.
+        #
+        # Serve para a tela mostrar as boas em vez de todas. Quase todo cliente
+        # ativo tem ALGUMA linha vencida — compra quinze linhas, sempre uma
+        # escapa —, então filtrar por "tem atraso" não separa nada. O que separa
+        # é quanto vale e há quanto tempo sumiu.
+        #
+        # O teto de 3x existe porque, passado o triplo do prazo, mais atraso não
+        # aumenta a urgência: o cliente já está comprando em outro lugar, e o
+        # que decide a ligação volta a ser o valor.
+        urgencia = min(atraso_desde / tipico, 3.0)
         saida[cliente].append({
             "line": linha,
             "intervalDays": int(round(tipico)),
@@ -14320,20 +14341,19 @@ def line_repurchase_for_clients(
             "occasions": len(ocasioes),
             "purchases": len(eventos),
             # Valor por OCASIÃO: é o que uma ligação bem-sucedida traz de volta.
-            "averageValue": round(sum(v for _d, v in ocasioes) / len(ocasioes), 2),
-            # None = não sabemos (unidade não informada). 0 = sabemos que não tem.
-            # A tela precisa distinguir: "sem saldo" é motivo para não sugerir;
-            # "não sei" não é.
+            "averageValue": round(valor_ocasiao, 2),
+            "score": round(valor_ocasiao * urgencia, 2),
+            # None = não sabemos (unidade não informada). False = sabemos que não
+            # tem. A tela precisa distinguir: "sem saldo" é motivo para não
+            # sugerir; "não sei" não é.
             "inStock": None if na_loja is None else na_loja["items"] > 0,
             "stockItems": None if na_loja is None else na_loja["items"],
         })
 
     for cliente in saida:
-        # Ordena por DINHEIRO. Todas as linhas da lista já estão atrasadas, então
-        # a pergunta que sobra é qual ligação vale mais — não qual está atrasada
-        # há mais tempo. Sem saldo na loja desce para o fim: sugerir o que não
-        # tem é mandar o vendedor prometer o que não pode entregar.
-        saida[cliente].sort(key=lambda x: (x["inStock"] is False, -x["averageValue"]))
+        # Sem saldo na loja desce para o fim: sugerir o que não tem é mandar o
+        # vendedor prometer o que não pode entregar.
+        saida[cliente].sort(key=lambda x: (x["inStock"] is False, -x["score"]))
         del saida[cliente][LINE_REPURCHASE_MAX_PER_CLIENT:]
     return dict(saida)
 
