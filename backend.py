@@ -13909,6 +13909,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
                     del _crm_base_cache[k]
     invalidate_dashboard_cache(company_id)
     invalidate_calendar_cache(company_id)
+    invalidate_mix_cache(company_id)
 
 
 def invalidate_activity_caches(company_id: int | None = None) -> None:
@@ -14430,6 +14431,45 @@ def unit_item_stock_refs(conn: sqlite3.Connection, company_id: int, unit_name: s
     }
     cache[(company_id, unidade)] = refs
     return refs
+
+
+_mix_cache: dict[tuple, dict[str, Any]] = {}
+_mix_cache_lock = threading.Lock()
+
+
+def invalidate_mix_cache(company_id: int | None = None) -> None:
+    with _mix_cache_lock:
+        if company_id is None:
+            _mix_cache.clear()
+        else:
+            for k in list(_mix_cache):
+                if k[0] == company_id:
+                    del _mix_cache[k]
+
+
+def mix_opportunities_cached(
+    conn: sqlite3.Connection, company_id: int, unit_name: str,
+) -> dict[str, Any]:
+    """Mesma resposta, guardada em memória até a próxima importação.
+
+    O cálculo varre três meses de faturamento da empresa inteira e agrupa o
+    catálogo: alguns segundos. Sem cache, cada vendedor da loja paga o mesmo
+    trabalho para chegar exatamente ao mesmo resultado — o recorte por vendedor
+    acontece depois, sobre o mesmo bolo. Não tem TTL porque o dado só muda em
+    importação, que já derruba os outros caches.
+    """
+    chave = (company_id, normalize_unit(unit_name))
+    with _mix_cache_lock:
+        pronto = _mix_cache.get(chave)
+    if pronto is not None:
+        return pronto
+    inicio = time.time()
+    resultado = mix_opportunities(conn, company_id, unit_name)
+    with _mix_cache_lock:
+        _mix_cache[chave] = resultado
+    print(f"[mix] {chave[1]} calculado em {time.time() - inicio:.1f}s "
+          f"({len(resultado.get('sellers') or [])} vendedores)", flush=True)
+    return resultado
 
 
 def mix_opportunities(
@@ -22751,7 +22791,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         # Diretoria sem unidade escolhida: a lista de mix só faz
                         # sentido por loja, porque o estoque é por loja.
                         unidade = normalize_unit(query.get("unit", [""])[0]) or CANONICAL_UNITS[0]
-                    res = mix_opportunities(conn, user["company_id"], unidade)
+                    res = mix_opportunities_cached(conn, user["company_id"], unidade)
                     if escopo == "proprio":
                         # Vendedor vê só a própria lista. Sem este corte ele
                         # receberia o recorte dos colegas junto.

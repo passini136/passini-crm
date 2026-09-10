@@ -5233,12 +5233,6 @@ async function refreshCurrentTab() {
   }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
-    // O mix carrega SOZINHO para o vendedor, e fora do Promise.all de propósito:
-    // ele leva ~2s e a fila de clientes não pode esperar por ele. A tela abre na
-    // hora e o bloco preenche sozinho alguns segundos depois. Escondido atrás de
-    // um botão "Calcular", ninguém clicava — e sugestão que não é vista não
-    // vende nada.
-    if (roleIsSeller() && !state.crm.mixOpportunities) loadMixOpportunities();
   }
   if (tab === "crm-clientes") {
     // O resumo e as coberturas valem para os dois perfis: o vendedor vê os
@@ -7385,10 +7379,37 @@ function mixItemLinha(s) {
 function mixOportunidadesBloco() {
   const d = state.crm.mixOpportunities;
   const souVendedor = roleIsSeller();
-  // Para o vendedor o cálculo dispara sozinho ao abrir a tela, então "não
-  // carregado ainda" e "carregando" são o mesmo momento para ele — mostrar um
-  // botão Calcular que some sozinho em dois segundos só confunde.
-  if (souVendedor && (!d || d.loading)) {
+  // ISCA, não bloco carregado sozinho.
+  //
+  // Carregar automático parecia melhor e não era: o cálculo demora alguns
+  // segundos e o vendedor ficava olhando "Procurando…" no topo da tela, o que
+  // atrapalha em vez de chamar. E bloco que já está aberto quando a tela abre
+  // vira paisagem. O convite fechado cria a pergunta — "o que eu não estou
+  // oferecendo?" — e o clique é o que faz ele LER o que vem depois.
+  if (souVendedor && !d) {
+    return `
+      <button type="button" onclick="loadMixOpportunities()"
+        style="width:100%;text-align:left;cursor:pointer;border:2px dashed #e67e22;
+               background:linear-gradient(135deg,#fff8f0,#fff);border-radius:12px;
+               padding:16px 18px;display:flex;justify-content:space-between;
+               align-items:center;gap:12px;flex-wrap:wrap">
+        <div>
+          <div style="font-size:11px;font-weight:800;color:#e67e22;letter-spacing:0.08em">
+            💰 DINHEIRO NA MESA
+          </div>
+          <div style="font-size:18px;font-weight:800;line-height:1.25;margin-top:2px;color:var(--text)">
+            O que a loja vende bem e você não está oferecendo?
+          </div>
+          <div style="font-size:12px;color:var(--muted)">
+            Peças de giro alto e preço acessível, com saldo aqui. Toque para ver as suas.
+          </div>
+        </div>
+        <span class="btn btn-primary" style="background:#e67e22;border-color:#e67e22;white-space:nowrap">
+          Ver minhas peças →
+        </span>
+      </button>`;
+  }
+  if (souVendedor && d.loading) {
     return '<div class="loader panel">Procurando o mix que você ainda não oferece…</div>';
   }
   if (!d) {
