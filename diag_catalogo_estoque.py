@@ -108,24 +108,42 @@ if melhor[0] and "em uso" not in melhor[0]:
 # ── 4. O estoque tem giro? ───────────────────────────────────────────────────
 if est["n"]:
     print("\n4) A POSIÇÃO DE ESTOQUE TEM MASSA PARA SUGERIR RECOMPRA?")
+    # O "vendeu nos 3 meses" sai de UM conjunto em memória, não de uma consulta
+    # correlacionada por item. A versão anterior varria o faturamento uma vez
+    # para cada um dos 57 mil itens, vezes seis unidades — o mesmo padrão que
+    # deixou a carteira lenta, agora dentro do próprio diagnóstico.
+    tres = competencias[:3]
+    marcadores = ",".join("?" for _ in tres) or "''"
+    vendidos: set[str] = set()
+    if tres:
+        for coluna in ("gtin_value", "manufacturer_sku", "sku_key"):
+            vendidos |= {
+                (r[0] or "").strip()
+                for r in conn.execute(
+                    f"SELECT DISTINCT {coluna} FROM fact_sales_detail "
+                    f"WHERE company_id = ? AND competence IN ({marcadores}) AND net_value > 0",
+                    (company_id, *tres)).fetchall()
+                if (r[0] or "").strip()
+            }
+    print(f"   (giro medido contra {len(vendidos)} códigos vendidos em {', '.join(tres) or '—'},"
+          f" somando as três colunas do faturamento)\n")
     print(f"   {'UNIDADE':<16}{'ITENS':>9}{'COM SALDO':>11}{'VENDEU 3M':>11}{'PARADO':>9}")
-    tres = ",".join("?" for _ in competencias[:3]) or "''"
     for u in conn.execute("SELECT DISTINCT unit_name FROM item_stock WHERE company_id = ? "
                           "ORDER BY unit_name", (company_id,)).fetchall():
         unidade = u["unit_name"]
-        r = um(f"""
-            SELECT COUNT(*) itens,
-                   SUM(CASE WHEN s.quantity > 0 THEN 1 ELSE 0 END) com_saldo,
-                   SUM(CASE WHEN EXISTS (
-                        SELECT 1 FROM fact_sales_detail f
-                        WHERE f.company_id = s.company_id AND f.gtin_value = s.item_code
-                          AND f.competence IN ({tres}) AND f.net_value > 0
-                   ) THEN 1 ELSE 0 END) vendeu
-            FROM item_stock s WHERE s.company_id = ? AND s.unit_name = ?
-        """, (*competencias[:3], company_id, unidade))
-        parado = int(r["com_saldo"] or 0) - int(r["vendeu"] or 0)
-        print(f"   {unidade[:15]:<16}{r['itens']:>9}{r['com_saldo'] or 0:>11}"
-              f"{r['vendeu'] or 0:>11}{max(parado, 0):>9}")
+        itens = com_saldo = vendeu = 0
+        for r in conn.execute(
+            "SELECT item_code, quantity FROM item_stock WHERE company_id = ? AND unit_name = ?",
+            (company_id, unidade),
+        ).fetchall():
+            itens += 1
+            tem_saldo = float(r["quantity"] or 0) > 0
+            if tem_saldo:
+                com_saldo += 1
+            if tem_saldo and (r["item_code"] or "").strip() in vendidos:
+                vendeu += 1
+        print(f"   {unidade[:15]:<16}{itens:>9}{com_saldo:>11}"
+              f"{vendeu:>11}{max(com_saldo - vendeu, 0):>9}")
 
     print("\n   Curva ABC na filial e frequência de giro (o que o Alfa já classificou):")
     for coluna, rotulo in (("abc_branch", "curva"), ("sales_frequency", "frequência")):
