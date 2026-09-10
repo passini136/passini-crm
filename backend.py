@@ -12558,6 +12558,41 @@ BRAND_DIMENSIONS = [
 ]
 BRAND_DIMENSION_IDS = {d["id"] for d in BRAND_DIMENSIONS}
 
+# O catálogo COLAPSADO em uma linha por chave, para entrar no JOIN sem duplicar.
+#
+# Duas descobertas de 10/09/2026, medidas antes de mexer:
+#
+#   1. A chave certa é manufacturer_ref (catálogo) x sku_key (faturamento) —
+#      99,6% do valor. A que estava em uso, item_code x gtin_value, casava ZERO:
+#      gtin_value vem sempre vazio do Alfa, e item_code é o código interno, que
+#      o faturamento não traz. A tela de Linha/Grupo nunca mostrou nada.
+#      Os comentários do schema diziam o contrário do que o dado faz.
+#
+#   2. 2.148 referências existem em mais de um item. Sem este GROUP BY, o LEFT
+#      JOIN repetiria a linha de venda e MULTIPLICARIA o faturamento da tela —
+#      erro que aumenta receita, e por isso ninguém contesta. A marca entra na
+#      chave porque as 209 marcas do faturamento existem no catálogo escritas
+#      igual, e ela derruba a ambiguidade de 1.549 referências para 15.
+#
+# NULLIF(TRIM(...),'') no MIN: entre um item com linha preenchida e outro sem,
+# fica o preenchido — MIN ignora nulo, e vazio venceria a ordenação.
+CATALOGO_AGRUPADO_SQL = """
+        WITH catalogo AS (
+            SELECT UPPER(TRIM(manufacturer_ref))            AS ref,
+                   UPPER(TRIM(COALESCE(brand_name, '')))    AS marca,
+                   MIN(NULLIF(TRIM(item_subgroup), ''))     AS item_subgroup,
+                   MIN(NULLIF(TRIM(item_group), ''))        AS item_group
+            FROM item_catalog
+            WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref, '')) <> ''
+            GROUP BY ref, marca
+        )
+"""
+CATALOGO_JOIN_SQL = """
+            LEFT JOIN catalogo c
+              ON c.ref = UPPER(TRIM(f.sku_key))
+             AND c.marca = UPPER(TRIM(COALESCE(f.brand_name, '')))
+"""
+
 _DIMENSION_EXPR = {
     "marca": "f.brand_name",
     "linha": "c.item_subgroup",
@@ -12572,7 +12607,8 @@ def brand_ranking_rows(
     """Ranking cru de uma competência, indexado pela dimensão escolhida."""
     coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
     onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
-    params: list[Any] = [company_id, competence]
+    # O company_id do catálogo agrupado vem PRIMEIRO: a CTE é lida antes do resto.
+    params: list[Any] = [company_id, company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
@@ -12591,14 +12627,14 @@ def brand_ranking_rows(
         }
         for r in conn.execute(
             f"""
+            {CATALOGO_AGRUPADO_SQL}
             SELECT {coluna} AS chave,
                    ROUND(SUM(f.quantity), 0)     AS itens,
                    COUNT(DISTINCT {item})        AS codigos,
                    ROUND(SUM(f.net_value), 2)    AS valor,
                    COUNT(DISTINCT f.client_name) AS clientes
             FROM fact_sales_detail f
-            LEFT JOIN item_catalog c
-              ON c.company_id = f.company_id AND c.item_code = f.gtin_value
+            {CATALOGO_JOIN_SQL}
             WHERE {" AND ".join(onde)}
             GROUP BY {coluna}
             """, params).fetchall()
@@ -12619,7 +12655,7 @@ def brand_seller_breakdown(
     """
     coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
     onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
-    params: list[Any] = [company_id, competence]
+    params: list[Any] = [company_id, company_id, competence]
     if vendedores is not None:
         if not vendedores:
             return {}
@@ -12631,14 +12667,14 @@ def brand_seller_breakdown(
     saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in conn.execute(
         f"""
+        {CATALOGO_AGRUPADO_SQL}
         SELECT {coluna} AS chave, f.seller_name AS vendedor,
                ROUND(SUM(f.quantity), 0)     AS itens,
                COUNT(DISTINCT {item})        AS codigos,
                ROUND(SUM(f.net_value), 2)    AS valor,
                COUNT(DISTINCT f.client_name) AS clientes
         FROM fact_sales_detail f
-        LEFT JOIN item_catalog c
-          ON c.company_id = f.company_id AND c.item_code = f.gtin_value
+        {CATALOGO_JOIN_SQL}
         WHERE {" AND ".join(onde)}
         GROUP BY {coluna}, f.seller_name
         """, params).fetchall():
