@@ -7093,6 +7093,7 @@ function crmAgendaView() {
             </div>
           </div>` : ""}
 
+        ${mixOportunidadesBloco()}
         ${sellerHomeCards()}
       </div>
     `;
@@ -7231,6 +7232,7 @@ function crmAgendaView() {
       <!-- Risco na carteira: onde a gestão precisa agir -->
       ${managerRiskBlocks()}
       ${oportunidadesRecompraBloco()}
+      ${mixOportunidadesBloco()}
 
       <!-- Tarefas -->
       <div class="grid-2 crm-grid">
@@ -7323,6 +7325,121 @@ function averageBreakdown(item) {
         Base: faturamento total do cliente nos 3 meses anteriores a ${escapeHtml(competenceShort(basis.currentCompetence))},
         somando todos os vendedores.
       </div>
+    </div>`;
+}
+
+/* ─── Mix: o que a unidade vende e o vendedor não ────────────────────────────
+ *
+ * A peça-isca: item de giro alto e preço abaixo da média da linha, que muita
+ * oficina compra. Quem não oferece uma dessas não está perdendo uma venda
+ * grande — está deixando de ter motivo para ligar.
+ *
+ * Sob demanda, como a recompra: o cálculo varre três meses de faturamento da
+ * empresa inteira, e ninguém deve pagar por isso ao abrir a Missão do Dia.
+ */
+async function loadMixOpportunities() {
+  state.crm.mixOpportunities = { loading: true };
+  requestRender();
+  try {
+    state.crm.mixOpportunities = {
+      ...(await api(`/api/crm/mix-opportunities?${buildQuery()}`)), loading: false };
+  } catch (e) {
+    state.crm.mixOpportunities = { error: e.message, loading: false };
+  }
+  requestRender();
+}
+
+function setMixSeller(nome) {
+  if (state.crm.mixOpportunities) state.crm.mixOpportunities.sellerFocus = nome;
+  requestRender();
+}
+
+/** Uma linha da lista de mix. Curta de propósito: é para bater o olho. */
+function mixItemLinha(s) {
+  const novo = s.status === "NUNCA";
+  return `
+    <div style="display:flex;justify-content:space-between;gap:10px;align-items:center;
+                padding:6px 0;border-top:1px solid var(--line);font-size:12px">
+      <div style="min-width:0">
+        <strong>${escapeHtml(s.ref)}</strong>
+        <span style="color:var(--muted)"> ${escapeHtml(s.brand)} · ${escapeHtml(s.line)}</span>
+        ${s.source === "EMPRESA"
+          ? '<span class="soft-badge" style="font-size:9px;background:#ede7f6;color:#4527a0">outra loja</span>' : ""}
+        <div style="color:var(--muted)">
+          ${s.clients} oficina(s) compram · ${currency(s.unitPrice)}
+          <span style="color:${novo ? "#2e7d32" : "#e67e22"};font-weight:700">
+            ${novo ? "nunca vendeu" : "parou de vender"}</span>
+          ${s.inStock === false ? ' · <span style="color:var(--bad)">sem saldo</span>' : ""}
+        </div>
+      </div>
+    </div>`;
+}
+
+function mixOportunidadesBloco() {
+  const d = state.crm.mixOpportunities;
+  const souVendedor = roleIsSeller();
+  if (!d) {
+    return `
+      <div class="panel padded-card">
+        <div class="section-title">
+          <div><h3>🎯 Mix que você não oferece</h3>
+            <div class="text-small">Peças de giro alto e preço acessível que a loja vende bem.</div></div>
+          <button class="btn btn-secondary btn-sm" onclick="loadMixOpportunities()">Calcular</button>
+        </div>
+      </div>`;
+  }
+  if (d.loading) return '<div class="loader panel">Procurando o mix da loja…</div>';
+  if (d.error) return `<div class="panel padded-card"><div class="message error">${escapeHtml(d.error)}</div></div>`;
+
+  if (souVendedor) {
+    const minhas = d.mine || [];
+    return `
+      <div class="panel padded-card">
+        <div class="section-title">
+          <div><h3>🎯 Mix que você não oferece</h3>
+            <div class="text-small">${escapeHtml(d.unitName || "")} · peças que a loja gira e você não vendeu nos últimos 3 meses</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Recalcular</button>
+        </div>
+        ${minhas.length ? minhas.map(mixItemLinha).join("")
+          : '<div class="message" style="margin-top:10px">Você já oferece o mix principal da loja. Bom sinal.</div>'}
+      </div>`;
+  }
+
+  // Gerente e diretoria: um vendedor por vez, para virar conversa individual.
+  const vendedores = d.sellers || [];
+  const foco = d.sellerFocus || vendedores[0] || "";
+  const lista = (d.bySeller || {})[foco] || [];
+  return `
+    <div class="panel padded-card">
+      <div class="section-title">
+        <div><h3>🎯 Mix por vendedor — ${escapeHtml(d.unitName || "")}</h3>
+          <div class="text-small">O que a loja gira e cada um não vendeu nos últimos 3 meses.</div></div>
+        <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Recalcular</button>
+      </div>
+
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0">
+        ${vendedores.map((v) => {
+          const on = v === foco;
+          const n = ((d.bySeller || {})[v] || []).length;
+          return `
+            <button type="button" onclick="setMixSeller('${jsAttr(v)}')"
+              style="border:1px solid ${on ? "var(--accent)" : "var(--line)"};
+                     background:${on ? "var(--accent)" : "#fff"};color:${on ? "#fff" : "var(--text)"};
+                     border-radius:14px;padding:4px 10px;font-size:12px;font-weight:600;cursor:pointer">
+              ${escapeHtml(v.split(" ")[0])} · ${n}
+            </button>`;
+        }).join("")}
+      </div>
+
+      ${lista.length ? lista.map(mixItemLinha).join("")
+        : '<div class="message">Este vendedor já oferece o mix principal da loja.</div>'}
+
+      ${(d.unitGap || []).length ? `
+        <div class="section-title" style="margin-top:18px">
+          <div><h3>🏬 O que outras lojas vendem e ${escapeHtml(d.unitName || "")} não</h3>
+            <div class="text-small">Decisão de compra, não de venda — os com saldo já dão para oferecer.</div></div>
+        </div>
+        ${d.unitGap.slice(0, 15).map(mixItemLinha).join("")}` : ""}
     </div>`;
 }
 

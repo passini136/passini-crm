@@ -22728,6 +22728,34 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado}))
                 return
+            if path == "/api/crm/mix-opportunities":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    filtros = crm_scoped_filters_for_user(
+                        conn, user["company_id"], user, build_filters_from_query(query))
+                    escopo = data_scope_for_user(conn, user)
+                    unidade = normalize_unit(filtros.get("unit_name"))
+                    if not unidade:
+                        # Diretoria sem unidade escolhida: a lista de mix só faz
+                        # sentido por loja, porque o estoque é por loja.
+                        unidade = normalize_unit(query.get("unit", [""])[0]) or CANONICAL_UNITS[0]
+                    res = mix_opportunities(conn, user["company_id"], unidade)
+                    if escopo == "proprio":
+                        # Vendedor vê só a própria lista. Sem este corte ele
+                        # receberia o recorte dos colegas junto.
+                        eu = seller_identity_for_user(user)
+                        minhas = entries_for_person(res["bySeller"], eu)
+                        res = {
+                            "unitName": res["unitName"], "window": res["window"],
+                            "mine": minhas[0] if minhas else [],
+                            "sellerName": eu,
+                        }
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
+                return
             if path == "/api/crm/line-opportunities":
                 user = self._require_auth()
                 if not user:
