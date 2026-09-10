@@ -14433,6 +14433,130 @@ def unit_item_stock_refs(conn: sqlite3.Connection, company_id: int, unit_name: s
     return refs
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# NOVIDADES: o que estreou em vendas
+#
+# A hipótese inicial era "código maior = item mais recente". Medida em
+# 10/09/2026 (diag_novidade.py), ela NÃO se sustenta: a mediana da primeira
+# venda é fevereiro em todos os dez decis de código, porque a faixa 38.872 a
+# 110.171 mistura anos de cadastro — peça de código 45.000 continua vendendo
+# hoje. Usar o código como critério apontaria peça velha como lançamento, e o
+# vendedor que oferecesse uma dessas como novidade passaria vergonha.
+#
+# O sinal honesto é a ESTREIA EM VENDAS: item que nunca tinha vendido e passou
+# a vender. Não depende de como o Alfa numera e é o que o vendedor reconhece
+# como novidade. O código alto entra como REFORÇO na tela, nunca como filtro.
+# ─────────────────────────────────────────────────────────────────────────────
+
+NOVELTY_WINDOW_DAYS = 90
+NOVELTY_MIN_CLIENTS = 2      # uma venda única é acaso, não lançamento
+NOVELTY_MAX_ITEMS = 40
+
+
+def sales_debut_novelties(
+    conn: sqlite3.Connection, company_id: int, unit_name: str = "",
+    days: int = NOVELTY_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Itens, marcas e linhas que estrearam em vendas na janela.
+
+    "Estrear" é ter a PRIMEIRA venda de toda a base dentro da janela. A base
+    começa em 2026-01, então o histórico anterior à janela é de vários meses —
+    item ausente por esse tempo e que agora vende é novidade na prática, mesmo
+    que o cadastro seja antigo.
+    """
+    corte = (today_in_brazil() - timedelta(days=days)).isoformat()
+    unidade = normalize_unit(unit_name)
+
+    linhas = conn.execute(
+        f"""
+        {CATALOGO_AGRUPADO_SQL}
+        SELECT UPPER(TRIM(f.sku_key))                     AS ref,
+               UPPER(TRIM(COALESCE(f.brand_name, '')))    AS marca,
+               UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               MIN(date(f.issue_date))                    AS estreia,
+               SUM(f.quantity)                            AS qtd,
+               SUM(f.net_value)                           AS valor,
+               COUNT(DISTINCT f.client_name)              AS clientes,
+               COUNT(DISTINCT f.seller_name)              AS vendedores
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.net_value > 0
+          AND TRIM(COALESCE(f.sku_key, '')) <> ''
+        GROUP BY ref, marca
+        HAVING estreia >= ?
+        """,
+        (company_id, company_id, corte),
+    ).fetchall()
+
+    com_saldo = unit_item_stock_refs(conn, company_id, unidade) if unidade else set()
+    # Código interno só para EXIBIR: código alto reforça que é lançamento, mas
+    # não decide nada — foi exatamente a hipótese que a medição derrubou.
+    codigo_por_ref: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT UPPER(TRIM(manufacturer_ref)) ref, MAX(item_code) codigo FROM item_catalog "
+        "WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref,'')) <> '' GROUP BY ref",
+        (company_id,)).fetchall():
+        codigo_por_ref[r["ref"]] = str(r["codigo"] or "")
+
+    itens: list[dict[str, Any]] = []
+    for r in linhas:
+        ref = r["ref"]
+        if not mix_referencia_utilizavel(ref) or int(r["clientes"] or 0) < NOVELTY_MIN_CLIENTS:
+            continue
+        itens.append({
+            "ref": ref,
+            "brand": r["marca"],
+            "line": r["linha"] or "—",
+            "code": codigo_por_ref.get(ref, ""),
+            "debutAt": r["estreia"],
+            "quantity": round(float(r["qtd"] or 0), 0),
+            "revenue": round(float(r["valor"] or 0), 2),
+            "unitPrice": round(float(r["valor"] or 0) / float(r["qtd"] or 1), 2),
+            "clients": int(r["clientes"] or 0),
+            "sellers": int(r["vendedores"] or 0),
+            "inStock": (ref in com_saldo) if unidade else None,
+        })
+    # Com saldo primeiro, depois quem já pegou mais oficinas: novidade que
+    # emplacou em vinte clientes é aposta provada; a de dois é ainda promessa.
+    itens.sort(key=lambda i: (i["inStock"] is False, -i["clients"], -i["quantity"]))
+
+    def estreantes(coluna: str) -> list[dict[str, Any]]:
+        """Marca ou linha cuja PRIMEIRA venda da base caiu na janela."""
+        return [
+            {"name": r["chave"], "debutAt": r["estreia"],
+             "items": int(r["itens"] or 0), "clients": int(r["clientes"] or 0),
+             "revenue": round(float(r["valor"] or 0), 2)}
+            for r in conn.execute(
+                f"""
+                {CATALOGO_AGRUPADO_SQL}
+                SELECT {coluna} AS chave,
+                       MIN(date(f.issue_date))                   AS estreia,
+                       COUNT(DISTINCT UPPER(TRIM(f.sku_key)))    AS itens,
+                       COUNT(DISTINCT f.client_name)             AS clientes,
+                       SUM(f.net_value)                          AS valor
+                FROM fact_sales_detail f
+                {CATALOGO_JOIN_SQL}
+                WHERE f.company_id = ? AND f.net_value > 0
+                  AND TRIM(COALESCE({coluna}, '')) <> ''
+                GROUP BY chave
+                HAVING estreia >= ?
+                ORDER BY valor DESC
+                """,
+                (company_id, company_id, corte)).fetchall()
+        ]
+
+    return {
+        "unitName": unidade,
+        "since": corte,
+        "days": days,
+        "items": itens[:NOVELTY_MAX_ITEMS],
+        "totalItems": len(itens),
+        "brands": estreantes("f.brand_name")[:15],
+        "lines": estreantes("c.item_subgroup")[:15],
+        "inStockCount": sum(1 for i in itens if i["inStock"]),
+    }
+
+
 _mix_cache: dict[tuple, dict[str, Any]] = {}
 _mix_cache_lock = threading.Lock()
 

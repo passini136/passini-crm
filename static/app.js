@@ -7218,6 +7218,14 @@ function crmAgendaView() {
         </div>
       ` : (taSellers.length > 0 ? `<div class="message success">✅ Todos os vendedores já realizaram contatos hoje.</div>` : "")}
 
+      <!-- Oportunidades ANTES dos cards de atividade e do risco.
+           Estavam no rodapé e o gerente não descia até lá. Atividade e risco
+           dizem o que está ruim; estas duas dizem o que fazer a respeito — e é
+           a segunda pergunta que ele precisa levar para a conversa com cada
+           vendedor. Continuam por clique: o cálculo é caro e é dele. -->
+      ${oportunidadesRecompraBloco()}
+      ${mixOportunidadesBloco()}
+
       <!-- Cards por unidade -->
       ${taLoading ? `<div class="loader panel">Carregando atividade da equipe…</div>` : Object.entries(sellersByUnit).map(([unit, sellers]) => `
         <div class="table-card">
@@ -7232,8 +7240,6 @@ function crmAgendaView() {
 
       <!-- Risco na carteira: onde a gestão precisa agir -->
       ${managerRiskBlocks()}
-      ${oportunidadesRecompraBloco()}
-      ${mixOportunidadesBloco()}
 
       <!-- Tarefas -->
       <div class="grid-2 crm-grid">
@@ -7329,6 +7335,33 @@ function averageBreakdown(item) {
     </div>`;
 }
 
+/**
+ * Convite do gestor: pergunta grande e botão, em vez de título com "Calcular".
+ *
+ * Os dois blocos ficavam no rodapé com cara de cartão administrativo, e o
+ * gerente não descia nem clicava. Subiram para cima dos cards de atividade e
+ * viraram pergunta: atividade e risco dizem o que está ruim, estes dizem o que
+ * fazer — e é isso que ele leva para a conversa com cada vendedor.
+ */
+function conviteGestor({ cor, etiqueta, titulo, apoio, acao, funcao }) {
+  return `
+    <button type="button" onclick="${funcao}"
+      style="width:100%;text-align:left;cursor:pointer;border:2px dashed ${cor};
+             background:#fff;border-radius:12px;padding:16px 18px;display:flex;
+             justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap">
+      <div>
+        <div style="font-size:11px;font-weight:800;color:${cor};letter-spacing:0.08em">${etiqueta}</div>
+        <div style="font-size:17px;font-weight:800;line-height:1.25;margin-top:2px;color:var(--text)">
+          ${escapeHtml(titulo)}
+        </div>
+        <div style="font-size:12px;color:var(--muted)">${escapeHtml(apoio)}</div>
+      </div>
+      <span class="btn btn-primary" style="background:${cor};border-color:${cor};white-space:nowrap">
+        ${escapeHtml(acao)}
+      </span>
+    </button>`;
+}
+
 /* ─── Mix: o que a unidade vende e o vendedor não ────────────────────────────
  *
  * A peça-isca: item de giro alto e preço abaixo da média da linha, que muita
@@ -7413,14 +7446,12 @@ function mixOportunidadesBloco() {
     return '<div class="loader panel">Procurando o mix que você ainda não oferece…</div>';
   }
   if (!d) {
-    return `
-      <div class="panel padded-card">
-        <div class="section-title">
-          <div><h3>🎯 Mix por vendedor</h3>
-            <div class="text-small">Peças de giro alto e preço acessível que a loja vende bem.</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="loadMixOpportunities()">Calcular</button>
-        </div>
-      </div>`;
+    return conviteGestor({
+      cor: "#e67e22", etiqueta: "🎯 MIX POR VENDEDOR",
+      titulo: "Quem da sua equipe não está oferecendo o que a loja vende?",
+      apoio: "Peça de giro alto e preço acessível, com saldo aqui. Uma lista por vendedor, para a conversa individual.",
+      acao: "Ver por vendedor →", funcao: "loadMixOpportunities()",
+    });
   }
   if (d.loading) return '<div class="loader panel">Procurando o mix da loja…</div>';
   if (d.error) return `<div class="panel padded-card"><div class="message error">${escapeHtml(d.error)}</div></div>`;
@@ -7541,14 +7572,12 @@ async function loadLineOpportunities() {
 function oportunidadesRecompraBloco() {
   const d = state.crm.lineOpportunities;
   if (!d) {
-    return `
-      <div class="panel padded-card">
-        <div class="section-title">
-          <div><h3>🔁 Recompra vencida da unidade</h3>
-            <div class="text-small">Clientes que compravam uma linha com regularidade e pararam.</div></div>
-          <button class="btn btn-secondary btn-sm" onclick="loadLineOpportunities()">Calcular</button>
-        </div>
-      </div>`;
+    return conviteGestor({
+      cor: "#2e7d32", etiqueta: "🔁 RECOMPRA VENCIDA",
+      titulo: "Quais clientes compravam uma linha todo mês e pararam?",
+      apoio: "Ordenado por quanto vale a ligação, com o vendedor responsável ao lado. Serve de roteiro.",
+      acao: "Ver oportunidades →", funcao: "loadLineOpportunities()",
+    });
   }
   if (d.loading) return '<div class="loader panel">Calculando a recompra da carteira…</div>';
   if (d.error) return `<div class="panel padded-card"><div class="message error">${escapeHtml(d.error)}</div></div>`;
