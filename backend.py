@@ -14300,27 +14300,37 @@ def line_repurchase_for_clients(
     for (cliente, linha), eventos in compras.items():
         eventos.sort()
         # Agrupa a rajada: pedidos do mesmo serviço viram uma ocasião de compra.
-        ocasioes: list[tuple[date, float]] = []
+        # Cada ocasião guarda INÍCIO e FIM, e os dois são usados para coisas
+        # diferentes — misturar os dois fazia a sugestão disparar cedo demais.
+        ocasioes: list[list[Any]] = []   # [inicio, fim, valor]
         for dia, valor in eventos:
-            if ocasioes and (dia - ocasioes[-1][0]).days <= LINE_REPURCHASE_BURST_DAYS:
-                ocasioes[-1] = (ocasioes[-1][0], ocasioes[-1][1] + valor)
+            if ocasioes and (dia - ocasioes[-1][1]).days <= LINE_REPURCHASE_BURST_DAYS:
+                ocasioes[-1][1] = dia
+                ocasioes[-1][2] += valor
             else:
-                ocasioes.append((dia, valor))
+                ocasioes.append([dia, dia, valor])
         if len(ocasioes) < LINE_REPURCHASE_MIN_OCCASIONS:
             continue
-        datas = [d for d, _v in ocasioes]
-        intervalos = sorted((datas[i] - datas[i - 1]).days for i in range(1, len(datas)))
+        # INÍCIO para o intervalo: mede de quanto em quanto tempo a necessidade
+        # aparece, que é o que se quer prever.
+        inicios = [o[0] for o in ocasioes]
+        intervalos = sorted((inicios[i] - inicios[i - 1]).days for i in range(1, len(inicios)))
         posicao = int(round(LINE_REPURCHASE_PERCENTILE * (len(intervalos) - 1)))
         tipico = intervalos[posicao]
         if not tipico or tipico > LINE_REPURCHASE_MAX_INTERVAL_DAYS:
             continue
-        atraso_desde = (referencia - datas[-1]).days
+        # FIM para o atraso: "faz quantos dias que ele não compra" tem de contar
+        # da última compra de verdade. Contando do início da rajada, um cliente
+        # que comprou dia 30 e de novo dia 04 aparecia como se tivesse sumido
+        # cinco dias antes — e o alerta soava antes da hora.
+        ultima_compra = ocasioes[-1][1]
+        atraso_desde = (referencia - ultima_compra).days
         if atraso_desde <= tipico * LINE_REPURCHASE_GRACE:
             continue
         if atraso_desde - tipico < LINE_REPURCHASE_MIN_OVERDUE_DAYS:
             continue
         na_loja = estoque.get(linha) if estoque else None
-        valor_ocasiao = sum(v for _d, v in ocasioes) / len(ocasioes)
+        valor_ocasiao = sum(o[2] for o in ocasioes) / len(ocasioes)
         # SCORE: dinheiro em jogo pesado pela urgência, com teto.
         #
         # Serve para a tela mostrar as boas em vez de todas. Quase todo cliente
@@ -14337,7 +14347,7 @@ def line_repurchase_for_clients(
             "intervalDays": int(round(tipico)),
             "daysSinceLast": atraso_desde,
             "overdueDays": int(round(atraso_desde - tipico)),
-            "lastPurchaseAt": datas[-1].isoformat(),
+            "lastPurchaseAt": ultima_compra.isoformat(),
             "occasions": len(ocasioes),
             "purchases": len(eventos),
             # Valor por OCASIÃO: é o que uma ligação bem-sucedida traz de volta.
