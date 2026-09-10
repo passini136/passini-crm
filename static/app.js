@@ -5233,6 +5233,12 @@ async function refreshCurrentTab() {
   }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
+    // O mix carrega SOZINHO para o vendedor, e fora do Promise.all de propósito:
+    // ele leva ~2s e a fila de clientes não pode esperar por ele. A tela abre na
+    // hora e o bloco preenche sozinho alguns segundos depois. Escondido atrás de
+    // um botão "Calcular", ninguém clicava — e sugestão que não é vista não
+    // vende nada.
+    if (roleIsSeller() && !state.crm.mixOpportunities) loadMixOpportunities();
   }
   if (tab === "crm-clientes") {
     // O resumo e as coberturas valem para os dois perfis: o vendedor vê os
@@ -7046,6 +7052,8 @@ function crmAgendaView() {
           ${missionProgressBar(contactsDone, 5)}
         </div>
 
+        ${mixOportunidadesBloco()}
+
         ${overdue.length > 0 ? `
           <div class="table-card" style="border-left:4px solid #e74c3c">
             <div class="section-title">
@@ -7093,7 +7101,6 @@ function crmAgendaView() {
             </div>
           </div>` : ""}
 
-        ${mixOportunidadesBloco()}
         ${sellerHomeCards()}
       </div>
     `;
@@ -7378,11 +7385,17 @@ function mixItemLinha(s) {
 function mixOportunidadesBloco() {
   const d = state.crm.mixOpportunities;
   const souVendedor = roleIsSeller();
+  // Para o vendedor o cálculo dispara sozinho ao abrir a tela, então "não
+  // carregado ainda" e "carregando" são o mesmo momento para ele — mostrar um
+  // botão Calcular que some sozinho em dois segundos só confunde.
+  if (souVendedor && (!d || d.loading)) {
+    return '<div class="loader panel">Procurando o mix que você ainda não oferece…</div>';
+  }
   if (!d) {
     return `
       <div class="panel padded-card">
         <div class="section-title">
-          <div><h3>🎯 Mix que você não oferece</h3>
+          <div><h3>🎯 Mix por vendedor</h3>
             <div class="text-small">Peças de giro alto e preço acessível que a loja vende bem.</div></div>
           <button class="btn btn-secondary btn-sm" onclick="loadMixOpportunities()">Calcular</button>
         </div>
@@ -7393,15 +7406,58 @@ function mixOportunidadesBloco() {
 
   if (souVendedor) {
     const minhas = d.mine || [];
+    if (!minhas.length) {
+      return `
+        <div class="panel padded-card">
+          <div class="section-title"><div><h3>🎯 Mix da loja</h3></div></div>
+          <div class="message">Você já oferece o mix principal da loja. Bom sinal.</div>
+        </div>`;
+    }
+    // Cartões grandes, número na frente do texto. O público é operacional e lê
+    // de relance entre uma ligação e outra: lista discreta com letra pequena
+    // não é lida, e sugestão que não é vista não vende nada.
+    const novos = minhas.filter((s) => s.status === "NUNCA").length;
     return `
-      <div class="panel padded-card">
-        <div class="section-title">
-          <div><h3>🎯 Mix que você não oferece</h3>
-            <div class="text-small">${escapeHtml(d.unitName || "")} · peças que a loja gira e você não vendeu nos últimos 3 meses</div></div>
-          <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Recalcular</button>
+      <div class="panel" style="border:2px solid #e67e22;background:#fffaf3;padding:16px 18px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+          <div>
+            <div style="font-size:11px;font-weight:800;color:#e67e22;letter-spacing:0.08em">
+              💰 DINHEIRO NA MESA
+            </div>
+            <div style="font-size:19px;font-weight:800;line-height:1.25;margin-top:2px">
+              ${minhas.length} peças que a loja vende bem e você não ofereceu
+            </div>
+            <div class="text-small" style="color:var(--muted)">
+              ${novos ? `${novos} você nunca vendeu · ` : ""}pergunte numa ligação de hoje
+            </div>
+          </div>
+          <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Atualizar</button>
         </div>
-        ${minhas.length ? minhas.map(mixItemLinha).join("")
-          : '<div class="message" style="margin-top:10px">Você já oferece o mix principal da loja. Bom sinal.</div>'}
+
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));
+                    gap:8px;margin-top:14px">
+          ${minhas.map((s) => {
+            const novo = s.status === "NUNCA";
+            return `
+              <div style="background:#fff;border:1px solid ${novo ? "#2e7d32" : "#e67e22"};
+                          border-left-width:5px;border-radius:8px;padding:10px 12px">
+                <div style="font-size:15px;font-weight:800;line-height:1.2">${escapeHtml(s.ref)}</div>
+                <div style="font-size:11px;color:var(--muted);margin-bottom:6px">
+                  ${escapeHtml(s.brand)} · ${escapeHtml(s.line)}
+                </div>
+                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:6px">
+                  <strong style="font-size:17px;color:#0f3044">${currency(s.unitPrice)}</strong>
+                  <span style="font-size:11px;font-weight:700;color:${novo ? "#2e7d32" : "#e67e22"}">
+                    ${novo ? "NUNCA VENDEU" : "PAROU"}
+                  </span>
+                </div>
+                <div style="font-size:11px;color:var(--muted);margin-top:4px">
+                  ${s.clients} oficinas compram${s.inStock === false
+                    ? ' · <span style="color:var(--bad)">sem saldo</span>' : ""}
+                </div>
+              </div>`;
+          }).join("")}
+        </div>
       </div>`;
   }
 
