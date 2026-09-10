@@ -7388,6 +7388,24 @@ function setMixSeller(nome) {
   requestRender();
 }
 
+/**
+ * Fecha a lista e devolve o convite.
+ *
+ * Aberta, cada uma dessas listas ocupa meia tela e empurra o resto para baixo.
+ * O gestor consulta, trabalha e quer a tela de volta — sem isso ele teria de
+ * recarregar a página. O cálculo fica em cache no servidor, então reabrir é
+ * instantâneo: fechar não custa nada.
+ */
+function fecharMixOportunidades() {
+  state.crm.mixOpportunities = null;
+  requestRender();
+}
+
+function fecharLineOpportunities() {
+  state.crm.lineOpportunities = null;
+  requestRender();
+}
+
 /** Uma linha da lista de mix. Curta de propósito: é para bater o olho. */
 function mixItemLinha(s) {
   const novo = s.status === "NUNCA";
@@ -7483,7 +7501,10 @@ function mixOportunidadesBloco() {
               ${novos ? `${novos} você nunca vendeu · ` : ""}pergunte numa ligação de hoje
             </div>
           </div>
-          <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Atualizar</button>
+          <div style="display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Atualizar</button>
+            <button class="btn btn-ghost btn-sm" onclick="fecharMixOportunidades()">Fechar ✕</button>
+          </div>
         </div>
 
         <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));
@@ -7522,7 +7543,10 @@ function mixOportunidadesBloco() {
       <div class="section-title">
         <div><h3>🎯 Mix por vendedor — ${escapeHtml(d.unitName || "")}</h3>
           <div class="text-small">O que a loja gira e cada um não vendeu nos últimos 3 meses.</div></div>
-        <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Recalcular</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="loadMixOpportunities()">Recalcular</button>
+          <button class="btn btn-ghost btn-sm" onclick="fecharMixOportunidades()">Fechar ✕</button>
+        </div>
       </div>
 
       <div style="display:flex;gap:6px;flex-wrap:wrap;margin:10px 0">
@@ -7589,7 +7613,10 @@ function oportunidadesRecompraBloco() {
           <div class="text-small">
             ${d.totalClients} cliente(s) · ${currency(d.totalValue)} somando o pedido típico de cada um
           </div></div>
-        <button class="btn btn-ghost btn-sm" onclick="loadLineOpportunities()">Recalcular</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="loadLineOpportunities()">Recalcular</button>
+          <button class="btn btn-ghost btn-sm" onclick="fecharLineOpportunities()">Fechar ✕</button>
+        </div>
       </div>
 
       ${(d.bySeller || []).length ? `

@@ -13910,6 +13910,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
     invalidate_dashboard_cache(company_id)
     invalidate_calendar_cache(company_id)
     invalidate_mix_cache(company_id)
+    invalidate_recompra_cache(company_id)
 
 
 def invalidate_activity_caches(company_id: int | None = None) -> None:
@@ -14798,6 +14799,45 @@ def mix_opportunities(
         "unitGap": [apresenta(i) for i in lacuna],
         "sellers": sorted(vendedores_da_unidade),
     }
+
+
+_recompra_cache: dict[tuple, dict[str, Any]] = {}
+_recompra_cache_lock = threading.Lock()
+
+
+def invalidate_recompra_cache(company_id: int | None = None) -> None:
+    with _recompra_cache_lock:
+        if company_id is None:
+            _recompra_cache.clear()
+        else:
+            for k in list(_recompra_cache):
+                if k[0] == company_id:
+                    del _recompra_cache[k]
+
+
+def line_repurchase_opportunities_cached(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    filters: dict[str, str | None],
+) -> dict[str, Any]:
+    """A lista do gerente, guardada por unidade.
+
+    Ela varre um ano de compras de TODA a carteira da unidade — 25 mil clientes
+    na Matriz. O resultado é o mesmo para qualquer gestor da loja, então
+    recalcular por pessoa é pagar várias vezes pelo mesmo número. Cai na
+    importação, junto dos outros caches.
+    """
+    chave = (company_id, normalize_unit(filters.get("unit_name")))
+    with _recompra_cache_lock:
+        pronto = _recompra_cache.get(chave)
+    if pronto is not None:
+        return pronto
+    inicio = time.time()
+    resultado = line_repurchase_opportunities(conn, company_id, user, filters)
+    with _recompra_cache_lock:
+        _recompra_cache[chave] = resultado
+    print(f"[recompra] {chave[1] or 'todas'} calculada em {time.time() - inicio:.1f}s "
+          f"({resultado.get('totalClients')} clientes)", flush=True)
+    return resultado
 
 
 def line_repurchase_opportunities(
@@ -22937,7 +22977,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 with closing(get_connection()) as conn:
                     filtros = crm_scoped_filters_for_user(
                         conn, user["company_id"], user, build_filters_from_query(query))
-                    res = line_repurchase_opportunities(conn, user["company_id"], user, filtros)
+                    res = line_repurchase_opportunities_cached(
+                        conn, user["company_id"], user, filtros)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))
                 return
