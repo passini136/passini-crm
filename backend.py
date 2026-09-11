@@ -14099,6 +14099,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
     invalidate_mix_cache(company_id)
     invalidate_recompra_cache(company_id)
     invalidate_novidades_cache(company_id)
+    invalidate_prospeccao_cache(company_id)
 
 
 def invalidate_activity_caches(company_id: int | None = None) -> None:
@@ -14899,7 +14900,13 @@ PROSPECT_MIN_CLIENTS = 3
 # novas", quase toda a base, e a lista virou o mix geral disfarçado de porta de
 # entrada. Só conta como novo quem estreou pelo menos este tanto DEPOIS do
 # primeiro dia de dados — aí a estreia é dele, não do arquivo.
-PROSPECT_BASE_GUARD_DAYS = 60
+# 90 dias, medido e não chutado (diag_prospeccao.py varre 60/90/120/150/180).
+# Com 60 a régua dava 63% da carteira como "cliente novo", o que é a censura do
+# início da base disfarçada de renovação. Com 90 cai para 51% e o peso das
+# linhas passa a variar de verdade (0,97 a 1,98). Acima de 90 a janela encolhe
+# sem ganho. Se a base ganhar 2025, rodar o diagnóstico de novo — a carência
+# ideal depende de quanto histórico existe antes da janela.
+PROSPECT_BASE_GUARD_DAYS = 90
 # Janela de "cliente novo". A base tem desde 2025-01, então sem teto a régua
 # olharia 18 meses e chamaria de novo quem entrou ano passado — o que serve
 # para estatística, não para orientar abordagem hoje. Doze meses mantém volume
@@ -15311,6 +15318,44 @@ def sales_debut_novelties_cached(
             _novidades_cache[chave] = resultado
         print(f"[novidades] {chave[1] or 'empresa'} calculada em {time.time() - inicio:.1f}s "
               f"({resultado.get('totalItems')} itens)", flush=True)
+    return resultado
+
+
+_prospeccao_cache: dict[tuple, dict[str, Any]] = {}
+_prospeccao_cache_lock = threading.Lock()
+
+
+def invalidate_prospeccao_cache(company_id: int | None = None) -> None:
+    with _prospeccao_cache_lock:
+        if company_id is None:
+            _prospeccao_cache.clear()
+        else:
+            for k in list(_prospeccao_cache):
+                if k[0] == company_id:
+                    del _prospeccao_cache[k]
+
+
+def prospecting_entry_items_cached(
+    conn: sqlite3.Connection, company_id: int, unit_name: str = "",
+) -> dict[str, Any]:
+    """Com cache e fila, como os outros cálculos caros. Ver trava_da_chave."""
+    chave = (company_id, normalize_unit(unit_name))
+    with _prospeccao_cache_lock:
+        pronto = _prospeccao_cache.get(chave)
+    if pronto is not None:
+        return pronto
+    with trava_da_chave(("prospeccao",) + chave):
+        with _prospeccao_cache_lock:
+            pronto = _prospeccao_cache.get(chave)
+        if pronto is not None:
+            return pronto
+        inicio = time.time()
+        resultado = prospecting_entry_items(conn, company_id, unit_name)
+        with _prospeccao_cache_lock:
+            _prospeccao_cache[chave] = resultado
+        print(f"[prospeccao] {chave[1] or 'empresa'} calculada em "
+              f"{time.time() - inicio:.1f}s ({resultado.get('newClients')} novos)",
+              flush=True)
     return resultado
 
 
@@ -23794,6 +23839,17 @@ class AppHandler(BaseHTTPRequestHandler):
                             "neverSold": sem_venda, "neverSoldTotal": len(sem_venda),
                         }
                     res.pop("allItems", None)
+                    # Dicas de prospecção: o que a oficina nova compra na
+                    # PRIMEIRA vez. Vai junto porque é a mesma tela e o cálculo
+                    # tem cache próprio — não atrasa a carga das novidades.
+                    try:
+                        res["prospecting"] = prospecting_entry_items_cached(
+                            conn, user["company_id"], unidade)
+                    except Exception as erro:  # noqa: BLE001
+                        # A tela de novidades não pode cair por causa da seção
+                        # de dicas. Sem prospecting o front simplesmente omite
+                        # o bloco.
+                        print(f"[prospeccao] falhou: {erro}", flush=True)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))
                 return

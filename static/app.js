@@ -7684,6 +7684,84 @@ function buscaNovidadesBloco() {
     </div>`;
 }
 
+// Dicas de prospecção: o que a oficina nova compra na PRIMEIRA vez.
+//
+// O palpite fácil é "ofereça o mais barato". O dado discorda: amortecedor a
+// R$ 241 abre cliente acima do que pesa na carteira. Por isso a tela ordena
+// por PESO (fatia na estreia ÷ fatia no dia a dia), e não por faturamento nem
+// por preço — ordenado por volume isso seria o ranking de vendas com outro
+// nome, e o vendedor já sabe que óleo vende.
+function dicasProspeccaoBloco() {
+  const p = (state.crm.novidades || {}).prospecting;
+  if (!p || !(p.lines || []).length) return "";
+
+  const linhas = [...p.lines].sort((a, b) => (b.lift || 0) - (a.lift || 0));
+  const puxam = linhas.filter((l) => (l.lift || 0) >= 1.15);
+  const depois = linhas.filter((l) => l.lift && l.lift <= 0.85);
+  // Só o que a loja tem para entregar. Dica de prospecção que manda oferecer
+  // peça sem saldo queima o vendedor na primeira visita.
+  const pecas = (p.items || []).filter((i) => i.inStock !== false).slice(0, 12);
+  if (!puxam.length) return "";
+
+  const barra = (l) => {
+    const pct = Math.min(100, Math.round(((l.lift || 0) / 2) * 100));
+    return `
+      <div style="display:flex;align-items:center;gap:10px;padding:7px 0;
+                  border-bottom:1px solid var(--line)">
+        <strong style="flex:0 0 120px;font-size:13px">${escapeHtml(l.name)}</strong>
+        <div style="flex:1;background:#eef2f5;border-radius:5px;height:16px;overflow:hidden">
+          <div style="width:${pct}%;height:100%;border-radius:5px;
+                      background:${l.lift >= 1.3 ? "#2e7d32" : "#5b9bd5"}"></div>
+        </div>
+        <span style="flex:0 0 130px;text-align:right;font-size:11px;color:var(--muted)">
+          ${l.sharePct}% das novas · ${currency(l.unitPrice)}
+        </span>
+      </div>`;
+  };
+
+  return `
+    <div class="table-card">
+      <div class="section-title"><div><h3>🚪 Como se abre uma oficina nova</h3>
+        <div class="text-small">
+          Medido em ${p.newClients} oficinas que compraram pela primeira vez
+          ${p.unitName ? "em " + escapeHtml(p.unitName) : ""} desde ${dataBr(p.since)}:
+          o que elas levaram nos primeiros ${p.firstDays} dias.
+        </div></div></div>
+
+      <div style="padding:4px 2px 10px">
+        ${puxam.map(barra).join("")}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-bottom:10px">
+        A barra é o <strong>peso na abertura</strong>: o quanto a linha pesa na
+        primeira compra comparada ao dia a dia da carteira. Não é a linha que
+        mais vende — é a que mais <em>abre</em>.
+        ${depois.length ? `Já ${depois.map((l) => escapeHtml(l.name)).join(", ")}
+          ${depois.length > 1 ? "vêm" : "vem"} depois, com relacionamento.` : ""}
+      </div>
+
+      ${pecas.length ? `
+        <div class="section-title"><div><h4 style="margin:0">As peças que abriram, e a loja tem</h4>
+          <div class="text-small">Levar na primeira visita. Cada uma já abriu oficina aqui.</div>
+        </div></div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:8px">
+          ${pecas.map((i) => `
+            <div style="background:#fff;border:1px solid var(--line);border-left:5px solid #2e7d32;
+                        border-radius:8px;padding:9px 11px">
+              <div style="font-size:14px;font-weight:800;line-height:1.2">${escapeHtml(i.name)}</div>
+              <div style="font-size:11px;color:var(--muted);margin-bottom:5px">
+                ${escapeHtml(i.brand || "")} · ${escapeHtml(i.line || "")}
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:baseline;gap:6px">
+                <strong style="font-size:15px;color:#0f3044">${currency(i.unitPrice)}</strong>
+                <span style="font-size:11px;color:#2e7d32;font-weight:700">
+                  abriu ${i.clients}
+                </span>
+              </div>
+            </div>`).join("")}
+        </div>` : ""}
+    </div>`;
+}
+
 function novidadesView() {
   const d = state.crm.novidades;
   if (!d) { loadNovidades(); return '<div class="loader panel">Procurando as novidades…</div>'; }
@@ -7793,6 +7871,8 @@ function novidadesView() {
         </div>` : ""}
 
       ${listaEstreante(d.lines || [], "📦 Linhas que a casa passou a vender")}
+
+      ${(d.search) ? "" : dicasProspeccaoBloco()}
 
       ${d.canSeeWithoutStock && semSaldo.length ? `
         <div>
