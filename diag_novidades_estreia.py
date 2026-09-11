@@ -126,9 +126,51 @@ if d["lines"]:
 else:
     print("   Nenhuma linha nova na janela.")
 
-print("\n5) LEITURA")
+# ── 5. Quem ficou de fora por pouco ──────────────────────────────────────────
+# Lista vazia não diz se a régua está certa ou apertada demais. Ver quem parou
+# na porta, e por qual número, é o que permite calibrar.
+print("\n5) QUEM FICOU NA PORTA (marcas que estrearam e não passaram)")
+quase = conn.execute(
+    f"""
+    SELECT UPPER(TRIM(COALESCE(f.brand_name,''))) chave,
+           MIN(date(f.issue_date)) estreia,
+           COUNT(DISTINCT UPPER(TRIM(f.sku_key))) itens,
+           COUNT(DISTINCT f.client_name) clientes,
+           COUNT(*) vendas, COUNT(DISTINCT f.competence) meses,
+           SUM(f.net_value) valor
+    FROM fact_sales_detail f
+    WHERE f.company_id = ? AND f.net_value > 0
+      AND TRIM(COALESCE(f.brand_name,'')) <> ''
+    GROUP BY chave HAVING estreia >= ?
+    ORDER BY valor DESC LIMIT 12
+    """, (company_id, d["since"])).fetchall()
+aprovadas = {b["name"] for b in (d["brands"] or [])}
+fora = [r for r in quase if r["chave"] not in aprovadas]
+if fora:
+    print(f"   {'MARCA':<20}{'ESTREIA':>12}{'ITENS':>7}{'VENDAS':>8}{'MES':>5}{'CLI':>5}"
+          f"{'VALOR':>14}  BARROU EM")
+    for r in fora:
+        faltas = []
+        if r["vendas"] < backend.NOVELTY_BRAND_MIN_SALES:
+            faltas.append(f"vendas {r['vendas']}/{backend.NOVELTY_BRAND_MIN_SALES}")
+        if r["clientes"] < backend.NOVELTY_BRAND_MIN_CLIENTS:
+            faltas.append(f"clientes {r['clientes']}/{backend.NOVELTY_BRAND_MIN_CLIENTS}")
+        if r["meses"] < backend.NOVELTY_MIN_MONTHS:
+            faltas.append(f"meses {r['meses']}/{backend.NOVELTY_MIN_MONTHS}")
+        if r["itens"] < backend.NOVELTY_BRAND_MIN_ITEMS:
+            faltas.append(f"itens {r['itens']}/{backend.NOVELTY_BRAND_MIN_ITEMS}")
+        print(f"   {r['chave'][:19]:<20}{r['estreia']:>12}{r['itens']:>7}{r['vendas']:>8}"
+              f"{r['meses']:>5}{r['clientes']:>5}{backend.brl(r['valor']):>14}  "
+              + ", ".join(faltas))
+    print("\n   Se alguma dessas for novidade de verdade para você, me diga qual —")
+    print("   o número que a barrou está na última coluna.")
+else:
+    print("   Nenhuma marca estreou e ficou de fora.")
+
+print("\n6) LEITURA")
 print("   Passe o olho na seção 3: se reconhecer peça que a casa vende há anos,")
-print("   a régua está frouxa e eu aperto (janela maior, ou mínimo de clientes).")
+print("   a régua está frouxa. Se faltar novidade que você sabe que existe,")
+print("   a seção 5 mostra qual gatilho a barrou.")
 print("   O que tem 'tem' na coluna LOJA é o que o vendedor pode oferecer hoje.")
 
 conn.close()

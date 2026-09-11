@@ -14528,9 +14528,17 @@ NOVELTY_MIN_SALES = 10       # linhas de venda: volume, não um pedido isolado
 NOVELTY_MIN_CLIENTS = 3      # espalhou na praça, não é de um cliente só
 NOVELTY_MIN_MONTHS = 2       # repetiu em outro mês: não é sazonal de uma vez
 NOVELTY_REQUIRE_STOCK = True # a casa passou a ESTOCAR: entrou no portfólio
-# Marca nova pede o mesmo, com escala própria: uma marca entra com um conjunto
-# de itens, não com uma peça avulsa.
-NOVELTY_BRAND_MIN_ITEMS = 3
+# Marca e linha novas: o mesmo comportamento, SEM exigir variedade de itens.
+#
+# A primeira versão pedia 3 itens distintos e zerou a lista. O funil explicou
+# por quê: o gatilho de 10 vendas já faz 99,6% do corte sozinho — depois dele,
+# clientes e meses não derrubaram nenhum item. Somar "3 itens" em cima disso
+# não filtrava ruído, filtrava a resposta.
+#
+# E é errado de conceito: fornecedor novo costuma entrar com UMA peça que
+# emplaca. Se ela vendeu 10 vezes para 3 oficinas em 2 meses, a marca entrou na
+# casa — o número de referências não muda isso.
+NOVELTY_BRAND_MIN_ITEMS = 1
 NOVELTY_BRAND_MIN_SALES = 10
 NOVELTY_BRAND_MIN_CLIENTS = 3
 
