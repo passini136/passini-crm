@@ -601,9 +601,9 @@ function allowedTabsForUser(user) {
   if (Array.isArray(user.modules) && user.modules.length) return withoutScore(user.modules);
   // Fallback para instalações antigas, antes dos perfis existirem
   if (user.role === "Vendedor") {
-    return withoutScore(["crm-agenda", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "calendario"]);
+    return withoutScore(["crm-agenda", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "novidades", "calendario"]);
   }
-  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
+  return withoutScore(["crm-agenda", "placar-equipe", "crm-clientes", "crm-tarefas", "visitas", "prospeccao", "contatos", "reunioes", "feedback", "novidades", "executivo", "vendedores", "unidades", "clientes", "cidades", "descontos", "calendario", "importacoes", "administracao", "configuracoes", "acessos"]);
 }
 
 function userCanManageUsers() {
@@ -7331,6 +7331,110 @@ function averageBreakdown(item) {
       <div class="text-small" style="color:var(--muted);margin-top:4px">
         Base: faturamento total do cliente nos 3 meses anteriores a ${escapeHtml(competenceShort(basis.currentCompetence))},
         somando todos os vendedores.
+      </div>
+    </div>`;
+}
+
+/* ─── NOVIDADES ──────────────────────────────────────────────────────────────
+ *
+ * "Novo" aqui é ESTREIA EM VENDAS: item que nunca tinha vendido e passou a
+ * vender. A hipótese de usar o código do cadastro ("número maior = mais
+ * recente") foi medida em 10/09/2026 e descartada — a mediana da primeira
+ * venda é fevereiro em todos os dez decis de código. O código continua na tela
+ * como reforço visual, nunca como critério.
+ *
+ * O risco desta tela é caro: apontar peça velha como lançamento. O vendedor
+ * oferece como novidade, o cliente responde "isso eu compro há anos", e ele
+ * para de acreditar em tudo que o sistema sugere.
+ */
+async function loadNovidades() {
+  state.crm.novidades = { loading: true };
+  requestRender();
+  try {
+    state.crm.novidades = { ...(await api(`/api/crm/novelties?${buildQuery()}`)), loading: false };
+  } catch (e) {
+    state.crm.novidades = { error: e.message, loading: false };
+  }
+  requestRender();
+}
+
+function novidadesView() {
+  const d = state.crm.novidades;
+  if (!d) { loadNovidades(); return '<div class="loader panel">Procurando as novidades…</div>'; }
+  if (d.loading) return '<div class="loader panel">Procurando as novidades…</div>';
+  if (d.error) return `<div class="panel padded-card"><div class="message error">${escapeHtml(d.error)}</div></div>`;
+
+  const todos = d.items || [];
+  const comSaldo = todos.filter((i) => i.inStock);
+  const semSaldo = todos.filter((i) => i.inStock === false);
+
+  const cartao = (i, podeOferecer) => `
+    <div style="background:#fff;border:1px solid ${podeOferecer ? "#2e7d32" : "var(--line)"};
+                border-left-width:5px;border-radius:8px;padding:10px 12px">
+      <div style="font-size:15px;font-weight:800;line-height:1.2">${escapeHtml(i.ref)}</div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:6px">
+        ${escapeHtml(i.brand)} · ${escapeHtml(i.line)}
+      </div>
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:6px">
+        <strong style="font-size:16px;color:#0f3044">${currency(i.unitPrice)}</strong>
+        <span style="font-size:11px;color:var(--muted)">${i.clients} oficinas</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">
+        estreou ${dataBr(i.debutAt)}${i.code ? ` · cód. ${escapeHtml(String(i.code))}` : ""}
+      </div>
+    </div>`;
+
+  const listaEstreante = (itens, rotulo) => itens.length ? `
+    <div class="table-card">
+      <div class="section-title"><div><h3>${rotulo}</h3></div></div>
+      <div class="timeline-list">
+        ${itens.map((x) => `
+          <div class="timeline-item">
+            <strong>${escapeHtml(x.name)}</strong>
+            <div class="text-small">estreou ${dataBr(x.debutAt)} · ${x.items} item(ns)
+              · ${x.clients} cliente(s) · ${currency(x.revenue)}</div>
+          </div>`).join("")}
+      </div>
+    </div>` : "";
+
+  return `
+    <div class="stack">
+      <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;border:none;padding:20px 24px">
+        <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:6px">✨ NOVIDADES</div>
+        <h3 style="color:#fff;margin:0 0 4px">
+          ${comSaldo.length} peça(s) novas com saldo${d.unitName ? " em " + escapeHtml(d.unitName) : ""}
+        </h3>
+        <div style="font-size:13px;color:rgba(255,255,255,0.75)">
+          Estrearam em vendas nos últimos ${d.days} dias. Quem oferece primeiro ganha o cliente do item.
+        </div>
+      </div>
+
+      ${comSaldo.length ? `
+        <div>
+          <div class="section-title"><div><h3>✅ Dá para oferecer hoje</h3>
+            <div class="text-small">Novidade com saldo na sua loja.</div></div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px">
+            ${comSaldo.slice(0, 24).map((i) => cartao(i, true)).join("")}
+          </div>
+        </div>`
+        : '<div class="message">Nenhuma novidade com saldo na loja no momento.</div>'}
+
+      ${listaEstreante(d.brands || [], "🏷️ Marcas que entraram na casa")}
+      ${listaEstreante(d.lines || [], "📦 Linhas que a casa passou a vender")}
+
+      ${d.canSeeWithoutStock && semSaldo.length ? `
+        <div>
+          <div class="section-title"><div><h3>🏬 Novidade sem saldo aqui</h3>
+            <div class="text-small">Vende em outras lojas e esta não tem. Decisão de compra, não de venda.</div></div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px">
+            ${semSaldo.slice(0, 18).map((i) => cartao(i, false)).join("")}
+          </div>
+        </div>` : ""}
+
+      <div class="text-small" style="color:var(--muted)">
+        ⚠ "Novo" aqui é o que <strong>estreou em vendas</strong> — nunca tinha vendido e passou a
+        vender. Não é a data de cadastro: medimos e o número do código não indica quando a peça
+        entrou. O código aparece só como referência.
       </div>
     </div>`;
 }
@@ -16432,6 +16536,7 @@ function topbarTitle() {
     "prospeccao":     { title: "Prospecção",             description: "Oficinas que ainda não são clientes, qualificação e conversão." },
     "contatos":       { title: "Contatos",               description: "Histórico dos registros e produtividade por vendedor." },
     "biblioteca":     { title: "Biblioteca de Vendas",    description: "Abordagens, mensagens, objeções e garantia." },
+    "novidades":      { title: "Novidades",               description: "Peças, marcas e linhas que estrearam em vendas." },
     "sem-vendedor":   { title: "Clientes sem Vendedor",   description: "Clientes recorrentes que ninguém responde por eles." },
     "crm-interacao":  { title: "Interação CRM",           description: "Registro de interações com clientes." },
   };
@@ -16789,6 +16894,7 @@ function dashboardView() {
     { id: "meu-placar",    title: "Meu Placar",       desc: "Seus pontos e premiação",  icon: "⭐" },
     { id: "placar-equipe", title: "Placar Equipe",    desc: "Apuração da premiação",    icon: "🏆" },
     { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
+    { id: "novidades",     title: "Novidades",        desc: "O que estreou em vendas",  icon: "✨" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
       badge: state.meetings?.pendingCount || 0 },
     { id: "feedback", title: "Feedback",  desc: "Avaliação e PDI",      icon: "🎯",
@@ -16928,6 +17034,7 @@ function dashboardView() {
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
+          ${state.activeTab === "novidades"     ? novidadesView()      : ""}
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "visitas"       ? visitasView()        : ""}

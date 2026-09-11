@@ -251,6 +251,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "meu-placar",     "label": "Meu Placar",         "group": "Equipe"},
     {"id": "placar-equipe",  "label": "Placar da Equipe",   "group": "Equipe"},
     {"id": "biblioteca",     "label": "Biblioteca de Vendas","group": "Equipe"},
+    {"id": "novidades",      "label": "Novidades",          "group": "Equipe"},
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
     # Resultados — o diário visível, o ocasional recolhido em Análises
@@ -306,7 +307,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "sem-vendedor",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "novidades", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
@@ -330,7 +331,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
-            "meu-placar", "biblioteca", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
+            "meu-placar", "biblioteca", "novidades", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             "executivo", "marcas", "devolucoes", "calendario",
         ],
         "data_scope": "proprio",
@@ -13968,6 +13969,7 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
     invalidate_calendar_cache(company_id)
     invalidate_mix_cache(company_id)
     invalidate_recompra_cache(company_id)
+    invalidate_novidades_cache(company_id)
 
 
 def invalidate_activity_caches(company_id: int | None = None) -> None:
@@ -14615,6 +14617,43 @@ def sales_debut_novelties(
         "lines": estreantes("c.item_subgroup")[:15],
         "inStockCount": sum(1 for i in itens if i["inStock"]),
     }
+
+
+_novidades_cache: dict[tuple, dict[str, Any]] = {}
+_novidades_cache_lock = threading.Lock()
+
+
+def invalidate_novidades_cache(company_id: int | None = None) -> None:
+    with _novidades_cache_lock:
+        if company_id is None:
+            _novidades_cache.clear()
+        else:
+            for k in list(_novidades_cache):
+                if k[0] == company_id:
+                    del _novidades_cache[k]
+
+
+def sales_debut_novelties_cached(
+    conn: sqlite3.Connection, company_id: int, unit_name: str = "",
+) -> dict[str, Any]:
+    """Com cache e fila, como os outros cálculos caros. Ver trava_da_chave."""
+    chave = (company_id, normalize_unit(unit_name))
+    with _novidades_cache_lock:
+        pronto = _novidades_cache.get(chave)
+    if pronto is not None:
+        return pronto
+    with trava_da_chave(("novidades",) + chave):
+        with _novidades_cache_lock:
+            pronto = _novidades_cache.get(chave)
+        if pronto is not None:
+            return pronto
+        inicio = time.time()
+        resultado = sales_debut_novelties(conn, company_id, unit_name)
+        with _novidades_cache_lock:
+            _novidades_cache[chave] = resultado
+        print(f"[novidades] {chave[1] or 'empresa'} calculada em {time.time() - inicio:.1f}s "
+              f"({resultado.get('totalItems')} itens)", flush=True)
+    return resultado
 
 
 _mix_cache: dict[tuple, dict[str, Any]] = {}
@@ -23025,6 +23064,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado}))
+                return
+            if path == "/api/crm/novelties":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    filtros = crm_scoped_filters_for_user(
+                        conn, user["company_id"], user, build_filters_from_query(query))
+                    unidade = (normalize_unit(filtros.get("unit_name"))
+                               or normalize_unit(query.get("unit", [""])[0]))
+                    res = sales_debut_novelties_cached(conn, user["company_id"], unidade)
+                    res["canSeeWithoutStock"] = data_scope_for_user(conn, user) != "proprio"
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
                 return
             if path == "/api/crm/mix-opportunities":
                 user = self._require_auth()
