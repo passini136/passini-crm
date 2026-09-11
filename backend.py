@@ -13888,6 +13888,31 @@ def _crm_cache_key(company_id: int, filters: dict) -> tuple:
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fila por chave: um constrói, os outros esperam o resultado dele.
+#
+# Sem isto acontece estouro de cache. Em 11/09/2026 a importação derrubou os
+# caches às 09:09 e SETE requisições entraram juntas para montar a mesma
+# carteira de 101 mil clientes. Cada uma começou a sua própria cópia, todas
+# disputaram a mesma CPU, e o que levava 12s passou a levar 380s — a etapa
+# "cadastro" saltou de 0,7s para 183s só de disputa. Nenhuma terminava a tempo
+# de servir as outras, então cada nova requisição piorava o problema.
+#
+# Com a fila, o primeiro calcula e os demais aguardam; ao entrar, encontram o
+# valor pronto. Custa a espera de um cálculo, não a de sete concorrentes.
+# ─────────────────────────────────────────────────────────────────────────────
+_fila_por_chave: dict[tuple, threading.Lock] = {}
+_fila_guarda = threading.Lock()
+
+
+def trava_da_chave(chave: tuple) -> threading.Lock:
+    with _fila_guarda:
+        trava = _fila_por_chave.get(chave)
+        if trava is None:
+            trava = _fila_por_chave[chave] = threading.Lock()
+        return trava
+
+
 def crm_base_client_rows_cached(conn: sqlite3.Connection, company_id: int, filters: dict) -> list:
     key = _crm_cache_key(company_id, filters)
     now = time.monotonic()
@@ -13895,9 +13920,17 @@ def crm_base_client_rows_cached(conn: sqlite3.Connection, company_id: int, filte
         entry = _crm_base_cache.get(key)
     if entry and now - entry[0] < _CRM_CACHE_TTL:
         return entry[1]
-    result = crm_base_client_rows(conn, company_id, filters)
-    with _crm_base_cache_lock:
-        _crm_base_cache[key] = (now, result)
+    with trava_da_chave(("carteira",) + key):
+        # Reconfere DENTRO da fila: quem esperou provavelmente já tem o
+        # resultado pronto de quem estava na frente.
+        agora = time.monotonic()
+        with _crm_base_cache_lock:
+            entry = _crm_base_cache.get(key)
+        if entry and agora - entry[0] < _CRM_CACHE_TTL:
+            return entry[1]
+        result = crm_base_client_rows(conn, company_id, filters)
+        with _crm_base_cache_lock:
+            _crm_base_cache[key] = (time.monotonic(), result)
     return result
 
 
@@ -14614,12 +14647,17 @@ def mix_opportunities_cached(
         pronto = _mix_cache.get(chave)
     if pronto is not None:
         return pronto
-    inicio = time.time()
-    resultado = mix_opportunities(conn, company_id, unit_name)
-    with _mix_cache_lock:
-        _mix_cache[chave] = resultado
-    print(f"[mix] {chave[1]} calculado em {time.time() - inicio:.1f}s "
-          f"({len(resultado.get('sellers') or [])} vendedores)", flush=True)
+    with trava_da_chave(("mix",) + chave):
+        with _mix_cache_lock:
+            pronto = _mix_cache.get(chave)
+        if pronto is not None:
+            return pronto
+        inicio = time.time()
+        resultado = mix_opportunities(conn, company_id, unit_name)
+        with _mix_cache_lock:
+            _mix_cache[chave] = resultado
+        print(f"[mix] {chave[1]} calculado em {time.time() - inicio:.1f}s "
+              f"({len(resultado.get('sellers') or [])} vendedores)", flush=True)
     return resultado
 
 
@@ -14858,12 +14896,17 @@ def line_repurchase_opportunities_cached(
         pronto = _recompra_cache.get(chave)
     if pronto is not None:
         return pronto
-    inicio = time.time()
-    resultado = line_repurchase_opportunities(conn, company_id, user, filters)
-    with _recompra_cache_lock:
-        _recompra_cache[chave] = resultado
-    print(f"[recompra] {chave[1] or 'todas'} calculada em {time.time() - inicio:.1f}s "
-          f"({resultado.get('totalClients')} clientes)", flush=True)
+    with trava_da_chave(("recompra",) + chave):
+        with _recompra_cache_lock:
+            pronto = _recompra_cache.get(chave)
+        if pronto is not None:
+            return pronto
+        inicio = time.time()
+        resultado = line_repurchase_opportunities(conn, company_id, user, filters)
+        with _recompra_cache_lock:
+            _recompra_cache[chave] = resultado
+        print(f"[recompra] {chave[1] or 'todas'} calculada em {time.time() - inicio:.1f}s "
+              f"({resultado.get('totalClients')} clientes)", flush=True)
     return resultado
 
 
