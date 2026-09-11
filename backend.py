@@ -14889,9 +14889,17 @@ def sales_debut_novelties(
 # vendedor uma frase de abertura que já funcionou com outras oficinas.
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROSPECT_WINDOW_MONTHS = 12
 PROSPECT_FIRST_DAYS = 30      # o que entrou junto na primeira compra
 PROSPECT_MIN_CLIENTS = 3
+# CARÊNCIA contra a censura da janela.
+#
+# O faturamento na base começa em 2026-01. Sem esta guarda, "primeira compra
+# registrada" é lida como "primeira compra da vida", e cliente que compra há dez
+# anos vira estreante de janeiro: a primeira medição devolveu 15.857 "oficinas
+# novas", quase toda a base, e a lista virou o mix geral disfarçado de porta de
+# entrada. Só conta como novo quem estreou pelo menos este tanto DEPOIS do
+# primeiro dia de dados — aí a estreia é dele, não do arquivo.
+PROSPECT_BASE_GUARD_DAYS = 60
 
 
 def prospecting_entry_items(
@@ -14900,21 +14908,51 @@ def prospecting_entry_items(
     """Linhas e peças que abriram cliente novo, medidas na primeira compra deles."""
     ensure_catalogo_temp(conn, company_id)
     unidade = normalize_unit(unit_name)
-    desde = (today_in_brazil() - timedelta(days=PROSPECT_WINDOW_MONTHS * 31)).isoformat()
 
-    # Primeira compra de cada cliente. Quem estreou dentro da janela é "cliente
-    # novo"; os demais entraram antes e não dizem nada sobre abertura.
+    inicio_base = conn.execute(
+        "SELECT MIN(date(issue_date)) AS d FROM fact_sales_detail "
+        "WHERE company_id = ? AND net_value > 0", (company_id,)).fetchone()["d"]
+    if not inicio_base:
+        return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
+    desde = (date.fromisoformat(inicio_base)
+             + timedelta(days=PROSPECT_BASE_GUARD_DAYS)).isoformat()
+
+    # Vendedores DESTA unidade: prospecção é sobre como a loja abre cliente, e
+    # a porta de entrada de Xangri-lá não é a da Matriz. Sem este recorte as
+    # unidades devolviam listas idênticas.
+    competencias = query_competences(conn, company_id)
+    mapa_unidade = build_seller_unit_map(conn, company_id,
+                                         competencias[0] if competencias else "")
+    da_unidade = {
+        normalize_whitespace(r["seller_name"])
+        for r in conn.execute(
+            "SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ?",
+            (company_id,)).fetchall()
+        if r["seller_name"] and (
+            mapa_unidade.get(person_key(normalize_whitespace(r["seller_name"])))
+            or mapa_unidade.get(short_person_key(normalize_whitespace(r["seller_name"])))
+        ) == unidade
+    } if unidade else set()
+
+    # Primeira compra de cada cliente NA UNIDADE (ou na empresa, sem recorte).
+    onde_vend, params_vend = "", []
+    if da_unidade:
+        marc = ",".join("?" for _ in da_unidade)
+        onde_vend = f" AND seller_name IN ({marc})"
+        params_vend = sorted(da_unidade)
     primeira: dict[str, str] = {}
     for r in conn.execute(
-        "SELECT client_name, MIN(date(issue_date)) AS inicio FROM fact_sales_detail "
-        "WHERE company_id = ? AND net_value > 0 GROUP BY client_name",
-        (company_id,),
+        f"SELECT client_name, MIN(date(issue_date)) AS inicio FROM fact_sales_detail "
+        f"WHERE company_id = ? AND net_value > 0{onde_vend} GROUP BY client_name",
+        (company_id, *params_vend),
     ).fetchall():
         if r["client_name"] and r["inicio"]:
             primeira[normalize_whitespace(r["client_name"])] = r["inicio"]
     novos = {c: d for c, d in primeira.items() if d >= desde}
     if not novos:
-        return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
+        return {"unitName": unidade, "lines": [], "items": [], "newClients": 0,
+                "since": desde, "baseStart": inicio_base,
+                "firstDays": PROSPECT_FIRST_DAYS}
 
     por_linha: dict[str, dict[str, Any]] = {}
     por_item: dict[str, dict[str, Any]] = {}
@@ -14929,9 +14967,10 @@ def prospecting_entry_items(
         {CATALOGO_JOIN_SQL}
         WHERE f.company_id = ? AND f.net_value > 0 AND date(f.issue_date) >= date(?)
           AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
+          {onde_vend.replace("seller_name", "f.seller_name")}
         GROUP BY cliente, dia, ref, marca
         """,
-        (company_id, desde),
+        (company_id, desde, *params_vend),
     ).fetchall():
         cliente = normalize_whitespace(r["cliente"])
         estreia = novos.get(cliente)
@@ -14983,7 +15022,10 @@ def prospecting_entry_items(
         "unitName": unidade,
         "newClients": len(novos),
         "since": desde,
+        "baseStart": inicio_base,
+        "guardDays": PROSPECT_BASE_GUARD_DAYS,
         "firstDays": PROSPECT_FIRST_DAYS,
+        "sellers": len(da_unidade),
         "lines": linhas[:12],
         "items": itens[:24],
     }

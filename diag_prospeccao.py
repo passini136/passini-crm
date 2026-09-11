@@ -42,11 +42,18 @@ seg = time.time() - inicio
 print(f"Banco: {backend.DB_PATH}")
 print(f"Unidade: {d['unitName']}  ·  {seg:.2f}s\n")
 print("Régua:")
-print(f"   cliente novo.......: primeira compra desde {d.get('since', '—')}")
+print(f"   dados começam em...: {d.get('baseStart', '—')}")
+print(f"   carência...........: {d.get('guardDays')} dias — antes disso não dá para saber")
+print("                         se a estreia é do cliente ou do arquivo")
+print(f"   cliente novo.......: primeira compra NA UNIDADE desde {d.get('since', '—')}")
 print(f"   primeira compra....: o que entrou em até {d.get('firstDays')} dias da estreia")
+print(f"   vendedores da loja.: {d.get('sellers', 0)}")
 print(f"   mínimo de clientes.: {backend.PROSPECT_MIN_CLIENTS}\n")
 
-print(f"1) {d['newClients']} oficina(s) compraram pela primeira vez na janela")
+print(f"1) {d['newClients']} oficina(s) compraram pela primeira vez com esta loja")
+if d["newClients"] > 3000:
+    print("   >> Número alto demais para ser 'cliente novo'. Confira se a carência")
+    print("      está pegando a censura da janela de dados.")
 if not d["lines"]:
     print("\n   Sem dados suficientes. Janela curta, ou poucos clientes novos.")
     conn.close()
