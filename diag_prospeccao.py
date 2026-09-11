@@ -35,9 +35,35 @@ conn = backend.get_connection()
 company_id = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()["id"]
 unidade = " ".join(a for a in sys.argv[1:] if not a.startswith("-")).strip().upper() or "MATRIZ"
 
+# ── Qual carência usar? Medir, não chutar ───────────────────────────────────
+# A base tem só 9 meses. Carência curta deixa passar cliente antigo disfarçado
+# de novo; carência longa protege mas sobra pouca janela para medir. O ponto
+# certo depende do dado, então varro alguns valores e olho o resultado.
+print("ESCOLHA DA CARÊNCIA (quanto ignorar do início da base)")
+print(f"   {'DIAS':>5}{'DESDE':>13}{'NOVOS':>8}{'% DA CARTEIRA':>15}{'LINHAS':>8}")
+melhor = None
+for dias in (60, 90, 120, 150, 180):
+    p = backend.prospecting_entry_items(conn, company_id, unidade, guard_days=dias)
+    tot = p.get("totalClients") or 1
+    prop = 100 * p.get("newClients", 0) / tot
+    print(f"   {dias:>5}{p.get('since', '—'):>13}{p.get('newClients', 0):>8}"
+          f"{prop:>14.0f}%{len(p.get('lines', [])):>8}")
+    # Primeiro valor que derruba a proporção abaixo de 60% E ainda devolve
+    # linhas suficientes para a tela ter conteúdo.
+    if melhor is None and prop < 60 and len(p.get("lines", [])) >= 8:
+        melhor = dias
+if melhor is None:
+    print("\n   >> Nenhuma carência resolve. Com 9 meses de base não dá para separar")
+    print("      cliente novo de cliente antigo — a tela precisa de mais histórico.")
+else:
+    print(f"\n   >> Usando {melhor} dias: é a menor carência que fica abaixo de 60%")
+    print("      sem esvaziar a lista.")
+
 inicio = time.time()
-d = backend.prospecting_entry_items(conn, company_id, unidade)
+d = backend.prospecting_entry_items(conn, company_id, unidade,
+                                    guard_days=melhor or 180)
 seg = time.time() - inicio
+print()
 
 print(f"Banco: {backend.DB_PATH}")
 print(f"Unidade: {d['unitName']}  ·  {seg:.2f}s\n")
@@ -115,18 +141,30 @@ for l in d["lines"]:
 # é o ranking de vendas com outro nome — o vendedor não aprende nada. O valor
 # está nas linhas com peso acima de 1: essas puxam cliente novo.
 print("\n2b) ISSO É DIFERENTE DO RANKING DE VENDAS?")
+# O peso é fatia-dentro-da-cesta dos dois lados, então 1,00 é o esperado de uma
+# linha que abre igual ao que vende. Se TODOS derem para o mesmo lado, o erro é
+# da conta, não do dado — foi o que aconteceu comparando 30 dias com 9 meses.
 pesos = [l.get("lift", 0) for l in d["lines"] if l.get("lift")]
 if pesos:
     acima = [l for l in d["lines"] if l.get("lift", 0) >= 1.15]
-    print(f"   peso vai de {min(pesos):.2f} a {max(pesos):.2f}")
-    if not acima:
-        print("   >> Nenhuma linha se destaca na abertura. A estreia é igual ao dia a dia:")
-        print("      como dica de prospecção isso não acrescenta nada.")
+    abaixo = [l for l in d["lines"] if 0 < l.get("lift", 0) <= 0.85]
+    print(f"   peso vai de {min(pesos):.2f} a {max(pesos):.2f}  "
+          f"(1,00 = abre igual ao que vende)")
+    if not acima and not abaixo:
+        print("   >> Nenhuma linha se destaca. A estreia é igual ao dia a dia e a tela")
+        print("      não acrescenta nada ao que o vendedor já sabe.")
+    elif not acima and abaixo:
+        print("   >> ATENÇÃO: todas as linhas abaixo de 1. Isso é defeito da conta, não")
+        print("      resultado — as duas cestas não estão na mesma medida.")
     else:
-        print(f"   {len(acima)} linha(s) pesam mais na abertura do que na carteira:")
+        print(f"\n   PUXAM CLIENTE NOVO ({len(acima)}):")
         for l in acima:
-            print(f"      {l['name'][:21]:<22} {l['sharePct']:.0f}% dos novos "
-                  f"vs {l.get('basePct', 0):.0f}% da carteira  (peso {l['lift']:.2f})")
+            print(f"      {l['name'][:21]:<22} peso {l['lift']:.2f}   "
+                  f"{l['sharePct']:.0f}% dos novos")
+        if abaixo:
+            print(f"\n   NÃO ABREM — vêm depois, com relacionamento ({len(abaixo)}):")
+            for l in abaixo:
+                print(f"      {l['name'][:21]:<22} peso {l['lift']:.2f}")
 
 print("\n3) AS PEÇAS QUE ABREM CLIENTE")
 print(f"   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<16}{'OFIC':>6}{'PREÇO':>11}  LOJA")

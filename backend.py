@@ -14909,6 +14909,7 @@ PROSPECT_WINDOW_MONTHS = 12
 
 def prospecting_entry_items(
     conn: sqlite3.Connection, company_id: int, unit_name: str = "",
+    guard_days: int | None = None,
 ) -> dict[str, Any]:
     """Linhas e peças que abriram cliente novo, medidas na primeira compra deles."""
     ensure_catalogo_temp(conn, company_id)
@@ -14936,8 +14937,9 @@ def prospecting_entry_items(
     meses_de_base = len(com_volume)
     # O mais RESTRITIVO dos dois: a carência protege da censura da base, e o
     # teto de 12 meses mantém a leitura no comportamento atual.
+    carencia = PROSPECT_BASE_GUARD_DAYS if guard_days is None else int(guard_days)
     desde = max(
-        (date.fromisoformat(inicio_base) + timedelta(days=PROSPECT_BASE_GUARD_DAYS)),
+        (date.fromisoformat(inicio_base) + timedelta(days=carencia)),
         (today_in_brazil() - timedelta(days=PROSPECT_WINDOW_MONTHS * 31)),
     ).isoformat()
 
@@ -15025,6 +15027,14 @@ def prospecting_entry_items(
     # tudo. O que serve para prospecção é a linha que pesa MAIS na abertura do
     # que no dia a dia — essa é porta de entrada de verdade. Sem esta base de
     # comparação a tela vira o ranking de vendas com outro nome.
+    #
+    # E a comparação é de COMPOSIÇÃO, não de cobertura. A primeira versão
+    # comparava "% dos novos que levaram óleo em 30 dias" contra "% da carteira
+    # que já comprou óleo em 9 meses" — cesta de mês contra cesta de ano. Como
+    # o cliente acumula linhas ao longo do tempo, TODA linha dava abaixo de 1
+    # e o resultado não dizia nada sobre nenhuma delas. Agora os dois lados são
+    # a fatia da linha dentro do próprio total, que não depende do tamanho da
+    # cesta.
     base_linha: dict[str, set[str]] = {}
     for r in conn.execute(
         f"""
@@ -15042,6 +15052,8 @@ def prospecting_entry_items(
         if r["linha"] and r["cliente"]:
             base_linha.setdefault(r["linha"], set()).add(normalize_whitespace(r["cliente"]))
     total_carteira = len(primeira) or 1
+    pares_base = sum(len(v) for v in base_linha.values()) or 1
+    pares_estreia = sum(len(v["clients"]) for v in por_linha.values()) or 1
 
     def formatar(d: dict[str, Any], com_estoque: bool) -> dict[str, Any]:
         clientes = len(d["clients"])
@@ -15054,11 +15066,13 @@ def prospecting_entry_items(
             "sharePct": round(100 * clientes / len(novos), 1),
         }
         if not com_estoque:  # linha
-            base_pct = 100 * len(base_linha.get(d["name"], ())) / total_carteira
-            saida["basePct"] = round(base_pct, 1)
-            # >1 = pesa mais na abertura do que na carteira. É o número que
-            # transforma o ranking em dica de prospecção.
-            saida["lift"] = round(saida["sharePct"] / base_pct, 2) if base_pct else 0.0
+            saida["basePct"] = round(
+                100 * len(base_linha.get(d["name"], ())) / total_carteira, 1)
+            # Fatia da linha dentro da cesta — os dois lados somam 100%, então
+            # comparar é justo. >1 = pesa mais na abertura do que no dia a dia.
+            fatia_estreia = clientes / pares_estreia
+            fatia_base = len(base_linha.get(d["name"], ())) / pares_base
+            saida["lift"] = round(fatia_estreia / fatia_base, 2) if fatia_base else 0.0
         for k in ("brand", "line"):
             if k in d:
                 saida[k] = d[k]
@@ -15078,7 +15092,7 @@ def prospecting_entry_items(
         "since": desde,
         "baseStart": inicio_base,
         "baseMonths": meses_de_base,
-        "guardDays": PROSPECT_BASE_GUARD_DAYS,
+        "guardDays": carencia,
         "firstDays": PROSPECT_FIRST_DAYS,
         "sellers": len(da_unidade),
         # Quantos clientes a unidade atendeu no total, para a tela mostrar a
