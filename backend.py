@@ -14880,6 +14880,115 @@ def sales_debut_novelties(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTA DE ENTRADA: o que o cliente novo compra na primeira vez
+#
+# O palpite fácil seria "ofereça o mais barato". O dado responde melhor: entre
+# os clientes que compraram pela primeira vez, o que eles levaram NAQUELA
+# primeira compra? Isso não é teoria de vendas, é o que aconteceu — e dá ao
+# vendedor uma frase de abertura que já funcionou com outras oficinas.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PROSPECT_WINDOW_MONTHS = 12
+PROSPECT_FIRST_DAYS = 30      # o que entrou junto na primeira compra
+PROSPECT_MIN_CLIENTS = 3
+
+
+def prospecting_entry_items(
+    conn: sqlite3.Connection, company_id: int, unit_name: str = "",
+) -> dict[str, Any]:
+    """Linhas e peças que abriram cliente novo, medidas na primeira compra deles."""
+    ensure_catalogo_temp(conn, company_id)
+    unidade = normalize_unit(unit_name)
+    desde = (today_in_brazil() - timedelta(days=PROSPECT_WINDOW_MONTHS * 31)).isoformat()
+
+    # Primeira compra de cada cliente. Quem estreou dentro da janela é "cliente
+    # novo"; os demais entraram antes e não dizem nada sobre abertura.
+    primeira: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT client_name, MIN(date(issue_date)) AS inicio FROM fact_sales_detail "
+        "WHERE company_id = ? AND net_value > 0 GROUP BY client_name",
+        (company_id,),
+    ).fetchall():
+        if r["client_name"] and r["inicio"]:
+            primeira[normalize_whitespace(r["client_name"])] = r["inicio"]
+    novos = {c: d for c, d in primeira.items() if d >= desde}
+    if not novos:
+        return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
+
+    por_linha: dict[str, dict[str, Any]] = {}
+    por_item: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        f"""
+        SELECT f.client_name AS cliente, date(f.issue_date) AS dia,
+               UPPER(TRIM(f.sku_key)) AS ref,
+               UPPER(TRIM(COALESCE(f.brand_name, ''))) AS marca,
+               UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               SUM(f.quantity) AS qtd, SUM(f.net_value) AS valor
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.net_value > 0 AND date(f.issue_date) >= date(?)
+          AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
+        GROUP BY cliente, dia, ref, marca
+        """,
+        (company_id, desde),
+    ).fetchall():
+        cliente = normalize_whitespace(r["cliente"])
+        estreia = novos.get(cliente)
+        if not estreia:
+            continue
+        # Só o que entrou na PRIMEIRA janela de compra. Depois disso já é
+        # relacionamento, não abertura.
+        try:
+            if (date.fromisoformat(r["dia"]) - date.fromisoformat(estreia)).days > PROSPECT_FIRST_DAYS:
+                continue
+        except (TypeError, ValueError):
+            continue
+        for mapa, chave, extra in ((por_linha, r["linha"], {}),
+                                   (por_item, r["ref"], {"brand": r["marca"], "line": r["linha"]})):
+            if not chave or (mapa is por_item and not mix_referencia_utilizavel(chave)):
+                continue
+            alvo = mapa.setdefault(chave, {"name": chave, "clients": set(),
+                                           "quantity": 0.0, "revenue": 0.0, **extra})
+            alvo["clients"].add(cliente)
+            alvo["quantity"] += float(r["qtd"] or 0)
+            alvo["revenue"] += float(r["valor"] or 0)
+
+    com_saldo = unit_item_stock_refs(conn, company_id, unidade) if unidade else set()
+
+    def formatar(d: dict[str, Any], com_estoque: bool) -> dict[str, Any]:
+        clientes = len(d["clients"])
+        saida = {
+            "name": d["name"], "clients": clientes,
+            "quantity": round(d["quantity"], 0),
+            "revenue": round(d["revenue"], 2),
+            "unitPrice": round(d["revenue"] / d["quantity"], 2) if d["quantity"] else 0.0,
+            # Quantos por cento das oficinas novas levaram isso na estreia.
+            "sharePct": round(100 * clientes / len(novos), 1),
+        }
+        for k in ("brand", "line"):
+            if k in d:
+                saida[k] = d[k]
+        if com_estoque:
+            saida["inStock"] = (d["name"] in com_saldo) if unidade else None
+        return saida
+
+    linhas = sorted((formatar(v, False) for v in por_linha.values()
+                     if len(v["clients"]) >= PROSPECT_MIN_CLIENTS),
+                    key=lambda x: -x["clients"])
+    itens = sorted((formatar(v, True) for v in por_item.values()
+                    if len(v["clients"]) >= PROSPECT_MIN_CLIENTS),
+                   key=lambda x: (x.get("inStock") is False, -x["clients"]))
+    return {
+        "unitName": unidade,
+        "newClients": len(novos),
+        "since": desde,
+        "firstDays": PROSPECT_FIRST_DAYS,
+        "lines": linhas[:12],
+        "items": itens[:24],
+    }
+
+
 def catalog_unsold_items(
     conn: sqlite3.Connection, company_id: int, termo: str = "",
     unit_name: str = "", limit: int = 120,
