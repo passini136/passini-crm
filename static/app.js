@@ -7348,14 +7348,106 @@ function averageBreakdown(item) {
  * para de acreditar em tudo que o sistema sugere.
  */
 async function loadNovidades() {
-  state.crm.novidades = { loading: true };
+  const busca = state.crm.novidadesBusca || {};
+  const anterior = state.crm.novidades;
+  state.crm.novidades = { ...(anterior || {}), loading: true };
   requestRender();
   try {
-    state.crm.novidades = { ...(await api(`/api/crm/novelties?${buildQuery()}`)), loading: false };
+    const q = new URLSearchParams(buildQuery());
+    if (busca.termo) q.set("q", busca.termo);
+    if (busca.tudo) q.set("all", "1");
+    state.crm.novidades = { ...(await api(`/api/crm/novelties?${q.toString()}`)), loading: false };
   } catch (e) {
     state.crm.novidades = { error: e.message, loading: false };
   }
   requestRender();
+}
+
+function buscarNovidades() {
+  state.crm.novidadesBusca = state.crm.novidadesBusca || {};
+  loadNovidades();
+}
+
+function limparBuscaNovidades() {
+  state.crm.novidadesBusca = { termo: "", tudo: false };
+  loadNovidades();
+}
+
+function alternarBuscaTudo(valor) {
+  state.crm.novidadesBusca = { ...(state.crm.novidadesBusca || {}), tudo: valor };
+  if ((state.crm.novidadesBusca.termo || "").trim()) loadNovidades();
+  else requestRender();
+}
+
+/**
+ * Busca dentro das novidades, por marca, linha, grupo ou referência.
+ *
+ * A lista automática é curta e filtrada de propósito. Quem procura uma marca
+ * específica tem outra necessidade: ver o que existe dela, inclusive a peça de
+ * uma venda só. Por isso a busca tem o interruptor "incluir o que vendeu
+ * pouco" — e o que não passaria na régua vem marcado, para ninguém apresentar
+ * ao cliente como lançamento consolidado.
+ */
+function buscaNovidadesBloco() {
+  const d = state.crm.novidades || {};
+  const b = state.crm.novidadesBusca || {};
+  const r = d.search;
+  return `
+    <div class="panel padded-card">
+      <div style="display:flex;gap:8px;align-items:end;flex-wrap:wrap">
+        <div class="field field-grow" style="margin:0">
+          <label>Procurar novidade por marca, linha, grupo ou código</label>
+          <input value="${escapeHtml(b.termo || "")}"
+            placeholder="Ex.: NAKATA, FILTROS, SUSPENSAO, WO130"
+            oninput="state.crm.novidadesBusca = { ...(state.crm.novidadesBusca || {}), termo: this.value }"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();buscarNovidades();}" />
+        </div>
+        <button class="btn btn-primary" onclick="buscarNovidades()">Procurar</button>
+        ${r ? '<button class="btn btn-ghost" onclick="limparBuscaNovidades()">Limpar</button>' : ""}
+      </div>
+      <label class="check-row" style="margin-top:8px;font-size:12px">
+        <input type="checkbox" ${b.tudo ? "checked" : ""}
+          onchange="alternarBuscaTudo(this.checked)" />
+        <span>Incluir o que vendeu pouco (fora da régua de novidade)</span>
+      </label>
+
+      ${r ? `
+        <div class="text-small" style="margin-top:10px">
+          <strong>${r.total}</strong> resultado(s) para "${escapeHtml(r.term)}"
+          ${r.all ? " · incluindo o que vendeu pouco" : ""}
+        </div>
+        ${r.items.length ? `
+          <div class="table-wrap" style="margin-top:8px">
+            <table>
+              <thead><tr>
+                <th>Referência</th><th>Marca</th><th>Linha</th><th>Grupo</th>
+                <th style="text-align:right">Estreia</th>
+                <th style="text-align:right">Vendas</th>
+                <th style="text-align:right">Oficinas</th>
+                <th style="text-align:right">Preço</th>
+                <th>Loja</th>
+              </tr></thead>
+              <tbody>
+                ${r.items.map((i) => `
+                  <tr>
+                    <td><strong>${escapeHtml(i.ref)}</strong>
+                      ${i.approved === false
+                        ? '<div class="text-small" style="color:#e67e22">vendeu pouco</div>' : ""}</td>
+                    <td>${escapeHtml(i.brand)}</td>
+                    <td>${escapeHtml(i.line)}</td>
+                    <td class="text-small">${escapeHtml(i.group || "—")}</td>
+                    <td style="text-align:right">${dataBr(i.debutAt)}</td>
+                    <td style="text-align:right">${i.sales}</td>
+                    <td style="text-align:right">${i.clients}</td>
+                    <td style="text-align:right">${currency(i.unitPrice)}</td>
+                    <td class="text-small" style="color:${i.inStock === false ? "var(--bad)" : "var(--good)"}">
+                      ${i.inStock === false ? "sem saldo" : (i.inStock ? "tem" : "—")}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>` : '<div class="message" style="margin-top:8px">Nada encontrado com esse termo.</div>'}
+      ` : ""}
+    </div>`;
 }
 
 function novidadesView() {
@@ -7367,6 +7459,11 @@ function novidadesView() {
   const todos = d.items || [];
   const comSaldo = todos.filter((i) => i.inStock);
   const semSaldo = todos.filter((i) => i.inStock === false);
+  // Marca que a casa já vende x marca entrando: são argumentos diferentes na
+  // boca do vendedor. Na consolidada ele não precisa defender o fabricante,
+  // só apresentar a peça — é a venda mais fácil, e por isso vem primeiro.
+  const daCasa = comSaldo.filter((i) => i.brandStatus === "CONSOLIDADA");
+  const deMarcaNova = comSaldo.filter((i) => i.brandStatus !== "CONSOLIDADA");
 
   const cartao = (i, podeOferecer) => `
     <div style="background:#fff;border:1px solid ${podeOferecer ? "#2e7d32" : "var(--line)"};
@@ -7382,6 +7479,10 @@ function novidadesView() {
       <div style="font-size:11px;color:var(--muted);margin-top:4px">
         estreou ${dataBr(i.debutAt)}${i.code ? ` · cód. ${escapeHtml(String(i.code))}` : ""}
       </div>
+      ${i.brandStatus === "CONSOLIDADA" && i.brandClientsBefore ? `
+        <div style="font-size:11px;color:#2e7d32;font-weight:700;margin-top:4px">
+          ${i.brandClientsBefore} oficinas já compram ${escapeHtml(i.brand)}
+        </div>` : ""}
     </div>`;
 
   const listaEstreante = (itens, rotulo) => itens.length ? `
@@ -7403,21 +7504,39 @@ function novidadesView() {
         <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:6px">✨ NOVIDADES</div>
         <h3 style="color:#fff;margin:0 0 4px">
           ${comSaldo.length} peça(s) novas com saldo${d.unitName ? " em " + escapeHtml(d.unitName) : ""}
+          ${daCasa.length ? ` · ${daCasa.length} de marca que você já vende` : ""}
         </h3>
         <div style="font-size:13px;color:rgba(255,255,255,0.75)">
           Estrearam em vendas nos últimos ${d.days} dias. Quem oferece primeiro ganha o cliente do item.
         </div>
       </div>
 
-      ${comSaldo.length ? `
+      ${buscaNovidadesBloco()}
+
+      ${(d.search) ? "" : `
+      ${daCasa.length ? `
         <div>
-          <div class="section-title"><div><h3>✅ Dá para oferecer hoje</h3>
-            <div class="text-small">Novidade com saldo na sua loja.</div></div></div>
+          <div class="section-title"><div><h3>⭐ Peça nova de marca que você já vende</h3>
+            <div class="text-small">A venda mais fácil: a oficina já confia no fabricante,
+              a conversa é só sobre a peça.</div></div></div>
           <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px">
-            ${comSaldo.slice(0, 24).map((i) => cartao(i, true)).join("")}
+            ${daCasa.slice(0, 24).map((i) => cartao(i, true)).join("")}
           </div>
-        </div>`
-        : '<div class="message">Nenhuma novidade com saldo na loja no momento.</div>'}
+        </div>` : ""}
+
+      ${deMarcaNova.length ? `
+        <div>
+          <div class="section-title"><div><h3>🆕 Marca nova na casa</h3>
+            <div class="text-small">Fabricante que a Passini passou a trabalhar.
+              Aqui vale apresentar a marca junto.</div></div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px">
+            ${deMarcaNova.slice(0, 24).map((i) => cartao(i, true)).join("")}
+          </div>
+        </div>` : ""}
+
+      ${comSaldo.length ? "" :
+        '<div class="message">Nenhuma novidade com saldo na loja no momento.</div>'}
+      `}
 
       ${listaEstreante(d.brands || [], "🏷️ Marcas que entraram na casa")}
       ${listaEstreante(d.lines || [], "📦 Linhas que a casa passou a vender")}

@@ -44,9 +44,11 @@ print(f"Banco: {backend.DB_PATH}")
 print(f"Unidade: {d['unitName']}  ·  estreias desde {d['since']} ({d['days']} dias)  ·  {seg:.2f}s\n")
 print("Régua de PORTFÓLIO (estreia sozinha não basta):")
 print("   estreia = PRIMEIRA venda de toda a base dentro da janela")
-print(f"   mínimo de vendas...: {backend.NOVELTY_MIN_SALES} linhas de nota")
-print(f"   mínimo de clientes.: {backend.NOVELTY_MIN_CLIENTS}")
-print(f"   mínimo de meses....: {backend.NOVELTY_MIN_MONTHS} (repetiu, não é sazonal de uma vez)")
+print("   passa por UM dos dois caminhos:")
+print(f"      volume.....: {backend.NOVELTY_MIN_SALES} vendas + "
+      f"{backend.NOVELTY_MIN_CLIENTS} clientes + {backend.NOVELTY_MIN_MONTHS} meses")
+print(f"      constância.: {backend.NOVELTY_MIN_CLIENTS} clientes + "
+      f"{backend.NOVELTY_STEADY_MONTHS} meses (volume baixo, mas espalhou e repetiu)")
 print(f"   exige estoque......: {'sim' if backend.NOVELTY_REQUIRE_STOCK else 'não'} "
       "(em qualquer loja — compra fora nunca entra no saldo)")
 print(f"   marca nova.........: {backend.NOVELTY_BRAND_MIN_ITEMS} itens, "
@@ -57,9 +59,7 @@ print("   código interno.....: exibido como reforço, NUNCA como filtro\n")
 f = d.get("funnel") or {}
 print("FUNIL — quanto cada gatilho derruba (use para calibrar)")
 etapas = [("estrearam", "estrearam na janela"), ("referencia", "referência utilizável"),
-          ("vendas", f"≥ {backend.NOVELTY_MIN_SALES} vendas"),
-          ("clientes", f"≥ {backend.NOVELTY_MIN_CLIENTS} clientes"),
-          ("meses", f"≥ {backend.NOVELTY_MIN_MONTHS} meses"),
+          ("comportamento", "com comportamento de portfólio"),
           ("estoque", "tem estoque na casa")]
 anterior = None
 for chave, rotulo in etapas:
@@ -67,6 +67,8 @@ for chave, rotulo in etapas:
     corte = f"  (−{anterior - n})" if anterior is not None and anterior >= n else ""
     print(f"   {n:>6}  {rotulo}{corte}")
     anterior = n
+print(f"          dos quais {f.get('porVolume', 0)} por volume e "
+      f"{f.get('porConstancia', 0)} por constância")
 print()
 
 print(f"1) VOLUME  ·  {d['totalItems']} item(ns) aprovados · "
@@ -98,14 +100,19 @@ if codigos_novos and todos:
 
 # ── 3. As novidades ──────────────────────────────────────────────────────────
 print(f"\n3) AS NOVIDADES (top 20 por alcance)")
-print(f"   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<15}{'ESTREIA':>12}"
-      f"{'VENDAS':>7}{'MES':>4}{'CLI':>5}{'QTD':>7}{'PREÇO':>11}  LOJA")
+print(f"   {d.get('establishedCount', 0)} de {len(d['items'])} são peça nova de marca "
+      f"que a casa JÁ VENDE (≥ {backend.NOVELTY_BRAND_ESTABLISHED_SALES} vendas antes da janela)")
+print(f"\n   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<14}{'ESTREIA':>12}"
+      f"{'VEND':>6}{'MES':>4}{'CLI':>5}{'PREÇO':>11}  {'MARCA É':<13}LOJA")
 for i in d["items"][:20]:
     loja = "—" if i["inStock"] is None else ("tem" if i["inStock"] else "SEM")
-    print(f"   {i['ref'][:16]:<17}{i['brand'][:12]:<13}{i['line'][:14]:<15}"
-          f"{i['debutAt']:>12}{i.get('sales', 0):>7}{i.get('months', 0):>4}"
-          f"{i['clients']:>5}{int(i['quantity']):>7}"
-          f"{backend.brl(i['unitPrice']):>11}  {loja}")
+    if i.get("brandStatus") == "CONSOLIDADA":
+        situacao = f"da casa ({i.get('brandClientsBefore', 0)} ofic.)"
+    else:
+        situacao = "entrando"
+    print(f"   {i['ref'][:16]:<17}{i['brand'][:12]:<13}{i['line'][:13]:<14}"
+          f"{i['debutAt']:>12}{i.get('sales', 0):>6}{i.get('months', 0):>4}"
+          f"{i['clients']:>5}{backend.brl(i['unitPrice']):>11}  {situacao[:12]:<13}{loja}")
 
 # ── 4. Marcas e linhas que estrearam ─────────────────────────────────────────
 print(f"\n4) MARCAS QUE ESTREARAM ({len(d['brands'])})")

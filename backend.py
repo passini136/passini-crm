@@ -14524,10 +14524,31 @@ NOVELTY_MAX_ITEMS = 40
 # depois dela: item que a casa adotou vende várias vezes, para clientes
 # diferentes, em mais de um mês, e fica em estoque. Compra fora vende uma vez,
 # para um cliente, e nunca entra no saldo.
-NOVELTY_MIN_SALES = 10       # linhas de venda: volume, não um pedido isolado
-NOVELTY_MIN_CLIENTS = 3      # espalhou na praça, não é de um cliente só
-NOVELTY_MIN_MONTHS = 2       # repetiu em outro mês: não é sazonal de uma vez
+# DOIS CAMINHOS para entrar, porque adoção tem duas caras.
+#
+# Medido em 11/09/2026: o corte de 10 vendas sozinho derrubava 3.584 de 3.598 —
+# fazia todo o trabalho, e clientes e meses não cortavam mais nada depois dele.
+# Parecia ótimo até olhar quem ficou de fora: a SULCINTAS vendeu 5 vezes, para
+# 5 oficinas DIFERENTES, ao longo de 4 meses. Isso não é compra fora; é marca
+# que entrou com volume baixo. Já CAFIL, HEADWAY, QUALITY e ORBITAL fizeram
+# 1 venda para 1 cliente em 1 mês — essas são compra fora de verdade.
+#
+# Volume sozinho não separa as duas. Então: passa quem tem VOLUME, ou quem tem
+# ESPALHAMENTO COM RECORRÊNCIA. O pedido isolado não tem nenhum dos dois.
+NOVELTY_MIN_SALES = 10       # caminho 1: volume
+NOVELTY_MIN_CLIENTS = 3      # caminho 2 (e piso do caminho 1): espalhou na praça
+NOVELTY_MIN_MONTHS = 2       # piso do caminho 1: repetiu em outro mês
+NOVELTY_STEADY_MONTHS = 3    # caminho 2: recorrência mais longa compensa o volume
 NOVELTY_REQUIRE_STOCK = True # a casa passou a ESTOCAR: entrou no portfólio
+
+
+def novidade_tem_comportamento(vendas: int, clientes: int, meses: int) -> bool:
+    """Volume, ou espalhamento com recorrência. Pedido isolado não tem nenhum."""
+    por_volume = (vendas >= NOVELTY_MIN_SALES
+                  and clientes >= NOVELTY_MIN_CLIENTS
+                  and meses >= NOVELTY_MIN_MONTHS)
+    por_constancia = clientes >= NOVELTY_MIN_CLIENTS and meses >= NOVELTY_STEADY_MONTHS
+    return por_volume or por_constancia
 # Marca e linha novas: o mesmo comportamento, SEM exigir variedade de itens.
 #
 # A primeira versão pedia 3 itens distintos e zerou a lista. O funil explicou
@@ -14541,6 +14562,11 @@ NOVELTY_REQUIRE_STOCK = True # a casa passou a ESTOCAR: entrou no portfólio
 NOVELTY_BRAND_MIN_ITEMS = 1
 NOVELTY_BRAND_MIN_SALES = 10
 NOVELTY_BRAND_MIN_CLIENTS = 3
+# Marca CONSOLIDADA: já vendia antes da janela, com volume. Peça nova numa
+# marca dessas é a novidade mais fácil de vender — a oficina já confia no
+# fabricante, então a conversa é só sobre a peça. Separar as duas situações
+# muda o argumento do vendedor, e por isso elas não podem virar uma lista só.
+NOVELTY_BRAND_ESTABLISHED_SALES = 30
 
 
 def sales_debut_novelties(
@@ -14564,6 +14590,7 @@ def sales_debut_novelties(
         SELECT UPPER(TRIM(f.sku_key))                     AS ref,
                UPPER(TRIM(COALESCE(f.brand_name, '')))    AS marca,
                UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               UPPER(TRIM(COALESCE(c.item_group, '')))    AS grupo,
                MIN(date(f.issue_date))                    AS estreia,
                SUM(f.quantity)                            AS qtd,
                SUM(f.net_value)                           AS valor,
@@ -14585,6 +14612,24 @@ def sales_debut_novelties(
     # Estoque em QUALQUER loja: é a prova de que a casa adotou o item. Compra
     # fora é comprada e entregue, nunca entra no saldo de ninguém.
     estocado = company_item_stock_refs(conn, company_id)
+
+    # Peso da MARCA antes da janela, para saber se a peça nova chega por um
+    # fabricante que a casa já vende ou por um que está entrando.
+    marca_antes: dict[str, dict[str, int]] = {}
+    for r in conn.execute(
+        """
+        SELECT UPPER(TRIM(COALESCE(brand_name, ''))) AS marca,
+               COUNT(*)                      AS vendas,
+               COUNT(DISTINCT client_name)   AS clientes
+        FROM fact_sales_detail
+        WHERE company_id = ? AND net_value > 0 AND date(issue_date) < date(?)
+          AND TRIM(COALESCE(brand_name, '')) <> ''
+        GROUP BY marca
+        """,
+        (company_id, corte),
+    ).fetchall():
+        marca_antes[r["marca"]] = {"sales": int(r["vendas"] or 0),
+                                   "clients": int(r["clientes"] or 0)}
     # Código interno só para EXIBIR: código alto reforça que é lançamento, mas
     # não decide nada — foi exatamente a hipótese que a medição derrubou.
     codigo_por_ref: dict[str, str] = {}
@@ -14596,23 +14641,23 @@ def sales_debut_novelties(
 
     # Funil, para calibrar com número em vez de opinião: cada etapa mostra
     # quanto derrubou. Sai no diagnóstico e no log.
-    funil = {"estrearam": len(linhas), "referencia": 0, "vendas": 0,
-             "clientes": 0, "meses": 0, "estoque": 0}
+    funil = {"estrearam": len(linhas), "referencia": 0, "comportamento": 0,
+             "porVolume": 0, "porConstancia": 0, "estoque": 0}
     itens: list[dict[str, Any]] = []
     for r in linhas:
         ref = r["ref"]
         if not mix_referencia_utilizavel(ref):
             continue
         funil["referencia"] += 1
-        if int(r["vendas"] or 0) < NOVELTY_MIN_SALES:
+        vendas, clientes, meses = (int(r["vendas"] or 0), int(r["clientes"] or 0),
+                                   int(r["meses"] or 0))
+        if not novidade_tem_comportamento(vendas, clientes, meses):
             continue
-        funil["vendas"] += 1
-        if int(r["clientes"] or 0) < NOVELTY_MIN_CLIENTS:
-            continue
-        funil["clientes"] += 1
-        if int(r["meses"] or 0) < NOVELTY_MIN_MONTHS:
-            continue
-        funil["meses"] += 1
+        funil["comportamento"] += 1
+        if vendas >= NOVELTY_MIN_SALES:
+            funil["porVolume"] += 1
+        else:
+            funil["porConstancia"] += 1
         if NOVELTY_REQUIRE_STOCK and ref not in estocado:
             continue
         funil["estoque"] += 1
@@ -14620,6 +14665,7 @@ def sales_debut_novelties(
             "ref": ref,
             "brand": r["marca"],
             "line": r["linha"] or "—",
+            "group": r["grupo"] or "—",
             "code": codigo_por_ref.get(ref, ""),
             "debutAt": r["estreia"],
             "quantity": round(float(r["qtd"] or 0), 0),
@@ -14629,11 +14675,20 @@ def sales_debut_novelties(
             "months": int(r["meses"] or 0),
             "clients": int(r["clientes"] or 0),
             "sellers": int(r["vendedores"] or 0),
+            # CONSOLIDADA = a casa já vendia esta marca antes da janela.
+            "brandStatus": ("CONSOLIDADA"
+                            if marca_antes.get(r["marca"], {}).get("sales", 0)
+                            >= NOVELTY_BRAND_ESTABLISHED_SALES else "NOVA"),
+            "brandSalesBefore": marca_antes.get(r["marca"], {}).get("sales", 0),
+            "brandClientsBefore": marca_antes.get(r["marca"], {}).get("clients", 0),
             "inStock": (ref in com_saldo) if unidade else None,
         })
-    # Com saldo primeiro, depois quem já pegou mais oficinas: novidade que
-    # emplacou em vinte clientes é aposta provada; a de dois é ainda promessa.
-    itens.sort(key=lambda i: (i["inStock"] is False, -i["clients"], -i["quantity"]))
+    # Com saldo primeiro; depois a marca que a casa já vende, porque é a venda
+    # mais fácil; só então quem pegou mais oficinas. Novidade que emplacou em
+    # vinte clientes é aposta provada; a de três ainda é promessa.
+    itens.sort(key=lambda i: (i["inStock"] is False,
+                              i["brandStatus"] != "CONSOLIDADA",
+                              -i["clients"], -i["quantity"]))
 
     def estreantes(coluna: str) -> list[dict[str, Any]]:
         """Marca ou linha cuja PRIMEIRA venda da base caiu na janela.
@@ -14662,15 +14717,14 @@ def sales_debut_novelties(
                 WHERE f.company_id = ? AND f.net_value > 0
                   AND TRIM(COALESCE({coluna}, '')) <> ''
                 GROUP BY chave
-                HAVING estreia >= ?
-                   AND itens    >= ?
-                   AND vendas   >= ?
-                   AND clientes >= ?
-                   AND meses    >= ?
+                HAVING estreia >= ? AND itens >= ?
+                   AND ( (vendas >= ? AND clientes >= ? AND meses >= ?)
+                      OR (clientes >= ? AND meses >= ?) )
                 ORDER BY valor DESC
                 """,
-                (company_id, corte, NOVELTY_BRAND_MIN_ITEMS, NOVELTY_BRAND_MIN_SALES,
-                 NOVELTY_BRAND_MIN_CLIENTS, NOVELTY_MIN_MONTHS)).fetchall()
+                (company_id, corte, NOVELTY_BRAND_MIN_ITEMS,
+                 NOVELTY_BRAND_MIN_SALES, NOVELTY_BRAND_MIN_CLIENTS, NOVELTY_MIN_MONTHS,
+                 NOVELTY_BRAND_MIN_CLIENTS, NOVELTY_STEADY_MONTHS)).fetchall()
         ]
 
     return {
@@ -14678,16 +14732,72 @@ def sales_debut_novelties(
         "since": corte,
         "days": days,
         "items": itens[:NOVELTY_MAX_ITEMS],
+        # Lista completa dos aprovados, para a busca procurar além do que cabe
+        # na tela. Buscar só no top 40 acharia menos do que existe, e a pessoa
+        # concluiria que não tem novidade daquela marca.
+        "allItems": itens,
         "totalItems": len(itens),
         "brands": estreantes("f.brand_name")[:15],
         "lines": estreantes("c.item_subgroup")[:15],
         "inStockCount": sum(1 for i in itens if i["inStock"]),
+        "establishedCount": sum(1 for i in itens if i["brandStatus"] == "CONSOLIDADA"),
         "funnel": funil,
         "rule": {
             "minSales": NOVELTY_MIN_SALES, "minClients": NOVELTY_MIN_CLIENTS,
             "minMonths": NOVELTY_MIN_MONTHS, "requireStock": NOVELTY_REQUIRE_STOCK,
         },
     }
+
+
+def novelty_debut_pool(
+    conn: sqlite3.Connection, company_id: int, desde: str, unit_name: str = "",
+) -> list[dict[str, Any]]:
+    """TUDO que estreou na janela, sem a régua de portfólio.
+
+    Serve só para a busca: quem procura uma marca específica quer ver o que
+    existe dela, inclusive a peça de uma venda. A lista automática continua
+    filtrada — ela precisa ser curta e confiável; esta precisa ser completa.
+    """
+    ensure_catalogo_temp(conn, company_id)
+    com_saldo = unit_item_stock_refs(conn, company_id, unit_name) if unit_name else set()
+    saida: list[dict[str, Any]] = []
+    for r in conn.execute(
+        f"""
+        SELECT UPPER(TRIM(f.sku_key))                     AS ref,
+               UPPER(TRIM(COALESCE(f.brand_name, '')))    AS marca,
+               UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               UPPER(TRIM(COALESCE(c.item_group, '')))    AS grupo,
+               MIN(date(f.issue_date))                    AS estreia,
+               SUM(f.quantity) AS qtd, SUM(f.net_value) AS valor,
+               COUNT(*) AS vendas, COUNT(DISTINCT f.competence) AS meses,
+               COUNT(DISTINCT f.client_name) AS clientes
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.net_value > 0
+          AND TRIM(COALESCE(f.sku_key, '')) <> ''
+        GROUP BY ref, marca
+        HAVING estreia >= ?
+        ORDER BY vendas DESC
+        """,
+        (company_id, desde),
+    ).fetchall():
+        if not mix_referencia_utilizavel(r["ref"]):
+            continue
+        qtd = float(r["qtd"] or 0)
+        saida.append({
+            "ref": r["ref"], "brand": r["marca"], "line": r["linha"] or "—",
+            "group": r["grupo"] or "—", "code": "", "debutAt": r["estreia"],
+            "quantity": round(qtd, 0), "revenue": round(float(r["valor"] or 0), 2),
+            "unitPrice": round(float(r["valor"] or 0) / (qtd or 1), 2),
+            "sales": int(r["vendas"] or 0), "months": int(r["meses"] or 0),
+            "clients": int(r["clientes"] or 0), "sellers": 0,
+            "brandStatus": "NOVA", "brandSalesBefore": 0, "brandClientsBefore": 0,
+            "inStock": (r["ref"] in com_saldo) if unit_name else None,
+            # Marca o que NÃO passaria na régua, para a tela poder avisar.
+            "approved": novidade_tem_comportamento(
+                int(r["vendas"] or 0), int(r["clientes"] or 0), int(r["meses"] or 0)),
+        })
+    return saida
 
 
 def company_item_stock_refs(conn: sqlite3.Connection, company_id: int) -> set[str]:
@@ -23171,8 +23281,30 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn, user["company_id"], user, build_filters_from_query(query))
                     unidade = (normalize_unit(filtros.get("unit_name"))
                                or normalize_unit(query.get("unit", [""])[0]))
-                    res = sales_debut_novelties_cached(conn, user["company_id"], unidade)
+                    res = dict(sales_debut_novelties_cached(conn, user["company_id"], unidade))
                     res["canSeeWithoutStock"] = data_scope_for_user(conn, user) != "proprio"
+                    busca = normalize_upper(strip_accents(
+                        normalize_whitespace(query.get("q", [""])[0])))
+                    # "tudo" procura também no que estreou e NÃO passou na régua
+                    # de portfólio. Quem está pesquisando uma marca específica
+                    # quer ver o que existe dela, inclusive o pouco — diferente
+                    # da lista automática, que precisa ser curta e confiável.
+                    tudo = query.get("all", ["0"])[0] == "1"
+                    if busca:
+                        base = res.get("allItems") or []
+                        if tudo:
+                            base = novelty_debut_pool(conn, user["company_id"],
+                                                      res["since"], unidade)
+                        achados = [
+                            i for i in base
+                            if busca in normalize_upper(strip_accents(
+                                f"{i['ref']} {i['brand']} {i['line']} {i.get('group', '')}"))
+                        ]
+                        res["search"] = {
+                            "term": busca, "all": tudo,
+                            "items": achados[:120], "total": len(achados),
+                        }
+                    res.pop("allItems", None)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))
                 return
