@@ -42,12 +42,34 @@ seg = time.time() - inicio
 
 print(f"Banco: {backend.DB_PATH}")
 print(f"Unidade: {d['unitName']}  ·  estreias desde {d['since']} ({d['days']} dias)  ·  {seg:.2f}s\n")
-print("Régua:")
+print("Régua de PORTFÓLIO (estreia sozinha não basta):")
 print("   estreia = PRIMEIRA venda de toda a base dentro da janela")
-print(f"   mínimo de clientes: {backend.NOVELTY_MIN_CLIENTS} (uma venda só é acaso)")
-print("   código interno: exibido como reforço, NUNCA como filtro\n")
+print(f"   mínimo de vendas...: {backend.NOVELTY_MIN_SALES} linhas de nota")
+print(f"   mínimo de clientes.: {backend.NOVELTY_MIN_CLIENTS}")
+print(f"   mínimo de meses....: {backend.NOVELTY_MIN_MONTHS} (repetiu, não é sazonal de uma vez)")
+print(f"   exige estoque......: {'sim' if backend.NOVELTY_REQUIRE_STOCK else 'não'} "
+      "(em qualquer loja — compra fora nunca entra no saldo)")
+print(f"   marca nova.........: {backend.NOVELTY_BRAND_MIN_ITEMS} itens, "
+      f"{backend.NOVELTY_BRAND_MIN_SALES} vendas, {backend.NOVELTY_BRAND_MIN_CLIENTS} clientes")
+print("   código interno.....: exibido como reforço, NUNCA como filtro\n")
 
-print(f"1) VOLUME  ·  {d['totalItems']} item(ns) estrearam · "
+# ── Funil: onde cada gatilho corta ───────────────────────────────────────────
+f = d.get("funnel") or {}
+print("FUNIL — quanto cada gatilho derruba (use para calibrar)")
+etapas = [("estrearam", "estrearam na janela"), ("referencia", "referência utilizável"),
+          ("vendas", f"≥ {backend.NOVELTY_MIN_SALES} vendas"),
+          ("clientes", f"≥ {backend.NOVELTY_MIN_CLIENTS} clientes"),
+          ("meses", f"≥ {backend.NOVELTY_MIN_MONTHS} meses"),
+          ("estoque", "tem estoque na casa")]
+anterior = None
+for chave, rotulo in etapas:
+    n = f.get(chave, 0)
+    corte = f"  (−{anterior - n})" if anterior is not None and anterior >= n else ""
+    print(f"   {n:>6}  {rotulo}{corte}")
+    anterior = n
+print()
+
+print(f"1) VOLUME  ·  {d['totalItems']} item(ns) aprovados · "
       f"{d['inStockCount']} com saldo em {d['unitName']}")
 if not d["items"]:
     print("\n   Nenhuma novidade na janela.")
@@ -76,12 +98,13 @@ if codigos_novos and todos:
 
 # ── 3. As novidades ──────────────────────────────────────────────────────────
 print(f"\n3) AS NOVIDADES (top 20 por alcance)")
-print(f"   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<16}{'CÓDIGO':>8}{'ESTREIA':>12}"
-      f"{'CLI':>5}{'QTD':>7}{'PREÇO':>11}  LOJA")
+print(f"   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<15}{'ESTREIA':>12}"
+      f"{'VENDAS':>7}{'MES':>4}{'CLI':>5}{'QTD':>7}{'PREÇO':>11}  LOJA")
 for i in d["items"][:20]:
     loja = "—" if i["inStock"] is None else ("tem" if i["inStock"] else "SEM")
-    print(f"   {i['ref'][:16]:<17}{i['brand'][:12]:<13}{i['line'][:15]:<16}"
-          f"{str(i['code']):>8}{i['debutAt']:>12}{i['clients']:>5}{int(i['quantity']):>7}"
+    print(f"   {i['ref'][:16]:<17}{i['brand'][:12]:<13}{i['line'][:14]:<15}"
+          f"{i['debutAt']:>12}{i.get('sales', 0):>7}{i.get('months', 0):>4}"
+          f"{i['clients']:>5}{int(i['quantity']):>7}"
           f"{backend.brl(i['unitPrice']):>11}  {loja}")
 
 # ── 4. Marcas e linhas que estrearam ─────────────────────────────────────────
@@ -89,6 +112,7 @@ print(f"\n4) MARCAS QUE ESTREARAM ({len(d['brands'])})")
 if d["brands"]:
     for b in d["brands"][:10]:
         print(f"   {b['name'][:24]:<26}estreou {b['debutAt']} · {b['items']} item(ns) · "
+              f"{b.get('sales', 0)} venda(s) em {b.get('months', 0)} mês(es) · "
               f"{b['clients']} cliente(s) · {backend.brl(b['revenue'])}")
 else:
     print("   Nenhuma marca nova na janela.")
@@ -97,6 +121,7 @@ print(f"\n   LINHAS QUE ESTREARAM ({len(d['lines'])})")
 if d["lines"]:
     for l in d["lines"][:10]:
         print(f"   {l['name'][:24]:<26}estreou {l['debutAt']} · {l['items']} item(ns) · "
+              f"{l.get('sales', 0)} venda(s) em {l.get('months', 0)} mês(es) · "
               f"{l['clients']} cliente(s) · {backend.brl(l['revenue'])}")
 else:
     print("   Nenhuma linha nova na janela.")

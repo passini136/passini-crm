@@ -1523,7 +1523,8 @@ class ConexaoPassini(sqlite3.Connection):
 def limpar_cache_conexao(conn: sqlite3.Connection) -> None:
     """Esvazia os caches de requisição. Para medição, que precisa simular frio."""
     for atributo in ("_cache_praca", "_cache_nomes_vendedor", "_cache_pessoas",
-                     "_cache_competencias", "_cache_tipo_pessoa", "_cache_estoque_linha"):
+                     "_cache_competencias", "_cache_tipo_pessoa", "_cache_estoque_linha",
+                     "_cache_estoque_ref", "_cache_estoque_empresa", "_catalogo_temp"):
         if hasattr(conn, atributo):
             delattr(conn, atributo)
 
@@ -14510,8 +14511,28 @@ def unit_item_stock_refs(conn: sqlite3.Connection, company_id: int, unit_name: s
 # ─────────────────────────────────────────────────────────────────────────────
 
 NOVELTY_WINDOW_DAYS = 90
-NOVELTY_MIN_CLIENTS = 2      # uma venda única é acaso, não lançamento
 NOVELTY_MAX_ITEMS = 40
+
+# Gatilhos de PORTFÓLIO, revistos em 11/09/2026 com o Felipe.
+#
+# A primeira régua pedia só 2 clientes e trouxe coisa que não é novidade de
+# portfólio: item comprado fora para atender um pedido específico, e peça
+# sazonal que apareceu uma vez. Os dois têm "primeira venda recente" e passam
+# por qualquer filtro de estreia.
+#
+# O que separa portfólio de compra fora não é a estreia, é o COMPORTAMENTO
+# depois dela: item que a casa adotou vende várias vezes, para clientes
+# diferentes, em mais de um mês, e fica em estoque. Compra fora vende uma vez,
+# para um cliente, e nunca entra no saldo.
+NOVELTY_MIN_SALES = 10       # linhas de venda: volume, não um pedido isolado
+NOVELTY_MIN_CLIENTS = 3      # espalhou na praça, não é de um cliente só
+NOVELTY_MIN_MONTHS = 2       # repetiu em outro mês: não é sazonal de uma vez
+NOVELTY_REQUIRE_STOCK = True # a casa passou a ESTOCAR: entrou no portfólio
+# Marca nova pede o mesmo, com escala própria: uma marca entra com um conjunto
+# de itens, não com uma peça avulsa.
+NOVELTY_BRAND_MIN_ITEMS = 3
+NOVELTY_BRAND_MIN_SALES = 10
+NOVELTY_BRAND_MIN_CLIENTS = 3
 
 
 def sales_debut_novelties(
@@ -14538,6 +14559,8 @@ def sales_debut_novelties(
                MIN(date(f.issue_date))                    AS estreia,
                SUM(f.quantity)                            AS qtd,
                SUM(f.net_value)                           AS valor,
+               COUNT(*)                                   AS vendas,
+               COUNT(DISTINCT f.competence)               AS meses,
                COUNT(DISTINCT f.client_name)              AS clientes,
                COUNT(DISTINCT f.seller_name)              AS vendedores
         FROM fact_sales_detail f
@@ -14551,6 +14574,9 @@ def sales_debut_novelties(
     ).fetchall()
 
     com_saldo = unit_item_stock_refs(conn, company_id, unidade) if unidade else set()
+    # Estoque em QUALQUER loja: é a prova de que a casa adotou o item. Compra
+    # fora é comprada e entregue, nunca entra no saldo de ninguém.
+    estocado = company_item_stock_refs(conn, company_id)
     # Código interno só para EXIBIR: código alto reforça que é lançamento, mas
     # não decide nada — foi exatamente a hipótese que a medição derrubou.
     codigo_por_ref: dict[str, str] = {}
@@ -14560,11 +14586,28 @@ def sales_debut_novelties(
         (company_id,)).fetchall():
         codigo_por_ref[r["ref"]] = str(r["codigo"] or "")
 
+    # Funil, para calibrar com número em vez de opinião: cada etapa mostra
+    # quanto derrubou. Sai no diagnóstico e no log.
+    funil = {"estrearam": len(linhas), "referencia": 0, "vendas": 0,
+             "clientes": 0, "meses": 0, "estoque": 0}
     itens: list[dict[str, Any]] = []
     for r in linhas:
         ref = r["ref"]
-        if not mix_referencia_utilizavel(ref) or int(r["clientes"] or 0) < NOVELTY_MIN_CLIENTS:
+        if not mix_referencia_utilizavel(ref):
             continue
+        funil["referencia"] += 1
+        if int(r["vendas"] or 0) < NOVELTY_MIN_SALES:
+            continue
+        funil["vendas"] += 1
+        if int(r["clientes"] or 0) < NOVELTY_MIN_CLIENTS:
+            continue
+        funil["clientes"] += 1
+        if int(r["meses"] or 0) < NOVELTY_MIN_MONTHS:
+            continue
+        funil["meses"] += 1
+        if NOVELTY_REQUIRE_STOCK and ref not in estocado:
+            continue
+        funil["estoque"] += 1
         itens.append({
             "ref": ref,
             "brand": r["marca"],
@@ -14574,6 +14617,8 @@ def sales_debut_novelties(
             "quantity": round(float(r["qtd"] or 0), 0),
             "revenue": round(float(r["valor"] or 0), 2),
             "unitPrice": round(float(r["valor"] or 0) / float(r["qtd"] or 1), 2),
+            "sales": int(r["vendas"] or 0),
+            "months": int(r["meses"] or 0),
             "clients": int(r["clientes"] or 0),
             "sellers": int(r["vendedores"] or 0),
             "inStock": (ref in com_saldo) if unidade else None,
@@ -14583,18 +14628,26 @@ def sales_debut_novelties(
     itens.sort(key=lambda i: (i["inStock"] is False, -i["clients"], -i["quantity"]))
 
     def estreantes(coluna: str) -> list[dict[str, Any]]:
-        """Marca ou linha cuja PRIMEIRA venda da base caiu na janela."""
+        """Marca ou linha cuja PRIMEIRA venda da base caiu na janela.
+
+        Mesma lógica dos itens: marca entra no portfólio com um CONJUNTO de
+        peças vendendo várias vezes, não com uma peça comprada fora para
+        atender um pedido. Sem esses mínimos, "marca nova" listava fornecedor
+        de uma venda só.
+        """
         return [
             {"name": r["chave"], "debutAt": r["estreia"],
              "items": int(r["itens"] or 0), "clients": int(r["clientes"] or 0),
+             "sales": int(r["vendas"] or 0), "months": int(r["meses"] or 0),
              "revenue": round(float(r["valor"] or 0), 2)}
             for r in conn.execute(
                 f"""
-                {CATALOGO_AGRUPADO_SQL}
                 SELECT {coluna} AS chave,
                        MIN(date(f.issue_date))                   AS estreia,
                        COUNT(DISTINCT UPPER(TRIM(f.sku_key)))    AS itens,
                        COUNT(DISTINCT f.client_name)             AS clientes,
+                       COUNT(*)                                  AS vendas,
+                       COUNT(DISTINCT f.competence)              AS meses,
                        SUM(f.net_value)                          AS valor
                 FROM fact_sales_detail f
                 {CATALOGO_JOIN_SQL}
@@ -14602,9 +14655,14 @@ def sales_debut_novelties(
                   AND TRIM(COALESCE({coluna}, '')) <> ''
                 GROUP BY chave
                 HAVING estreia >= ?
+                   AND itens    >= ?
+                   AND vendas   >= ?
+                   AND clientes >= ?
+                   AND meses    >= ?
                 ORDER BY valor DESC
                 """,
-                (company_id, corte)).fetchall()
+                (company_id, corte, NOVELTY_BRAND_MIN_ITEMS, NOVELTY_BRAND_MIN_SALES,
+                 NOVELTY_BRAND_MIN_CLIENTS, NOVELTY_MIN_MONTHS)).fetchall()
         ]
 
     return {
@@ -14616,7 +14674,37 @@ def sales_debut_novelties(
         "brands": estreantes("f.brand_name")[:15],
         "lines": estreantes("c.item_subgroup")[:15],
         "inStockCount": sum(1 for i in itens if i["inStock"]),
+        "funnel": funil,
+        "rule": {
+            "minSales": NOVELTY_MIN_SALES, "minClients": NOVELTY_MIN_CLIENTS,
+            "minMonths": NOVELTY_MIN_MONTHS, "requireStock": NOVELTY_REQUIRE_STOCK,
+        },
     }
+
+
+def company_item_stock_refs(conn: sqlite3.Connection, company_id: int) -> set[str]:
+    """Referências com saldo em QUALQUER loja — prova de item adotado pela casa."""
+    cache = getattr(conn, "_cache_estoque_empresa", None)
+    if cache is not None and company_id in cache:
+        return cache[company_id]
+    if cache is None:
+        cache = conn._cache_estoque_empresa = {}
+    refs = {
+        normalize_upper(r["ref"])
+        for r in conn.execute(
+            """
+            SELECT DISTINCT UPPER(TRIM(ic.manufacturer_ref)) AS ref
+            FROM item_stock s
+            JOIN item_catalog ic
+              ON ic.company_id = s.company_id AND ic.item_code = s.item_code
+            WHERE s.company_id = ? AND s.quantity > 0
+              AND TRIM(COALESCE(ic.manufacturer_ref, '')) <> ''
+            """,
+            (company_id,)).fetchall()
+        if normalize_upper(r["ref"])
+    }
+    cache[company_id] = refs
+    return refs
 
 
 _novidades_cache: dict[tuple, dict[str, Any]] = {}
