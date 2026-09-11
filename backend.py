@@ -14739,6 +14739,9 @@ def sales_debut_novelties(
         "totalItems": len(itens),
         "brands": estreantes("f.brand_name")[:15],
         "lines": estreantes("c.item_subgroup")[:15],
+        # Marca cadastrada cujo portfólio inteiro ainda não vendeu: entrou na
+        # casa e ninguém ofereceu. É notícia, e é a mais acionável de todas.
+        "brandsUnsold": catalog_unsold_brands(conn, company_id),
         "inStockCount": sum(1 for i in itens if i["inStock"]),
         "establishedCount": sum(1 for i in itens if i["brandStatus"] == "CONSOLIDADA"),
         "funnel": funil,
@@ -14747,6 +14750,104 @@ def sales_debut_novelties(
             "minMonths": NOVELTY_MIN_MONTHS, "requireStock": NOVELTY_REQUIRE_STOCK,
         },
     }
+
+
+def catalog_unsold_items(
+    conn: sqlite3.Connection, company_id: int, termo: str = "",
+    unit_name: str = "", limit: int = 120,
+) -> list[dict[str, Any]]:
+    """Itens CADASTRADOS que ainda não venderam nenhuma vez.
+
+    A lista automática de novidades exige comportamento de venda, e por isso
+    nunca mostra estes — eles não têm comportamento nenhum ainda. Mas para quem
+    PROCURA uma marca, eles são a informação mais valiosa: o vendedor que
+    oferece primeiro leva o cliente do item.
+
+    Ordena por cadastro mais recente e código mais alto. Nenhum dos dois é
+    prova de novidade isolado (o código foi medido e descartado como critério),
+    mas para item sem venda não existe sinal melhor — e a tela diz claramente
+    que são "sem venda ainda", sem prometer que emplacaram.
+    """
+    ensure_catalogo_temp(conn, company_id)
+    alvo = normalize_upper(strip_accents(normalize_whitespace(termo)))
+    if not alvo:
+        return []
+    com_saldo = unit_item_stock_refs(conn, company_id, unit_name) if unit_name else set()
+    vendidos = {
+        normalize_upper(r["ref"])
+        for r in conn.execute(
+            "SELECT DISTINCT UPPER(TRIM(sku_key)) AS ref FROM fact_sales_detail "
+            "WHERE company_id = ? AND TRIM(COALESCE(sku_key,'')) <> ''",
+            (company_id,)).fetchall()
+    }
+    saida: list[dict[str, Any]] = []
+    for r in conn.execute(
+        """
+        SELECT item_code, manufacturer_ref, brand_name, item_subgroup, item_group,
+               sale_price, created_at
+        FROM item_catalog
+        WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref,'')) <> ''
+        ORDER BY created_at DESC, CAST(item_code AS INTEGER) DESC
+        """,
+        (company_id,)).fetchall():
+        ref = normalize_upper(r["manufacturer_ref"])
+        if not ref or ref in vendidos or not mix_referencia_utilizavel(ref):
+            continue
+        texto = normalize_upper(strip_accents(
+            f"{ref} {r['brand_name'] or ''} {r['item_subgroup'] or ''} {r['item_group'] or ''}"))
+        if alvo not in texto:
+            continue
+        saida.append({
+            "ref": ref,
+            "brand": normalize_upper(r["brand_name"]) or "—",
+            "line": normalize_upper(r["item_subgroup"]) or "—",
+            "group": normalize_upper(r["item_group"]) or "—",
+            "code": str(r["item_code"] or ""),
+            "debutAt": "", "quantity": 0, "revenue": 0.0,
+            "unitPrice": round(float(r["sale_price"] or 0), 2),
+            "sales": 0, "months": 0, "clients": 0, "sellers": 0,
+            "brandStatus": "NOVA", "brandSalesBefore": 0, "brandClientsBefore": 0,
+            "inStock": (ref in com_saldo) if unit_name else None,
+            "approved": False,
+            # A tela precisa distinguir "vendeu pouco" de "nunca vendeu": o
+            # segundo não é fracasso, é oportunidade intocada.
+            "neverSold": True,
+            "registeredAt": str(r["created_at"] or "")[:10],
+        })
+        if len(saida) >= limit:
+            break
+    return saida
+
+
+def catalog_unsold_brands(
+    conn: sqlite3.Connection, company_id: int, limit: int = 15,
+) -> list[dict[str, Any]]:
+    """Marcas cadastradas cujo portfólio inteiro ainda não vendeu nada."""
+    vendidas = {
+        normalize_upper(r["marca"])
+        for r in conn.execute(
+            "SELECT DISTINCT UPPER(TRIM(COALESCE(brand_name,''))) AS marca "
+            "FROM fact_sales_detail WHERE company_id = ?", (company_id,)).fetchall()
+        if normalize_upper(r["marca"])
+    }
+    saida: list[dict[str, Any]] = []
+    for r in conn.execute(
+        """
+        SELECT UPPER(TRIM(COALESCE(brand_name,''))) AS marca,
+               COUNT(*) AS itens, MAX(created_at) AS cadastro
+        FROM item_catalog
+        WHERE company_id = ? AND TRIM(COALESCE(brand_name,'')) <> ''
+        GROUP BY marca
+        ORDER BY cadastro DESC, itens DESC
+        """,
+        (company_id,)).fetchall():
+        if r["marca"] in vendidas:
+            continue
+        saida.append({"name": r["marca"], "items": int(r["itens"] or 0),
+                      "registeredAt": str(r["cadastro"] or "")[:10]})
+        if len(saida) >= limit:
+            break
+    return saida
 
 
 def novelty_debut_pool(
@@ -23300,9 +23401,17 @@ class AppHandler(BaseHTTPRequestHandler):
                             if busca in normalize_upper(strip_accents(
                                 f"{i['ref']} {i['brand']} {i['line']} {i.get('group', '')}"))
                         ]
+                        # Itens cadastrados que ainda não venderam entram SEMPRE
+                        # na busca. Eles nunca aparecem na lista automática —
+                        # não têm comportamento de venda para provar nada — mas
+                        # para quem procura uma marca são o achado mais útil:
+                        # quem oferecer primeiro leva o cliente do item.
+                        sem_venda = catalog_unsold_items(
+                            conn, user["company_id"], busca, unidade)
                         res["search"] = {
                             "term": busca, "all": tudo,
                             "items": achados[:120], "total": len(achados),
+                            "neverSold": sem_venda, "neverSoldTotal": len(sem_venda),
                         }
                     res.pop("allItems", None)
                 self._set_headers(200)

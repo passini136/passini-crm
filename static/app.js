@@ -7446,6 +7446,41 @@ function buscaNovidadesBloco() {
               </tbody>
             </table>
           </div>` : '<div class="message" style="margin-top:8px">Nada encontrado com esse termo.</div>'}
+
+        ${(r.neverSold || []).length ? `
+          <div class="section-title" style="margin-top:18px">
+            <div><h3>📦 Cadastrado e ainda sem nenhuma venda (${r.neverSoldTotal})</h3>
+              <div class="text-small">Entrou no catálogo e ninguém ofereceu ainda.
+                Quem oferecer primeiro leva o cliente do item.</div></div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th>Referência</th><th>Marca</th><th>Linha</th><th>Grupo</th>
+                <th style="text-align:right">Cadastro</th>
+                <th style="text-align:right">Preço tabela</th>
+                <th>Loja</th>
+              </tr></thead>
+              <tbody>
+                ${r.neverSold.map((i) => `
+                  <tr>
+                    <td><strong>${escapeHtml(i.ref)}</strong>
+                      ${i.code ? `<div class="text-small">cód. ${escapeHtml(i.code)}</div>` : ""}</td>
+                    <td>${escapeHtml(i.brand)}</td>
+                    <td>${escapeHtml(i.line)}</td>
+                    <td class="text-small">${escapeHtml(i.group || "—")}</td>
+                    <td style="text-align:right" class="text-small">${dataBr(i.registeredAt) || "—"}</td>
+                    <td style="text-align:right">${i.unitPrice ? currency(i.unitPrice) : "—"}</td>
+                    <td class="text-small" style="color:${i.inStock === false ? "var(--bad)" : "var(--good)"}">
+                      ${i.inStock === false ? "sem saldo" : (i.inStock ? "tem" : "—")}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            ⚠ Estes não passaram por nenhuma prova de venda — ninguém comprou ainda.
+            O preço é o de tabela do cadastro, confira antes de passar ao cliente.
+          </div>` : ""}
       ` : ""}
     </div>`;
 }
@@ -7539,6 +7574,24 @@ function novidadesView() {
       `}
 
       ${listaEstreante(d.brands || [], "🏷️ Marcas que entraram na casa")}
+
+      ${(d.brandsUnsold || []).length ? `
+        <div class="table-card">
+          <div class="section-title"><div><h3>🆕 Marcas no catálogo que ainda não venderam</h3>
+            <div class="text-small">A Passini passou a trabalhar e ninguém ofereceu ainda.</div></div></div>
+          <div class="timeline-list">
+            ${d.brandsUnsold.map((b) => `
+              <div class="timeline-item">
+                <strong>${escapeHtml(b.name)}</strong>
+                <div class="text-small">${b.items} item(ns) no catálogo
+                  ${b.registeredAt ? ` · cadastrada em ${dataBr(b.registeredAt)}` : ""}
+                  · <button type="button" class="link-num"
+                      onclick="state.crm.novidadesBusca={termo:'${jsAttr(b.name)}'};loadNovidades()"
+                      >ver as peças</button></div>
+              </div>`).join("")}
+          </div>
+        </div>` : ""}
+
       ${listaEstreante(d.lines || [], "📦 Linhas que a casa passou a vender")}
 
       ${d.canSeeWithoutStock && semSaldo.length ? `
