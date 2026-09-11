@@ -66,9 +66,12 @@ for chave, rotulo in etapas:
     n = f.get(chave, 0)
     corte = f"  (−{anterior - n})" if anterior is not None and anterior >= n else ""
     print(f"   {n:>6}  {rotulo}{corte}")
+    # A quebra por caminho pertence à etapa de comportamento, não à de estoque.
+    # Imprimir no fim dava a impressão de detalhar o número errado.
+    if chave == "comportamento":
+        print(f"           └ {f.get('porVolume', 0)} por volume · "
+              f"{f.get('porConstancia', 0)} por constância")
     anterior = n
-print(f"          dos quais {f.get('porVolume', 0)} por volume e "
-      f"{f.get('porConstancia', 0)} por constância")
 print()
 
 print(f"1) VOLUME  ·  {d['totalItems']} item(ns) aprovados · "
@@ -99,20 +102,22 @@ if codigos_novos and todos:
         print("      pode ser reposição, não lançamento. Cuidado ao chamar de novidade.")
 
 # ── 3. As novidades ──────────────────────────────────────────────────────────
-print(f"\n3) AS NOVIDADES (top 20 por alcance)")
-print(f"   {d.get('establishedCount', 0)} de {len(d['items'])} são peça nova de marca "
+print(f"\n3) AS NOVIDADES (top 20 de {d['totalItems']})")
+# establishedCount conta TODOS os aprovados; comparar com len(items), que vem
+# cortado em NOVELTY_MAX_ITEMS, imprimia coisas como "54 de 40".
+print(f"   {d.get('establishedCount', 0)} de {d['totalItems']} são peça nova de marca "
       f"que a casa JÁ VENDE (≥ {backend.NOVELTY_BRAND_ESTABLISHED_SALES} vendas antes da janela)")
 print(f"\n   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<14}{'ESTREIA':>12}"
-      f"{'VEND':>6}{'MES':>4}{'CLI':>5}{'PREÇO':>11}  {'MARCA É':<13}LOJA")
+      f"{'VEND':>6}{'MES':>4}{'CLI':>5}{'PREÇO':>11}  {'MARCA':<18}LOJA")
 for i in d["items"][:20]:
     loja = "—" if i["inStock"] is None else ("tem" if i["inStock"] else "SEM")
     if i.get("brandStatus") == "CONSOLIDADA":
-        situacao = f"da casa ({i.get('brandClientsBefore', 0)} ofic.)"
+        situacao = f"da casa · {i.get('brandClientsBefore', 0)} ofic."
     else:
-        situacao = "entrando"
+        situacao = "entrando agora"
     print(f"   {i['ref'][:16]:<17}{i['brand'][:12]:<13}{i['line'][:13]:<14}"
           f"{i['debutAt']:>12}{i.get('sales', 0):>6}{i.get('months', 0):>4}"
-          f"{i['clients']:>5}{backend.brl(i['unitPrice']):>11}  {situacao[:12]:<13}{loja}")
+          f"{i['clients']:>5}{backend.brl(i['unitPrice']):>11}  {situacao[:17]:<18}{loja}")
 
 # ── 4. Marcas e linhas que estrearam ─────────────────────────────────────────
 print(f"\n4) MARCAS QUE ESTREARAM ({len(d['brands'])})")
