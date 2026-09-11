@@ -14914,11 +14914,26 @@ def prospecting_entry_items(
     ensure_catalogo_temp(conn, company_id)
     unidade = normalize_unit(unit_name)
 
-    inicio_base = conn.execute(
-        "SELECT MIN(date(issue_date)) AS d FROM fact_sales_detail "
-        "WHERE company_id = ? AND net_value > 0", (company_id,)).fetchone()["d"]
-    if not inicio_base:
+    # INÍCIO REAL da base, não o MIN(issue_date).
+    #
+    # Uma única linha com data errada envenena o MIN: a base tem 262.801 linhas
+    # em 2026 e UMA em 2025, e o MIN devolvia 2025-01-02. A carência calculada
+    # sobre essa data fantasma não protegia nada, e a régua concluiu que 100%
+    # dos clientes eram novos. Aqui vale a primeira competência com volume de
+    # verdade — pelo menos 1% do total —, que ignora digitação errada.
+    linhas_comp = conn.execute(
+        "SELECT competence, COUNT(*) n FROM fact_sales_detail "
+        "WHERE company_id = ? AND net_value > 0 GROUP BY competence ORDER BY competence",
+        (company_id,)).fetchall()
+    total_linhas = sum(int(r["n"]) for r in linhas_comp)
+    if not total_linhas:
         return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
+    com_volume = [r["competence"] for r in linhas_comp
+                  if int(r["n"]) >= max(total_linhas * 0.01, 1)]
+    if not com_volume:
+        return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
+    inicio_base = first_day_of_competence(com_volume[0]).isoformat()
+    meses_de_base = len(com_volume)
     # O mais RESTRITIVO dos dois: a carência protege da censura da base, e o
     # teto de 12 meses mantém a leitura no comportamento atual.
     desde = max(
@@ -15004,6 +15019,30 @@ def prospecting_entry_items(
 
     com_saldo = unit_item_stock_refs(conn, company_id, unidade) if unidade else set()
 
+    # O MESMO cálculo sobre a carteira inteira, para ter contra o que comparar.
+    #
+    # "ÓLEO é a linha nº 1 na estreia" não ajuda ninguém: óleo é a linha nº 1 em
+    # tudo. O que serve para prospecção é a linha que pesa MAIS na abertura do
+    # que no dia a dia — essa é porta de entrada de verdade. Sem esta base de
+    # comparação a tela vira o ranking de vendas com outro nome.
+    base_linha: dict[str, set[str]] = {}
+    for r in conn.execute(
+        f"""
+        SELECT UPPER(TRIM(COALESCE(c.item_subgroup, ''))) AS linha,
+               f.client_name AS cliente
+        FROM fact_sales_detail f
+        {CATALOGO_JOIN_SQL}
+        WHERE f.company_id = ? AND f.net_value > 0
+          AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
+          {onde_vend.replace("seller_name", "f.seller_name")}
+        GROUP BY linha, cliente
+        """,
+        (company_id, *params_vend),
+    ).fetchall():
+        if r["linha"] and r["cliente"]:
+            base_linha.setdefault(r["linha"], set()).add(normalize_whitespace(r["cliente"]))
+    total_carteira = len(primeira) or 1
+
     def formatar(d: dict[str, Any], com_estoque: bool) -> dict[str, Any]:
         clientes = len(d["clients"])
         saida = {
@@ -15014,6 +15053,12 @@ def prospecting_entry_items(
             # Quantos por cento das oficinas novas levaram isso na estreia.
             "sharePct": round(100 * clientes / len(novos), 1),
         }
+        if not com_estoque:  # linha
+            base_pct = 100 * len(base_linha.get(d["name"], ())) / total_carteira
+            saida["basePct"] = round(base_pct, 1)
+            # >1 = pesa mais na abertura do que na carteira. É o número que
+            # transforma o ranking em dica de prospecção.
+            saida["lift"] = round(saida["sharePct"] / base_pct, 2) if base_pct else 0.0
         for k in ("brand", "line"):
             if k in d:
                 saida[k] = d[k]
@@ -15032,6 +15077,7 @@ def prospecting_entry_items(
         "newClients": len(novos),
         "since": desde,
         "baseStart": inicio_base,
+        "baseMonths": meses_de_base,
         "guardDays": PROSPECT_BASE_GUARD_DAYS,
         "firstDays": PROSPECT_FIRST_DAYS,
         "sellers": len(da_unidade),

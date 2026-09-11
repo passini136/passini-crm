@@ -42,7 +42,8 @@ seg = time.time() - inicio
 print(f"Banco: {backend.DB_PATH}")
 print(f"Unidade: {d['unitName']}  ·  {seg:.2f}s\n")
 print("Régua:")
-print(f"   dados começam em...: {d.get('baseStart', '—')}")
+print(f"   dados começam em...: {d.get('baseStart', '—')}  "
+      f"({d.get('baseMonths', '—')} meses com volume de verdade)")
 print(f"   carência...........: {d.get('guardDays')} dias — antes disso não dá para saber")
 print("                         se a estreia é do cliente ou do arquivo")
 print(f"   cliente novo.......: primeira compra NA UNIDADE desde {d.get('since', '—')}")
@@ -102,10 +103,30 @@ if not d["lines"]:
     raise SystemExit(0)
 
 print("\n2) AS LINHAS QUE ABREM CLIENTE (por quantas oficinas levaram na estreia)")
-print(f"   {'LINHA':<24}{'OFICINAS':>9}{'% DOS NOVOS':>13}{'PREÇO MÉDIO':>14}")
+print(f"   {'LINHA':<22}{'OFIC':>6}{'% NOVOS':>9}{'% CARTEIRA':>12}{'PESO':>7}{'PREÇO':>12}")
 for l in d["lines"]:
-    print(f"   {l['name'][:23]:<24}{l['clients']:>9}{l['sharePct']:>12.1f}%"
-          f"{backend.brl(l['unitPrice']):>14}")
+    print(f"   {l['name'][:21]:<22}{l['clients']:>6}{l['sharePct']:>8.1f}%"
+          f"{l.get('basePct', 0):>11.1f}%{l.get('lift', 0):>7.2f}"
+          f"{backend.brl(l['unitPrice']):>12}")
+
+# O teste que decide se a tela vale a pena existir.
+#
+# Se a coluna PESO for ~1,00 em tudo, a estreia é igual à carteira e esta tela
+# é o ranking de vendas com outro nome — o vendedor não aprende nada. O valor
+# está nas linhas com peso acima de 1: essas puxam cliente novo.
+print("\n2b) ISSO É DIFERENTE DO RANKING DE VENDAS?")
+pesos = [l.get("lift", 0) for l in d["lines"] if l.get("lift")]
+if pesos:
+    acima = [l for l in d["lines"] if l.get("lift", 0) >= 1.15]
+    print(f"   peso vai de {min(pesos):.2f} a {max(pesos):.2f}")
+    if not acima:
+        print("   >> Nenhuma linha se destaca na abertura. A estreia é igual ao dia a dia:")
+        print("      como dica de prospecção isso não acrescenta nada.")
+    else:
+        print(f"   {len(acima)} linha(s) pesam mais na abertura do que na carteira:")
+        for l in acima:
+            print(f"      {l['name'][:21]:<22} {l['sharePct']:.0f}% dos novos "
+                  f"vs {l.get('basePct', 0):.0f}% da carteira  (peso {l['lift']:.2f})")
 
 print("\n3) AS PEÇAS QUE ABREM CLIENTE")
 print(f"   {'REFERÊNCIA':<17}{'MARCA':<13}{'LINHA':<16}{'OFIC':>6}{'PREÇO':>11}  LOJA")
@@ -118,8 +139,10 @@ for i in d["items"]:
 print("\n4) LEITURA")
 top = d["lines"][0]
 print(f"   {top['sharePct']:.0f}% das oficinas novas levaram {top['name']} na primeira compra.")
-print("   Se as linhas do topo fizerem sentido como porta de entrada, a régua está boa.")
-print("   Se aparecer peça cara e rara no topo, a janela de primeira compra está larga")
-print("   demais — está medindo relacionamento, não abertura.")
+print("   Duas conferências, nesta ordem:")
+print(f"   a) a proporção de novos ({pct:.0f}%) precisa estar abaixo de 60%. Acima disso")
+print("      a janela ainda pega a censura do início da base e 'novo' perde o sentido.")
+print("   b) a coluna PESO precisa variar. Se for 1,00 em tudo, a estreia é igual ao")
+print("      dia a dia e a tela não tem o que ensinar ao vendedor.")
 
 conn.close()
