@@ -14892,6 +14892,12 @@ def sales_debut_novelties(
 
 PROSPECT_FIRST_DAYS = 30      # o que entrou junto na primeira compra
 PROSPECT_MIN_CLIENTS = 3
+# Abaixo disso a leitura da própria loja é ruído: na Zona Norte, com 108
+# estreias, a peça do topo tinha 5 oficinas e a terceira tinha 3 — qualquer
+# sazonalidade vira "porta de entrada". Nesse caso vale mais a leitura da
+# empresa inteira, dita com todas as letras na tela, do que um número da casa
+# que o vendedor vai levar a sério sem ter por quê.
+PROSPECT_MIN_NEW_CLIENTS = 200
 # CARÊNCIA contra a censura da janela.
 #
 # O faturamento na base começa em 2026-01. Sem esta guarda, "primeira compra
@@ -15351,10 +15357,24 @@ def prospecting_entry_items_cached(
             return pronto
         inicio = time.time()
         resultado = prospecting_entry_items(conn, company_id, unit_name)
+        # Loja com pouca estreia não sustenta leitura própria: cai para a da
+        # empresa, marcada como tal. Só a LEITURA cai — o estoque continua
+        # sendo o da loja, senão a dica sugere peça que ela não tem.
+        if (chave[1] and resultado.get("newClients", 0) < PROSPECT_MIN_NEW_CLIENTS):
+            empresa = prospecting_entry_items(conn, company_id, "")
+            saldo = unit_item_stock_refs(conn, company_id, chave[1])
+            for i in empresa.get("items", []):
+                i["inStock"] = i["name"] in saldo
+            empresa["items"].sort(key=lambda x: (x.get("inStock") is False, -x["clients"]))
+            empresa["basedOn"] = "empresa"
+            empresa["unitName"] = chave[1]
+            empresa["unitNewClients"] = resultado.get("newClients", 0)
+            resultado = empresa
         with _prospeccao_cache_lock:
             _prospeccao_cache[chave] = resultado
         print(f"[prospeccao] {chave[1] or 'empresa'} calculada em "
-              f"{time.time() - inicio:.1f}s ({resultado.get('newClients')} novos)",
+              f"{time.time() - inicio:.1f}s ({resultado.get('newClients')} novos"
+              f"{', leitura da empresa' if resultado.get('basedOn') else ''})",
               flush=True)
     return resultado
 

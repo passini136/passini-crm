@@ -7723,10 +7723,22 @@ function dicasProspeccaoBloco() {
     <div class="table-card">
       <div class="section-title"><div><h3>🚪 Como se abre uma oficina nova</h3>
         <div class="text-small">
-          Medido em ${p.newClients} oficinas que compraram pela primeira vez
-          ${p.unitName ? "em " + escapeHtml(p.unitName) : ""} desde ${dataBr(p.since)}:
-          o que elas levaram nos primeiros ${p.firstDays} dias.
+          ${p.basedOn === "empresa" ? `
+            Medido em ${p.newClients} oficinas da <strong>Passini inteira</strong> que
+            compraram pela primeira vez desde ${dataBr(p.since)}, nos primeiros
+            ${p.firstDays} dias. O estoque mostrado é o desta loja.`
+          : `
+            Medido em ${p.newClients} oficinas que compraram pela primeira vez
+            ${p.unitName ? "em " + escapeHtml(p.unitName) : ""} desde ${dataBr(p.since)}:
+            o que elas levaram nos primeiros ${p.firstDays} dias.`}
         </div></div></div>
+      ${p.basedOn === "empresa" ? `
+        <div class="message" style="margin-bottom:10px">
+          ${escapeHtml(p.unitName || "Esta loja")} ainda tem poucas estreias
+          (${p.unitNewClients}) para uma leitura própria confiável — com esse volume,
+          uma venda sazonal viraria "porta de entrada". Por isso vale aqui a leitura
+          da empresa. Conforme a loja abrir mais oficinas, ela passa a ter a sua.
+        </div>` : ""}
 
       <div style="padding:4px 2px 10px">
         ${puxam.map(barra).join("")}

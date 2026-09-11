@@ -115,6 +115,30 @@ if vendedores:
     print(f"   {'ANO':<8}{'LINHAS':>10}{'CLIENTES':>10}")
     for r in linhas_ano:
         print(f"   {r['ano']:<8}{r['linhas']:>10}{r['clientes']:>10}")
+
+    # MÊS a mês, e não só ano.
+    #
+    # Na Zona Norte a varredura devolveu o MESMO número de novos para as cinco
+    # carências — o que só acontece se não houver estreia nenhuma no intervalo
+    # que a carência varre. Ano fechado esconde isso; mês mostra se a loja
+    # abriu depois ou se está herdando venda antiga dos vendedores.
+    print(f"\n   {'MÊS':<10}{'LINHAS':>9}{'ESTREIAS':>10}   (estreia = 1ª compra do cliente aqui)")
+    estreia_mes: dict[str, int] = {}
+    for r in conn.execute(
+        f"SELECT client_name, MIN(date(issue_date)) ini FROM fact_sales_detail "
+        f"WHERE company_id = ? AND net_value > 0 AND seller_name IN ({marc}) "
+        f"GROUP BY client_name", (company_id, *vendedores)).fetchall():
+        if r["ini"]:
+            estreia_mes[r["ini"][:7]] = estreia_mes.get(r["ini"][:7], 0) + 1
+    por_mes = conn.execute(
+        f"SELECT substr(competence,1,7) mes, COUNT(*) linhas FROM fact_sales_detail "
+        f"WHERE company_id = ? AND seller_name IN ({marc}) "
+        f"GROUP BY mes ORDER BY mes", (company_id, *vendedores)).fetchall()
+    for r in por_mes:
+        print(f"   {r['mes']:<10}{r['linhas']:>9}{estreia_mes.get(r['mes'], 0):>10}")
+    vazios = [m for m, n in sorted(estreia_mes.items()) if n == 0]
+    if vazios:
+        print(f"   >> meses sem nenhuma estreia: {', '.join(vazios)}")
     geral = conn.execute(
         "SELECT substr(competence,1,4) ano, COUNT(*) linhas FROM fact_sales_detail "
         "WHERE company_id = ? GROUP BY ano ORDER BY ano", (company_id,)).fetchall()
