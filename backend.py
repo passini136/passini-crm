@@ -2111,6 +2111,30 @@ def init_db() -> None:
                 FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
             );
 
+            -- Mural: notícia, imagem e vídeo publicados pela diretoria.
+            -- Separado da content_library de propósito: lá é material de apoio
+            -- à venda, indexado por situação do cliente e consultado na hora do
+            -- atendimento. Aqui é comunicado, tem data e envelhece.
+            CREATE TABLE IF NOT EXISTS news_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT,
+                image_name TEXT,          -- arquivo em disco, como os anexos de ata
+                link_url TEXT,            -- vídeo, pasta, matéria externa
+                link_label TEXT,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                published INTEGER NOT NULL DEFAULT 1,
+                author_name TEXT,
+                created_by_user_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_news_posts_lookup
+                ON news_posts(company_id, published, pinned, created_at);
+
             -- Feedback estruturado (gerente x vendedor e diretor x gerente)
             CREATE TABLE IF NOT EXISTS feedbacks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5907,6 +5931,110 @@ def meeting_files_dir() -> Path:
     caminho = DATA_DIR / "meeting_files"
     caminho.mkdir(parents=True, exist_ok=True)
     return caminho
+
+
+def news_files_dir() -> Path:
+    caminho = DATA_DIR / "news_files"
+    caminho.mkdir(parents=True, exist_ok=True)
+    return caminho
+
+
+NEWS_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+NEWS_IMAGE_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def list_news_posts(
+    conn: sqlite3.Connection, company_id: int, incluir_rascunho: bool = False,
+) -> list[dict[str, Any]]:
+    """Mural, fixados primeiro e depois do mais novo para o mais velho."""
+    onde = "company_id = ?" + ("" if incluir_rascunho else " AND published = 1")
+    return [
+        {
+            "id": int(r["id"]), "title": r["title"], "body": r["body"] or "",
+            "imageName": r["image_name"] or "", "linkUrl": r["link_url"] or "",
+            "linkLabel": r["link_label"] or "", "pinned": bool(r["pinned"]),
+            "published": bool(r["published"]), "authorName": r["author_name"] or "",
+            "createdAt": r["created_at"], "updatedAt": r["updated_at"] or "",
+        }
+        for r in conn.execute(
+            f"SELECT * FROM news_posts WHERE {onde} "
+            "ORDER BY pinned DESC, datetime(created_at) DESC LIMIT 60",
+            (company_id,),
+        ).fetchall()
+    ]
+
+
+def save_news_post(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any],
+) -> dict[str, Any]:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria publica no mural.")
+    titulo = normalize_whitespace(payload.get("title"))
+    if not titulo:
+        raise ValueError("Informe o título — é o que a equipe lê primeiro.")
+    link = normalize_whitespace(payload.get("linkUrl"))
+    if link and not link.lower().startswith(("http://", "https://")):
+        link = "https://" + link
+    campos = (titulo, payload.get("body") or "", normalize_whitespace(payload.get("imageName")),
+              link, normalize_whitespace(payload.get("linkLabel")),
+              1 if payload.get("pinned") else 0,
+              0 if payload.get("draft") else 1)
+    post_id = int(payload.get("id") or 0)
+    if post_id:
+        conn.execute(
+            "UPDATE news_posts SET title=?, body=?, image_name=?, link_url=?, link_label=?, "
+            "pinned=?, published=?, updated_at=? WHERE id=? AND company_id=?",
+            (*campos, now_iso(), post_id, company_id))
+    else:
+        cursor = conn.execute(
+            "INSERT INTO news_posts (company_id, title, body, image_name, link_url, link_label, "
+            "pinned, published, author_name, created_by_user_id, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (company_id, *campos, meeting_person_identity(user), user["id"], now_iso()))
+        post_id = int(cursor.lastrowid)
+    audit_log(conn, company_id, user["id"], "salvar", "news_posts", str(post_id),
+              {"titulo": titulo})
+    conn.commit()
+    return {"id": post_id}
+
+
+def delete_news_post(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, post_id: int,
+) -> None:
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria remove do mural.")
+    row = conn.execute(
+        "SELECT image_name FROM news_posts WHERE id = ? AND company_id = ?",
+        (post_id, company_id)).fetchone()
+    if not row:
+        raise ValueError("Publicação não encontrada.")
+    if row["image_name"]:
+        caminho = news_files_dir() / row["image_name"]
+        if caminho.exists():
+            caminho.unlink()
+    conn.execute("DELETE FROM news_posts WHERE id = ? AND company_id = ?", (post_id, company_id))
+    audit_log(conn, company_id, user["id"], "excluir", "news_posts", str(post_id), {})
+    conn.commit()
+
+
+def save_news_image(
+    conn: sqlite3.Connection, user: sqlite3.Row, file_name: str, content: bytes,
+) -> str:
+    """Grava a imagem e devolve o nome em disco. Mesma disciplina dos anexos de ata."""
+    if not user_can_manage_users(conn, user):
+        raise PermissionError("Apenas a diretoria publica no mural.")
+    extensao = Path(normalize_whitespace(file_name) or "img").suffix.lower()
+    if extensao not in NEWS_IMAGE_EXT:
+        raise ValueError(f"Formato não aceito ({extensao or 'sem extensão'}). "
+                         "Use PNG, JPG, WEBP ou GIF.")
+    if not content:
+        raise ValueError("Arquivo vazio.")
+    if len(content) > NEWS_IMAGE_MAX_BYTES:
+        raise ValueError(f"Imagem acima de {NEWS_IMAGE_MAX_BYTES // (1024 * 1024)} MB.")
+    # Nome gerado: o original poderia trazer "../" e escapar da pasta.
+    stored = f"{uuid.uuid4().hex}{extensao}"
+    (news_files_dir() / stored).write_bytes(content)
+    return stored
 
 
 def person_key(value: Any) -> str:
@@ -23372,6 +23500,35 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"client": achado}))
                 return
+            if path.startswith("/api/news/image/"):
+                user = self._require_auth()
+                if not user:
+                    return
+                nome = Path(path.rsplit("/", 1)[-1]).name
+                caminho = news_files_dir() / nome
+                if not nome or not caminho.exists():
+                    self._set_headers(404)
+                    self.wfile.write(json_dumps({"error": "Imagem não encontrada."}))
+                    return
+                conteudo = caminho.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type",
+                                 mimetypes.guess_type(nome)[0] or "image/jpeg")
+                self.send_header("Content-Length", str(len(conteudo)))
+                self.send_header("Cache-Control", "private, max-age=86400")
+                self.end_headers()
+                self.wfile.write(conteudo)
+                return
+            if path == "/api/news":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    pode = user_can_manage_users(conn, user)
+                    itens = list_news_posts(conn, user["company_id"], incluir_rascunho=pode)
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"posts": itens, "canPublish": pode}))
+                return
             if path == "/api/crm/novelties":
                 user = self._require_auth()
                 if not user:
@@ -24678,6 +24835,52 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True, "attachments": salvos}))
+                return
+            if path in ("/api/news/save", "/api/news/delete"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path == "/api/news/save":
+                            resultado = save_news_post(conn, user["company_id"], user, payload)
+                        else:
+                            delete_news_post(conn, user["company_id"], user,
+                                             int(payload.get("id") or 0))
+                            resultado = {"ok": True}
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps(resultado))
+                return
+            if path == "/api/news/image/upload":
+                user = self._require_auth()
+                if not user:
+                    return
+                arquivos, _campos = self._parse_multipart()
+                try:
+                    if not arquivos:
+                        raise ValueError("Envie uma imagem.")
+                    with closing(get_connection()) as conn:
+                        nome = save_news_image(conn, user, arquivos[0]["fileName"],
+                                               arquivos[0]["content"])
+                except PermissionError as exc:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"imageName": nome}))
                 return
             if path == "/api/meetings/attachment/link":
                 user = self._require_auth()

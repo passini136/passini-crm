@@ -7379,6 +7379,205 @@ function alternarBuscaTudo(valor) {
   else requestRender();
 }
 
+/* ─── Mural: comunicado da diretoria ─────────────────────────────────────────
+ *
+ * Fica em Novidades, acima das peças. Separado da Biblioteca de propósito: lá
+ * é material de apoio consultado na hora do atendimento, indexado por situação
+ * do cliente; aqui é comunicado, tem data e envelhece.
+ */
+async function loadMural() {
+  try {
+    state.mural = { ...(await api("/api/news")), loading: false };
+  } catch (e) {
+    state.mural = { error: e.message, posts: [], loading: false };
+  }
+  requestRender();
+}
+
+function novoPostMural() {
+  state.muralEditor = { id: null, title: "", body: "", imageName: "",
+                        linkUrl: "", linkLabel: "", pinned: false, draft: false };
+  requestRender();
+}
+
+function editarPostMural(post) {
+  state.muralEditor = { ...post, draft: !post.published };
+  requestRender();
+}
+
+function fecharMuralEditor() { state.muralEditor = null; requestRender(); }
+
+function fecharMuralEditorPorFora() {
+  fecharComGuarda(fecharMuralEditor, {
+    titulo: "Fechar sem publicar?",
+    texto: "O que você escreveu ainda não foi salvo.",
+    rascunhoLabel: "Salvar como rascunho",
+    rascunho: () => salvarPostMural(true),
+  });
+}
+
+async function enviarImagemMural(input) {
+  const arquivo = input?.files?.[0];
+  const e = state.muralEditor;
+  if (!arquivo || !e) return;
+  if (arquivo.size > 8 * 1024 * 1024) {
+    addMessage("error", `Imagem de ${(arquivo.size / 1024 / 1024).toFixed(1)} MB, acima de 8 MB.`);
+    input.value = "";
+    return;
+  }
+  try {
+    const form = new FormData();
+    form.append("imagem", arquivo, arquivo.name);
+    const r = await api("/api/news/image/upload",
+                        { method: "POST", body: form, timeoutMs: 60000 });
+    e.imageName = r.imageName;
+    addMessage("success", "Imagem carregada.");
+  } catch (err) {
+    addMessage("error", err.message);
+  } finally {
+    input.value = "";
+    requestRender();
+  }
+}
+
+/** Devolve true/false — a guarda de fechamento precisa saber se gravou. */
+async function salvarPostMural(comoRascunho) {
+  const e = state.muralEditor;
+  if (!e) return false;
+  if (!(e.title || "").trim()) {
+    addMessage("error", "Informe o título — é o que a equipe lê primeiro.");
+    return false;
+  }
+  try {
+    await api("/api/news/save", {
+      method: "POST",
+      body: JSON.stringify({ ...e, draft: Boolean(comoRascunho) }),
+    });
+    addMessage("success", comoRascunho ? "Rascunho salvo." : "Publicado no mural.");
+    limparModalSujo();
+    await loadMural();
+    if (!comoRascunho) state.muralEditor = null;
+    requestRender();
+    return true;
+  } catch (err) {
+    addMessage("error", err.message);
+    return false;
+  }
+}
+
+async function excluirPostMural(id) {
+  if (!confirm("Excluir esta publicação do mural?")) return;
+  try {
+    await api("/api/news/delete", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", "Publicação removida.");
+    state.muralEditor = null;
+    await loadMural();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function muralEditorModal() {
+  const e = state.muralEditor;
+  if (!e) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharMuralEditorPorFora()">
+      <div class="panel modal-panel" style="max-width:720px;margin:5vh auto;padding:22px;
+           max-height:90vh;overflow:auto" onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>${e.id ? "Editar" : "Nova"} publicação</h3>
+            <div class="text-small">Aparece em Novidades para toda a equipe.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharMuralEditor()">Fechar</button>
+        </div>
+
+        <div class="field"><label>Título <span style="color:var(--bad)">*</span></label>
+          <input value="${escapeHtml(e.title || "")}"
+            oninput="state.muralEditor.title=this.value"
+            placeholder="Ex.: Chegou a linha nova da NAKATA" /></div>
+
+        <div class="field"><label>Texto</label>
+          <textarea rows="6" style="font-family:inherit;line-height:1.6"
+            oninput="state.muralEditor.body=this.value"
+            placeholder="O recado para a equipe.">${escapeHtml(e.body || "")}</textarea></div>
+
+        <div class="two-column-form">
+          <div class="field"><label>Link (vídeo, pasta, matéria)</label>
+            <input value="${escapeHtml(e.linkUrl || "")}"
+              oninput="state.muralEditor.linkUrl=this.value"
+              placeholder="https://… cola do YouTube ou Drive" /></div>
+          <div class="field"><label>Como chamar o link</label>
+            <input value="${escapeHtml(e.linkLabel || "")}"
+              oninput="state.muralEditor.linkLabel=this.value"
+              placeholder="Opcional" /></div>
+        </div>
+
+        <div class="field"><label>Imagem</label>
+          <input type="file" accept="image/*" onchange="enviarImagemMural(this)" />
+          ${e.imageName ? `
+            <div style="margin-top:8px">
+              <img src="/api/news/image/${escapeHtml(e.imageName)}" alt=""
+                   style="max-width:100%;max-height:220px;border-radius:8px;border:1px solid var(--line)" />
+              <button class="btn btn-ghost btn-sm" style="margin-top:6px"
+                onclick="state.muralEditor.imageName='';requestRender()">Remover imagem</button>
+            </div>` : ""}
+        </div>
+
+        <label class="check-row">
+          <input type="checkbox" ${e.pinned ? "checked" : ""}
+            onchange="state.muralEditor.pinned=this.checked" />
+          <span>📌 Fixar no topo do mural</span>
+        </label>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-secondary" onclick="salvarPostMural(true)">Salvar rascunho</button>
+          <button class="btn btn-primary" onclick="salvarPostMural(false)">Publicar</button>
+          ${e.id ? `<button class="btn btn-ghost" style="color:var(--bad)"
+                      onclick="excluirPostMural(${e.id})">Excluir</button>` : ""}
+          <button class="btn btn-ghost" onclick="fecharMuralEditor()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function muralBloco() {
+  const m = state.mural;
+  if (!m) { loadMural(); return ""; }
+  const posts = m.posts || [];
+  if (!posts.length && !m.canPublish) return "";
+  return `
+    <div class="stack">
+      ${m.canPublish ? `
+        <div style="display:flex;justify-content:flex-end">
+          <button class="btn btn-secondary btn-sm" onclick="novoPostMural()">
+            ✏️ Publicar no mural
+          </button>
+        </div>` : ""}
+
+      ${posts.map((p) => `
+        <div class="panel padded-card" style="${p.pinned ? "border-left:4px solid #f4c25f" : ""}">
+          <div class="section-title">
+            <div>
+              <h3>${p.pinned ? "📌 " : ""}${escapeHtml(p.title)}
+                ${!p.published ? '<span class="soft-badge" style="background:#fff3e0;color:#e65100">rascunho</span>' : ""}</h3>
+              <div class="text-small">${dataBr(String(p.createdAt).slice(0, 10))}
+                ${p.authorName ? ` · ${escapeHtml(p.authorName)}` : ""}</div>
+            </div>
+            ${m.canPublish ? `<button class="btn btn-ghost btn-sm"
+                onclick='editarPostMural(${JSON.stringify(p).replace(/'/g, "&#39;")})'>Editar</button>` : ""}
+          </div>
+          ${p.imageName ? `
+            <img src="/api/news/image/${escapeHtml(p.imageName)}" alt=""
+                 style="max-width:100%;border-radius:8px;margin:10px 0" />` : ""}
+          ${p.body ? `<div style="white-space:pre-wrap;line-height:1.6;font-size:13px">${escapeHtml(p.body)}</div>` : ""}
+          ${p.linkUrl ? `
+            <div style="margin-top:10px">
+              <a class="btn btn-secondary btn-sm" href="${escapeHtml(p.linkUrl)}"
+                 target="_blank" rel="noopener noreferrer">
+                ▶ ${escapeHtml(p.linkLabel || "Abrir link")}
+              </a>
+            </div>` : ""}
+        </div>`).join("")}
+    </div>`;
+}
+
 /**
  * Busca dentro das novidades, por marca, linha, grupo ou referência.
  *
@@ -7546,6 +7745,7 @@ function novidadesView() {
         </div>
       </div>
 
+      ${muralBloco()}
       ${buscaNovidadesBloco()}
 
       ${(d.search) ? "" : `
@@ -17238,6 +17438,7 @@ function dashboardView() {
       ${scheduleContactModal()}
       ${conciliacaoModal()}
       ${clientesDoVendedorModal()}
+      ${muralEditorModal()}
       ${ticketSemanalModal()}
       ${apoioModal()}
       ${coberturaModal()}
