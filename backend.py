@@ -14900,6 +14900,11 @@ PROSPECT_MIN_CLIENTS = 3
 # entrada. Só conta como novo quem estreou pelo menos este tanto DEPOIS do
 # primeiro dia de dados — aí a estreia é dele, não do arquivo.
 PROSPECT_BASE_GUARD_DAYS = 60
+# Janela de "cliente novo". A base tem desde 2025-01, então sem teto a régua
+# olharia 18 meses e chamaria de novo quem entrou ano passado — o que serve
+# para estatística, não para orientar abordagem hoje. Doze meses mantém volume
+# e continua sendo comportamento atual.
+PROSPECT_WINDOW_MONTHS = 12
 
 
 def prospecting_entry_items(
@@ -14914,8 +14919,12 @@ def prospecting_entry_items(
         "WHERE company_id = ? AND net_value > 0", (company_id,)).fetchone()["d"]
     if not inicio_base:
         return {"unitName": unidade, "lines": [], "items": [], "newClients": 0}
-    desde = (date.fromisoformat(inicio_base)
-             + timedelta(days=PROSPECT_BASE_GUARD_DAYS)).isoformat()
+    # O mais RESTRITIVO dos dois: a carência protege da censura da base, e o
+    # teto de 12 meses mantém a leitura no comportamento atual.
+    desde = max(
+        (date.fromisoformat(inicio_base) + timedelta(days=PROSPECT_BASE_GUARD_DAYS)),
+        (today_in_brazil() - timedelta(days=PROSPECT_WINDOW_MONTHS * 31)),
+    ).isoformat()
 
     # Vendedores DESTA unidade: prospecção é sobre como a loja abre cliente, e
     # a porta de entrada de Xangri-lá não é a da Matriz. Sem este recorte as
@@ -15026,6 +15035,9 @@ def prospecting_entry_items(
         "guardDays": PROSPECT_BASE_GUARD_DAYS,
         "firstDays": PROSPECT_FIRST_DAYS,
         "sellers": len(da_unidade),
+        # Quantos clientes a unidade atendeu no total, para a tela mostrar a
+        # PROPORÇÃO de novos. Número absoluto sozinho não diz se é muito.
+        "totalClients": len(primeira),
         "lines": linhas[:12],
         "items": itens[:24],
     }

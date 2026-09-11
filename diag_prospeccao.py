@@ -50,10 +50,16 @@ print(f"   primeira compra....: o que entrou em até {d.get('firstDays')} dias d
 print(f"   vendedores da loja.: {d.get('sellers', 0)}")
 print(f"   mínimo de clientes.: {backend.PROSPECT_MIN_CLIENTS}\n")
 
-print(f"1) {d['newClients']} oficina(s) compraram pela primeira vez com esta loja")
-if d["newClients"] > 3000:
-    print("   >> Número alto demais para ser 'cliente novo'. Confira se a carência")
-    print("      está pegando a censura da janela de dados.")
+# Proporção, não número absoluto. O limite fixo que eu tinha posto (3.000) era
+# um chute meu e disparou alarme num número que pode estar certo: distribuidora
+# de autopeças atende muito balcão, e balcão renova rápido.
+total = d.get("totalClients") or 0
+pct = (100 * d["newClients"] / total) if total else 0
+print(f"1) {d['newClients']} de {total} oficinas desta loja compraram pela primeira vez "
+      f"na janela ({pct:.0f}%)")
+if pct > 60:
+    print("   >> Proporção alta. Ou a loja renovou muito a carteira, ou a janela")
+    print("      ainda está pegando a censura do início dos dados.")
 if not d["lines"]:
     print("\n   Sem dados suficientes. Janela curta, ou poucos clientes novos.")
     conn.close()
