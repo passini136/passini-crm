@@ -224,6 +224,7 @@ const state = {
       compras: { rows: [], loaded: false, loading: false, error: "" },
       itens: { rows: [], loaded: false, loading: false, error: "", page: 1, pageSize: 20, total: 0, totalPages: 0 },
       interacoes: { rows: [], loaded: false, loading: false, error: "", page: 1, pageSize: 20, total: 0, totalPages: 0 },
+      visitas: { rows: [], loaded: false, loading: false, error: "" },
     },
     taskRows: [],
     interactionForm: {
@@ -420,6 +421,7 @@ function resetSelectedClientTabs() {
     compras: { rows: [], loaded: false, loading: false, error: "" },
     itens: emptyClientTabState(20),
     interacoes: emptyClientTabState(20),
+    visitas: { rows: [], loaded: false, loading: false, error: "" },
   };
 }
 
@@ -1287,6 +1289,12 @@ async function ensureCrmClientTabLoaded(tab, silent = false) {
     if (tab === "compras") {
       result = await api(`/api/crm/client/purchases?${buildQuery()}&clientKey=${encodeURIComponent(clientKey)}`);
       state.crm.selectedClientTabs.compras = { rows: result.rows || [], loaded: true, loading: false, error: "" };
+      if (!silent) requestRender();
+      return;
+    }
+    if (tab === "visitas") {
+      result = await api(`/api/crm/client/visits?clientKey=${encodeURIComponent(clientKey)}`);
+      state.crm.selectedClientTabs.visitas = { rows: result.rows || [], loaded: true, loading: false, error: "" };
       if (!silent) requestRender();
       return;
     }
@@ -13644,6 +13652,7 @@ function clientDrawerView() {
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "compras" ? "active" : ""}" onclick="setCrmClientDetailTab('compras')">Compras</button>
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "itens" ? "active" : ""}" onclick="setCrmClientDetailTab('itens')">Itens</button>
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "interacoes" ? "active" : ""}" onclick="setCrmClientDetailTab('interacoes')">Interações</button>
+                <button class="subtab-button ${state.ui.crmClientDetailTab === "visitas" ? "active" : ""}" onclick="setCrmClientDetailTab('visitas')">Visitas</button>
               </div>
               ${crmClientHistoryPanel(detail)}
             </div>
@@ -13684,6 +13693,48 @@ function crmClientHistoryPanel(clientDetail) {
             ${(tabState?.rows || []).map((row) => `<tr><td>${escapeHtml((row.issue_date || "").slice(0, 10))}</td><td>${escapeHtml(row.item_code)}</td><td>${number(row.quantity)}</td><td>${currency(row.net_value)}</td></tr>`).join("") || '<tr><td colspan="4">Sem itens recentes.</td></tr>'}
           </tbody>
         </table>
+      </div>
+    `;
+  }
+  if (tab === "visitas") {
+    const linhas = tabState?.rows || [];
+    if (!linhas.length) {
+      return `<div class="timeline-list"><div class="timeline-item">
+        <div class="text-small">Nenhuma visita registrada para este cliente.</div></div></div>`;
+    }
+    // O efeito (60 dias antes × 60 dias depois) é o que diferencia a visita da
+    // ligação: só aparece quando já foi medido. Visita planejada e visita de
+    // ontem ainda não têm efeito, e inventar um zero ali seria mentira.
+    return `
+      <div class="timeline-list">
+        ${linhas.map((v) => {
+          const quando = v.occurredAt || v.scheduledFor || (v.createdAt || "").slice(0, 10);
+          const efeito = v.effectPct;
+          const cor = efeito == null ? "var(--muted)" : (efeito >= 0 ? "#2e7d32" : "var(--bad)");
+          return `
+            <div class="timeline-item">
+              <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline">
+                <strong>${v.visitTypeIcon || "📍"} ${escapeHtml(v.visitTypeLabel || v.visitType)}</strong>
+                <span class="text-small" style="color:var(--muted)">
+                  ${escapeHtml((quando || "").slice(0, 10))} ·
+                  <span class="status-tag ${v.status === "REALIZADA" ? "good" : ""}">${escapeHtml(v.status)}</span>
+                </span>
+              </div>
+              <div class="text-small" style="color:var(--muted)">
+                ${escapeHtml(v.managerName || "")}${v.sellerName ? ` · com ${escapeHtml(v.sellerName)}` : ""}
+              </div>
+              ${v.objective ? `<div class="text-small"><strong>Objetivo:</strong> ${escapeHtml(v.objective)}</div>` : ""}
+              ${v.outcome ? `<div class="text-small">${escapeHtml(v.outcome)}</div>` : ""}
+              ${v.agreement ? `<div class="text-small"><strong>Combinado:</strong> ${escapeHtml(v.agreement)}</div>` : ""}
+              ${v.nextAction ? `<div class="text-small"><strong>Ação:</strong> ${escapeHtml(v.nextAction)}${
+                v.nextActionDue ? ` · até ${escapeHtml(v.nextActionDue)}` : ""}</div>` : ""}
+              ${efeito == null ? "" : `
+                <div class="text-small" style="color:${cor};font-weight:700;margin-top:3px">
+                  Efeito: ${efeito >= 0 ? "+" : ""}${efeito}% no faturamento
+                  (${currency(v.revenueBefore)} → ${currency(v.revenueAfter)})
+                </div>`}
+            </div>`;
+        }).join("")}
       </div>
     `;
   }

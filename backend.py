@@ -23510,6 +23510,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
                 return
+            if path == "/api/crm/client/visits":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                client_key = normalize_client_key(query.get("clientKey", [None])[0])
+                if not client_key:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Informe clientKey"}))
+                    return
+                # list_visits já aplica o escopo do usuário (vendedor vê o que é
+                # dele, gerente vê a unidade). Não repetir a regra aqui: duas
+                # cópias da mesma permissão é o caminho para uma delas ficar
+                # para trás.
+                with closing(get_connection()) as conn:
+                    linhas = list_visits(conn, user["company_id"], user,
+                                         client_key=client_key, limit=100)
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"rows": linhas}))
+                return
             if path == "/api/crm/client/purchases":
                 user = self._require_auth()
                 if not user:
