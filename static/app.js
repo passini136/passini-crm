@@ -97,6 +97,9 @@ const state = {
       awards: false,
     },
     visitOpenGroups: {},   // bairros abertos no roteiro
+    // Blocos recolhidos da tela de Visitas. Começam abertos; o que a pessoa
+    // recolher fica recolhido enquanto ela estiver no sistema.
+    visitBlocosFechados: {},
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
     bulkCityUnit: "",      // unidade escolhida para o lote
     analysisOpen: false,   // subgrupo Análises do menu aberto
@@ -472,13 +475,32 @@ async function api(path, options = {}) {
   return response.blob();
 }
 
+let contadorAviso = 0;
+
 function addMessage(type, text) {
-  const id = Date.now();
+  // Contador, e não Date.now(): dois avisos no mesmo milissegundo geravam o
+  // mesmo id, e agora o id vira o do elemento no DOM — repetido, some o aviso
+  // errado.
+  const id = `${Date.now()}-${++contadorAviso}`;
   state.messages = [{ type, text, id }, ...state.messages].slice(0, 3);
   requestRender();
   const delay = type === "error" ? 6000 : 4000;
   setTimeout(() => {
     state.messages = state.messages.filter((m) => m.id !== id);
+    // Some o aviso TIRANDO O ELEMENTO, não redesenhando a tela.
+    //
+    // O gerente registrava uma visita, aceitava um pedido (que mostra o aviso
+    // verde), começava a escrever e quatro segundos depois a tela piscava e o
+    // cursor caía fora do campo. Era este timer: render() faz
+    // app.innerHTML = ..., e o navegador destrói o input que estava em foco.
+    // Para apagar um aviso não há motivo nenhum para reconstruir o resto.
+    const el = document.getElementById(`msg-${id}`);
+    if (el) {
+      el.remove();
+      const pilha = document.querySelector(".toast-stack");
+      if (pilha && !pilha.children.length) pilha.remove();
+      return;
+    }
     requestRender();
   }, delay);
 }
@@ -1668,7 +1690,7 @@ function messageHtml() {
   return `
     <div class="toast-stack">
       ${state.messages
-        .map((item) => `<div class="message ${item.type}">${escapeHtml(item.text)}</div>`)
+        .map((item) => `<div class="message ${item.type}" id="msg-${item.id}">${escapeHtml(item.text)}</div>`)
         .join("")}
     </div>
   `;
@@ -11086,6 +11108,25 @@ function toggleBairro(chave) {
   requestRender();
 }
 
+function toggleBlocoVisita(chave) {
+  state.ui.visitBlocosFechados[chave] = !state.ui.visitBlocosFechados[chave];
+  requestRender();
+}
+
+function blocoVisitaFechado(chave) {
+  return Boolean(state.ui.visitBlocosFechados[chave]);
+}
+
+/** Botão de recolher/abrir, igual nos dois blocos da tela de Visitas. */
+function botaoRecolherVisita(chave) {
+  const fechado = blocoVisitaFechado(chave);
+  return `
+    <button type="button" class="btn btn-ghost btn-sm" onclick="toggleBlocoVisita('${jsAttr(chave)}')"
+      title="${fechado ? "Abrir" : "Recolher"} este bloco">
+      ${fechado ? "▸ Abrir" : "▾ Recolher"}
+    </button>`;
+}
+
 // ─── Registro da visita ─────────────────────────────────────────────────────
 
 function novaVisita(cliente) {
@@ -11555,16 +11596,39 @@ function visitasView() {
       ${state.visitEditor ? visitaEditorModal() : ""}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
 
+      <!-- Registrar visita é o que mais se faz nesta tela, e estava embaixo de
+           dois blocos longos. Agora é a primeira coisa, e os blocos recolhem. -->
+      <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;
+                                border:none;padding:16px 20px;display:flex;gap:14px;
+                                align-items:center;flex-wrap:wrap">
+        <div style="flex:1;min-width:200px">
+          <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:2px">VISITAS</div>
+          <div style="font-size:13px;color:rgba(255,255,255,0.8)">
+            ${visitas.length} registrada(s)${pedidos.length
+              ? ` · <strong style="color:#ffb4a8">${pedidos.length} pedido(s) da equipe</strong>` : ""}
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="novaVisita(null)"
+          style="background:#f4c25f;color:#0f3044;border:none;font-weight:800;
+                 font-size:15px;padding:11px 22px;box-shadow:0 2px 8px rgba(0,0,0,0.25)">
+          ＋ NOVA VISITA
+        </button>
+      </div>
+
       ${pedidos.length ? `
         <div class="table-card" style="border-left:4px solid #e74c3c">
           <div class="section-title">
             <div><h3>🙋 Pedidos de visita da equipe</h3>
-              <div class="text-small">${podeGerir
-                ? "O vendedor já ligou e pediu sua presença. Aceite e registre, ou recuse com o motivo."
-                : "Pedidos que você enviou ao gerente."}</div></div>
-            <div class="soft-badge" style="background:#fde8e8;color:#e74c3c">${pedidos.length}</div>
+              ${blocoVisitaFechado("pedidos") ? "" : `
+                <div class="text-small">${podeGerir
+                  ? "O vendedor já ligou e pediu sua presença. Aceite e registre, ou recuse com o motivo."
+                  : "Pedidos que você enviou ao gerente."}</div>`}</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <div class="soft-badge" style="background:#fde8e8;color:#e74c3c">${pedidos.length}</div>
+              ${botaoRecolherVisita("pedidos")}
+            </div>
           </div>
-          <div class="stack" style="padding-top:8px">
+          <div class="stack" style="padding-top:8px;${blocoVisitaFechado("pedidos") ? "display:none" : ""}">
             ${pedidos.map((p) => `
               <div style="border-left:3px solid #e74c3c;background:#fff;border:1px solid var(--line);
                           border-left-width:3px;border-radius:0 6px 6px 0;padding:10px 12px">
@@ -11591,12 +11655,17 @@ function visitasView() {
         <div class="table-card">
           <div class="section-title">
             <div><h3>🗺️ Roteiro sugerido</h3>
-              <div class="text-small">
-                Agrupado por bairro e rua para você não cruzar a cidade duas vezes.
-                Só entra quem teve ligação registrada nos últimos ${rota.params?.callWindowDays || 30} dias.
-              </div></div>
-            <div class="soft-badge">${rota.total || 0}</div>
+              ${blocoVisitaFechado("roteiro") ? "" : `
+                <div class="text-small">
+                  Agrupado por bairro e rua para você não cruzar a cidade duas vezes.
+                  Só entra quem teve ligação registrada nos últimos ${rota.params?.callWindowDays || 30} dias.
+                </div>`}</div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <div class="soft-badge">${rota.total || 0}</div>
+              ${botaoRecolherVisita("roteiro")}
+            </div>
           </div>
+          <div style="${blocoVisitaFechado("roteiro") ? "display:none" : ""}">
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:10px 0">
             <span class="text-small" style="font-weight:700;color:var(--muted)">CIDADE</span>
             <select style="min-width:160px" onchange="setVisitCity(this.value)">
@@ -11646,6 +11715,7 @@ function visitasView() {
                 }).join("")}
               </div>`).join("") || (state.ui.loading.visitRoute ? "" : emptyStateCard(
                 "Nenhuma sugestão. Lembre que o cliente só entra depois de uma ligação registrada pelo vendedor."))}
+          </div>
           </div>
         </div>` : ""}
 
@@ -17544,6 +17614,56 @@ function dashboardView() {
   `;
 }
 
+/* ─── Foco através do render ─────────────────────────────────────────────────
+ *
+ * Como render() troca o innerHTML inteiro, o campo onde a pessoa estava
+ * escrevendo deixa de existir e o cursor volta para o nada. O scroll já era
+ * preservado; o cursor não era, e quem digita texto longo (ata, visita)
+ * perdia a linha no meio da frase.
+ *
+ * A identificação é por id quando existe e, sem id, pela POSIÇÃO entre os
+ * campos da tela. Posição sozinha seria perigosa — se a tela mudar de forma,
+ * o cursor cairia em outro campo e a digitação iria para o lugar errado —,
+ * então só restaura se o campo daquela posição for do mesmo tipo.
+ */
+function guardarFoco() {
+  const el = document.activeElement;
+  if (!el || !app.contains(el)) return null;
+  if (!["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName)) return null;
+  const campos = Array.from(app.querySelectorAll("input, textarea, select"));
+  const idx = campos.indexOf(el);
+  if (idx < 0) return null;
+  let inicio = null, fim = null;
+  // selectionStart estoura em input type=date/number em alguns navegadores.
+  try { inicio = el.selectionStart; fim = el.selectionEnd; } catch { /* ignora */ }
+  return {
+    idx, inicio, fim,
+    id: el.id || "",
+    tag: el.tagName,
+    tipo: el.getAttribute("type") || "",
+    dica: el.getAttribute("placeholder") || "",
+  };
+}
+
+function restaurarFoco(f) {
+  if (!f) return;
+  let el = f.id ? document.getElementById(f.id) : null;
+  if (!el) {
+    const campos = Array.from(app.querySelectorAll("input, textarea, select"));
+    const alvo = campos[f.idx];
+    if (alvo && alvo.tagName === f.tag
+        && (alvo.getAttribute("type") || "") === f.tipo
+        && (alvo.getAttribute("placeholder") || "") === f.dica) {
+      el = alvo;
+    }
+  }
+  if (!el || el === document.activeElement) return;
+  el.focus({ preventScroll: true });
+  if (f.inicio != null) {
+    try { el.setSelectionRange(f.inicio, f.fim); } catch { /* ignora */ }
+  }
+}
+
 function render() {
   // Cada render reconstrói o DOM inteiro, e o navegador zera o scroll dos
   // elementos novos. Em telas longas dentro de modal (ata de reunião, por
@@ -17558,6 +17678,7 @@ function render() {
   });
   const drawerEl = document.querySelector(".client-drawer");
   const drawerScroll = drawerEl ? drawerEl.scrollTop : 0;
+  const foco = guardarFoco();
 
   app.innerHTML = (state.user ? dashboardView() : loginView())
     + confirmacaoFechamentoModal();
@@ -17575,6 +17696,7 @@ function render() {
     const el = document.querySelector(`[data-keep-scroll="${chave}"]`);
     if (el && topo > 0) el.scrollTop = topo;
   });
+  restaurarFoco(foco);
 }
 
 async function ignoreIssue(issueId) {

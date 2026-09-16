@@ -92,26 +92,23 @@ if pct > 60:
 # Se as vendas dos vendedores desta loja só existirem nos meses recentes, todo
 # cliente parece estreante — e o defeito não está na régua, está no recorte.
 print("\n1b) O HISTÓRICO DESTA LOJA COBRE A JANELA?")
-competencias = backend.query_competences(conn, company_id)
-mapa = backend.build_seller_unit_map(conn, company_id, competencias[0] if competencias else "")
-vendedores = sorted({
-    backend.normalize_whitespace(r["seller_name"])
-    for r in conn.execute(
-        "SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ?",
-        (company_id,)).fetchall()
-    if r["seller_name"] and (
-        mapa.get(backend.person_key(backend.normalize_whitespace(r["seller_name"])))
-        or mapa.get(backend.short_person_key(backend.normalize_whitespace(r["seller_name"])))
-    ) == d["unitName"]
-})
+# Usa a MESMA tabela temporária que o cálculo montou (vendedor × competência),
+# senão o diagnóstico mede uma coisa e a tela mostra outra — foi assim que a
+# Zona Norte apareceu com janeiro.
+tem_temp = bool(conn.execute(
+    "SELECT 1 FROM temp.sqlite_master WHERE name = 'vend_unidade'").fetchone())
+vendedores = sorted({r["seller_name"] for r in conn.execute(
+    "SELECT DISTINCT seller_name FROM vend_unidade").fetchall()}) if tem_temp else []
 print(f"   {len(vendedores)} vendedor(es) casaram com {d['unitName']}")
 if vendedores:
-    marc = ",".join("?" for _ in vendedores)
+    dentro = ("EXISTS (SELECT 1 FROM vend_unidade v WHERE v.competence = f.competence "
+              "AND v.seller_name = f.seller_name)")
+    marc, vendedores = "", []  # o recorte agora é o EXISTS, não uma lista de nomes
     linhas_ano = conn.execute(
-        f"SELECT substr(competence,1,4) ano, COUNT(*) linhas, "
-        f"COUNT(DISTINCT client_name) clientes "
-        f"FROM fact_sales_detail WHERE company_id = ? AND seller_name IN ({marc}) "
-        f"GROUP BY ano ORDER BY ano", (company_id, *vendedores)).fetchall()
+        f"SELECT substr(f.competence,1,4) ano, COUNT(*) linhas, "
+        f"COUNT(DISTINCT f.client_name) clientes "
+        f"FROM fact_sales_detail f WHERE f.company_id = ? AND {dentro} "
+        f"GROUP BY ano ORDER BY ano", (company_id,)).fetchall()
     print(f"   {'ANO':<8}{'LINHAS':>10}{'CLIENTES':>10}")
     for r in linhas_ano:
         print(f"   {r['ano']:<8}{r['linhas']:>10}{r['clientes']:>10}")
@@ -125,15 +122,15 @@ if vendedores:
     print(f"\n   {'MÊS':<10}{'LINHAS':>9}{'ESTREIAS':>10}   (estreia = 1ª compra do cliente aqui)")
     estreia_mes: dict[str, int] = {}
     for r in conn.execute(
-        f"SELECT client_name, MIN(date(issue_date)) ini FROM fact_sales_detail "
-        f"WHERE company_id = ? AND net_value > 0 AND seller_name IN ({marc}) "
-        f"GROUP BY client_name", (company_id, *vendedores)).fetchall():
+        f"SELECT f.client_name, MIN(date(f.issue_date)) ini FROM fact_sales_detail f "
+        f"WHERE f.company_id = ? AND f.net_value > 0 AND {dentro} "
+        f"GROUP BY f.client_name", (company_id,)).fetchall():
         if r["ini"]:
             estreia_mes[r["ini"][:7]] = estreia_mes.get(r["ini"][:7], 0) + 1
     por_mes = conn.execute(
-        f"SELECT substr(competence,1,7) mes, COUNT(*) linhas FROM fact_sales_detail "
-        f"WHERE company_id = ? AND seller_name IN ({marc}) "
-        f"GROUP BY mes ORDER BY mes", (company_id, *vendedores)).fetchall()
+        f"SELECT substr(f.competence,1,7) mes, COUNT(*) linhas FROM fact_sales_detail f "
+        f"WHERE f.company_id = ? AND {dentro} "
+        f"GROUP BY mes ORDER BY mes", (company_id,)).fetchall()
     for r in por_mes:
         print(f"   {r['mes']:<10}{r['linhas']:>9}{estreia_mes.get(r['mes'], 0):>10}")
     vazios = [m for m, n in sorted(estreia_mes.items()) if n == 0]

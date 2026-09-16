@@ -14959,26 +14959,44 @@ def prospecting_entry_items(
     # Vendedores DESTA unidade: prospecção é sobre como a loja abre cliente, e
     # a porta de entrada de Xangri-lá não é a da Matriz. Sem este recorte as
     # unidades devolviam listas idênticas.
+    #
+    # E o vínculo é POR COMPETÊNCIA, não o de hoje. A Zona Norte abriu em
+    # agosto/2026, mas os 3 vendedores dela tinham 736 linhas em janeiro feitas
+    # na loja anterior — com o mapa de hoje aplicado ao histórico, metade da
+    # "carteira" da Zona Norte era de outra unidade. people_records guarda
+    # valid_from/valid_to justamente para isso; eu é que estava ignorando.
     competencias = query_competences(conn, company_id)
-    mapa_unidade = build_seller_unit_map(conn, company_id,
-                                         competencias[0] if competencias else "")
-    da_unidade = {
-        normalize_whitespace(r["seller_name"])
-        for r in conn.execute(
-            "SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ?",
-            (company_id,)).fetchall()
-        if r["seller_name"] and (
-            mapa_unidade.get(person_key(normalize_whitespace(r["seller_name"])))
-            or mapa_unidade.get(short_person_key(normalize_whitespace(r["seller_name"])))
-        ) == unidade
-    } if unidade else set()
+    # Guardo o nome CRU do faturamento, não o normalizado: a comparação no SQL
+    # é contra a coluna, e normalizar só de um lado não casa nada.
+    nomes_vend = [r["seller_name"] for r in conn.execute(
+        "SELECT DISTINCT seller_name FROM fact_sales_detail "
+        "WHERE company_id = ? AND seller_name IS NOT NULL "
+        "AND TRIM(seller_name) <> ''", (company_id,)).fetchall()]
+    da_unidade: set[str] = set()
+    if unidade:
+        conn.execute("DROP TABLE IF EXISTS temp.vend_unidade")
+        conn.execute("CREATE TEMP TABLE vend_unidade "
+                     "(competence TEXT, seller_name TEXT, PRIMARY KEY (competence, seller_name))")
+        pares: list[tuple[str, str]] = []
+        for comp in competencias:
+            mapa_comp = build_seller_unit_map(conn, company_id, comp)
+            for cru in nomes_vend:
+                nome = normalize_whitespace(cru)
+                if (mapa_comp.get(person_key(nome))
+                        or mapa_comp.get(short_person_key(nome))) == unidade:
+                    pares.append((comp, cru))
+                    da_unidade.add(nome)
+        conn.executemany("INSERT OR IGNORE INTO vend_unidade VALUES (?, ?)", pares)
 
     # Primeira compra de cada cliente NA UNIDADE (ou na empresa, sem recorte).
-    onde_vend, params_vend = "", []
-    if da_unidade:
-        marc = ",".join("?" for _ in da_unidade)
-        onde_vend = f" AND seller_name IN ({marc})"
-        params_vend = sorted(da_unidade)
+    def clausula_unidade(alias: str = "") -> str:
+        if not da_unidade:
+            return ""
+        return (f" AND EXISTS (SELECT 1 FROM vend_unidade v "
+                f"WHERE v.competence = {alias}competence "
+                f"AND v.seller_name = {alias}seller_name)")
+
+    onde_vend, params_vend = clausula_unidade(), []
     primeira: dict[str, str] = {}
     for r in conn.execute(
         f"SELECT client_name, MIN(date(issue_date)) AS inicio FROM fact_sales_detail "
@@ -15006,7 +15024,7 @@ def prospecting_entry_items(
         {CATALOGO_JOIN_SQL}
         WHERE f.company_id = ? AND f.net_value > 0 AND date(f.issue_date) >= date(?)
           AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
-          {onde_vend.replace("seller_name", "f.seller_name")}
+          {clausula_unidade("f.")}
         GROUP BY cliente, dia, ref, marca
         """,
         (company_id, desde, *params_vend),
@@ -15057,7 +15075,7 @@ def prospecting_entry_items(
         {CATALOGO_JOIN_SQL}
         WHERE f.company_id = ? AND f.net_value > 0
           AND TRIM(COALESCE(c.item_subgroup, '')) <> ''
-          {onde_vend.replace("seller_name", "f.seller_name")}
+          {clausula_unidade("f.")}
         GROUP BY linha, cliente
         """,
         (company_id, *params_vend),
