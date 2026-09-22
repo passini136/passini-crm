@@ -135,6 +135,28 @@ else:
 # ARCELORMITTAL apareceu 4× com a MESMA média de R$ 18.545,44, CONECTA idem.
 # O faturamento é indexado por nome e existe uma vez só: se N códigos recebem
 # o valor inteiro, a carteira mostra dinheiro que não entrou.
+# ── 4b. "Em queda" ou "não comprou ainda"? ──────────────────────────────────
+# São dois problemas diferentes com duas conversas diferentes, e misturá-los
+# faz o alerta perder o sentido. O ajuste por dias úteis não resolveu (87% →
+# 84%), o que já indica que o peso não está em quem comprou menos.
+print("\n4b) QUEM ESTÁ CAINDO x QUEM NÃO COMPROU")
+em_queda = [c for c in linhas
+            if float(c.get("averageRevenue") or 0) > 0
+            and float(c.get("dropPct") or 0) <= backend.HIGH_VALUE_DROP_PCT]
+zerados = [c for c in em_queda if float(c.get("currentRevenue") or 0) <= 0]
+comprando = [c for c in em_queda if float(c.get("currentRevenue") or 0) > 0]
+print(f"   {len(zerados):>6} sem NENHUMA compra no mês  ({100 * len(zerados) / len(em_queda):.0f}%)")
+print(f"   {len(comprando):>6} compraram, mas abaixo do esperado")
+if len(zerados) > len(comprando):
+    print("\n   >> A lista é dominada por quem ainda não comprou. Isso não é")
+    print("      'comprando menos' — é 'parou de comprar', que já tem bloco")
+    print("      próprio (Cobertura falha) e pede outra conversa com o cliente.")
+# E dentro das classes altas, que é o que o painel mostra de fato.
+altos = [c for c in em_queda if c.get("classCode") in backend.HIGH_VALUE_CLASSES]
+altos_zero = [c for c in altos if float(c.get("currentRevenue") or 0) <= 0]
+print(f"\n   Nas classes do painel: {len(altos)} em queda, "
+      f"{len(altos_zero)} deles sem compra nenhuma")
+
 print("\n5) O MESMO NOME EM VÁRIOS CÓDIGOS")
 por_nome = defaultdict(list)
 for c in linhas:
