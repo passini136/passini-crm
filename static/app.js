@@ -18018,6 +18018,9 @@ function dashboardView() {
       badge: state.meetings?.pendingCount || 0 },
     { id: "feedback", title: "Feedback",  desc: "Avaliação e PDI",      icon: "🎯",
       badge: state.feedback?.pendingCount || 0 },
+    // O `allowed` abaixo já respeita o perfil; o escopo de QUEM aparece dentro
+    // da tela (empresa, unidade ou só a própria pessoa) é decidido no backend.
+    { id: "atividade", title: "Atividade", desc: "Acessos e fichas abertas", icon: "🔎" },
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
