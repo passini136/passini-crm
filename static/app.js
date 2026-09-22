@@ -9,6 +9,7 @@ const state = {
   leads: null,         // base fria de empresas que ainda não são clientes
   leadFilters: { city: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
   leadAssign: null,    // modal "Direcionar": { id, name, seller }
+  leadFiltersApplied: null,  // recorte que gerou a lista que está na tela
   contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
                     search: "", portfolio: "", origin: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
@@ -2374,6 +2375,9 @@ async function loadLeads() {
     if (f.withPhone) q.set("withPhone", "1");
     if (f.status) q.set("status", f.status);
     state.leads = await api(`/api/prospects/leads?${q.toString()}`);
+    // Guarda o recorte que gerou ESTA lista, para a tela saber quando o que
+    // está nos campos deixou de ser o que está na tabela.
+    state.leadFiltersApplied = { ...f };
   } catch (error) {
     addMessage("error", error.message);
     state.leads = { items: [], total: 0 };
@@ -2389,9 +2393,24 @@ function toggleLeads() {
   if (state.ui.leadsOpen && !state.leads) void loadLeads();
 }
 
+/* Escolher NÃO busca. Só o botão Buscar busca.
+ *
+ * Trocar a cidade disparava a consulta na hora, e a base tem 69 mil empresas:
+ * quem queria "Capão da Canoa + transportadora + só com telefone" pagava três
+ * varreduras para chegar no recorte que queria, e as duas primeiras ainda
+ * podiam voltar depois da terceira e sobrescrever a tela. Agora os filtros
+ * ficam pendentes e vão todos juntos. */
 function setLeadFilter(campo, valor) {
   state.leadFilters[campo] = valor;
-  void loadLeads();
+  requestRender();   // atualiza o aviso de "filtros alterados"
+}
+
+/** Os filtros na tela diferem dos que geraram a lista que está aparecendo? */
+function leadFiltrosPendentes() {
+  const a = state.leadFiltersApplied;
+  if (!a) return false;
+  return ["city", "segment", "search", "withPhone", "status"]
+    .some((k) => String(state.leadFilters[k] ?? "") !== String(a[k] ?? ""));
 }
 
 /* ─── Direcionar: o gestor escolhe quem liga ─────────────────────────────────
@@ -2607,9 +2626,6 @@ function blocoBaseDeLeads() {
               <input style="flex:1" value="${escapeHtml(f.search || "")}" placeholder="Nome ou CNPJ"
                 oninput="state.leadFilters.search=this.value"
                 onkeydown="if(event.key==='Enter'){event.preventDefault();loadLeads();}" />
-              <button class="btn btn-secondary btn-sm" type="button"
-                ${carregando ? "disabled" : ""} onclick="loadLeads()">
-                ${carregando ? "⏳" : "Buscar"}</button>
               ${f.search ? `<button class="btn btn-ghost btn-sm" type="button"
                 onclick="state.leadFilters.search='';loadLeads()">Limpar</button>` : ""}
             </div></div>
@@ -2627,6 +2643,22 @@ function blocoBaseDeLeads() {
                 <option value="ADOTADO" ${f.status === "ADOTADO" ? "selected" : ""}>Já assumidos</option>
                 <option value="CLIENTE" ${f.status === "CLIENTE" ? "selected" : ""}>Viraram clientes</option>
               </select></div>` : ""}
+        </div>
+
+        <!-- Um Buscar só, para todos os filtros. Escolher cidade, segmento ou
+             situação não dispara consulta: a base tem 69 mil empresas e montar
+             o recorte em três passos custava três varreduras. -->
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:4px 0 10px">
+          <button class="btn btn-primary" type="button"
+            ${carregando ? "disabled" : ""} onclick="loadLeads()">
+            ${carregando ? "⏳ Buscando…" : "🔎 Buscar"}</button>
+          ${leadFiltrosPendentes() && !carregando ? `
+            <span class="text-small" style="color:#b06000;font-weight:700">
+              Filtros alterados — clique em Buscar para aplicar.
+            </span>`
+          : `<span class="text-small" style="color:var(--muted)">
+              Escolha cidade, segmento e situação e clique em Buscar.
+            </span>`}
         </div>
 
         ${carregando ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
