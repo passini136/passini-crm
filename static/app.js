@@ -24,6 +24,7 @@ const state = {
   pdiEditor: null,        // ponto de desenvolvimento em edição
   visits: null,           // visitas + pedidos
   visitRoute: null,        // roteiro sugerido por proximidade
+  rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
   visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
@@ -11274,6 +11275,130 @@ function toggleBairro(chave) {
   requestRender();
 }
 
+/* ─── Ajuste do roteiro pelo gestor ──────────────────────────────────────────
+ *
+ * A régua monta o roteiro por indicador, e erra nos dois sentidos: sugere a
+ * oficina que fechou e não sugere aquela que o gerente combinou de visitar.
+ * As duas decisões ficam gravadas — sem isso ele tiraria o mesmo cliente toda
+ * vez que abrisse a tela e largaria o roteiro.
+ */
+async function ajustarRoteiro(clientKey, action, reason) {
+  try {
+    const r = await api("/api/visits/route/override", {
+      method: "POST", body: JSON.stringify({ clientKey, action, reason: reason || "" }),
+    });
+    addMessage("success", r.message || "Roteiro ajustado.");
+    await loadVisitSuggestions();
+  } catch (error) {
+    addMessage("error", error.message);
+  }
+}
+
+async function tirarDoRoteiro(clientKey, nome) {
+  const motivo = window.prompt(
+    `Tirar "${nome}" do roteiro sugerido.\n\n`
+    + `Ele não volta a ser sugerido até você desfazer. Por quê?\n`
+    + `(oficina fechada, visita já marcada, não vale o deslocamento)`);
+  if (motivo === null) return;
+  await ajustarRoteiro(clientKey, "FORA", motivo);
+}
+
+async function devolverAoAutomatico(clientKey) {
+  await ajustarRoteiro(clientKey, "AUTO");
+}
+
+function abrirAdicionarAoRoteiro(cidade) {
+  state.rotaAdd = { city: cidade || "", search: "", items: null, loading: false };
+  requestRender();
+  void carregarCandidatosRoteiro();
+}
+
+function fecharAdicionarAoRoteiro() {
+  state.rotaAdd = null;
+  requestRender();
+}
+
+async function carregarCandidatosRoteiro() {
+  const a = state.rotaAdd;
+  if (!a) return;
+  a.loading = true;
+  requestRender();
+  try {
+    const q = new URLSearchParams();
+    if (a.city) q.set("city", a.city);
+    if ((a.search || "").trim()) q.set("q", a.search.trim());
+    const r = await api(`/api/visits/route/candidates?${q.toString()}`);
+    if (state.rotaAdd) { state.rotaAdd.items = r.items || []; }
+  } catch (error) {
+    addMessage("error", error.message);
+    if (state.rotaAdd) state.rotaAdd.items = [];
+  } finally {
+    if (state.rotaAdd) state.rotaAdd.loading = false;
+    requestRender();
+  }
+}
+
+async function adicionarAoRoteiro(clientKey, nome) {
+  state.rotaAdd = null;
+  await ajustarRoteiro(clientKey, "DENTRO", `Incluído pelo gestor: ${nome}`);
+}
+
+function adicionarAoRoteiroModal() {
+  const a = state.rotaAdd;
+  if (!a) return "";
+  const itens = a.items || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharAdicionarAoRoteiro)">
+      <div class="panel modal-panel" data-keep-scroll="rota-add"
+           style="max-width:680px;margin:6vh auto;padding:22px;max-height:86vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>Adicionar ao roteiro</h3>
+            <div class="text-small">
+              Clientes${a.city ? ` de ${escapeHtml(a.city)}` : ""} que a régua não sugeriu —
+              normalmente por não terem ligação registrada.
+            </div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharAdicionarAoRoteiro()">Fechar</button>
+        </div>
+
+        <div style="display:flex;gap:8px;margin:12px 0">
+          <input style="flex:1" placeholder="Buscar por nome, código ou bairro"
+            value="${escapeHtml(a.search || "")}"
+            oninput="state.rotaAdd.search=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();carregarCandidatosRoteiro();}" />
+          <button class="btn btn-secondary btn-sm" ${a.loading ? "disabled" : ""}
+            onclick="carregarCandidatosRoteiro()">${a.loading ? "⏳" : "Buscar"}</button>
+        </div>
+
+        ${a.loading ? '<div class="loader">Procurando…</div>' : ""}
+        ${!a.loading && a.items && !itens.length
+          ? '<div class="message">Nenhum cliente com esse filtro.</div>' : ""}
+
+        <div class="timeline-list">
+          ${itens.map((c) => `
+            <div class="timeline-item" style="display:flex;justify-content:space-between;
+                        gap:10px;align-items:center;flex-wrap:wrap">
+              <div style="flex:1;min-width:220px">
+                <strong>${escapeHtml(c.clientName)}</strong>
+                <div class="text-small" style="color:var(--muted)">
+                  ${escapeHtml(c.clientKey)}
+                  ${c.neighborhood ? ` · ${escapeHtml(c.neighborhood)}` : ""}
+                  ${c.assignedSeller ? ` · ${escapeHtml(c.assignedSeller)}` : " · sem vendedor"}
+                </div>
+                <div class="text-small">
+                  média ${currency(c.averageRevenue)}/mês
+                  ${c.daysWithoutPurchase != null ? ` · parado há ${number(c.daysWithoutPurchase)} dias` : ""}
+                </div>
+              </div>
+              <button class="btn btn-primary btn-sm"
+                onclick="adicionarAoRoteiro('${jsAttr(c.clientKey)}', '${jsAttr(c.clientName)}')">
+                Adicionar</button>
+            </div>`).join("")}
+        </div>
+      </div>
+    </div>`;
+}
+
 function toggleBlocoVisita(chave) {
   state.ui.visitBlocosFechados[chave] = !state.ui.visitBlocosFechados[chave];
   requestRender();
@@ -11468,7 +11593,16 @@ function clienteRoteiroLinha(c, podeGerir) {
         <div class="actions" style="gap:4px;margin-top:4px;justify-content:flex-end">
           <button class="btn btn-ghost btn-sm" onclick="openCrmClient('${jsAttr(c.clientKey)}', false)">Ficha</button>
           ${podeGerir ? `<button class="btn btn-primary btn-sm" onclick='novaVisita(${JSON.stringify(c).replace(/'/g, "&#39;")})'>Registrar visita</button>` : ""}
+          ${podeGerir ? `<button class="btn btn-ghost btn-sm" title="Tirar do roteiro — não volta a ser sugerido"
+            onclick="tirarDoRoteiro('${jsAttr(c.clientKey)}', '${jsAttr(c.clientName)}')"
+            style="color:var(--bad)">✕</button>` : ""}
         </div>
+        ${c.addedByManager ? `
+          <div class="text-small" style="color:#2e7d32;font-weight:600;margin-top:2px">
+            incluído à mão ·
+            <button type="button" class="link-num"
+              onclick="devolverAoAutomatico('${jsAttr(c.clientKey)}')">desfazer</button>
+          </div>` : ""}
       </div>
     </div>`;
 }
@@ -11761,6 +11895,7 @@ function visitasView() {
     <div class="stack">
       ${state.visitEditor ? visitaEditorModal() : ""}
       ${state.visitRequestEditor ? pedidoVisitaModal() : ""}
+      ${adicionarAoRoteiroModal()}
 
       <!-- Registrar visita é o que mais se faz nesta tela, e estava embaixo de
            dois blocos longos. Agora é a primeira coisa, e os blocos recolhem. -->
@@ -11851,6 +11986,9 @@ function visitasView() {
             </label>
             ${botaoAtualizar("visitas", "loadVisitSuggestions()", { mensagem: "Sugestões de visita atualizadas." })}
             <span style="flex:1"></span>
+            <button class="btn btn-secondary btn-sm"
+              title="Acrescentar um cliente que a régua não sugeriu"
+              onclick="abrirAdicionarAoRoteiro('${jsAttr(f.city || "")}')">＋ Adicionar cliente</button>
             <button class="btn btn-secondary btn-sm" onclick="imprimirRoteiro()">🖨️ Imprimir / PDF</button>
             <button class="btn btn-secondary btn-sm" onclick="copiarRoteiroWhatsapp()">💬 Copiar p/ WhatsApp</button>
           </div>
@@ -11860,9 +11998,13 @@ function visitasView() {
             ${(rota.route || []).map((cidade) => `
               <div>
                 <div style="display:flex;justify-content:space-between;align-items:baseline;
-                            padding:6px 0;border-bottom:2px solid var(--accent)">
+                            gap:8px;flex-wrap:wrap;padding:6px 0;border-bottom:2px solid var(--accent)">
                   <strong style="font-size:14px">📍 ${escapeHtml(cidade.cityName)}</strong>
-                  <span class="text-small">${cidade.count} cliente(s) · potencial ${currency(cidade.potential)}/mês</span>
+                  <span class="text-small">${cidade.count} cliente(s) · potencial ${currency(cidade.potential)}/mês
+                    <button type="button" class="btn btn-ghost btn-sm" style="margin-left:6px"
+                      title="Acrescentar um cliente desta cidade que a régua não sugeriu"
+                      onclick="abrirAdicionarAoRoteiro('${jsAttr(cidade.cityName)}')">＋ Adicionar</button>
+                  </span>
                 </div>
                 ${cidade.neighborhoods.map((b) => {
                   const chave = `${cidade.cityName}|${b.neighborhood}`;
@@ -11880,7 +12022,8 @@ function visitasView() {
                     </div>`;
                 }).join("")}
               </div>`).join("") || (state.ui.loading.visitRoute ? "" : emptyStateCard(
-                "Nenhuma sugestão. Lembre que o cliente só entra depois de uma ligação registrada pelo vendedor."))}
+                "Nenhuma sugestão. O cliente só entra depois de uma ligação registrada pelo vendedor — "
+                + "use ＋ Adicionar cliente para pôr alguém à mão."))}
           </div>
           </div>
         </div>` : ""}

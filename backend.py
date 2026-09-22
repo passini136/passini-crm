@@ -2284,6 +2284,25 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_visit_requests_status
                 ON visit_requests(company_id, status, unit_name);
 
+            -- Ajustes do gestor no roteiro sugerido.
+            --
+            -- A régua automática erra nos dois sentidos: sugere a oficina que
+            -- fechou na semana passada e esquece aquela que o gerente combinou
+            -- de passar. Sem guardar a decisão, ele tiraria o mesmo cliente
+            -- toda vez que abrisse a tela — e desistiria de usar o roteiro.
+            -- FORA   = nunca sugerir (até o gestor desfazer)
+            -- DENTRO = sugerir sempre, mesmo sem ligação registrada
+            CREATE TABLE IF NOT EXISTS visit_route_overrides (
+                company_id INTEGER NOT NULL,
+                client_key TEXT NOT NULL,
+                action TEXT NOT NULL,              -- FORA | DENTRO
+                reason TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (company_id, client_key),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
             -- Visita gerencial. O endereço é copiado no momento do registro:
             -- o cadastro do cliente muda, e o roteiro de ontem precisa continuar
             -- mostrando onde a visita realmente aconteceu.
@@ -8169,6 +8188,14 @@ def suggest_visits(
         ).fetchall()
     }
 
+    # Decisões do gestor sobre o roteiro. Ver visit_route_overrides.
+    ajustes = {
+        normalize_client_key(r["client_key"]): (r["action"], r["reason"] or "")
+        for r in conn.execute(
+            "SELECT client_key, action, reason FROM visit_route_overrides "
+            "WHERE company_id = ?", (company_id,)).fetchall()
+    }
+
     codigos = [c["clientKey"] for c in clientes]
     enderecos = client_addresses(conn, company_id, codigos)
     cidade_filtro = normalize_upper(city)
@@ -8179,6 +8206,11 @@ def suggest_visits(
     candidatos: list[dict[str, Any]] = []
     for c in clientes:
         chave = normalize_client_key(c["clientKey"])
+        acao, motivo_ajuste = ajustes.get(chave, ("", ""))
+        # Tirado pelo gestor sai antes de qualquer conta. Ele viu algo que o
+        # indicador não vê — oficina fechada, dono brigado, visita já marcada.
+        if acao == "FORA":
+            continue
         endereco = enderecos.get(c["clientKey"], {})
         cidade = endereco.get("cityName") or normalize_upper(c.get("cityName"))
         if cidade_filtro and cidade != cidade_filtro:
@@ -8190,13 +8222,16 @@ def suggest_visits(
             continue
 
         pedido = pedidos.get(chave)
+        incluido = acao == "DENTRO"
         ultima_visita = visitados.get(chave)
         dias_visita = None
         if ultima_visita:
             d = parse_datetime_flexible(ultima_visita)
             dias_visita = (hoje - d.date()).days if d else None
-            # Cooldown: quem foi visitado há pouco sai, exceto se o vendedor pediu.
-            if dias_visita is not None and dias_visita < VISIT_COOLDOWN_DAYS and not pedido:
+            # Cooldown: quem foi visitado há pouco sai, exceto se o vendedor pediu
+            # ou se o gestor colocou de volta à mão.
+            if (dias_visita is not None and dias_visita < VISIT_COOLDOWN_DAYS
+                    and not pedido and not incluido):
                 continue
 
         status = normalize_upper(c.get("statusCode"))
@@ -8211,6 +8246,13 @@ def suggest_visits(
             tipo = "SOLICITADA"
             motivo = normalize_whitespace(pedido["reason"])
             base = 1_000_000.0 + media
+        elif incluido:
+            # Colocado à mão: entra sem precisar de ligação registrada nem de se
+            # encaixar em alguma categoria. Fica logo abaixo do pedido do
+            # vendedor, porque também é decisão de gente, não de régua.
+            tipo = "RELACIONAMENTO"
+            motivo = motivo_ajuste or "Incluído pelo gestor"
+            base = 900_000.0 + media
         elif not com_ligacao and not pedido:
             continue
         elif chave not in com_ligacao:
@@ -8257,6 +8299,7 @@ def suggest_visits(
             "reason": motivo,
             "requestId": pedido["id"] if pedido else None,
             "requestedBy": pedido["seller_name"] if pedido else "",
+            "addedByManager": bool(incluido),
             "score": round(base, 2),
         })
 
@@ -8486,6 +8529,94 @@ def visit_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         "effectMeasuredAt": row["effect_measured_at"] or "",
         "createdAt": row["created_at"],
     }
+
+
+def save_visit_route_override(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    client_key: str, action: str, reason: str = "",
+) -> dict[str, Any]:
+    """Tira ou põe um cliente no roteiro, e lembra disso."""
+    if not user_can_manage_visits(conn, user):
+        raise PermissionError("Só a gestão ajusta o roteiro.")
+    chave = normalize_client_key(client_key)
+    if not chave:
+        raise ValueError("Cliente não informado.")
+    acao = normalize_upper(action)
+    if acao not in ("FORA", "DENTRO", "AUTO"):
+        raise ValueError("Ação inválida.")
+    if acao == "AUTO":
+        # Volta a valer a régua automática — não é o mesmo que "tirar".
+        conn.execute("DELETE FROM visit_route_overrides WHERE company_id = ? AND client_key = ?",
+                     (company_id, chave))
+        conn.commit()
+        return {"message": "Cliente voltou para a régua automática.", "action": "AUTO"}
+    conn.execute(
+        "INSERT INTO visit_route_overrides (company_id, client_key, action, reason, "
+        "created_by, created_at) VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(company_id, client_key) DO UPDATE SET "
+        "action = excluded.action, reason = excluded.reason, "
+        "created_by = excluded.created_by, created_at = excluded.created_at",
+        (company_id, chave, acao, normalize_whitespace(reason) or None,
+         seller_identity_for_user(user), now_iso()))
+    audit_log(conn, company_id, user["id"], "ajustar_roteiro", "visit_route_overrides",
+              chave, {"action": acao, "reason": reason})
+    conn.commit()
+    return {"message": ("Cliente fora do roteiro." if acao == "FORA"
+                        else "Cliente incluído no roteiro."), "action": acao}
+
+
+def visit_route_candidates(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    city: str = "", termo: str = "", limite: int = 60,
+) -> list[dict[str, Any]]:
+    """Clientes da cidade que o gestor pode acrescentar ao roteiro.
+
+    Vem da mesma base da carteira, e não de uma consulta nova: é o cache que
+    já está quente na tela. Quem já está no roteiro não aparece aqui — a lista
+    serve para achar quem a régua NÃO sugeriu.
+    """
+    if not user_can_manage_visits(conn, user):
+        raise PermissionError("Só a gestão ajusta o roteiro.")
+    linhas = crm_base_client_rows_cached(conn, company_id, build_filters_from_query({}))
+    permitidas = crm_allowed_units_for_user(conn, user)
+    alvo_cidade = normalize_upper(strip_accents(city))
+    busca = normalize_upper(strip_accents(termo))
+    ja_dentro = {
+        normalize_client_key(r["client_key"])
+        for r in conn.execute(
+            "SELECT client_key FROM visit_route_overrides "
+            "WHERE company_id = ? AND action = 'DENTRO'", (company_id,)).fetchall()
+    }
+
+    fora: list[dict[str, Any]] = []
+    for c in linhas:
+        if permitidas is not None and normalize_unit(c.get("unitName")) not in set(permitidas):
+            continue
+        cidade = normalize_upper(strip_accents(c.get("cityName")))
+        if alvo_cidade and cidade != alvo_cidade:
+            continue
+        chave = normalize_client_key(c.get("clientKey"))
+        if chave in ja_dentro:
+            continue
+        if busca:
+            alvo = normalize_upper(strip_accents(
+                f"{c.get('clientName')} {c.get('clientKey')} {c.get('neighborhood')}"))
+            if busca not in alvo:
+                continue
+        fora.append({
+            "clientKey": c.get("clientKey"),
+            "clientName": c.get("clientName"),
+            "cityName": c.get("cityName") or "",
+            "neighborhood": c.get("neighborhood") or "",
+            "statusCode": normalize_upper(c.get("statusCode")),
+            "assignedSeller": c.get("assignedSeller") or "",
+            "averageRevenue": float(c.get("averageRevenue") or 0),
+            "daysWithoutPurchase": c.get("daysWithoutPurchase"),
+        })
+    # Maior média primeiro: se o gestor vai gastar uma visita, que seja na
+    # oficina que pesa mais.
+    fora.sort(key=lambda x: -x["averageRevenue"])
+    return fora[:limite]
 
 
 def list_visits(
@@ -23276,6 +23407,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
+            if path == "/api/visits/route/candidates":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                try:
+                    with closing(get_connection()) as conn:
+                        itens = visit_route_candidates(
+                            conn, user["company_id"], user,
+                            city=normalize_whitespace(query.get("city", [""])[0]),
+                            termo=normalize_whitespace(query.get("q", [""])[0]))
+                except PermissionError as erro:
+                    self._set_headers(403)
+                    self.wfile.write(json_dumps({"error": str(erro)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"items": itens}))
+                return
             if path == "/api/feedback":
                 user = self._require_auth()
                 if not user:
@@ -25057,7 +25206,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json_dumps({"ok": True, **resultado}))
                 return
             if path in ("/api/visits/save", "/api/visits/delete", "/api/visits/request",
-                        "/api/visits/request/resolve", "/api/visits/client"):
+                        "/api/visits/request/resolve", "/api/visits/client",
+                        "/api/visits/route/override"):
                 user = self._require_auth()
                 if not user:
                     return
@@ -25076,6 +25226,12 @@ class AppHandler(BaseHTTPRequestHandler):
                                 conn, user["company_id"], user,
                                 int(payload.get("requestId") or 0),
                                 bool(payload.get("accept")), payload.get("note") or "")
+                        elif path == "/api/visits/route/override":
+                            resultado = save_visit_route_override(
+                                conn, user["company_id"], user,
+                                normalize_whitespace(payload.get("clientKey")),
+                                payload.get("action") or "",
+                                payload.get("reason") or "")
                         else:
                             resultado = client_contact_effect(
                                 conn, user["company_id"], normalize_whitespace(payload.get("clientKey")))
