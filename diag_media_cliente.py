@@ -110,20 +110,34 @@ else:
             "WHERE company_id = ? AND competence IN (?,?,?)",
             (company_id, c1, c2, c3)).fetchall() if r["client_name"]
     }
-    cadastro = [r["client_name"] for r in conn.execute(
-        "SELECT DISTINCT client_name FROM crm_client_profiles WHERE company_id = ?",
-        (company_id,)).fetchall() if r["client_name"]]
-    casaram = sum(1 for n in cadastro
-                  if backend.normalize_client_key(n) in chaves_det)
-    pct = 100 * casaram / len(cadastro) if cadastro else 0
-    print(f"   {len(chaves_det)} nome(s) no faturamento da janela")
-    print(f"   {len(cadastro)} nome(s) no cadastro")
-    print(f"   {casaram} casaram ({pct:.1f}%)")
-    if pct < 50:
+    # A TAXA SE MEDE DO LADO DO FATURAMENTO, não do cadastro.
+    #
+    # Na primeira versão eu dividia pelos 95.116 nomes do cadastro e o
+    # resultado dava 8,8% — parecia casamento quebrado. Mas o cadastro carrega
+    # milhares de registros que nunca compraram (base morta pré-2022), e eles
+    # nunca teriam faturamento para casar. A pergunta certa é a inversa: de
+    # quem COMPROU, quantos o cadastro conhece? Ali a resposta foi 8.338 de
+    # 8.339 — praticamente tudo.
+    chaves_cad = {
+        backend.normalize_client_key(r["client_name"])
+        for r in conn.execute(
+            "SELECT DISTINCT client_name FROM crm_client_profiles WHERE company_id = ?",
+            (company_id,)).fetchall() if r["client_name"]
+    }
+    casaram = len(chaves_det & chaves_cad)
+    pct = 100 * casaram / len(chaves_det) if chaves_det else 0
+    print(f"   {len(chaves_det)} nome(s) compraram na janela")
+    print(f"   {len(chaves_cad)} nome(s) no cadastro (inclui base morta, que nunca comprou)")
+    print(f"   {casaram} dos que compraram estão no cadastro ({pct:.1f}%)")
+    if pct < 90:
         print("   >> CAUSA (B): o casamento por nome está falhando. O conserto é na")
         print("      chave, não na importação.")
     else:
         print("   >> Casamento saudável. Se a média ainda zerar, o defeito está no")
         print("      merge dentro de build_crm_base_client_rows.")
+    orfaos = len(chaves_det - chaves_cad)
+    if orfaos:
+        print(f"   ({orfaos} nome(s) faturaram sem estar no cadastro — vale olhar,")
+        print("    mas não afeta a média de quem está cadastrado.)")
 
 conn.close()
