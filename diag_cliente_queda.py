@@ -118,18 +118,29 @@ if _amostra:
     print(f"   Parte do mês já decorrida (dias úteis): {_b['monthProgress'] * 100:.0f}%")
     print("   A queda compara o realizado com a média AJUSTADA a essa fatia,")
     print("   não com o mês cheio.")
+# A proporção tem de ser medida DENTRO das classes do painel.
+#
+# Medindo a base inteira eu cheguei a 87% e 84% e concluí duas vezes que a
+# régua estava quebrada. Estava medindo os 99.249 NAO_CLASSIFICADO — cadastro
+# morto, média de R$ 7,97, que compra de vez em quando e por isso "cai" quase
+# sempre. Eles nunca entram no painel. A pergunta certa é sobre quem entra.
 caindo_todos = sum(1 for c in linhas
                    if float(c.get("averageRevenue") or 0) > 0
                    and float(c.get("dropPct") or 0) <= backend.HIGH_VALUE_DROP_PCT)
-pct_caindo = 100 * caindo_todos / len(com_media) if com_media else 0
-print(f"   {caindo_todos} de {len(com_media)} clientes com média > 0 aparecem em queda "
-      f"({pct_caindo:.0f}%)")
-if pct_caindo > 70:
-    print("   >> Quase todo mundo 'em queda'. Isso é o mês incompleto falando, não")
-    print("      o comportamento do cliente. Vale comparar contra o mesmo dia do")
-    print("      mês anterior, ou só usar o mês fechado.")
+pct_todos = 100 * caindo_todos / len(com_media) if com_media else 0
+print(f"   base inteira....: {caindo_todos} de {len(com_media)} em queda "
+      f"({pct_todos:.0f}%) — inclui o cadastro morto, ignore")
+
+da_classe = [c for c in linhas if c.get("classCode") in backend.HIGH_VALUE_CLASSES]
+caindo_classe = [c for c in da_classe
+                 if float(c.get("dropPct") or 0) <= backend.HIGH_VALUE_DROP_PCT]
+pct_classe = 100 * len(caindo_classe) / len(da_classe) if da_classe else 0
+print(f"   classes do painel: {len(caindo_classe)} de {len(da_classe)} em queda "
+      f"({pct_classe:.0f}%)  ← é este que vale")
+if pct_classe > 80:
+    print("   >> Alto demais. Aí sim vale rever a régua ou o comparativo.")
 else:
-    print("   >> Proporção saudável: a queda está medindo comportamento.")
+    print("   >> Proporção de trabalho: dá para o gestor ligar para essa lista.")
 
 # ── 5. Nome repetido inflando a média ───────────────────────────────────────
 # ARCELORMITTAL apareceu 4× com a MESMA média de R$ 18.545,44, CONECTA idem.
