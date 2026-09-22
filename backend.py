@@ -6414,13 +6414,18 @@ def list_meetings(
         params.append(date_to)
     termo = normalize_whitespace(search)
     if termo:
+        # sem_acento nos DOIS lados. O termo já vinha sem acento, mas as
+        # colunas eram comparadas com UPPER, que preserva: procurar "reunião"
+        # virava "%REUNIAO%" e nunca achava "REUNIÃO DE VENDAS". Em português
+        # isso derruba a maior parte das buscas. Mesmo defeito que escondia
+        # 241 empresas de Capão da Canoa na base de leads.
         alvo = f"%{normalize_upper(strip_accents(termo))}%"
         sql += (
-            " AND (UPPER(m.title) LIKE ? OR UPPER(COALESCE(m.topic,'')) LIKE ?"
-            "   OR UPPER(COALESCE(m.summary,'')) LIKE ? OR UPPER(COALESCE(m.agenda,'')) LIKE ?"
-            "   OR UPPER(COALESCE(m.decisions,'')) LIKE ?"
+            " AND (sem_acento(m.title) LIKE ? OR sem_acento(COALESCE(m.topic,'')) LIKE ?"
+            "   OR sem_acento(COALESCE(m.summary,'')) LIKE ? OR sem_acento(COALESCE(m.agenda,'')) LIKE ?"
+            "   OR sem_acento(COALESCE(m.decisions,'')) LIKE ?"
             "   OR EXISTS (SELECT 1 FROM meeting_participants p2"
-            "              WHERE p2.meeting_id = m.id AND UPPER(p2.person_name) LIKE ?))"
+            "              WHERE p2.meeting_id = m.id AND sem_acento(p2.person_name) LIKE ?))"
         )
         params.extend([alvo] * 6)
 
