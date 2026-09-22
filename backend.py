@@ -26115,8 +26115,31 @@ def _auto_import_tick_inner() -> None:
             # Agrupa arquivos por competência extraída do nome
             by_competence = {}
             no_comp: list[Path] = []
+            # Mês do futuro é erro de digitação no nome, não competência.
+            #
+            # Um arquivo chamado "2029-09 ..." criou um grupo só dele. Como a
+            # pasta de custo exige o par (unidade + vendedor), nem esse grupo
+            # nem o do mês certo ficaram completos, e os dois pararam de subir
+            # sem dizer nada. Aceitar a data também seria ruim: gravaria custo
+            # em 2029 e o mês certo continuaria vazio.
+            _limite_comp = (today_in_brazil().replace(day=1) + timedelta(days=45)).strftime("%Y-%m")
             for f in csv_files:
                 comp = _auto_import_extract_competence(f.name)
+                if comp and comp > _limite_comp:
+                    _msg_fut = (
+                        f"'{f.name}' tem a competência {comp} no nome, que é no futuro. "
+                        f"Provável erro de digitação — renomeie para o mês correto "
+                        f"e o arquivo entra na próxima verificação.")
+                    with closing(get_connection()) as conn:
+                        _ant = conn.execute(
+                            "SELECT message FROM auto_import_log WHERE folder = ? "
+                            "AND competence = ? ORDER BY ran_at DESC LIMIT 1",
+                            (cfg["folder"], comp)).fetchone()
+                        if not _ant or _ant["message"] != _msg_fut:
+                            _auto_import_log(conn, cfg["folder"], scope, comp, "erro",
+                                             _msg_fut, [f.name])
+                    print(f"[auto-import] REJEITADO {f.name}: competência futura {comp}")
+                    continue
                 if comp:
                     by_competence.setdefault(comp, []).append(f)
                 else:
@@ -26187,6 +26210,27 @@ def _auto_import_tick_inner() -> None:
             if scope != "crm":
                 missing = required_kinds - detected_kinds
                 if missing:
+                    # Espera que APARECE na tela.
+                    #
+                    # Antes isto era só um print no log do servidor: a tela
+                    # mostrava "2 pendentes" e nenhuma explicação, e clicar em
+                    # importar de novo não mudava nada — porque o sistema não
+                    # estava falhando, estava esperando o arquivo que falta.
+                    # Espera invisível é indistinguível de defeito.
+                    _faltam = ", ".join(FILE_TYPE_LABELS.get(m, m) for m in sorted(missing))
+                    _msg = (f"Falta o arquivo de {_faltam} para a competência {competence}. "
+                            f"Esta pasta só importa com os dois juntos — o que já está aqui "
+                            f"fica esperando o par.")
+                    with closing(get_connection()) as conn:
+                        # A verificação roda de hora em hora; repetir o mesmo
+                        # aviso encheria o histórico e escondria o que é novo.
+                        _ultimo = conn.execute(
+                            "SELECT message FROM auto_import_log WHERE folder = ? "
+                            "AND competence = ? ORDER BY ran_at DESC LIMIT 1",
+                            (cfg["folder"], competence)).fetchone()
+                        if not _ultimo or _ultimo["message"] != _msg:
+                            _auto_import_log(conn, cfg["folder"], scope, competence,
+                                             "aguardando", _msg, [f.name for f in files])
                     print(f"[auto-import] {cfg['folder']}/{competence}: aguardando {missing}")
                     continue
 
