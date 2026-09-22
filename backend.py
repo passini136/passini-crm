@@ -10232,10 +10232,14 @@ def mark_lead_as_client(
         return {"message": f"{lead['razao_social']} já é cliente: código "
                            f"{cliente['client_code']} · {dono}.",
                 "clientCode": cliente["client_code"], "sellerName": cliente.get("vendedor") or ""}
-    return {"message": f"{lead['razao_social']} marcado como já cadastrado. "
-                       "Sem CNPJ correspondente no cadastro — informe o código depois, "
-                       "se quiser abrir a ficha por aqui.",
-            "clientCode": ""}
+    # Sem CNPJ correspondente: a tela pede o código na hora.
+    #
+    # Antes a empresa saía da fila com o vínculo vazio e a conciliação ficava
+    # para "depois" — que não chega. Sem código, a próxima carga da base traz a
+    # empresa de volta e alguém liga de novo para um cliente que já é cliente.
+    return {"message": f"{lead['razao_social']} não tem CNPJ correspondente no cadastro.",
+            "clientCode": "", "needsCode": True,
+            "leadName": lead["razao_social"], "cnpj": lead["cnpj"]}
 
 
 def mark_leads_already_clients(conn: sqlite3.Connection, company_id: int) -> int:

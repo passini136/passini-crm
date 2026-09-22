@@ -8,6 +8,7 @@ const state = {
   inactives: null,     // clientes inativos da unidade, para reativação
   leads: null,         // base fria de empresas que ainda não são clientes
   leadFilters: { city: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
+  leadAssign: null,    // modal "Direcionar": { id, name, seller }
   contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
                     search: "", portfolio: "", origin: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
@@ -2392,13 +2393,80 @@ function setLeadFilter(campo, valor) {
   void loadLeads();
 }
 
-async function assumirLead(id, nome) {
+/* ─── Direcionar: o gestor escolhe quem liga ─────────────────────────────────
+ *
+ * Gerente e diretoria não trabalham a oficina, então "Assumir" nunca fez
+ * sentido para eles — o lead precisa de dono. Antes a escolha ficava num
+ * seletor no alto da lista, longe da linha em que se clica: era fácil
+ * direcionar dez empresas para o vendedor errado sem perceber.
+ *
+ * Agora a escolha acontece no próprio lead, e o último vendedor usado fica
+ * pré-selecionado — direcionar vários para a mesma pessoa continua rápido.
+ */
+function abrirDirecionarLead(id, nome) {
+  state.leadAssign = {
+    id, name: nome,
+    seller: state.leadFilters.assignTo || "",
+  };
+  requestRender();
+}
+
+function fecharDirecionarLead() {
+  state.leadAssign = null;
+  requestRender();
+}
+
+function direcionarLeadModal() {
+  const a = state.leadAssign;
+  if (!a) return "";
+  const vendedores = state.leads?.sellers || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharDirecionarLead)">
+      <div class="panel modal-panel" style="max-width:480px;margin:12vh auto;padding:22px"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>Direcionar empresa</h3>
+            <div class="text-small">${escapeHtml(a.name)}</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharDirecionarLead()">Fechar</button>
+        </div>
+        <div class="field" style="margin-top:14px">
+          <label>Quem vai ligar <span style="color:var(--bad)">*</span></label>
+          <select onchange="state.leadAssign.seller=this.value;requestRender()">
+            <option value="">Selecione o vendedor…</option>
+            ${vendedores.map((v) => `<option value="${escapeHtml(v)}" ${
+              a.seller === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+          </select>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            A empresa vira prospect no nome dele, com telefone e endereço já preenchidos,
+            e aparece na Missão do Dia dele.
+          </div>
+        </div>
+        <div class="actions" style="margin-top:18px">
+          <button class="btn btn-primary" ${a.seller ? "" : "disabled"}
+            onclick="confirmarDirecionarLead()">Direcionar</button>
+          <button class="btn btn-ghost" onclick="fecharDirecionarLead()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function confirmarDirecionarLead() {
+  const a = state.leadAssign;
+  if (!a || !a.seller) return;
+  // Guarda a escolha: quem direciona uma empresa costuma direcionar várias.
+  state.leadFilters.assignTo = a.seller;
+  const { id, seller } = a;
+  state.leadAssign = null;
+  await assumirLead(id, "", seller);
+}
+
+async function assumirLead(id, nome, vendedorEscolhido) {
   // Gestor precisa dizer para QUEM vai o lead — ele não trabalha a oficina.
-  let vendedor = "";
-  if (state.leads?.canManage) {
+  let vendedor = vendedorEscolhido || "";
+  if (state.leads?.canManage && !vendedor) {
     vendedor = state.leadFilters.assignTo || "";
     if (!vendedor) {
-      addMessage("error", "Escolha primeiro, no alto da lista, para qual vendedor os leads vão.");
+      abrirDirecionarLead(id, nome);
       return;
     }
   }
@@ -2436,6 +2504,14 @@ async function marcarLeadCliente(id, nome) {
     const r = await api("/api/prospects/leads/client", {
       method: "POST", body: JSON.stringify({ id }),
     });
+    // CNPJ não bateu: pede o código AGORA, enquanto a pessoa está olhando a
+    // empresa. Deixar para depois é deixar o vínculo vazio, e vínculo vazio
+    // traz a empresa de volta na próxima carga da base.
+    if (r.needsCode) {
+      await loadLeads();
+      await vincularLeadPorCodigo(id, nome || r.leadName, r.cnpj);
+      return;
+    }
     addMessage("success", r.message);
     if (r.clientCode && window.confirm(`${r.message}\n\nAbrir a ficha deste cliente?`)) {
       await openCrmClient(r.clientCode, true, true, { outside: true });
@@ -2447,8 +2523,13 @@ async function marcarLeadCliente(id, nome) {
 }
 
 /** Quando o CNPJ não bate, o gestor informa o código na mão. */
-async function vincularLeadPorCodigo(id, nome) {
-  const codigo = window.prompt(`Qual o código de "${nome}" no cadastro do Alfa?`);
+async function vincularLeadPorCodigo(id, nome, cnpj) {
+  const codigo = window.prompt(
+    `"${nome}" já é cliente, mas o CNPJ ${cnpj || ""} não existe no cadastro do Alfa.\n\n`
+    + `Isso acontece quando a oficina está cadastrada com outro CNPJ (matriz, filial\n`
+    + `ou CPF do dono). Informe o código do cliente para conciliar:\n\n`
+    + `Deixe em branco se não souber — dá para informar depois pelo botão\n`
+    + `"Informar código" na situação "Viraram clientes".`);
   if (!codigo) return;
   try {
     const r = await api("/api/prospects/leads/client", {
@@ -2544,16 +2625,7 @@ function blocoBaseDeLeads() {
                 <option value="DESCARTADO" ${f.status === "DESCARTADO" ? "selected" : ""}>Descartados</option>
                 <option value="ADOTADO" ${f.status === "ADOTADO" ? "selected" : ""}>Já assumidos</option>
                 <option value="CLIENTE" ${f.status === "CLIENTE" ? "selected" : ""}>Viraram clientes</option>
-              </select></div>
-            <div class="field">
-              <label>Enviar leads para <span style="color:var(--bad)">*</span></label>
-              <select onchange="state.leadFilters.assignTo=this.value;requestRender()">
-                <option value="">Selecione o vendedor…</option>
-                ${(d.sellers || []).map((v) => `<option value="${escapeHtml(v)}" ${f.assignTo === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
-              </select>
-              <div class="text-small" style="color:var(--muted);margin-top:4px">
-                Você não trabalha a oficina — o lead precisa de dono.
-              </div></div>` : ""}
+              </select></div>` : ""}
         </div>
 
         ${carregando ? `<div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
@@ -2607,8 +2679,14 @@ function blocoBaseDeLeads() {
                             onclick="restaurarLead(${Number(l.id)})">Devolver à base</button>`
                         : l.status !== "NOVO" ? `<span class="text-small" style="color:var(--muted)">${escapeHtml(l.claimed_by || l.status)}</span>`
                         : `
-                          <button class="btn btn-primary btn-sm" type="button"
-                            onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>
+                          ${d.canManage ? `
+                            <button class="btn btn-primary btn-sm" type="button"
+                              title="Escolher o vendedor que vai ligar para esta empresa"
+                              onclick="abrirDirecionarLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">
+                              Direcionar</button>`
+                          : `
+                            <button class="btn btn-primary btn-sm" type="button"
+                              onclick="assumirLead(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Assumir</button>`}
                           <button class="btn btn-secondary btn-sm" type="button"
                             title="Esta empresa já é cliente da Passini — o sistema busca o código pelo CNPJ"
                             onclick="marcarLeadCliente(${Number(l.id)}, '${jsAttr(l.razao_social)}')">Já é cliente</button>
@@ -2625,8 +2703,11 @@ function blocoBaseDeLeads() {
               Achou uma empresa que já compra da Passini? <strong>Já é cliente</strong> tira da fila
               e guarda o vínculo pelo CNPJ — na próxima carga da base ela não volta.<br>
               A ordem prioriza quem tem telefone confiável — ligação que não completa é tempo
-              perdido antes da abordagem. <strong>Assumir</strong> cria o prospect no seu nome com
-              os dados já preenchidos; <strong>Descartar</strong> tira da fila sem apagar o registro.
+              perdido antes da abordagem.
+              ${d.canManage
+                ? "<strong>Direcionar</strong> escolhe o vendedor que vai ligar e cria o prospect no nome dele, já com telefone e endereço;"
+                : "<strong>Assumir</strong> cria o prospect no seu nome com os dados já preenchidos;"}
+              <strong>Descartar</strong> tira da fila sem apagar o registro.
             </div>
           </div>` : ""}
       ` : ""}
@@ -2831,6 +2912,7 @@ function prospeccaoView() {
   return `
     <div class="stack">
       ${state.prospectEditor ? prospectEditorModal() : ""}
+      ${direcionarLeadModal()}
       ${pedidoCadastroModal()}
       ${configFaseModal()}
       ${metasAtividadeModal()}
