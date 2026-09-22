@@ -333,6 +333,11 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
             "meu-placar", "biblioteca", "novidades", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
+            # "atividade" com escopo "proprio" mostra ao vendedor o PRÓPRIO
+            # acesso e as próprias fichas abertas — nada dos colegas. Sem esta
+            # entrada a tela simplesmente não aparecia para ele, embora o
+            # backend já tratasse o caso.
+            "atividade",
             "executivo", "marcas", "devolucoes", "calendario",
         ],
         "data_scope": "proprio",
