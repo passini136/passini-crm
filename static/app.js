@@ -8523,7 +8523,7 @@ function managerRiskBlocks() {
         "gap", "✅ Nenhum cliente em risco sem contato.")}
       ${block(
         "🟠 Cliente grande em queda",
-        "Diamante e Ouro comprando menos que a própria média.",
+        "Diamante, Ouro e Prata comprando menos que a própria média dos 3 meses anteriores.",
         risk.highValueDrop || [], risk.highValueDropTotal || 0, risk.highValueDropBySeller || [],
         "drop", "✅ Nenhum cliente de alto valor em queda.")}
     </div>

@@ -956,6 +956,14 @@ def crm_class_from_average(avg_revenue: float) -> str:
     return "NAO_CLASSIFICADO"
 
 
+# Quem entra no bloco "cliente grande em queda" da Missão do Dia do gestor.
+# Mexer aqui muda o que a gestão cobra todo dia — medir antes com
+# diag_cliente_queda.py, que mostra quantos clientes e quanto dinheiro cada
+# combinação de classe e corte de queda traz.
+HIGH_VALUE_CLASSES = {"DIAMANTE", "OURO", "PRATA"}
+HIGH_VALUE_DROP_PCT = -0.1
+
+
 def crm_class_rank(class_code: str) -> int:
     order = {
         "DIAMANTE": 0,
@@ -22635,8 +22643,15 @@ def compute_manager_mission(
         # Bloco 1 — cobertura falha: parou de comprar e ninguém falou com ele
         if status in {"INATIVO", "PRE_INATIVO"} and (days_no_contact is None or days_no_contact >= COVERAGE_GAP_DAYS):
             coverage_gap.append(item)
-        # Bloco 2 — cliente grande perdendo volume
-        if row.get("classCode") in {"DIAMANTE", "OURO"} and float(row.get("dropPct") or 0) <= -0.1:
+        # Bloco 2 — cliente grande perdendo volume.
+        #
+        # PRATA entrou a pedido do Felipe (22/09/2026). A régua anterior pedia
+        # média de R$ 6.000/mês (OURO) e o bloco vinha sempre vazio: numa base
+        # onde o cliente típico compra bem menos, DIAMANTE e OURO são um punhado
+        # de contas. PRATA começa em R$ 3.000/mês — ainda é cliente grande para
+        # esta carteira, e é quem dói perder sem perceber.
+        if (row.get("classCode") in HIGH_VALUE_CLASSES
+                and float(row.get("dropPct") or 0) <= HIGH_VALUE_DROP_PCT):
             high_value_drop.append(item)
 
     # Prioriza o que dói mais no bolso: maior média histórica primeiro
