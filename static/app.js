@@ -2505,7 +2505,15 @@ function blocoBaseDeLeads() {
           <div class="field"><label>Cidade</label>
             <select onchange="setLeadFilter('city', this.value)">
               <option value="">Todas as cidades da unidade</option>
-              ${(d?.cities || []).map((c) => `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+              ${(d?.cities || []).map((c) => {
+                // A contagem vem indexada sem acento, porque é assim que o
+                // servidor compara. Cidade sem lead no status atual aparece
+                // com (0) em vez de sumir: o vazio é informação.
+                const chave = (c || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase();
+                const n = (d?.cityCounts || {})[chave];
+                return `<option value="${escapeHtml(c)}" ${f.city === c ? "selected" : ""}>${
+                  escapeHtml(c)}${n != null ? ` (${number(n)})` : ""}</option>`;
+              }).join("")}
             </select></div>
           <div class="field"><label>Segmento</label>
             <select onchange="setLeadFilter('segment', this.value)">
@@ -2564,9 +2572,10 @@ function blocoBaseDeLeads() {
         ${d && d.items ? `
           <div style="${carregando ? "opacity:.45;pointer-events:none" : ""}">
             <div class="text-small" style="color:var(--muted);margin:8px 0">
-              ${number(d.total)} empresa(s) disponível(is)
+              ${number(d.total)} empresa(s) disponível(is)${f.city ? ` em ${escapeHtml(f.city)}` : ""}
               ${d.limited ? ` · mostrando as ${number(d.items.length)} de melhor contato` : ""}
-              ${resumo.ADOTADO ? ` · ${number(resumo.ADOTADO)} já assumida(s)` : ""}
+              ${d.claimedHere ? ` · ${number(d.claimedHere)} já assumida(s) neste filtro` : ""}
+              ${resumo.ADOTADO ? ` · ${number(resumo.ADOTADO)} assumidas na empresa toda` : ""}
             </div>
             <div class="table-wrap">
               <table class="table-sticky-actions">

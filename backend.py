@@ -10308,8 +10308,13 @@ def search_prospect_leads(
     cidades = lead_cities_for_user(conn, company_id, user)
     sem_restricao = cidades is None
     status_filtro = normalize_upper(filtros.get("status")) or "NOVO"
-    condicoes = ["l.company_id = ?", "l.status = ?"]
-    params: list[Any] = [company_id, status_filtro]
+    # A situação fica FORA de `condicoes` porque os mesmos filtros precisam ser
+    # contados em outro status no fim (ver `assumidas`). Antes o "já assumidas"
+    # vinha de um resumo da empresa inteira e não mudava com filtro nenhum —
+    # aparecia "44" com a cidade selecionada e lista vazia, o que não quer
+    # dizer nada.
+    condicoes = ["l.company_id = ?"]
+    params: list[Any] = [company_id]
 
     # Restrito e sem cidade mapeada: não devolve nada. Silenciar aqui seria
     # entregar a base inteira para quem deveria ver só a praça dele.
@@ -10325,11 +10330,18 @@ def search_prospect_leads(
             return {"items": [], "total": 0, "cities": cidades, "segments": LEAD_SEGMENTS,
                     "unrestricted": False,
                     "blocked": f"{cidade} não é atendida pela sua unidade."}
-        condicoes.append("UPPER(l.cidade) = ?")
+        # sem_acento nos DOIS lados.
+        #
+        # `cidade` chega sem acento (strip_accents acima) e era comparada com
+        # UPPER(l.cidade), que tem o acento do cadastro: "CAPAO DA CANOA" nunca
+        # casava com "CAPÃO DA CANOA". Selecionar a cidade no menu devolvia
+        # lista vazia para TODA cidade acentuada — inclusive para gerente e
+        # vendedor, cuja lista restrita também vem sem acento.
+        condicoes.append("sem_acento(l.cidade) = ?")
         params.append(cidade)
     elif not sem_restricao:
         marcadores = ",".join("?" for _ in cidades)
-        condicoes.append(f"UPPER(l.cidade) IN ({marcadores})")
+        condicoes.append(f"sem_acento(l.cidade) IN ({marcadores})")
         params.extend(cidades)
 
     # Empresa dada como PERDIDA some da base fria também. Sem isto, ela
@@ -10360,31 +10372,52 @@ def search_prospect_leads(
             params.append(f"%{digitos}%")
         condicoes.append("(" + " OR ".join(partes) + ")")
 
-    onde = " AND ".join(condicoes)
+    onde_sem_status = " AND ".join(condicoes)
+    onde = f"{onde_sem_status} AND l.status = ?"
     total = conn.execute(f"SELECT COUNT(*) c FROM prospect_leads l WHERE {onde}",
-                         params).fetchone()["c"]
+                         (*params, status_filtro)).fetchone()["c"]
+    # Quantas destas MESMAS empresas (mesma cidade, mesmo segmento, mesma
+    # busca) já têm dono. Assim o número acompanha o filtro e responde a
+    # pergunta certa: "nesta praça, quanto já foi trabalhado?".
+    assumidas = conn.execute(
+        f"SELECT COUNT(*) c FROM prospect_leads l WHERE {onde_sem_status} AND l.status = 'ADOTADO'",
+        params).fetchone()["c"]
     limite = min(int(filtros.get("limit") or 100), 500)
     linhas = [dict(r) for r in conn.execute(
         f"SELECT * FROM prospect_leads l WHERE {onde} ORDER BY l.razao_social LIMIT ?",
-        (*params, limite * 3),
+        (*params, status_filtro, limite * 3),
     ).fetchall()]
     # Ordena por chance de contato em Python: a coluna é texto e a ordem certa
     # não é a alfabética ("Alta" viria antes de "Muito Alta").
     linhas.sort(key=lambda l: (LEAD_CHANCE_RANK.get(normalize_upper(l.get("chance_contato")), 9),
                                0 if normalize_whitespace(l.get("telefone")) else 1,
                                l.get("razao_social") or ""))
-    # Lista de cidades do seletor: as da unidade ou, sem restrição, as que
-    # realmente têm lead disponível (ordenadas por volume, não alfabeticamente —
-    # ninguém procura "Ajuricaba" antes de "Porto Alegre").
-    if sem_restricao:
-        opcoes = [r["cidade"] for r in conn.execute(
+    # Lista de cidades do seletor, em ORDEM ALFABÉTICA.
+    #
+    # Antes vinha por volume, com o argumento de que ninguém procura Ajuricaba
+    # antes de Porto Alegre. Só que num menu a pessoa procura uma cidade que ela
+    # já decidiu, e sem ordem alfabética não se acha nada numa lista de 120.
+    # O volume não se perde: vai no rótulo, ao lado do nome.
+    contagem = {
+        normalize_upper(strip_accents(r["cidade"])): int(r["c"])
+        for r in conn.execute(
             "SELECT cidade, COUNT(*) c FROM prospect_leads "
-            "WHERE company_id = ? AND status = 'NOVO' AND TRIM(COALESCE(cidade,'')) <> '' "
-            "GROUP BY cidade ORDER BY c DESC LIMIT 120", (company_id,)).fetchall()]
+            "WHERE company_id = ? AND status = ? AND TRIM(COALESCE(cidade,'')) <> '' "
+            "GROUP BY cidade", (company_id, status_filtro)).fetchall()
+    }
+    if sem_restricao:
+        vistas: dict[str, str] = {}
+        for r in conn.execute(
+            "SELECT DISTINCT cidade FROM prospect_leads "
+            "WHERE company_id = ? AND TRIM(COALESCE(cidade,'')) <> ''",
+                (company_id,)).fetchall():
+            vistas.setdefault(normalize_upper(strip_accents(r["cidade"])), r["cidade"])
+        opcoes = [vistas[k] for k in sorted(vistas)]
     else:
-        opcoes = cidades
+        opcoes = sorted(cidades)
 
     return {"items": linhas[:limite], "total": total, "cities": opcoes,
+            "cityCounts": contagem, "claimedHere": assumidas,
             "unrestricted": sem_restricao, "status": status_filtro,
             "segments": LEAD_SEGMENTS, "limited": total > limite}
 
