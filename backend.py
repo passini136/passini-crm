@@ -254,6 +254,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "novidades",      "label": "Novidades",          "group": "Equipe"},
     {"id": "reunioes",       "label": "Reuniões e Treinamentos","group": "Equipe"},
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
+    {"id": "atividade",      "label": "Atividade no CRM",    "group": "Equipe"},
     # Resultados — o diário visível, o ocasional recolhido em Análises
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
@@ -308,7 +309,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "novidades", "sem-vendedor",
-            "visitas", "prospeccao", "contatos", "reunioes", "feedback",
+            "visitas", "prospeccao", "contatos", "reunioes", "feedback", "atividade",
             "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
@@ -1543,6 +1544,58 @@ def get_connection() -> sqlite3.Connection:
         "sem_acento", 1,
         lambda v: normalize_upper(strip_accents(v)) if v is not None else None)
     return conn
+
+
+def unidade_de_exibicao(conn: sqlite3.Connection, company_id: int, user: Any) -> str:
+    """Unidade da pessoa, para rotular o log. Vazio = enxerga tudo."""
+    try:
+        permitidas = crm_allowed_units_for_user(conn, user)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not permitidas:
+        return ""                      # None (diretoria) ou lista vazia
+    return normalize_unit(permitidas[0]) if len(permitidas) == 1 else ""
+
+
+def nome_de_exibicao(user: Any) -> str:
+    """Como a pessoa aparece nos logs: o nome vinculado, senão o login."""
+    for campo in ("linked_person_name", "full_name", "username"):
+        try:
+            valor = normalize_whitespace(user[campo])
+        except (KeyError, IndexError, TypeError):
+            valor = ""
+        if valor:
+            return valor
+    return "—"
+
+
+def registrar_visualizacao_cliente(
+    conn: sqlite3.Connection, company_id: int, user: Any, client_key: str
+) -> None:
+    """Marca que esta pessoa abriu esta ficha hoje. Ver tabela client_views.
+
+    Nunca derruba a ficha: o log é acessório e a ficha é o trabalho. Se a
+    gravação falhar, o cliente continua abrindo.
+    """
+    chave = normalize_client_key(client_key)
+    if not chave or not user:
+        return
+    try:
+        agora = now_iso()
+        hoje = today_in_brazil().isoformat()
+        conn.execute(
+            "INSERT INTO client_views (company_id, client_key, user_id, view_date, "
+            "person_name, role_label, unit_name, first_at, last_at, views) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1) "
+            "ON CONFLICT(company_id, client_key, user_id, view_date) DO UPDATE SET "
+            "last_at = excluded.last_at, views = views + 1, "
+            "person_name = excluded.person_name",
+            (company_id, chave, user["id"], hoje, nome_de_exibicao(user),
+             normalize_whitespace(user["role"]),
+             unidade_de_exibicao(conn, company_id, user), agora, agora))
+        conn.commit()
+    except Exception as erro:  # noqa: BLE001
+        print(f"[client_views] não gravou: {erro}", flush=True)
 
 
 def audit_log(conn: sqlite3.Connection, company_id: int, user_id: int | None, action: str, entity_type: str, entity_id: str, changes: dict[str, Any]) -> None:
@@ -2877,6 +2930,48 @@ def init_db() -> None:
                 FOREIGN KEY (company_id) REFERENCES companies(id),
                 FOREIGN KEY (import_id) REFERENCES imports(id)
             );
+
+            -- Quem abriu a ficha de quem.
+            --
+            -- UMA linha por pessoa + cliente + DIA, com contador. Gravar cada
+            -- abertura daria dezenas de milhares de linhas por mês (o vendedor
+            -- abre e fecha a mesma ficha o dia todo) sem acrescentar nada: o
+            -- que interessa é "fulano olhou este cliente hoje", não às 14h07.
+            CREATE TABLE IF NOT EXISTS client_views (
+                company_id INTEGER NOT NULL,
+                client_key TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                view_date TEXT NOT NULL,           -- YYYY-MM-DD
+                person_name TEXT NOT NULL,         -- nome de exibição na época
+                role_label TEXT,
+                unit_name TEXT,
+                first_at TEXT NOT NULL,
+                last_at TEXT NOT NULL,
+                views INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (company_id, client_key, user_id, view_date),
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_client_views_data
+                ON client_views(company_id, view_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_client_views_pessoa
+                ON client_views(company_id, user_id, view_date DESC);
+
+            -- Cada entrada no sistema. A tabela sessions não serve: a sessão
+            -- expira e some, então o histórico de acesso desapareceria junto.
+            CREATE TABLE IF NOT EXISTS login_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                person_name TEXT,
+                role_label TEXT,
+                unit_name TEXT,
+                logged_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_login_events_quando
+                ON login_events(company_id, logged_at DESC);
 
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8617,6 +8712,153 @@ def visit_route_candidates(
     # oficina que pesa mais.
     fora.sort(key=lambda x: -x["averageRevenue"])
     return fora[:limite]
+
+
+def client_view_log(
+    conn: sqlite3.Connection, company_id: int, client_key: str, limite: int = 60
+) -> list[dict[str, Any]]:
+    """Quem abriu esta ficha, do mais recente para o mais antigo.
+
+    Sem recorte de permissão de propósito: é o histórico DO CLIENTE, e a ideia
+    é justamente o vendedor ver que o gerente passou por ali — e vice-versa.
+    """
+    chave = normalize_client_key(client_key)
+    return [
+        {"personName": r["person_name"], "role": r["role_label"] or "",
+         "unitName": r["unit_name"] or "", "date": r["view_date"],
+         "firstAt": r["first_at"], "lastAt": r["last_at"], "views": int(r["views"])}
+        for r in conn.execute(
+            "SELECT * FROM client_views WHERE company_id = ? AND client_key = ? "
+            "ORDER BY view_date DESC, last_at DESC LIMIT ?",
+            (company_id, chave, int(limite))).fetchall()
+    ]
+
+
+def _escopo_de_pessoas(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> tuple[str, list[str]]:
+    """(modo, unidades) para os logs — a mesma hierarquia do resto do CRM.
+
+    proprio  = vendedor, vê só o próprio acesso
+    unidade  = gerente, vê quem é da unidade dele
+    tudo     = diretoria e administração
+    """
+    escopo = data_scope_for_user(conn, user)
+    if escopo == "proprio":
+        return "proprio", []
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if permitidas is None:
+        return "tudo", []
+    return "unidade", [normalize_unit(u) for u in permitidas]
+
+
+def crm_access_log(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, dias: int = 30
+) -> dict[str, Any]:
+    """Quem entrou no CRM, quem não entra há tempo — dentro da hierarquia."""
+    modo, unidades = _escopo_de_pessoas(conn, company_id, user)
+    desde = (today_in_brazil() - timedelta(days=int(dias))).isoformat()
+
+    ultimo = {
+        int(r["user_id"]): r
+        for r in conn.execute(
+            "SELECT user_id, MAX(logged_at) AS ultimo, COUNT(*) AS entradas "
+            "FROM login_events WHERE company_id = ? GROUP BY user_id",
+            (company_id,)).fetchall()
+    }
+    recentes_por_pessoa = {
+        int(r["user_id"]): int(r["n"])
+        for r in conn.execute(
+            "SELECT user_id, COUNT(*) n FROM login_events "
+            "WHERE company_id = ? AND date(logged_at) >= date(?) GROUP BY user_id",
+            (company_id, desde)).fetchall()
+    }
+
+    hoje = today_in_brazil()
+    pessoas: list[dict[str, Any]] = []
+    for u in conn.execute(
+        "SELECT id, username, full_name, linked_person_name, role FROM users "
+        "WHERE company_id = ? AND is_active = 1 ORDER BY role, username",
+            (company_id,)).fetchall():
+        if modo == "proprio" and int(u["id"]) != int(user["id"]):
+            continue
+        unidade = unidade_de_exibicao(conn, company_id, u)
+        if modo == "unidade" and unidade and unidade not in unidades:
+            continue
+        reg = ultimo.get(int(u["id"]))
+        dias_sem = None
+        if reg and reg["ultimo"]:
+            d = parse_datetime_flexible(reg["ultimo"])
+            if d:
+                dias_sem = (hoje - d.date()).days
+        pessoas.append({
+            "userId": int(u["id"]),
+            "personName": nome_de_exibicao(u),
+            "role": normalize_whitespace(u["role"]),
+            "unitName": unidade,
+            "lastAccessAt": reg["ultimo"] if reg else "",
+            "daysSinceAccess": dias_sem,
+            # None = nunca entrou. Zero seria mentira: "entrou hoje".
+            "loginsInWindow": recentes_por_pessoa.get(int(u["id"]), 0),
+            "totalLogins": int(reg["entradas"]) if reg else 0,
+        })
+
+    # Nunca acessou primeiro, depois quem está sumido há mais tempo. É a ordem
+    # da pergunta que a tela responde: quem não está usando o sistema?
+    pessoas.sort(key=lambda p: (p["daysSinceAccess"] is not None,
+                                -(p["daysSinceAccess"] or 0)))
+    return {
+        "people": pessoas,
+        "windowDays": int(dias),
+        "scope": modo,
+        "todayCount": sum(1 for p in pessoas if p["daysSinceAccess"] == 0),
+        "neverCount": sum(1 for p in pessoas if p["daysSinceAccess"] is None),
+    }
+
+
+def client_activity_feed(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    dias: int = 7, pessoa: str = "", limite: int = 300,
+) -> dict[str, Any]:
+    """Aberturas de ficha em ordem de tempo, dentro da hierarquia."""
+    modo, unidades = _escopo_de_pessoas(conn, company_id, user)
+    desde = (today_in_brazil() - timedelta(days=int(dias))).isoformat()
+    onde = ["v.company_id = ?", "v.view_date >= date(?)"]
+    params: list[Any] = [company_id, desde]
+    if modo == "proprio":
+        onde.append("v.user_id = ?")
+        params.append(int(user["id"]))
+    elif modo == "unidade" and unidades:
+        marc = ",".join("?" for _ in unidades)
+        # Quem não tem unidade resolvida (diretoria) não entra na lista do
+        # gerente: ele acompanha a equipe dele, não a diretoria.
+        onde.append(f"COALESCE(NULLIF(TRIM(v.unit_name),''),'—') IN ({marc})")
+        params.extend(unidades)
+    if normalize_whitespace(pessoa):
+        onde.append("sem_acento(v.person_name) LIKE ?")
+        params.append(f"%{normalize_upper(strip_accents(pessoa))}%")
+
+    linhas = conn.execute(
+        f"""
+        SELECT v.*, COALESCE(NULLIF(TRIM(p.client_name),''), v.client_key) AS nome_cliente
+        FROM client_views v
+        LEFT JOIN crm_client_profiles p
+               ON p.company_id = v.company_id AND p.client_code = v.client_key
+        WHERE {' AND '.join(onde)}
+        ORDER BY v.last_at DESC LIMIT ?
+        """, (*params, int(limite))).fetchall()
+
+    return {
+        "items": [
+            {"personName": r["person_name"], "role": r["role_label"] or "",
+             "unitName": r["unit_name"] or "", "clientKey": r["client_key"],
+             "clientName": r["nome_cliente"], "date": r["view_date"],
+             "lastAt": r["last_at"], "views": int(r["views"])}
+            for r in linhas
+        ],
+        "windowDays": int(dias),
+        "scope": modo,
+    }
 
 
 def list_visits(
@@ -23717,6 +23959,10 @@ class AppHandler(BaseHTTPRequestHandler):
                         data["ownerName"] = normalize_whitespace(dono["v"]) if dono else ""
                         data["isOwnClient"] = not client_is_outside_own_portfolio(
                             conn, user["company_id"], user, client_key)
+                        # Marca a passagem. Fica DENTRO do if: ficha que não
+                        # existe não é visita a cliente nenhum.
+                        registrar_visualizacao_cliente(
+                            conn, user["company_id"], user, client_key)
                 if not data:
                     self._set_headers(404)
                     self.wfile.write(json_dumps({"error": "Cliente nao encontrado"}))
@@ -23724,6 +23970,37 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json_dumps(data)
                 self._set_headers(200)
                 self.wfile.write(payload)
+                return
+            if path == "/api/crm/client/views":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                chave = normalize_client_key(query.get("clientKey", [None])[0])
+                if not chave:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": "Informe clientKey"}))
+                    return
+                with closing(get_connection()) as conn:
+                    linhas = client_view_log(conn, user["company_id"], chave)
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"rows": linhas}))
+                return
+            if path == "/api/crm/activity":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = client_activity_feed(
+                        conn, user["company_id"], user,
+                        dias=parse_int(query.get("days", ["7"])[0]) or 7,
+                        pessoa=normalize_whitespace(query.get("person", [""])[0]))
+                    dados["access"] = crm_access_log(
+                        conn, user["company_id"], user,
+                        dias=parse_int(query.get("accessDays", ["30"])[0]) or 30)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
                 return
             if path == "/api/crm/client/summary":
                 user = self._require_auth()
@@ -24414,6 +24691,20 @@ class AppHandler(BaseHTTPRequestHandler):
                     session_id = secrets.token_hex(24)
                     expires_at = (datetime.now() + timedelta(hours=SESSION_TTL_HOURS)).isoformat(timespec="seconds")
                     conn.execute("INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)", (session_id, user["id"], now_iso(), expires_at))
+                    # Histórico de acesso em tabela própria: a sessão expira e
+                    # é apagada, então contar login pela tabela sessions perderia
+                    # o passado justamente de quem entra pouco.
+                    try:
+                        conn.execute(
+                            "INSERT INTO login_events (company_id, user_id, username, "
+                            "person_name, role_label, unit_name, logged_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (user.get("company_id"), user["id"], user.get("username"),
+                             nome_de_exibicao(user), normalize_whitespace(user.get("role")),
+                             unidade_de_exibicao(conn, user.get("company_id"), user),
+                             now_iso()))
+                    except Exception as _erro:  # noqa: BLE001
+                        print(f"[login_events] não gravou: {_erro}", flush=True)
                     conn.commit()
                     profile = get_access_profile_for_user(conn, user)
                 headers = {"Set-Cookie": f"{SESSION_COOKIE}={session_id}; HttpOnly; Path=/; SameSite=Lax"}

@@ -25,6 +25,8 @@ const state = {
   pdiEditor: null,        // ponto de desenvolvimento em edição
   visits: null,           // visitas + pedidos
   visitRoute: null,        // roteiro sugerido por proximidade
+  atividade: null,         // log de fichas abertas + acessos ao CRM
+  atividadeFiltros: { days: 7, person: "" },
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -90,6 +92,7 @@ const state = {
       feedback: false,
       visits: false,
       visitRoute: false,
+      atividade: false,
       prospects: false,
       territories: false,
       contacts: false,
@@ -230,6 +233,7 @@ const state = {
       itens: { rows: [], loaded: false, loading: false, error: "", page: 1, pageSize: 20, total: 0, totalPages: 0 },
       interacoes: { rows: [], loaded: false, loading: false, error: "", page: 1, pageSize: 20, total: 0, totalPages: 0 },
       visitas: { rows: [], loaded: false, loading: false, error: "" },
+      quemviu: { rows: [], loaded: false, loading: false, error: "" },
     },
     taskRows: [],
     interactionForm: {
@@ -427,6 +431,7 @@ function resetSelectedClientTabs() {
     itens: emptyClientTabState(20),
     interacoes: emptyClientTabState(20),
     visitas: { rows: [], loaded: false, loading: false, error: "" },
+    quemviu: { rows: [], loaded: false, loading: false, error: "" },
   };
 }
 
@@ -1300,6 +1305,12 @@ async function ensureCrmClientTabLoaded(tab, silent = false) {
     if (tab === "visitas") {
       result = await api(`/api/crm/client/visits?clientKey=${encodeURIComponent(clientKey)}`);
       state.crm.selectedClientTabs.visitas = { rows: result.rows || [], loaded: true, loading: false, error: "" };
+      if (!silent) requestRender();
+      return;
+    }
+    if (tab === "quemviu") {
+      result = await api(`/api/crm/client/views?clientKey=${encodeURIComponent(clientKey)}`);
+      state.crm.selectedClientTabs.quemviu = { rows: result.rows || [], loaded: true, loading: false, error: "" };
       if (!silent) requestRender();
       return;
     }
@@ -12207,6 +12218,165 @@ function visitaEditorModal() {
     </div>`;
 }
 
+/* ─── Atividade no CRM ───────────────────────────────────────────────────────
+ *
+ * Duas perguntas na mesma tela: o que a equipe olhou, e quem não está entrando.
+ * O recorte segue a hierarquia do resto do sistema — vendedor vê o próprio,
+ * gerente vê a unidade, diretoria vê tudo. Não é uma tela de vigilância: é a
+ * mesma informação que hoje mora na cabeça de quem senta ao lado.
+ */
+async function loadAtividade() {
+  if (state.ui.loading.atividade) return;
+  setLoading("atividade", true);
+  requestRender();
+  try {
+    const q = new URLSearchParams();
+    q.set("days", String(state.atividadeFiltros.days || 7));
+    if ((state.atividadeFiltros.person || "").trim()) {
+      q.set("person", state.atividadeFiltros.person.trim());
+    }
+    state.atividade = await api(`/api/crm/activity?${q.toString()}`);
+  } catch (error) {
+    state.atividade = { error: error.message, items: [], access: { people: [] } };
+  } finally {
+    setLoading("atividade", false);
+  }
+  requestRender();
+}
+
+function setAtividadeDias(d) {
+  state.atividadeFiltros.days = Number(d) || 7;
+  void loadAtividade();
+}
+
+function atividadeView() {
+  if (!state.atividade) { loadAtividade(); return '<div class="loader panel">Carregando atividade…</div>'; }
+  const d = state.atividade;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  const f = state.atividadeFiltros;
+  const acesso = d.access || { people: [] };
+  const pessoas = acesso.people || [];
+  const itens = d.items || [];
+
+  // Quantas fichas cada pessoa abriu na janela. É o indicador de uso do CRM:
+  // quem registra ligação mas nunca abre ficha está trabalhando de memória.
+  const porPessoa = {};
+  itens.forEach((i) => {
+    const k = i.personName || "—";
+    porPessoa[k] = (porPessoa[k] || 0) + 1;
+  });
+  const ranking = Object.entries(porPessoa).sort((a, b) => b[1] - a[1]);
+
+  const diaBotao = (n, rotulo) => `
+    <button type="button" onclick="setAtividadeDias(${n})"
+      style="border:1px solid ${f.days === n ? "#0f3044" : "var(--line)"};
+             background:${f.days === n ? "#0f3044" : "#fff"};
+             color:${f.days === n ? "#fff" : "var(--muted)"};
+             border-radius:14px;padding:5px 13px;font-size:12px;
+             font-weight:${f.days === n ? "700" : "500"};cursor:pointer">${rotulo}</button>`;
+
+  return `
+    <div class="stack">
+      <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;
+                                border:none;padding:18px 22px">
+        <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:4px">ATIVIDADE NO CRM</div>
+        <h3 style="color:#fff;margin:0 0 4px">
+          ${number(acesso.todayCount || 0)} pessoa(s) entraram hoje
+          ${acesso.neverCount ? ` · ${number(acesso.neverCount)} nunca entraram` : ""}
+        </h3>
+        <div style="font-size:13px;color:rgba(255,255,255,0.75)">
+          ${d.scope === "proprio" ? "Você está vendo a sua própria atividade."
+            : d.scope === "unidade" ? "Você está vendo a sua unidade."
+            : "Você está vendo a empresa inteira."}
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>🔑 Acesso ao sistema</h3>
+            <div class="text-small">Quem entrou, e há quantos dias cada um não entra.</div></div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Pessoa</th><th>Perfil</th><th>Unidade</th>
+              <th style="text-align:right">Último acesso</th>
+              <th style="text-align:right">Entradas (${acesso.windowDays || 30}d)</th>
+            </tr></thead>
+            <tbody>
+              ${pessoas.length ? pessoas.map((p) => {
+                const dias = p.daysSinceAccess;
+                const cor = dias == null ? "var(--bad)"
+                  : dias === 0 ? "var(--good)" : dias >= 7 ? "var(--bad)" : "#b06000";
+                const texto = dias == null ? "nunca entrou"
+                  : dias === 0 ? "hoje" : dias === 1 ? "ontem" : `há ${number(dias)} dias`;
+                return `
+                  <tr>
+                    <td><strong>${escapeHtml(p.personName)}</strong></td>
+                    <td class="text-small">${escapeHtml(p.role || "")}</td>
+                    <td class="text-small">${escapeHtml(p.unitName || "—")}</td>
+                    <td style="text-align:right;color:${cor};font-weight:700">${texto}</td>
+                    <td style="text-align:right">${number(p.loginsInWindow || 0)}</td>
+                  </tr>`;
+              }).join("")
+                : '<tr><td colspan="5" class="text-small">Sem registros de acesso ainda.</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          O registro começou na data em que esta tela entrou no ar — acessos anteriores
+          não existem no histórico, e "nunca entrou" pode significar só isso nos
+          primeiros dias.
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title">
+          <div><h3>👀 Fichas abertas</h3>
+            <div class="text-small">Quem olhou qual cliente. Uma linha por pessoa, cliente e dia.</div></div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            ${diaBotao(1, "Hoje")} ${diaBotao(7, "7 dias")} ${diaBotao(30, "30 dias")}
+          </div>
+        </div>
+
+        <div style="display:flex;gap:8px;margin:10px 0">
+          <input style="flex:1" placeholder="Filtrar por pessoa"
+            value="${escapeHtml(f.person || "")}"
+            oninput="state.atividadeFiltros.person=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();loadAtividade();}" />
+          <button class="btn btn-secondary btn-sm" onclick="loadAtividade()">Filtrar</button>
+        </div>
+
+        ${ranking.length ? `
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+            ${ranking.map(([nome, n]) => `
+              <span class="soft-badge">${escapeHtml(nome)} · ${number(n)}</span>`).join("")}
+          </div>` : ""}
+
+        <div class="timeline-list">
+          ${itens.length ? itens.map((i) => `
+            <div class="timeline-item" style="display:flex;justify-content:space-between;
+                        gap:10px;flex-wrap:wrap;align-items:baseline">
+              <div style="flex:1;min-width:240px">
+                <strong>${escapeHtml(i.personName)}</strong>
+                <span class="text-small" style="color:var(--muted)">
+                  ${i.role ? `(${escapeHtml(i.role)})` : ""} abriu
+                </span>
+                <button type="button" class="link-num"
+                  onclick="openCrmClient('${jsAttr(i.clientKey)}', false, true, { outside: true })">
+                  ${escapeHtml(i.clientName)}</button>
+              </div>
+              <span class="text-small" style="color:var(--muted)">
+                ${escapeHtml(dataBr(i.date))}${i.views > 1 ? ` · ${i.views}×` : ""}
+                ${i.unitName ? ` · ${escapeHtml(i.unitName)}` : ""}
+              </span>
+            </div>`).join("")
+            : '<div class="timeline-item"><div class="text-small">Nenhuma ficha aberta no período.</div></div>'}
+        </div>
+      </div>
+    </div>`;
+}
+
 function feedbackView() {
   if (!state.feedback) { loadFeedback(); return `<div class="loader panel">Carregando feedback…</div>`; }
   if (state.feedback.error) return `<div class="message error">${escapeHtml(state.feedback.error)}</div>`;
@@ -13986,6 +14156,7 @@ function clientDrawerView() {
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "itens" ? "active" : ""}" onclick="setCrmClientDetailTab('itens')">Itens</button>
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "interacoes" ? "active" : ""}" onclick="setCrmClientDetailTab('interacoes')">Interações</button>
                 <button class="subtab-button ${state.ui.crmClientDetailTab === "visitas" ? "active" : ""}" onclick="setCrmClientDetailTab('visitas')">Visitas</button>
+                <button class="subtab-button ${state.ui.crmClientDetailTab === "quemviu" ? "active" : ""}" onclick="setCrmClientDetailTab('quemviu')">Quem viu</button>
               </div>
               ${crmClientHistoryPanel(detail)}
             </div>
@@ -14026,6 +14197,36 @@ function crmClientHistoryPanel(clientDetail) {
             ${(tabState?.rows || []).map((row) => `<tr><td>${escapeHtml((row.issue_date || "").slice(0, 10))}</td><td>${escapeHtml(row.item_code)}</td><td>${number(row.quantity)}</td><td>${currency(row.net_value)}</td></tr>`).join("") || '<tr><td colspan="4">Sem itens recentes.</td></tr>'}
           </tbody>
         </table>
+      </div>
+    `;
+  }
+  if (tab === "quemviu") {
+    const linhas = tabState?.rows || [];
+    if (!linhas.length) {
+      return `<div class="timeline-list"><div class="timeline-item">
+        <div class="text-small">Ninguém abriu esta ficha ainda — ou ela só foi aberta
+        antes do registro começar.</div></div></div>`;
+    }
+    return `
+      <div class="timeline-list">
+        ${linhas.map((v) => `
+          <div class="timeline-item" style="display:flex;justify-content:space-between;
+                      gap:10px;flex-wrap:wrap;align-items:baseline">
+            <div>
+              <strong>${escapeHtml(v.personName)}</strong>
+              <span class="text-small" style="color:var(--muted)">
+                ${v.role ? ` · ${escapeHtml(v.role)}` : ""}${v.unitName ? ` · ${escapeHtml(v.unitName)}` : ""}
+              </span>
+            </div>
+            <span class="text-small" style="color:var(--muted)">
+              ${escapeHtml(dataBr(v.date))}
+              ${v.views > 1 ? ` · ${v.views}×` : ""}
+            </span>
+          </div>`).join("")}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        Uma linha por pessoa e por dia. Quem abre a mesma ficha várias vezes no dia
+        aparece uma vez, com a contagem.
       </div>
     `;
   }
@@ -17953,6 +18154,7 @@ function dashboardView() {
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "novidades"     ? novidadesView()      : ""}
+          ${state.activeTab === "atividade"     ? atividadeView()      : ""}
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "visitas"       ? visitasView()        : ""}
