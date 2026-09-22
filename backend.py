@@ -10520,27 +10520,42 @@ def prospect_leads_summary(conn: sqlite3.Connection, company_id: int) -> dict[st
     return {r["status"]: r["c"] for r in linhas}
 
 
-INACTIVE_RECURRING_MONTHS = 6   # janela onde se mede o hábito de compra
-INACTIVE_RECURRING_MIN = 3      # "mais de 2 meses" = pelo menos 3
+# 18 meses, não 6. Com 6 a régua só enxergava quem parou ontem; cliente que
+# comprava firme e sumiu há um ano — justamente o que mais vale recuperar —
+# ficava de fora. Os meses NÃO precisam ser seguidos: oficina compra por
+# necessidade, e três meses espalhados no ano e meio já é hábito.
+INACTIVE_RECURRING_MONTHS = 18
+INACTIVE_RECURRING_MIN = 3
 
 
-def client_months_with_purchase(
+def client_purchase_habit(
     conn: sqlite3.Connection, company_id: int, meses: int = INACTIVE_RECURRING_MONTHS
-) -> dict[str, int]:
-    """Chave do cliente → em quantos meses distintos ele comprou na janela.
+) -> dict[str, tuple[int, float]]:
+    """Chave do cliente → (meses distintos com compra, faturamento na janela).
 
     Uma consulta agregada para a empresa toda, e não uma por cliente: são 600+
     inativos na tela e o N+1 é o defeito que já derrubou a carteira antes.
+
+    O faturamento vem junto porque a média que a tela mostrava era a do
+    recorte atual — e cliente INATIVO não compra no mês atual por definição,
+    então ela dava R$ 0,00 para todo mundo e a ordenação por média não ordenava
+    nada. Aqui a média é histórica: o que ele comprava POR MÊS quando comprava.
     """
     desde = (today_in_brazil() - timedelta(days=meses * 31)).isoformat()
-    fora: dict[str, int] = {}
+    fora: dict[str, tuple[int, float]] = {}
     for r in conn.execute(
-        "SELECT client_name, COUNT(DISTINCT competence) n FROM fact_sales_detail "
+        "SELECT client_name, COUNT(DISTINCT competence) n, SUM(net_value) v "
+        "FROM fact_sales_detail "
         "WHERE company_id = ? AND net_value > 0 AND date(issue_date) >= date(?) "
         "GROUP BY client_name", (company_id, desde)).fetchall():
         if r["client_name"]:
             chave = normalize_client_key(r["client_name"])
-            fora[chave] = max(fora.get(chave, 0), int(r["n"]))
+            n, v = int(r["n"]), float(r["v"] or 0)
+            anterior = fora.get(chave)
+            # Mesmo cliente com duas grafias: soma o valor e fica com o maior
+            # número de meses, senão a normalização faria um apagar o outro.
+            fora[chave] = ((max(anterior[0], n), anterior[1] + v)
+                           if anterior else (n, v))
     return fora
 
 
@@ -10609,32 +10624,49 @@ def inactive_clients_for_unit(
     # quem passou uma vez.
     tipos = client_person_type_map(conn, company_id,
                                    [c["clientName"] for c in achados])
-    meses_compra = client_months_with_purchase(conn, company_id)
+    habito = client_purchase_habit(conn, company_id)
     for c in achados:
         chave = normalize_client_key(c["clientName"])
+        n_meses, receita = habito.get(chave, (0, 0.0))
         c["personType"] = tipos.get(chave, "PF")
-        c["monthsWithPurchase"] = meses_compra.get(chave, 0)
-        c["isRecurring"] = c["monthsWithPurchase"] >= INACTIVE_RECURRING_MIN
-
-    # Contagens ANTES de filtrar, para a tela dizer quanto cada filtro deixa.
-    # Filtro que devolve lista vazia sem explicar parece defeito.
-    resumo = {
-        "pf": sum(1 for c in achados if c["personType"] == "PF"),
-        "pj": sum(1 for c in achados if c["personType"] == "PJ"),
-        "recurring": sum(1 for c in achados if c["isRecurring"]),
-    }
+        c["monthsWithPurchase"] = n_meses
+        c["isRecurring"] = n_meses >= INACTIVE_RECURRING_MIN
+        # Média do que ele comprava POR MÊS EM QUE COMPROU. Dividir pelos 18
+        # meses da janela daria quase zero para todos e não diria nada sobre o
+        # porte do cliente.
+        c["averageRevenue"] = round(receita / n_meses, 2) if n_meses else 0.0
+        c["windowRevenue"] = round(receita, 2)
 
     alvo_tipo = normalize_upper(tipo_pessoa)
+
+    # Cada contagem considera os OUTROS filtros ligados.
+    #
+    # Antes eram independentes: o chip dizia "18 recorrentes" com PJ marcado e
+    # a lista trazia 3, porque 15 dos 18 eram PF. Número que promete uma coisa
+    # e entrega outra é pior que número nenhum — o chip tem que dizer quanto
+    # sobra se você clicar nele, do jeito que a tela está agora.
+    def _conta(tipo: str = "", recorrente: bool = False) -> int:
+        return sum(1 for c in achados
+                   if (not tipo or c["personType"] == tipo)
+                   and (not recorrente or c["isRecurring"]))
+
+    resumo = {
+        "all": _conta(recorrente=so_recorrentes),
+        "pf": _conta("PF", so_recorrentes),
+        "pj": _conta("PJ", so_recorrentes),
+        # O de recorrência respeita o tipo já escolhido, e não o contrário.
+        "recurring": _conta(alvo_tipo if alvo_tipo in ("PF", "PJ") else "", True),
+    }
+    resumo["totalBefore"] = len(achados)
     if alvo_tipo in ("PF", "PJ"):
         achados = [c for c in achados if c["personType"] == alvo_tipo]
     if so_recorrentes:
         achados = [c for c in achados if c["isRecurring"]]
 
     # Quem já foi bom cliente vale mais que quem nunca comprou. Meses com
-    # compra vem PRIMEIRO na ordenação: a média histórica volta R$ 0,00 para
-    # boa parte da base (cliente antigo cujo faturamento está fora da janela
-    # importada), e ordenar por um campo zerado não ordena nada — era por isso
-    # que o topo da lista vinha com balcão de média zero.
+    # compra vem PRIMEIRO na ordenação, e a média agora é a histórica (ver
+    # client_purchase_habit) — a anterior era a do recorte atual e dava
+    # R$ 0,00 para todo inativo, o que não ordenava nada.
     achados.sort(key=lambda c: (
         -(c["monthsWithPurchase"] or 0),
         -(c["averageRevenue"] or 0),

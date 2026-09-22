@@ -2724,20 +2724,23 @@ function blocoInativosDaUnidade() {
           return `
             <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
               <span class="text-small" style="font-weight:700;color:var(--muted)">MOSTRAR</span>
-              ${chip(!tipo, "Todos", "setInativoTipo('')", "#0f3044")}
+              ${chip(!tipo, `Todos${c.all != null ? ` · ${number(c.all)}` : ""}`,
+                     "setInativoTipo('')", "#0f3044")}
               ${chip(tipo === "PJ", `🏭 Oficina (PJ)${c.pj != null ? ` · ${number(c.pj)}` : ""}`,
                      "setInativoTipo('PJ')", "#0f3044")}
               ${chip(tipo === "PF", `👤 Balcão (PF)${c.pf != null ? ` · ${number(c.pf)}` : ""}`,
                      "setInativoTipo('PF')", "#0f3044")}
               <span style="width:10px"></span>
-              ${chip(rec, `🔁 Comprava todo mês${c.recurring != null ? ` · ${number(c.recurring)}` : ""}`,
+              ${chip(rec, `🔁 Comprava com constância${c.recurring != null ? ` · ${number(c.recurring)}` : ""}`,
                      "toggleInativoRecorrente()", "#2e7d32")}
             </div>
-            ${rec ? `
-              <div class="text-small" style="color:var(--muted);margin:-4px 0 10px">
-                Comprou em <strong>${d?.recurringMin || 3} meses ou mais</strong> dos últimos
-                ${d?.recurringMonths || 6}. Tinha hábito e parou — é quem mais vale o telefonema.
-              </div>` : ""}`;
+            <div class="text-small" style="color:var(--muted);margin:-4px 0 10px">
+              ${rec ? `Comprou em <strong>${d?.recurringMin || 3} meses ou mais</strong> dos últimos
+                ${d?.recurringMonths || 18} — não precisam ser seguidos. Tinha hábito e parou:
+                é quem mais vale o telefonema.`
+              : `Cada número já considera o outro filtro ligado, então é o que sobra
+                 de verdade ao clicar.`}
+            </div>`;
         })()}
 
         ${carregando ? `
@@ -2749,7 +2752,9 @@ function blocoInativosDaUnidade() {
         ${d ? `
           <div style="${carregando ? "opacity:.45;pointer-events:none" : ""}">
           <div class="text-small" style="color:var(--muted);margin-bottom:8px">
-            ${number(d.total)} inativo(s) em <strong>${escapeHtml(d.unitName || "todas")}</strong>
+            ${number(d.total)}${d.counts?.totalBefore && d.counts.totalBefore !== d.total
+              ? ` de ${number(d.counts.totalBefore)}` : ""} inativo(s) em
+            <strong>${escapeHtml(d.unitName || "todas")}</strong>
             · ${number(d.withoutSeller)} sem vendedor
             ${d.total > (d.items || []).length ? ` · mostrando os ${number(d.items.length)} de maior potencial` : ""}
           </div>
@@ -2758,7 +2763,8 @@ function blocoInativosDaUnidade() {
               <thead><tr>
                 <th>Cliente</th><th>Cidade</th><th>Classe</th>
                 <th style="text-align:center">Meses<br>com compra</th>
-                <th style="text-align:right">Média/mês</th><th style="text-align:right">Dias parado</th>
+                <th style="text-align:right">Média nos meses<br>em que comprou</th>
+                <th style="text-align:right">Dias parado</th>
                 <th>Carteira</th><th style="text-align:right">Ações</th>
               </tr></thead>
               <tbody>
@@ -2773,9 +2779,11 @@ function blocoInativosDaUnidade() {
                     <td style="text-align:center;font-weight:${c.isRecurring ? "800" : "400"};
                                color:${c.isRecurring ? "#2e7d32" : "var(--muted)"}">
                       ${number(c.monthsWithPurchase || 0)}${c.isRecurring ? " 🔁" : ""}
-                      <div style="font-size:10px;color:var(--muted);font-weight:400">de ${d?.recurringMonths || 6}</div>
+                      <div style="font-size:10px;color:var(--muted);font-weight:400">de ${d?.recurringMonths || 18}</div>
                     </td>
-                    <td style="text-align:right">${currency(c.averageRevenue || 0)}</td>
+                    <td style="text-align:right">${currency(c.averageRevenue || 0)}
+                      ${c.windowRevenue ? `<div style="font-size:10px;color:var(--muted)">
+                        ${currency(c.windowRevenue)} no total</div>` : ""}</td>
                     <td style="text-align:right;color:var(--bad);font-weight:700">${number(c.daysWithoutPurchase || 0)}</td>
                     <td class="text-small">
                       ${c.isMine ? '<span class="soft-badge">sua carteira</span>'
