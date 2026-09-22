@@ -14357,6 +14357,10 @@ def crm_base_client_rows(
     # Regra: o faturamento fica com um único código — o que tem movimento no mês
     # corrente; sem movimento em nenhum, fica com o de compra mais recente.
     revenue_owner_by_name: dict[str, str] = {}
+    # Mesmo nome com CNPJs diferentes: o faturamento fica com um código só, mas
+    # vale avisar na tela — pode ser matriz e filial que o comercial trata como
+    # uma conta, ou dois clientes distintos que por acaso têm o mesmo nome.
+    nomes_multi_documento: set[str] = set()
     _candidates_by_name: dict[str, list[tuple[float, str, str, str]]] = defaultdict(list)
     for row in aggregate_rows:
         code = normalize_whitespace(row["client_code"])
@@ -14385,16 +14389,25 @@ def crm_base_client_rows(
         if len(candidates) < 2:
             revenue_owner_by_name[name_key] = candidates[0][2]
             continue
-        # Segunda trava: documentos diferentes são clientes diferentes, por mais
-        # parecido que o nome seja. Homônimo existe — duas empresas do mesmo dono,
-        # matriz e filial, pessoa física e jurídica com o mesmo nome. Sem isso, o
-        # faturamento de uma seria creditado à outra.
+        # Documentos diferentes com o mesmo nome: matriz e filial, ou homônimos
+        # de verdade. A trava antiga desistia aqui (`continue`) para não creditar
+        # o faturamento de uma empresa à outra — mas o efeito era o oposto e pior:
+        # sem dono eleito, TODOS os códigos recebiam o valor inteiro.
+        #
+        # ARCELORMITTAL aparecia 4× com R$ 18.545,44 de média cada, CONECTA
+        # idem. O faturamento é indexado por NOME e existe uma vez só; espalhá-lo
+        # por N códigos multiplica dinheiro que não entrou, e isso inflava média,
+        # classe, potencial do roteiro e todo total somado sobre a carteira.
+        #
+        # Como não há informação para repartir por CNPJ (o detalhado não traz
+        # documento), o valor fica com UM código — o mesmo critério do caso
+        # normal. Os demais ficam marcados como cadastro duplicado.
         documentos = {c[3] for c in candidates if c[3]}
-        if len(documentos) > 1:
-            continue
         # Maior receita no mês corrente; empate resolve pela compra mais recente
         candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
         revenue_owner_by_name[name_key] = candidates[0][2]
+        if len(documentos) > 1:
+            nomes_multi_documento.add(name_key)
     _etapa("duplicados")
 
     client_rows: list[dict[str, Any]] = []
@@ -14511,6 +14524,11 @@ def crm_base_client_rows(
                 "trimesterRevenue3": round(previous_revenues[2], 2),
                 # Sinaliza cadastro duplicado: o faturamento deste nome está em outro código
                 "duplicateOfCode": duplicated_codes[0] if duplicated_codes else None,
+                # Mesmo nome, CNPJs diferentes. O faturamento ficou com um
+                # código só (antes ia inteiro para todos, multiplicando a
+                # média); quem confere número precisa saber que é este caso.
+                "sameNameOtherDocument": any(
+                    k in nomes_multi_documento for k in candidate_keys),
                 # Memória de cálculo da média — permite auditar o número na tela
                 "averageBasis": {
                     "currentCompetence": c0,

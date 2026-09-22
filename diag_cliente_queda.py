@@ -125,4 +125,37 @@ if pct_caindo > 70:
 else:
     print("   >> Proporção saudável: a queda está medindo comportamento.")
 
+# ── 5. Nome repetido inflando a média ───────────────────────────────────────
+# ARCELORMITTAL apareceu 4× com a MESMA média de R$ 18.545,44, CONECTA idem.
+# O faturamento é indexado por nome e existe uma vez só: se N códigos recebem
+# o valor inteiro, a carteira mostra dinheiro que não entrou.
+print("\n5) O MESMO NOME EM VÁRIOS CÓDIGOS")
+por_nome = defaultdict(list)
+for c in linhas:
+    nome = backend.normalize_client_key(c.get("clientName"))
+    if nome:
+        por_nome[nome].append(c)
+repetidos = {n: v for n, v in por_nome.items() if len(v) > 1}
+com_media = [(n, v) for n, v in repetidos.items()
+             if sum(float(x.get("averageRevenue") or 0) for x in v) > 0]
+print(f"   {len(repetidos)} nome(s) com mais de um código · "
+      f"{len(com_media)} com faturamento")
+if com_media:
+    # Quanto a média TOTAL da carteira cresce por causa da repetição.
+    inflado = 0.0
+    for _, v in com_media:
+        medias = sorted((float(x.get("averageRevenue") or 0) for x in v), reverse=True)
+        inflado += sum(medias[1:])   # tudo além do maior é repetição
+    print(f"   {backend.brl(inflado)} de média/mês vinha repetida")
+    print(f"\n   {'NOME':<34}{'CÓDIGOS':>8}{'MÉDIA CADA':>14}")
+    piores = sorted(com_media,
+                    key=lambda kv: -sum(float(x.get("averageRevenue") or 0)
+                                        for x in kv[1]))[:10]
+    for nome, v in piores:
+        media = float(v[0].get("averageRevenue") or 0)
+        print(f"   {str(v[0].get('clientName'))[:33]:<34}{len(v):>8}"
+              f"{backend.brl(media):>14}")
+    print("\n   Se todos os códigos do mesmo nome mostrarem a MESMA média, o")
+    print("   faturamento está sendo contado uma vez por código.")
+
 conn.close()
