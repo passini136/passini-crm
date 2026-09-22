@@ -10482,9 +10482,34 @@ def prospect_leads_summary(conn: sqlite3.Connection, company_id: int) -> dict[st
     return {r["status"]: r["c"] for r in linhas}
 
 
+INACTIVE_RECURRING_MONTHS = 6   # janela onde se mede o hábito de compra
+INACTIVE_RECURRING_MIN = 3      # "mais de 2 meses" = pelo menos 3
+
+
+def client_months_with_purchase(
+    conn: sqlite3.Connection, company_id: int, meses: int = INACTIVE_RECURRING_MONTHS
+) -> dict[str, int]:
+    """Chave do cliente → em quantos meses distintos ele comprou na janela.
+
+    Uma consulta agregada para a empresa toda, e não uma por cliente: são 600+
+    inativos na tela e o N+1 é o defeito que já derrubou a carteira antes.
+    """
+    desde = (today_in_brazil() - timedelta(days=meses * 31)).isoformat()
+    fora: dict[str, int] = {}
+    for r in conn.execute(
+        "SELECT client_name, COUNT(DISTINCT competence) n FROM fact_sales_detail "
+        "WHERE company_id = ? AND net_value > 0 AND date(issue_date) >= date(?) "
+        "GROUP BY client_name", (company_id, desde)).fetchall():
+        if r["client_name"]:
+            chave = normalize_client_key(r["client_name"])
+            fora[chave] = max(fora.get(chave, 0), int(r["n"]))
+    return fora
+
+
 def inactive_clients_for_unit(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     busca: str = "", limite: int = 200,
+    tipo_pessoa: str = "", so_recorrentes: bool = False,
 ) -> dict[str, Any]:
     """Clientes INATIVOS da unidade, para o vendedor buscar reativação.
 
@@ -10538,15 +10563,55 @@ def inactive_clients_for_unit(
             "averageRevenue": linha.get("averageRevenue"),
         })
 
-    # Quem já foi bom cliente vale mais que quem nunca comprou: ordena pela
-    # média histórica e, empatando, por quem parou há menos tempo (mais fácil
-    # de trazer de volta).
-    achados.sort(key=lambda c: (-(c["averageRevenue"] or 0), c["daysWithoutPurchase"] or 9999))
+    # PF/PJ e hábito de compra só para os que sobraram do recorte acima.
+    #
+    # Balcão e oficina são listas diferentes de trabalho: o consumidor que levou
+    # um par de pastilhas e sumiu não é "cliente inativo para reativar", e é ele
+    # que enche o topo da tela. Meses com compra separa quem tinha hábito de
+    # quem passou uma vez.
+    tipos = client_person_type_map(conn, company_id,
+                                   [c["clientName"] for c in achados])
+    meses_compra = client_months_with_purchase(conn, company_id)
+    for c in achados:
+        chave = normalize_client_key(c["clientName"])
+        c["personType"] = tipos.get(chave, "PF")
+        c["monthsWithPurchase"] = meses_compra.get(chave, 0)
+        c["isRecurring"] = c["monthsWithPurchase"] >= INACTIVE_RECURRING_MIN
+
+    # Contagens ANTES de filtrar, para a tela dizer quanto cada filtro deixa.
+    # Filtro que devolve lista vazia sem explicar parece defeito.
+    resumo = {
+        "pf": sum(1 for c in achados if c["personType"] == "PF"),
+        "pj": sum(1 for c in achados if c["personType"] == "PJ"),
+        "recurring": sum(1 for c in achados if c["isRecurring"]),
+    }
+
+    alvo_tipo = normalize_upper(tipo_pessoa)
+    if alvo_tipo in ("PF", "PJ"):
+        achados = [c for c in achados if c["personType"] == alvo_tipo]
+    if so_recorrentes:
+        achados = [c for c in achados if c["isRecurring"]]
+
+    # Quem já foi bom cliente vale mais que quem nunca comprou. Meses com
+    # compra vem PRIMEIRO na ordenação: a média histórica volta R$ 0,00 para
+    # boa parte da base (cliente antigo cujo faturamento está fora da janela
+    # importada), e ordenar por um campo zerado não ordena nada — era por isso
+    # que o topo da lista vinha com balcão de média zero.
+    achados.sort(key=lambda c: (
+        -(c["monthsWithPurchase"] or 0),
+        -(c["averageRevenue"] or 0),
+        c["daysWithoutPurchase"] or 9999,
+    ))
     return {
         "items": achados[:limite],
         "total": len(achados),
         "unitName": unidade_alvo or "todas",
         "withoutSeller": sum(1 for c in achados if c["assignedSeller"] == "Sem vendedor"),
+        "counts": resumo,
+        "personType": alvo_tipo if alvo_tipo in ("PF", "PJ") else "",
+        "recurringOnly": bool(so_recorrentes),
+        "recurringMonths": INACTIVE_RECURRING_MONTHS,
+        "recurringMin": INACTIVE_RECURRING_MIN,
     }
 
 
@@ -23788,7 +23853,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 with closing(get_connection()) as conn:
                     dados = inactive_clients_for_unit(
                         conn, user["company_id"], user,
-                        normalize_whitespace(query.get("q", [""])[0]))
+                        normalize_whitespace(query.get("q", [""])[0]),
+                        tipo_pessoa=query.get("personType", [""])[0],
+                        so_recorrentes=query.get("recurring", ["0"])[0] == "1")
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return

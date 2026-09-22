@@ -108,6 +108,8 @@ const state = {
     fichaAberta: null,     // null = decide sozinho; true/false = escolha da pessoa
     switching: {},         // troca de aba/filtro em andamento, por grupo de chips
     inactivesOpen: false,  // painel de inativos da unidade na Prospecção
+    inactivePersonType: "",   // "", "PF" ou "PJ"
+    inactiveRecurring: false, // só quem comprava com constância antes de parar
     inactiveSearch: "",
     territoryCity: "",     // filtro de cidade na tela de territórios
     territoryDraft: null,  // linha em edição/criação no mapa de territórios
@@ -2634,8 +2636,12 @@ async function loadInativos() {
   setLoading("inactives", true);
   requestRender();   // sem isto o "Buscando…" só apareceria depois da resposta
   try {
+    const p = new URLSearchParams();
     const q = (state.ui.inactiveSearch || "").trim();
-    state.inactives = await api(`/api/prospects/inactive${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+    if (q) p.set("q", q);
+    if (state.ui.inactivePersonType) p.set("personType", state.ui.inactivePersonType);
+    if (state.ui.inactiveRecurring) p.set("recurring", "1");
+    state.inactives = await api(`/api/prospects/inactive?${p.toString()}`);
   } catch (error) {
     addMessage("error", error.message);
     state.inactives = { items: [], total: 0 };
@@ -2649,6 +2655,17 @@ function toggleInativos() {
   state.ui.inactivesOpen = !state.ui.inactivesOpen;
   requestRender();                       // abre o painel na hora
   if (state.ui.inactivesOpen && !state.inactives) void loadInativos();
+}
+
+/** Filtro clicado recarrega na hora: ninguém espera ter de apertar "Filtrar". */
+function setInativoTipo(tipo) {
+  state.ui.inactivePersonType = state.ui.inactivePersonType === tipo ? "" : tipo;
+  void loadInativos();
+}
+
+function toggleInativoRecorrente() {
+  state.ui.inactiveRecurring = !state.ui.inactiveRecurring;
+  void loadInativos();
 }
 
 function blocoInativosDaUnidade() {
@@ -2681,6 +2698,39 @@ function blocoInativosDaUnidade() {
             ${carregando ? "⏳ Buscando…" : "Filtrar"}</button>
         </div>
 
+        ${(() => {
+          // Contagens vêm do servidor ANTES do filtro, então cada botão já diz
+          // quantos vai deixar. Filtro que zera a lista sem avisar parece bug.
+          const c = d?.counts || {};
+          const tipo = state.ui.inactivePersonType || "";
+          const rec = Boolean(state.ui.inactiveRecurring);
+          const chip = (ativo, rotulo, acao, cor) => `
+            <button type="button" ${carregando ? "disabled" : ""} onclick="${acao}"
+              style="border:1px solid ${ativo ? cor : "var(--line)"};
+                     background:${ativo ? cor : "#fff"};color:${ativo ? "#fff" : "var(--muted)"};
+                     border-radius:14px;padding:5px 13px;font-size:12px;
+                     font-weight:${ativo ? "700" : "500"};cursor:pointer">
+              ${rotulo}
+            </button>`;
+          return `
+            <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+              <span class="text-small" style="font-weight:700;color:var(--muted)">MOSTRAR</span>
+              ${chip(!tipo, "Todos", "setInativoTipo('')", "#0f3044")}
+              ${chip(tipo === "PJ", `🏭 Oficina (PJ)${c.pj != null ? ` · ${number(c.pj)}` : ""}`,
+                     "setInativoTipo('PJ')", "#0f3044")}
+              ${chip(tipo === "PF", `👤 Balcão (PF)${c.pf != null ? ` · ${number(c.pf)}` : ""}`,
+                     "setInativoTipo('PF')", "#0f3044")}
+              <span style="width:10px"></span>
+              ${chip(rec, `🔁 Comprava todo mês${c.recurring != null ? ` · ${number(c.recurring)}` : ""}`,
+                     "toggleInativoRecorrente()", "#2e7d32")}
+            </div>
+            ${rec ? `
+              <div class="text-small" style="color:var(--muted);margin:-4px 0 10px">
+                Comprou em <strong>${d?.recurringMin || 3} meses ou mais</strong> dos últimos
+                ${d?.recurringMonths || 6}. Tinha hábito e parou — é quem mais vale o telefonema.
+              </div>` : ""}`;
+        })()}
+
         ${carregando ? `
           <div class="message" style="background:rgba(15,48,68,0.07);color:var(--accent);font-weight:600">
             ⏳ Buscando inativos da unidade… a varredura passa pela carteira inteira e pode
@@ -2698,6 +2748,7 @@ function blocoInativosDaUnidade() {
             <table class="table-sticky-actions">
               <thead><tr>
                 <th>Cliente</th><th>Cidade</th><th>Classe</th>
+                <th style="text-align:center">Meses<br>com compra</th>
                 <th style="text-align:right">Média/mês</th><th style="text-align:right">Dias parado</th>
                 <th>Carteira</th><th style="text-align:right">Ações</th>
               </tr></thead>
@@ -2705,9 +2756,16 @@ function blocoInativosDaUnidade() {
                 ${(d.items || []).length ? d.items.map((c) => `
                   <tr>
                     <td><strong>${escapeHtml(c.clientName)}</strong>
+                        <span class="soft-badge" style="margin-left:6px;font-size:10px">${
+                          c.personType === "PJ" ? "🏭 PJ" : "👤 PF"}</span>
                         <div class="text-small" style="color:var(--muted)">${escapeHtml(c.clientKey)}${c.phone ? ` · ${escapeHtml(c.phone)}` : ""}</div></td>
                     <td class="text-small">${escapeHtml([c.cityName, c.neighborhood].filter(Boolean).join(" · ") || "-")}</td>
                     <td class="text-small">${escapeHtml(c.classCode || "-")}</td>
+                    <td style="text-align:center;font-weight:${c.isRecurring ? "800" : "400"};
+                               color:${c.isRecurring ? "#2e7d32" : "var(--muted)"}">
+                      ${number(c.monthsWithPurchase || 0)}${c.isRecurring ? " 🔁" : ""}
+                      <div style="font-size:10px;color:var(--muted);font-weight:400">de ${d?.recurringMonths || 6}</div>
+                    </td>
                     <td style="text-align:right">${currency(c.averageRevenue || 0)}</td>
                     <td style="text-align:right;color:var(--bad);font-weight:700">${number(c.daysWithoutPurchase || 0)}</td>
                     <td class="text-small">
@@ -2721,13 +2779,14 @@ function blocoInativosDaUnidade() {
                         onclick="openCrmClient('${jsAttr(c.clientKey)}', false, true, { outside: true })">Abrir ficha</button>
                     </td>
                   </tr>`).join("")
-                  : '<tr><td colspan="7" class="text-small">Nenhum cliente inativo com esse filtro.</td></tr>'}
+                  : '<tr><td colspan="8" class="text-small">Nenhum cliente inativo com esse filtro.</td></tr>'}
               </tbody>
             </table>
           </div>
           <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
-            Ordenado pela média histórica: quem já comprou mais vale mais o telefonema.
-            Cliente <strong>sem vendedor</strong> é o alvo mais direto — ninguém responde por ele hoje.
+            Ordenado por <strong>meses com compra</strong> e depois pela média: quem tinha
+            hábito e parou volta mais fácil que quem passou uma vez. Cliente
+            <strong>sem vendedor</strong> é o alvo mais direto — ninguém responde por ele hoje.
           </div>
           </div>` : ""}
       ` : ""}
