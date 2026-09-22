@@ -1441,9 +1441,20 @@ def crm_summary_latest_competence(conn: sqlite3.Connection, company_id: int) -> 
     """Competência mais recente nos dados CRM (crm_client_summary).
     Independente da competência do faturamento — permite importar CRM de junho
     mesmo que o faturamento ainda seja de maio."""
+    # MÊS FUTURO NÃO DEFINE O PRESENTE.
+    #
+    # Em 22/09/2026 um consolidado entrou com competência 2029-09 (3.343
+    # linhas, erro de digitação no nome do arquivo). Como este MAX define o c0
+    # de todo o CRM, a média dos 3 meses anteriores passou a somar 2029-08,
+    # 07 e 06 — meses vazios. Resultado: média R$ 0,00 para os 101.269
+    # clientes, todo mundo NAO_CLASSIFICADO, queda sempre zero, e o roteiro,
+    # os inativos e a Missão do Dia ordenando por um campo morto. Nenhuma tela
+    # deu erro. Ignorar o futuro aqui contém qualquer repetição disso.
+    limite = (today_in_brazil().replace(day=1) + timedelta(days=45)).strftime("%Y-%m")
     row = conn.execute(
-        "SELECT MAX(competence) AS competence FROM crm_client_summary WHERE company_id = ?",
-        (company_id,),
+        "SELECT MAX(competence) AS competence FROM crm_client_summary "
+        "WHERE company_id = ? AND competence <= ?",
+        (company_id, limite),
     ).fetchone()
     crm_comp = row["competence"] if row else None
     # Fallback para competência do faturamento se não houver dados CRM
@@ -4766,6 +4777,20 @@ def import_package(
     files_payload: dict[str, bytes] | list[dict[str, Any]],
 ) -> dict[str, Any]:
     import_scope = normalize_import_scope(import_scope)
+    # COMPETÊNCIA NO FUTURO NÃO ENTRA.
+    #
+    # A trava do auto-import olha o NOME do arquivo, e só protege aquele
+    # caminho. Este é o portão por onde passa TODA importação, inclusive a
+    # manual — e foi por ela que um consolidado de 3.343 linhas entrou como
+    # 2029-09 e zerou a média mensal dos 101.269 clientes, sem erro nenhum na
+    # tela. Recusar aqui custa uma linha e cobre os dois caminhos.
+    _limite_futuro = (today_in_brazil().replace(day=1)
+                      + timedelta(days=45)).strftime("%Y-%m")
+    if competence and competence > _limite_futuro:
+        raise ValueError(
+            f"Competência {competence} é no futuro. Provável erro de digitação — "
+            f"confira o mês antes de importar. Mês no futuro quebra o cálculo da "
+            f"média mensal de toda a carteira.")
     selected_file_types = {
         item["fileType"]
         for item in preview.get("files", [])
