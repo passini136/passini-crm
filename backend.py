@@ -14267,6 +14267,18 @@ def crm_base_client_rows(
     aggregate_rows = conn.execute(scope_query, params).fetchall()
     _etapa("cadastro")
 
+    # Quanto do mês corrente já passou, em dias ÚTEIS. Uma vez só: dentro do
+    # laço seriam 101 mil consultas ao calendário, o defeito N+1 que já derrubou
+    # esta tela antes. Mês fechado devolve 1.0 e nada muda.
+    ritmo_do_mes = 1.0
+    if c0 == today_in_brazil().strftime("%Y-%m"):
+        _cal = get_business_calendar(conn, company_id, c0)
+        _total = int(_cal.get("totalWorkingDays") or 0)
+        _decorridos = int(_cal.get("elapsedWorkingDays") or 0)
+        if _total > 0 and _decorridos > 0:
+            ritmo_do_mes = min(_decorridos / _total, 1.0)
+    _etapa("ritmo")
+
     # Precarrega os três mapas de unidade em uma query cada (evita N+1)
     city_unit_map = build_city_unit_map(conn, company_id, c0)
     seller_unit_map = build_seller_unit_map(conn, company_id, c0)
@@ -14455,6 +14467,17 @@ def crm_base_client_rows(
         # inclusive meses sem compra — mede volume médio mensal, não ticket médio).
         # Base: fact_sales_detail, faturamento total do cliente (todos os vendedores).
         average_revenue = sum(previous_revenues) / 3
+        # Comparação PROPORCIONAL ao que já passou do mês.
+        #
+        # A média é de meses INTEIROS; o mês corrente está pela metade. No dia
+        # 22 de setembro, 87% da carteira aparecia "em queda" — e isso não é
+        # comportamento do cliente, é o calendário. No dia 3 seria a carteira
+        # toda, e um alerta que acusa todo mundo não acusa ninguém.
+        #
+        # Por dias ÚTEIS, não corridos: distribuidora de autopeças não fatura
+        # no domingo, e o mês que começa numa sexta não está 10% vencido na
+        # segunda. É a mesma régua que o atingimento projetado da meta já usa.
+        esperado_ate_hoje = average_revenue * ritmo_do_mes
         months_with_purchase = sum(1 for v in previous_revenues if v > 0)
         summary_last_purchase = parse_datetime_flexible(row["last_purchase_at"])
         last_purchase_at = summary_last_purchase
@@ -14463,7 +14486,10 @@ def crm_base_client_rows(
         days_without_purchase = (date.today() - last_purchase_at.date()).days if last_purchase_at else None
         status_code = crm_status_from_days(days_without_purchase)
         class_code = crm_class_from_average(average_revenue)
-        drop_pct = safe_div(current_revenue - average_revenue, average_revenue) if average_revenue else 0.0
+        # A queda mede o realizado contra o ESPERADO até hoje, não contra o mês
+        # cheio. Em mês fechado ritmo_do_mes = 1 e a conta é a de sempre.
+        drop_pct = (safe_div(current_revenue - esperado_ate_hoje, esperado_ate_hoje)
+                    if esperado_ate_hoje else 0.0)
         has_mix_opportunity = current_revenue > 0 and merged_current_sku_count <= 2
         resolved_unit_name = unit_for_client_row(
             row["assigned_seller"], row["city_name"], row["neighborhood"],
@@ -14541,6 +14567,17 @@ def crm_base_client_rows(
                     "divisor": 3,
                     "monthsWithPurchase": months_with_purchase,
                     "formula": "soma dos 3 meses anteriores ÷ 3",
+                },
+                # Memória de cálculo da QUEDA. Sem isto o número fica
+                # inauditável: a pessoa vê "-40%" e não tem como saber que a
+                # comparação é contra o esperado até hoje, não contra o mês
+                # cheio — e conclui que o sistema está errado.
+                "dropBasis": {
+                    "monthProgress": round(ritmo_do_mes, 4),
+                    "expectedSoFar": round(esperado_ate_hoje, 2),
+                    "actual": round(current_revenue, 2),
+                    "formula": ("realizado ÷ (média × parte do mês já decorrida, "
+                                "em dias úteis) − 1"),
                 },
                 "neighborhood": normalize_upper(row["neighborhood"]),
                 "dropPct": round(drop_pct, 4),

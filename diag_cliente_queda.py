@@ -112,6 +112,12 @@ else:
 # média de três meses inteiros acusa queda em quase todo mundo — e aí o bloco
 # vira ruído em vez de alerta. Vale saber o tamanho desse efeito.
 print("\n4) O MÊS EM CURSO ESTÁ INCOMPLETO?")
+_amostra = next((c for c in linhas if c.get("dropBasis")), None)
+if _amostra:
+    _b = _amostra["dropBasis"]
+    print(f"   Parte do mês já decorrida (dias úteis): {_b['monthProgress'] * 100:.0f}%")
+    print("   A queda compara o realizado com a média AJUSTADA a essa fatia,")
+    print("   não com o mês cheio.")
 caindo_todos = sum(1 for c in linhas
                    if float(c.get("averageRevenue") or 0) > 0
                    and float(c.get("dropPct") or 0) <= backend.HIGH_VALUE_DROP_PCT)
@@ -146,16 +152,20 @@ if com_media:
     for _, v in com_media:
         medias = sorted((float(x.get("averageRevenue") or 0) for x in v), reverse=True)
         inflado += sum(medias[1:])   # tudo além do maior é repetição
-    print(f"   {backend.brl(inflado)} de média/mês vinha repetida")
-    print(f"\n   {'NOME':<34}{'CÓDIGOS':>8}{'MÉDIA CADA':>14}")
+    print(f"   {backend.brl(inflado)} de média/mês repetida entre códigos do mesmo nome")
+    if inflado < 1:
+        print("   >> CORRETO: o faturamento ficou com UM código por nome.")
+    else:
+        print("   >> INFLADO: mais de um código do mesmo nome recebeu o valor.")
+    print(f"\n   {'NOME':<34}{'CÓDIGOS':>8}{'DONO DO VALOR':>16}{'OS OUTROS':>12}")
     piores = sorted(com_media,
-                    key=lambda kv: -sum(float(x.get("averageRevenue") or 0)
+                    key=lambda kv: -max(float(x.get("averageRevenue") or 0)
                                         for x in kv[1]))[:10]
     for nome, v in piores:
-        media = float(v[0].get("averageRevenue") or 0)
+        medias = sorted((float(x.get("averageRevenue") or 0) for x in v), reverse=True)
         print(f"   {str(v[0].get('clientName'))[:33]:<34}{len(v):>8}"
-              f"{backend.brl(media):>14}")
-    print("\n   Se todos os códigos do mesmo nome mostrarem a MESMA média, o")
-    print("   faturamento está sendo contado uma vez por código.")
+              f"{backend.brl(medias[0]):>16}{backend.brl(sum(medias[1:])):>12}")
+    print("\n   'OS OUTROS' precisa ser R$ 0,00: o faturamento vem por NOME e")
+    print("   existe uma vez só. Valor ali é dinheiro contado duas vezes.")
 
 conn.close()
