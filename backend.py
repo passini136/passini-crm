@@ -1571,14 +1571,35 @@ def get_connection() -> sqlite3.Connection:
 
 
 def unidade_de_exibicao(conn: sqlite3.Connection, company_id: int, user: Any) -> str:
-    """Unidade da pessoa, para rotular o log. Vazio = enxerga tudo."""
+    """Unidade da pessoa, para rotular e recortar os logs.
+
+    Vem de people_records pelo NOME VINCULADO — a fonte única do sistema —, e
+    não da lista de permissões. A primeira versão usava
+    crm_allowed_units_for_user, que devolve None para vendedor (escopo
+    "proprio") e para a diretoria: a coluna Unidade saía vazia para todo mundo
+    e, pior, o recorte do gerente deixava de filtrar, porque a condição
+    `unidade and ...` era falsa. Ele passava a ver a empresa inteira.
+    """
     try:
+        nome = ""
+        for campo in ("linked_person_name", "full_name"):
+            try:
+                nome = normalize_whitespace(user[campo])
+            except (KeyError, IndexError, TypeError):
+                nome = ""
+            if nome:
+                break
+        if nome:
+            unidade = seller_unit_name(conn, company_id, nome)
+            if unidade:
+                return unidade
+        # Sem pessoa vinculada, tenta o vínculo de unidades do próprio usuário.
         permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas and len(permitidas) == 1:
+            return normalize_unit(permitidas[0])
     except Exception:  # noqa: BLE001
-        return ""
-    if not permitidas:
-        return ""                      # None (diretoria) ou lista vazia
-    return normalize_unit(permitidas[0]) if len(permitidas) == 1 else ""
+        pass
+    return ""
 
 
 def nome_de_exibicao(user: Any) -> str:
@@ -8821,8 +8842,13 @@ def crm_access_log(
         if modo == "proprio" and int(u["id"]) != int(user["id"]):
             continue
         unidade = unidade_de_exibicao(conn, company_id, u)
-        if modo == "unidade" and unidade and unidade not in unidades:
-            continue
+        # FALHA FECHADA: sem unidade resolvida, a pessoa NÃO entra na lista do
+        # gerente. A versão anterior exigia `unidade` para filtrar, então quem
+        # não tinha unidade passava — e como quase ninguém tinha, o gerente
+        # enxergava a empresa toda. Ele sempre se vê, mesmo sem vínculo.
+        if modo == "unidade" and int(u["id"]) != int(user["id"]):
+            if not unidade or unidade not in unidades:
+                continue
         reg = ultimo.get(int(u["id"]))
         dias_sem = None
         if reg and reg["ultimo"]:
@@ -24129,6 +24155,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     )
                     if data:
                         data["isOwnClient"] = not client_is_outside_own_portfolio(
+                            conn, user["company_id"], user, client_key)
+                        # É AQUI que a ficha abre de verdade.
+                        #
+                        # Eu tinha posto o registro em /api/crm/client, que a tela
+                        # não chama: o drawer carrega por /summary. Resultado: o
+                        # log de acessos funcionava e o de fichas ficava vazio,
+                        # parecendo que ninguém tinha aberto cliente nenhum.
+                        registrar_visualizacao_cliente(
                             conn, user["company_id"], user, client_key)
                         # Gestão pode cobrar contato de qualquer cliente da ficha.
                         # A lista de vendedores acompanha para o caso de o cliente
