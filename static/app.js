@@ -14094,7 +14094,8 @@ function crmClientsView() {
                     <td>
                       <div class="table-actions">
                         <button class="btn btn-secondary btn-sm" onclick="openCrmClient('${escapeHtml(item.clientKey)}')">Abrir ficha</button>
-                        <button class="btn btn-ghost btn-sm" onclick="openContactUpdateModal('${escapeHtml(item.clientKey)}')">Atualizar contato</button>
+                        <button class="btn btn-ghost btn-sm btn-icon" title="Atualizar telefone e contato"
+                          onclick="openContactUpdateModal('${escapeHtml(item.clientKey)}')">✏️</button>
                       </div>
                     </td>
                   </tr>

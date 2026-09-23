@@ -609,6 +609,42 @@ button {
   z-index: 3;
 }
 
+/* A coluna de ações ocupa o MÍNIMO possível.
+   Sem isto ela herdava a distribuição normal da tabela, os botões quebravam
+   linha ("Abrir / ficha"), a linha crescia para três alturas e a coluna
+   grudada passava por cima da anterior. `width: 1%` com `nowrap` é o truque
+   padrão para coluna que deve encolher até o conteúdo. */
+.table-sticky-actions th:last-child,
+.table-sticky-actions td:last-child {
+  width: 1%;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.table-sticky-actions td:last-child .table-actions {
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.table-sticky-actions td:last-child .btn {
+  white-space: nowrap;
+}
+
+/* Botão só de ícone para a ação secundária: o rótulo inteiro dobrava a
+   largura da coluna numa tabela que já não cabe na tela. */
+.btn-icon {
+  padding: 6px 9px;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* Nome do cliente é o que identifica a linha — dar espaço a ele reduz a
+   quebra em quatro linhas que inchava a altura da tabela inteira. */
+.table-sticky-actions td:nth-child(2) {
+  min-width: 210px;
+}
+
 .table-sticky-actions tbody tr:nth-child(even) td:last-child {
   background: #fafbfc;
 }
