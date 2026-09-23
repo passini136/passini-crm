@@ -3570,7 +3570,11 @@ function marcasView() {
                     <td style="text-align:right;color:var(--muted)">
                       ${r.revenue ? (b.revenue / r.revenue * 100).toFixed(1) : "0.0"}%
                     </td>
-                    <td></td>
+                    <td style="text-align:right">
+                      ${b.deltaPct !== null && b.deltaPct !== undefined
+                        ? seta(b.deltaPct)
+                        : '<span class="text-small" style="color:var(--muted)">—</span>'}
+                    </td>
                   </tr>`).join("") : ""}`;
               }).join("")
                 || `<tr><td colspan="9">${emptyStateCard("Sem faturamento com marca nesta competência.")}</td></tr>`}
@@ -3610,7 +3614,9 @@ async function exportBrandsXLSX() {
       linhas.push(["", r.brand, b.sellerName || b.unitName || "",
                    b.sellerName ? (b.unitName || "") : "",
                    b.items, b.skus, b.clients, b.revenue,
-                   r.revenue ? Number((b.revenue / r.revenue * 100).toFixed(1)) : 0, "", ""]);
+                   r.revenue ? Number((b.revenue / r.revenue * 100).toFixed(1)) : 0,
+                   b.prevRevenue ?? "",
+                   b.deltaPct ?? ""]);
     });
   });
   const rotulo = d.scope === "vendedor" ? (d.seller || "vendedor")

@@ -13426,13 +13426,24 @@ _DIMENSION_EXPR = {
 def brand_ranking_rows(
     conn: sqlite3.Connection, company_id: int, competence: str,
     vendedores: list[str] | None = None, dimensao: str = "marca",
+    competence_prev: str = "",
 ) -> dict[str, dict[str, Any]]:
-    """Ranking cru de uma competência, indexado pela dimensão escolhida."""
+    """Ranking cru de uma competência, indexado pela dimensão escolhida.
+
+    Com `competence_prev`, traz o mês anterior NA MESMA CONSULTA, por SUM(CASE).
+    Buscar os dois meses separadamente dobraria as idas ao banco — e no detalhe
+    por unidade isso vira uma consulta por unidade por mês. Quantidade, códigos
+    e clientes continuam medindo só o mês atual: eles descrevem o presente, não
+    a comparação.
+    """
     ensure_catalogo_temp(conn, company_id)
     coluna = _DIMENSION_EXPR.get(dimensao, _DIMENSION_EXPR["marca"])
-    onde = ["f.company_id = ?", "f.competence = ?", f"TRIM(COALESCE({coluna},'')) <> ''"]
+    meses = [competence] + ([competence_prev] if competence_prev else [])
+    marc_meses = ",".join("?" for _ in meses)
+    onde = ["f.company_id = ?", f"f.competence IN ({marc_meses})",
+            f"TRIM(COALESCE({coluna},'')) <> ''"]
     # O company_id do catálogo agrupado vem PRIMEIRO: a CTE é lida antes do resto.
-    params: list[Any] = [company_id, competence]
+    params: list[Any] = [company_id, *meses]
     if vendedores is not None:
         if not vendedores:
             return {}
@@ -13441,6 +13452,11 @@ def brand_ranking_rows(
         params.extend(vendedores)
     item = ("COALESCE(NULLIF(f.manufacturer_sku, ''), NULLIF(f.sku_key, ''), "
             "NULLIF(f.gtin_value, ''), 'ITEM')")
+    atual = "f.competence = ?"
+    # Os parâmetros do SELECT vêm ANTES dos do WHERE na ordem de leitura.
+    sel_params = [competence, competence, competence, competence]
+    if competence_prev:
+        sel_params.append(competence_prev)
     return {
         r["chave"]: {
             "brand": r["chave"],
@@ -13448,20 +13464,23 @@ def brand_ranking_rows(
             "skus": int(r["codigos"] or 0),
             "revenue": float(r["valor"] or 0.0),
             "clients": int(r["clientes"] or 0),
+            **({"prevRevenue": float(r["valor_ant"] or 0.0)} if competence_prev else {}),
         }
         for r in conn.execute(
             f"""
             {CATALOGO_AGRUPADO_SQL}
             SELECT {coluna} AS chave,
-                   ROUND(SUM(f.quantity), 0)     AS itens,
-                   COUNT(DISTINCT {item})        AS codigos,
-                   ROUND(SUM(f.net_value), 2)    AS valor,
-                   COUNT(DISTINCT f.client_name) AS clientes
+                   ROUND(SUM(CASE WHEN {atual} THEN f.quantity ELSE 0 END), 0) AS itens,
+                   COUNT(DISTINCT CASE WHEN {atual} THEN {item} END)           AS codigos,
+                   ROUND(SUM(CASE WHEN {atual} THEN f.net_value ELSE 0 END), 2) AS valor,
+                   COUNT(DISTINCT CASE WHEN {atual} THEN f.client_name END)    AS clientes
+                   {", ROUND(SUM(CASE WHEN f.competence = ? THEN f.net_value ELSE 0 END), 2) AS valor_ant"
+                    if competence_prev else ""}
             FROM fact_sales_detail f
             {CATALOGO_JOIN_SQL}
             WHERE {" AND ".join(onde)}
             GROUP BY {coluna}
-            """, params).fetchall()
+            """, [*sel_params, *params]).fetchall()
     }
 
 
@@ -13740,14 +13759,28 @@ def brand_sales_report(
         for un in unidades:
             nomes = sellers_of_unit(conn, company_id, comp, un)
             if nomes:
-                por_unidade[un] = brand_ranking_rows(conn, company_id, comp, nomes, dim)
+                # Os dois meses numa consulta só: buscar separado dobraria as
+                # idas ao banco, uma por unidade por mês.
+                por_unidade[un] = brand_ranking_rows(
+                    conn, company_id, comp, nomes, dim, competence_prev=anterior)
         for r in linhas:
             itens = []
             for un, rank in por_unidade.items():
                 v = rank.get(r["brand"])
                 if v and v["revenue"] > 0:
-                    itens.append({"unitName": un, **{k: v[k] for k in
-                                  ("items", "skus", "revenue", "clients")}})
+                    ant = float(v.get("prevRevenue") or 0.0)
+                    esperado_un = ant * ritmo
+                    itens.append({
+                        "unitName": un,
+                        **{k: v[k] for k in ("items", "skus", "revenue", "clients")},
+                        "prevRevenue": round(ant, 2),
+                        "expectedSoFar": round(esperado_un, 2),
+                        # Mesma régua do resto da tela: contra a fatia
+                        # equivalente do mês anterior, não contra o mês cheio.
+                        "deltaPct": (round(safe_div(v["revenue"] - esperado_un,
+                                                    esperado_un) * 100, 1)
+                                     if esperado_un > 0 else None),
+                    })
             itens.sort(key=lambda x: x["revenue"], reverse=True)
             # Faturamento sem unidade acontece quando o vendedor não está no
             # cadastro de pessoas. Dizer isso é melhor que somar errado.
