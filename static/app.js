@@ -14056,7 +14056,9 @@ function crmClientsView() {
         ${crmFilterToolbar()}
         <div class="table-card">
           <div class="table-wrap">
-            <table>
+            <!-- Carteira é a tabela mais larga do sistema: sem a coluna de ações
+                 grudada, "Abrir ficha" fica fora da tela na rolagem horizontal. -->
+            <table class="table-sticky-actions">
               <thead>
                 <tr>
                   <th>Código</th>

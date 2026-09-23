@@ -426,10 +426,31 @@ button {
   transition: grid-template-columns 0.2s ease;
 }
 
+/* Grid SEM coluna declarada usa `auto`, que estica até caber o conteúdo.
+   Uma tabela larga (Carteira) alargava a coluna, empurrava o conteúdo para
+   fora da tela e escondia as últimas colunas — inclusive o botão de ação. Só
+   recolhendo o menu lateral aparecia, e acontecia em várias telas ao mesmo
+   tempo, porque o defeito é do layout, não da tabela.
+   `minmax(0, 1fr)` prende a coluna à largura disponível e devolve a rolagem
+   horizontal para dentro de .table-wrap, onde a coluna de ações fica grudada. */
 .main {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   min-width: 0;
+}
+
+/* Mesmo motivo, um nível abaixo: sem isto o filho do grid volta a crescer
+   pelo próprio conteúdo (min-width: auto) e anula a trava de cima. */
+.main > *,
+.stack > *,
+.table-card,
+.chart-card {
+  min-width: 0;
+}
+
+.table-wrap {
+  max-width: 100%;
 }
 
 .topbar {
@@ -794,6 +815,7 @@ tbody tr:hover {
 
 .stack {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px;
   min-width: 0;
 }
