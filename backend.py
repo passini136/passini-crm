@@ -8880,6 +8880,101 @@ def crm_access_log(
     }
 
 
+SELLER_WATCH_DAYS = 7
+
+
+def seller_watch_feed(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    dias: int = SELLER_WATCH_DAYS,
+) -> dict[str, Any]:
+    """O que a gestão fez NOS CLIENTES DESTE VENDEDOR, nos últimos dias.
+
+    O texto é factual de propósito — "Fulano (Gerente) abriu a ficha de X" —,
+    e não "a gestão está de olho". O mesmo fato, dito dos dois jeitos, produz
+    comportamentos opostos: o segundo ensina a abrir fichas para aparecer no
+    log, e aí o indicador passa a medir encenação. O primeiro leva o vendedor
+    a se perguntar por que AQUELE cliente chamou atenção.
+
+    Só para vendedor: gestor já tem a tela de Atividade inteira.
+    """
+    vazio = {"items": [], "days": int(dias), "total": 0, "byClient": {}}
+    if data_scope_for_user(conn, user) != "proprio":
+        return vazio
+    eu = seller_identity_for_user(user)
+    cond, params = seller_filter_sql(
+        conn, company_id, eu,
+        "UPPER(TRIM(COALESCE(internal_seller_name,'')))", maiusculas=True)
+    meus = {
+        normalize_client_key(r["client_code"]): normalize_whitespace(r["client_name"])
+        for r in conn.execute(
+            f"SELECT client_code, client_name FROM crm_client_profiles "
+            f"WHERE company_id = ? AND {cond}", (company_id, *params)).fetchall()
+        if r["client_code"]
+    }
+    if not meus:
+        return vazio
+
+    desde = (today_in_brazil() - timedelta(days=int(dias))).isoformat()
+    itens: list[dict[str, Any]] = []
+
+    # 1. Alguém abriu a ficha de um cliente dele. A janela é curta, então filtrar
+    # em Python é mais barato que um IN com milhares de códigos.
+    for r in conn.execute(
+        "SELECT * FROM client_views WHERE company_id = ? AND view_date >= date(?) "
+        "AND user_id <> ? ORDER BY last_at DESC",
+            (company_id, desde, user["id"])).fetchall():
+        chave = normalize_client_key(r["client_key"])
+        if chave not in meus:
+            continue
+        itens.append({
+            "kind": "FICHA", "icon": "👀",
+            "personName": r["person_name"], "role": r["role_label"] or "",
+            "clientKey": r["client_key"], "clientName": meus[chave],
+            "at": r["last_at"], "date": r["view_date"],
+            "text": "abriu a ficha de",
+        })
+
+    # 2. Visita registrada num cliente dele — hoje ele só descobre por conversa.
+    for r in conn.execute(
+        "SELECT * FROM visits WHERE company_id = ? "
+        "AND date(COALESCE(NULLIF(occurred_at,''), scheduled_for, created_at)) >= date(?)",
+            (company_id, desde)).fetchall():
+        chave = normalize_client_key(r["client_key"])
+        if chave not in meus:
+            continue
+        quando = r["occurred_at"] or r["scheduled_for"] or r["created_at"]
+        itens.append({
+            "kind": "VISITA", "icon": "🗺️",
+            "personName": r["manager_name"], "role": "",
+            "clientKey": r["client_key"], "clientName": meus[chave],
+            "at": quando, "date": (quando or "")[:10],
+            "text": ("visitou" if r["status"] == "REALIZADA" else "agendou visita em"),
+        })
+
+    # 3. Tarefa que a gestão criou para ele. `origin = COBRANCA` já marca isso.
+    for r in conn.execute(
+        "SELECT * FROM crm_tasks WHERE company_id = ? AND date(created_at) >= date(?) "
+        "AND origin = 'COBRANCA' AND COALESCE(created_by_user_id, 0) <> ?",
+            (company_id, desde, user["id"])).fetchall():
+        if normalize_client_key(r["seller_name"]) and person_key(r["seller_name"]) != person_key(eu):
+            continue
+        itens.append({
+            "kind": "TAREFA", "icon": "📌",
+            "personName": r["created_by_name"] or "Gestão", "role": "",
+            "clientKey": r["client_key"], "clientName": r["client_name"],
+            "at": r["created_at"], "date": (r["created_at"] or "")[:10],
+            "text": "criou uma tarefa em",
+        })
+
+    itens.sort(key=lambda x: str(x.get("at") or ""), reverse=True)
+    # Índice por cliente: a ficha mostra só o que é dela, sem uma segunda consulta.
+    por_cliente: dict[str, list[dict[str, Any]]] = {}
+    for i in itens:
+        por_cliente.setdefault(normalize_client_key(i["clientKey"]), []).append(i)
+    return {"items": itens[:40], "days": int(dias), "total": len(itens),
+            "byClient": por_cliente}
+
+
 def client_activity_feed(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     dias: int = 7, pessoa: str = "", limite: int = 300,
@@ -24096,6 +24191,15 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json_dumps(data)
                 self._set_headers(200)
                 self.wfile.write(payload)
+                return
+            if path == "/api/crm/watch":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    dados = seller_watch_feed(conn, user["company_id"], user)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
                 return
             if path == "/api/crm/client/views":
                 user = self._require_auth()

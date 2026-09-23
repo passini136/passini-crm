@@ -27,6 +27,7 @@ const state = {
   visitRoute: null,        // roteiro sugerido por proximidade
   atividade: null,         // log de fichas abertas + acessos ao CRM
   atividadeFiltros: { days: 7, person: "" },
+  watch: null,             // o que a gestão fez nos clientes deste vendedor
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -93,6 +94,7 @@ const state = {
       visits: false,
       visitRoute: false,
       atividade: false,
+      watch: false,
       prospects: false,
       territories: false,
       contacts: false,
@@ -7271,6 +7273,7 @@ function crmAgendaView() {
   if (roleIsSeller()) {
     return `
       <div class="stack">
+        ${faixaGestaoOlhou()}
         <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;border:none;padding:20px 24px">
           <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:8px">🎯 MISSÃO DO DIA</div>
           <h3 style="color:#fff;margin:0 0 4px">${firstName(state.user?.fullName || state.user?.username)}, aqui está sua fila de hoje.</h3>
@@ -12218,6 +12221,78 @@ function visitaEditorModal() {
     </div>`;
 }
 
+/* ─── O que a gestão andou olhando ───────────────────────────────────────────
+ *
+ * Faixa na Missão do Dia do vendedor e marca na ficha do cliente. O texto é
+ * factual — "Adailton (Gerente) abriu a ficha de OFICINA X" — e não "a gestão
+ * está acompanhando você": dito do segundo jeito, o recado ensina a abrir
+ * fichas para aparecer no log, e o indicador passa a medir encenação.
+ */
+async function loadWatch() {
+  if (state.ui.loading.watch) return;
+  setLoading("watch", true);
+  try {
+    state.watch = await api("/api/crm/watch");
+  } catch (e) {
+    state.watch = { items: [], total: 0, byClient: {} };
+  } finally {
+    setLoading("watch", false);
+  }
+  requestRender();
+}
+
+function faixaGestaoOlhou() {
+  const w = state.watch;
+  if (!w) { loadWatch(); return ""; }
+  const itens = w.items || [];
+  if (!itens.length) return "";
+
+  const pessoas = [...new Set(itens.map((i) => i.personName).filter(Boolean))];
+  const mostrar = itens.slice(0, 4);
+  return `
+    <div class="panel" style="border-left:4px solid #1a5276;padding:12px 16px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;
+                  gap:10px;flex-wrap:wrap;margin-bottom:6px">
+        <strong style="font-size:14px">👀 Na sua carteira, nos últimos ${w.days} dias</strong>
+        <span class="text-small" style="color:var(--muted)">
+          ${number(w.total)} registro(s)${pessoas.length ? ` · ${escapeHtml(pessoas.slice(0, 3).join(", "))}` : ""}
+        </span>
+      </div>
+      <div class="stack" style="gap:4px">
+        ${mostrar.map((i) => `
+          <div class="text-small">
+            ${i.icon} <strong>${escapeHtml(i.personName)}</strong>${
+              i.role ? ` <span style="color:var(--muted)">(${escapeHtml(i.role)})</span>` : ""}
+            ${escapeHtml(i.text)}
+            <button type="button" class="link-num"
+              onclick="openCrmClient('${jsAttr(i.clientKey)}', false, true, { outside: true })">
+              ${escapeHtml(i.clientName)}</button>
+            <span style="color:var(--muted)">· ${escapeHtml(dataBr(i.date))}</span>
+          </div>`).join("")}
+        ${itens.length > mostrar.length ? `
+          <div class="text-small" style="color:var(--muted)">
+            e mais ${number(itens.length - mostrar.length)} registro(s).
+          </div>` : ""}
+      </div>
+    </div>`;
+}
+
+/** Na ficha: o que a gestão fez NESTE cliente. Sem consulta nova. */
+function marcaGestaoNaFicha(clientKey) {
+  const w = state.watch;
+  if (!w || !clientKey) return "";
+  const chave = String(clientKey).normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().trim();
+  const itens = (w.byClient || {})[chave] || [];
+  if (!itens.length) return "";
+  return `
+    <div class="message" style="background:#eef4fa;color:#0f3044;margin-bottom:10px">
+      ${itens.slice(0, 3).map((i) => `
+        <div>${i.icon} <strong>${escapeHtml(i.personName)}</strong>${
+          i.role ? ` (${escapeHtml(i.role)})` : ""} ${escapeHtml(i.text)} esta oficina
+          · ${escapeHtml(dataBr(i.date))}</div>`).join("")}
+    </div>`;
+}
+
 /* ─── Atividade no CRM ───────────────────────────────────────────────────────
  *
  * Duas perguntas na mesma tela: o que a equipe olhou, e quem não está entrando.
@@ -14088,6 +14163,7 @@ function clientDrawerView() {
         </div>
         ${state.ui.loading.clientDrawer ? `<div class="message success">Carregando ficha do cliente...</div>` : ""}
         ${state.ui.clientDrawerError ? `<div class="message error">Não foi possível abrir a ficha do cliente.</div>` : ""}
+        ${marcaGestaoNaFicha(client.clientCode || client.clientKey || state.crm.selectedClientKey)}
         ${detail ? `
           <div class="stack">
             <div class="subtle-card padded-card">
