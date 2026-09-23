@@ -3481,11 +3481,20 @@ function marcasView() {
           ${escopoAtual === "vendedor" && d.seller ? ` · ${escapeHtml(d.seller)}` : ""}
           ${d.breakdownBy ? ` · clique no <strong>+</strong> para abrir a marca por ${escapeHtml(d.breakdownBy)}` : ""}
         </div>
+        <!-- Sem esta frase o número parece errado: a pessoa confere contra o
+             extrato do mês anterior FECHADO e não bate. -->
+        ${d.monthProgress != null && d.monthProgress < 0.999 ? `
+          <div class="text-small" style="color:#b06000;font-weight:600;margin-top:6px">
+            ⏳ Mês em andamento — ${Math.round(d.monthProgress * 100)}% dos dias úteis.
+            A variação compara o realizado com a MESMA fatia do mês anterior,
+            não com o mês inteiro.
+          </div>` : ""}
       </div>
 
       <div style="display:flex;gap:10px;flex-wrap:wrap">
         ${kpi("Faturamento", currency(t.revenue), t.deltaPct !== null && t.deltaPct !== undefined
-              ? `${seta(t.deltaPct)} vs mês anterior` : "sem base de comparação")}
+              ? `${seta(t.deltaPct)} vs ${d.monthProgress != null && d.monthProgress < 0.999
+                  ? "o mesmo ponto do mês anterior" : "mês anterior"}` : "sem base de comparação")}
         ${kpi(`${rotuloDim}s vendidas`, number(t.brands))}
         ${kpi("Itens vendidos", number(t.items))}
         ${kpi("Códigos distintos", number(t.skus))}

@@ -13688,6 +13688,20 @@ def brand_sales_report(
     total = sum(v["revenue"] for v in agora.values())
     total_antes = sum(v["revenue"] for v in antes.values())
 
+    # Mês em curso não se compara com mês fechado.
+    #
+    # No dia 10 a marca aparecia "caindo 60%" só porque faltavam 20 dias de
+    # faturamento. Para a comparação fazer sentido, o mês anterior entra na
+    # mesma fatia já decorrida — em dias ÚTEIS, que é como a distribuidora
+    # fatura. Mês fechado devolve 1.0 e a conta é a de sempre.
+    ritmo = 1.0
+    if comp == today_in_brazil().strftime("%Y-%m"):
+        _cal = get_business_calendar(conn, company_id, comp)
+        _total_du = int(_cal.get("totalWorkingDays") or 0)
+        _passados = int(_cal.get("elapsedWorkingDays") or 0)
+        if _total_du > 0 and _passados > 0:
+            ritmo = min(_passados / _total_du, 1.0)
+
     linhas = []
     for marca, v in agora.items():
         if v["revenue"] < BRAND_MIN_REVENUE:
@@ -13697,12 +13711,16 @@ def brand_sales_report(
         # percentual: dividir por número negativo inverte o sinal e produz
         # "caiu 59.467%" para uma marca que na verdade subiu.
         comparavel = valor_ant > 0
+        # O esperado até hoje, e não o mês anterior inteiro.
+        esperado = valor_ant * ritmo
         linhas.append({
             **v,
             "share": round(safe_div(v["revenue"], total) * 100, 1),
             "prevRevenue": round(valor_ant, 2),
-            "deltaPct": (round(safe_div(v["revenue"] - valor_ant, valor_ant) * 100, 1)
-                         if comparavel else None),
+            # Quanto a marca já deveria ter vendido a esta altura do mês.
+            "expectedSoFar": round(esperado, 2),
+            "deltaPct": (round(safe_div(v["revenue"] - esperado, esperado) * 100, 1)
+                         if comparavel and esperado > 0 else None),
             "isNew": not comparavel,
         })
     linhas.sort(key=lambda r: r["revenue"], reverse=True)
@@ -13757,6 +13775,10 @@ def brand_sales_report(
     return {
         "competence": comp,
         "prevCompetence": anterior,
+        # Fatia do mês já decorrida, em dias úteis. A tela precisa disso para
+        # explicar contra o que a variação está sendo medida — senão alguém
+        # compara com o extrato do mês anterior fechado e o número não bate.
+        "monthProgress": round(ritmo, 4),
         "dimension": dim,
         "dimensions": BRAND_DIMENSIONS,
         "hasCatalog": tem_catalogo,
@@ -13772,8 +13794,13 @@ def brand_sales_report(
         "totals": {
             "revenue": round(total, 2),
             "prevRevenue": round(total_antes, 2),
-            "deltaPct": (round(safe_div(total - total_antes, total_antes) * 100, 1)
-                         if total_antes else None),
+            # Mesma régua das linhas: o total também se compara com a fatia
+            # equivalente do mês anterior, senão o KPI do topo contradiz a
+            # tabela logo abaixo dele.
+            "expectedSoFar": round(total_antes * ritmo, 2),
+            "deltaPct": (round(safe_div(total - total_antes * ritmo,
+                                        total_antes * ritmo) * 100, 1)
+                         if total_antes * ritmo > 0 else None),
             "brands": len(linhas),
             "items": sum(r["items"] for r in linhas),
             "skus": sum(r["skus"] for r in linhas),
