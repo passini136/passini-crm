@@ -23145,10 +23145,35 @@ def compute_team_activity_today(
     contacts_map = {normalize_whitespace(r["seller_name"]): {"total": int(r["total"]), "active": int(r["active"])} for r in contacts_rows}
     overdue_map = {normalize_whitespace(r["seller_name"]): int(r["overdue"]) for r in tasks_rows}
 
+    # QUEM SAIU DA EMPRESA NÃO ENTRA NA COBRANÇA DO DIA.
+    #
+    # A lista nasce de goals_seller: quem tinha meta no mês continuava aparecendo
+    # depois de desligado, com "0 de 5 contatos" e "nunca registrou contato" —
+    # inflando o painel do gerente com gente que não trabalha mais aqui e
+    # derrubando o percentual da equipe. O desligamento vive em people_records
+    # (`valid_to` anterior ao início da competência), que é a mesma fonte que o
+    # resto do sistema usa.
+    desligados = {
+        person_key(normalize_whitespace(r["person_name"]))
+        for r in conn.execute(
+            "SELECT person_name, MAX(valid_to) AS fim FROM people_records "
+            "WHERE company_id = ? AND valid_to IS NOT NULL AND TRIM(valid_to) <> '' "
+            "GROUP BY person_name", (company_id,)).fetchall()
+        # Contra HOJE, não contra o início da competência.
+        #
+        # A régua do `classify_seller` compara com o começo do mês, e faz
+        # sentido lá: quem saiu dia 15 teve meta e resultado naquele mês. Aqui
+        # o painel é do DIA — quem saiu dia 15 não tem ligação a fazer no dia
+        # 25, e cobrá-lo é ruído puro para o gerente.
+        if r["person_name"] and str(r["fim"])[:10] < date.today().isoformat()
+    }
+
     results = []
     for row in list(seller_rows) + sem_meta:
         seller_name = normalize_whitespace(row["seller_name"])
         if not seller_name:
+            continue
+        if person_key(seller_name) in desligados:
             continue
         # Unidade da meta tem prioridade; people_records é o complemento
         unit = normalize_unit(row["base_unit"]) or seller_unit_map.get(seller_name, "")
