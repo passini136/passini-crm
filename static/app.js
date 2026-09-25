@@ -12384,14 +12384,16 @@ function atividadeView() {
       <div class="table-card">
         <div class="section-title">
           <div><h3>🔑 Acesso ao sistema</h3>
-            <div class="text-small">Quem entrou, e há quantos dias cada um não entra.</div></div>
+            <div class="text-small">Quando cada pessoa usou o CRM pela última vez.
+              Conta qualquer uso, não só o login — a sessão dura 24h e quem já
+              estava dentro não digita senha de novo.</div></div>
         </div>
         <div class="table-wrap">
           <table>
             <thead><tr>
               <th>Pessoa</th><th>Perfil</th><th>Unidade</th>
-              <th style="text-align:right">Último acesso</th>
-              <th style="text-align:right">Entradas (${acesso.windowDays || 30}d)</th>
+              <th style="text-align:right">Último uso</th>
+              <th style="text-align:right">Logins (${acesso.windowDays || 30}d)</th>
             </tr></thead>
             <tbody>
               ${pessoas.length ? pessoas.map((p) => {
@@ -12405,7 +12407,10 @@ function atividadeView() {
                     <td><strong>${escapeHtml(p.personName)}</strong></td>
                     <td class="text-small">${escapeHtml(p.role || "")}</td>
                     <td class="text-small">${escapeHtml(p.unitName || "—")}</td>
-                    <td style="text-align:right;color:${cor};font-weight:700">${texto}</td>
+                    <td style="text-align:right;color:${cor};font-weight:700"
+                        title="${p.lastSeenAt ? `uso: ${escapeHtml(String(p.lastSeenAt).slice(0, 16))}` : "sem uso registrado"}${
+                          p.lastLoginAt ? ` · login: ${escapeHtml(String(p.lastLoginAt).slice(0, 16))}` : ""}">
+                      ${texto}</td>
                     <td style="text-align:right">${number(p.loginsInWindow || 0)}</td>
                   </tr>`;
               }).join("")

@@ -1614,6 +1614,42 @@ def nome_de_exibicao(user: Any) -> str:
     return "—"
 
 
+_presenca_ultima: dict[int, float] = {}
+_presenca_lock = threading.Lock()
+PRESENCA_INTERVALO_SEG = 300   # grava no máximo a cada 5 min por pessoa
+
+
+def registrar_presenca(user: Any) -> None:
+    """Marca que esta pessoa está usando o sistema agora.
+
+    Estrangulado a cada 5 minutos por pessoa: sem isso seria uma escrita por
+    requisição, e a tela de carteira sozinha dispara várias. Com 40 contas, o
+    pior caso vira 40 escritas a cada 5 minutos — irrelevante.
+
+    Nunca derruba a requisição: é registro acessório.
+    """
+    if not user:
+        return
+    try:
+        uid = int(user["id"])
+        agora = time.time()
+        with _presenca_lock:
+            if agora - _presenca_ultima.get(uid, 0.0) < PRESENCA_INTERVALO_SEG:
+                return
+            _presenca_ultima[uid] = agora
+        with closing(get_connection()) as conn:
+            conn.execute(
+                "INSERT INTO user_presence (company_id, user_id, seen_date, "
+                "first_at, last_at, hits) VALUES (?, ?, ?, ?, ?, 1) "
+                "ON CONFLICT(user_id, seen_date) DO UPDATE SET "
+                "last_at = excluded.last_at, hits = hits + 1",
+                (user.get("company_id") if isinstance(user, dict) else user["company_id"],
+                 uid, today_in_brazil().isoformat(), now_iso(), now_iso()))
+            conn.commit()
+    except Exception as erro:  # noqa: BLE001
+        print(f"[presenca] não gravou: {erro}", flush=True)
+
+
 def registrar_visualizacao_cliente(
     conn: sqlite3.Connection, company_id: int, user: Any, client_key: str
 ) -> None:
@@ -3017,6 +3053,26 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_login_events_quando
                 ON login_events(company_id, logged_at DESC);
+
+            -- PRESENÇA, que é diferente de login.
+            --
+            -- A sessão dura 24h: quem entrou ontem às 16h usa o sistema a manhã
+            -- inteira de hoje sem passar pela tela de login. O painel dizia que
+            -- a Gabriely não acessava desde ontem enquanto o gerente a via
+            -- trabalhando. Aqui grava qualquer requisição autenticada, com uma
+            -- linha por pessoa por dia.
+            CREATE TABLE IF NOT EXISTS user_presence (
+                company_id INTEGER,
+                user_id INTEGER NOT NULL,
+                seen_date TEXT NOT NULL,
+                first_at TEXT NOT NULL,
+                last_at TEXT NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY (user_id, seen_date)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_user_presence_dia
+                ON user_presence(company_id, seen_date DESC);
 
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -8825,6 +8881,14 @@ def crm_access_log(
             "FROM login_events WHERE company_id = ? GROUP BY user_id",
             (company_id,)).fetchall()
     }
+    # Uso real, que vale mais que o login: a sessão dura 24h e quem já estava
+    # dentro não gera login novo.
+    presenca = {
+        int(r["user_id"]): r
+        for r in conn.execute(
+            "SELECT user_id, MAX(last_at) AS ultimo, MAX(seen_date) AS dia "
+            "FROM user_presence GROUP BY user_id").fetchall()
+    }
     recentes_por_pessoa = {
         int(r["user_id"]): int(r["n"])
         for r in conn.execute(
@@ -8850,9 +8914,15 @@ def crm_access_log(
             if not unidade or unidade not in unidades:
                 continue
         reg = ultimo.get(int(u["id"]))
+        pres = presenca.get(int(u["id"]))
+        # O MAIS RECENTE entre digitar a senha e usar o sistema. Só o login
+        # fazia quem já estava logado parecer sumido.
+        candidatos = [x for x in (reg["ultimo"] if reg else None,
+                                  pres["ultimo"] if pres else None) if x]
+        visto_em = max(candidatos) if candidatos else ""
         dias_sem = None
-        if reg and reg["ultimo"]:
-            d = parse_datetime_flexible(reg["ultimo"])
+        if visto_em:
+            d = parse_datetime_flexible(visto_em)
             if d:
                 dias_sem = (hoje - d.date()).days
         pessoas.append({
@@ -8860,8 +8930,11 @@ def crm_access_log(
             "personName": nome_de_exibicao(u),
             "role": normalize_whitespace(u["role"]),
             "unitName": unidade,
-            "lastAccessAt": reg["ultimo"] if reg else "",
+            "lastAccessAt": visto_em,
             "daysSinceAccess": dias_sem,
+            # Separado para quem quiser auditar: um é senha, o outro é uso.
+            "lastLoginAt": reg["ultimo"] if reg else "",
+            "lastSeenAt": pres["ultimo"] if pres else "",
             # None = nunca entrou. Zero seria mentira: "entrou hoje".
             "loginsInWindow": recentes_por_pessoa.get(int(u["id"]), 0),
             "totalLogins": int(reg["entradas"]) if reg else 0,
@@ -23360,6 +23433,9 @@ class AppHandler(BaseHTTPRequestHandler):
             self._set_headers(401)
             self.wfile.write(json_dumps({"error": "Sessão expirada"}))
             return None
+        # Porta única por onde passa toda requisição autenticada — é aqui que dá
+        # para saber quem está usando o sistema, e não só quem digitou a senha.
+        registrar_presenca(user)
         return user
 
     # Módulos que caracterizam a área administrativa — basta ter um deles no perfil
