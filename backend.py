@@ -23168,6 +23168,21 @@ def compute_team_activity_today(
         if r["person_name"] and str(r["fim"])[:10] < date.today().isoformat()
     }
 
+    # SEGUNDA FONTE: conta de acesso desativada.
+    #
+    # O processo do Felipe é desativar o usuário E lançar a vigência. Ler as
+    # duas fontes cobre o esquecimento de qualquer uma delas — e o risco de
+    # sobra é pequeno, porque nenhum vendedor ativo trabalha com login
+    # desativado. A vigência continua sendo a fonte de meta e apuração; aqui,
+    # que é a cobrança do dia, vale o que chegar primeiro.
+    for r in conn.execute(
+        "SELECT linked_person_name, full_name FROM users "
+        "WHERE company_id = ? AND is_active = 0", (company_id,)).fetchall():
+        for nome in (r["linked_person_name"], r["full_name"]):
+            chave = person_key(normalize_whitespace(nome)) if nome else ""
+            if chave:
+                desligados.add(chave)
+
     results = []
     for row in list(seller_rows) + sem_meta:
         seller_name = normalize_whitespace(row["seller_name"])
