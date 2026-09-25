@@ -53,10 +53,13 @@ for r in conn.execute(
     if r["person_name"]:
         registros[backend.person_key(r["person_name"])].append(dict(r))
 
+# SEM filtro por company_id, igual ao backend: há conta com company_id nulo ou
+# diferente, e filtrar fazia a conta sumir do diagnóstico — dando a impressão
+# de que a pessoa não tinha login quando tinha.
 contas = defaultdict(list)
 for r in conn.execute(
-    "SELECT username, full_name, linked_person_name, role, is_active "
-    "FROM users WHERE company_id = ?", (company_id,)).fetchall():
+    "SELECT username, full_name, linked_person_name, role, is_active, company_id "
+    "FROM users").fetchall():
     for nome in (r["linked_person_name"], r["full_name"]):
         if nome:
             contas[backend.person_key(nome)].append(dict(r))
@@ -107,7 +110,8 @@ for chave in sorted(alvos)[: (60 if procurado else 0) or len(alvos)]:
     if minhas_contas:
         for c in minhas_contas:
             estado = "ATIVA" if c["is_active"] else "INATIVA"
-            print(f"      conta...: {c['username'][:40]:<42}{estado}  ({c['role']})")
+            emp = "" if c["company_id"] == company_id else f"  ⚠ company_id={c['company_id']}"
+            print(f"      conta...: {c['username'][:40]:<42}{estado}  ({c['role']}){emp}")
     else:
         print("      conta...: nenhuma conta de acesso vinculada")
     if fora:
@@ -128,5 +132,32 @@ for chave in sorted(alvos)[: (60 if procurado else 0) or len(alvos)]:
 if not procurado:
     print("\n   (Acima, só quem o sistema considera desligado. Para investigar")
     print("    alguém específico, rode com o nome: ... diag_pessoas_duplicadas.py marcelo)")
+
+# ── 3. Vigências impossíveis ────────────────────────────────────────────────
+# Saída antes da entrada não é só feio: build_seller_unit_map procura o mês
+# DENTRO do período, e num período invertido nenhum mês casa. A pessoa fica sem
+# unidade em toda competência — e "sem unidade" já causou problema em carteira,
+# meta e ranking nesta base.
+print("\n3) VIGÊNCIAS IMPOSSÍVEIS OU SUSPEITAS")
+problemas = []
+for chave, v in registros.items():
+    for x in v:
+        ini = str(x["valid_from"] or "")[:10]
+        fim = str(x["valid_to"] or "")[:10]
+        if fim and ini and fim < ini:
+            problemas.append((chave, x, f"saída ({fim}) ANTES da entrada ({ini})"))
+        elif ini and ini < "2015-01-01":
+            problemas.append((chave, x, f"entrada em {ini} — data implausível"))
+        elif fim and fim > "2030-01-01":
+            problemas.append((chave, x, f"saída em {fim} — data implausível"))
+if not problemas:
+    print("   Nenhuma. Todas as vigências têm período coerente.")
+else:
+    print(f"   {len(problemas)} registro(s) com período inválido:\n")
+    for chave, x, motivo in problemas:
+        print(f"   {x['person_name'][:44]:<46}{motivo}")
+    print("\n   >> Corrigir no cadastro de pessoas. Enquanto estiver assim, a")
+    print("      pessoa não casa com unidade nenhuma em nenhuma competência —")
+    print("      o que afeta carteira, meta e ranking, não só esta tela.")
 
 conn.close()

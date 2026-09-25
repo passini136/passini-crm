@@ -23184,9 +23184,13 @@ def compute_team_activity_today(
     # sobra é pequeno, porque nenhum vendedor ativo trabalha com login
     # desativado. A vigência continua sendo a fonte de meta e apuração; aqui,
     # que é a cobrança do dia, vale o que chegar primeiro.
+    # SEM filtro por company_id: existe conta com company_id nulo ou divergente,
+    # e filtrar fazia a conta desativada passar despercebida — o desligamento
+    # não surtia efeito e ninguém entendia por quê. A instalação é de uma
+    # empresa só, e o casamento aqui é por NOME, então não há risco de misturar.
     for r in conn.execute(
-        "SELECT linked_person_name, full_name FROM users "
-        "WHERE company_id = ? AND is_active = 0", (company_id,)).fetchall():
+        "SELECT linked_person_name, full_name FROM users WHERE is_active = 0"
+    ).fetchall():
         for nome in (r["linked_person_name"], r["full_name"]):
             chave = person_key(normalize_whitespace(nome)) if nome else ""
             if chave:
