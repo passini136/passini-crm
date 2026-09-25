@@ -3331,6 +3331,38 @@ def competence_window(competence: str | None = None) -> tuple[str, str]:
             last_day_of_competence(competence).isoformat())
 
 
+def pessoa_ja_cadastrada(conn: sqlite3.Connection, company_id: int, nome: str) -> bool:
+    """A pessoa já existe no cadastro, em QUALQUER grafia e vigência?
+
+    Serve para não levantar pendência de "vendedor sem vínculo" duas vezes pela
+    mesma pessoa. A pendência nasce de `current_role_and_unit`, que casa por
+    NOME EXATO e por vigência — então ela dispara em dois casos que não são
+    falta de vínculo:
+
+      1. quem saiu da empresa e ainda aparece no faturamento (devolução,
+         acerto, venda antiga importada depois). A pendência voltava todo mês,
+         e "resolver" criaria vigência nova, ressuscitando o desligado;
+      2. quem está cadastrado com outra grafia. Aqui o estrago era maior:
+         resolver criava MAIS UM cadastro com o nome novo — foi assim que 27 de
+         64 pessoas acabaram com registro repetido.
+
+    Em ambos, o vínculo já foi feito uma vez. O que falta é corrigir a vigência
+    ou associar as grafias, e as duas coisas se fazem em Administração → Equipe.
+    """
+    cache = getattr(conn, "_cache_chaves_pessoas", None)
+    if cache is None:
+        cache = {
+            chave_canonica(conn, company_id, normalize_whitespace(r["person_name"]))
+            for r in conn.execute(
+                "SELECT DISTINCT person_name FROM people_records WHERE company_id = ?",
+                (company_id,)).fetchall()
+            if r["person_name"]
+        }
+        cache.discard("")
+        conn._cache_chaves_pessoas = cache
+    return chave_canonica(conn, company_id, normalize_whitespace(nome)) in cache
+
+
 def current_role_and_unit(conn: sqlite3.Connection, company_id: int, person_name: str, competence: str | None = None) -> tuple[str | None, str | None]:
     inicio, fim = competence_window(competence)
     row = conn.execute(
@@ -5127,7 +5159,10 @@ def import_package(
                     _cache_vendedor[_ck] = current_role_and_unit(
                         conn, company_id, seller_name, row_competence)[0]
                 role = _cache_vendedor[_ck]
-                if role is None:
+                # Só é "sem vínculo" quem o cadastro nunca viu. Ver
+                # pessoa_ja_cadastrada: desligado e grafia diferente têm outro
+                # conserto, e pedir vínculo de novo criava cadastro duplicado.
+                if role is None and not pessoa_ja_cadastrada(conn, company_id, seller_name):
                     register_issue(conn, company_id, import_id, row_competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
                 if city_name:
                     _comp_day = first_day_of_competence(row_competence).isoformat()
@@ -5303,7 +5338,7 @@ def import_package(
                 except sqlite3.IntegrityError:
                     duplicate_rows_skipped += 1
                 role, _ = current_role_and_unit(conn, company_id, seller_name, competence)
-                if role is None:
+                if role is None and not pessoa_ja_cadastrada(conn, company_id, seller_name):
                     register_issue(conn, company_id, import_id, competence, "vendedor_sem_vinculo", seller_name, {"kind": "seller"})
         elif kind == "posicao_estoque":
             # Fotografia por unidade. Cada importação SUBSTITUI o saldo das

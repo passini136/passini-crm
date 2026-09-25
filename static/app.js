@@ -16420,7 +16420,20 @@ function importacoesView() {
   `;
 }
 
-function adminEditorCards() {
+/* Os cards de Administração, agora por ASSUNTO.
+ *
+ * Antes a função devolvia os quatro de uma vez e a aba renderizava todos. Com a
+ * tela de Equipe (que lista, desliga, reclassifica e associa), a Administração
+ * passou a mostrar TRÊS formulários de cadastrar pessoa, DOIS de desligamento e
+ * DOIS de ajustar unidade — cada um escrevendo na mesma tabela por um caminho
+ * diferente. Quem usava não sabia qual era o certo.
+ *
+ * `quais` decide o que entra: "cidade" em Territórios, nada em Equipe (o roster
+ * já faz, e melhor). Os cards continuam existindo para não perder caminho que
+ * alguém use — só deixaram de aparecer onde duplicavam.
+ */
+function adminEditorCards(quais = ["pessoa", "desligamento", "vendedor", "cidade"]) {
+  const mostrar = (id) => quais.includes(id);
   const UNITS = ["MATRIZ", "LAJEADO", "PELOTAS", "ZONA SUL", "ZONA NORTE", "XANGRILA"];
   const unitOptions = UNITS.map((u) => `<option value="${u}">${u}</option>`).join("");
   const people = state.admin?.people || [];
@@ -16442,6 +16455,7 @@ function adminEditorCards() {
   const pendingSellers = [...new Set((state.admin?.salesSellers || []).filter((n) => n && !peopleNames.has(n)))].sort();
   return `
     <div class="grid-2">
+      ${mostrar("pessoa") ? `
       <div class="form-card">
         <div class="section-title">
           <div><h3>Cadastrar pessoa</h3>
@@ -16466,8 +16480,9 @@ function adminEditorCards() {
           Dica: use exatamente o nome que virá do Alfa quando ele começar a faturar — assim o
           histórico dele não fica dividido em dois cadastros.
         </div>
-      </div>
+      </div>` : ""}
 
+      ${mostrar("desligamento") ? `
       <div class="form-card">
         <div class="section-title">
           <div><h3>Desligamento</h3>
@@ -16508,8 +16523,9 @@ function adminEditorCards() {
                 .map((p) => [p.person_name, p])).values()]
               .map((p) => `<span class="status-tag" title="até ${escapeHtml(p.valid_to)}">${escapeHtml(p.person_name)} · ${escapeHtml(String(p.valid_to).slice(0,7))}</span>`).join("")}
           </div>` : ""}
-      </div>
+      </div>` : ""}
 
+      ${mostrar("vendedor") ? `
       <div class="form-card">
         <div class="section-title"><div><h3>Ajustar vendedor × unidade</h3><div class="text-small">Busque o vendedor pelo nome e defina a unidade correta.</div></div></div>
         <div class="two-column-form">
@@ -16532,7 +16548,9 @@ function adminEditorCards() {
         </div>`
           : `<div class="text-small" style="margin-top:10px;color:var(--muted)">Nenhum vendedor sem unidade. ✅</div>`}
         <datalist id="sellers-datalist">${sellerOpts}</datalist>
-      </div>
+      </div>` : ""}
+
+      ${mostrar("cidade") ? `
       <div class="form-card">
         <div class="section-title"><div><h3>Ajustar cidade × unidade</h3><div class="text-small">Busque a cidade pelo nome e defina a unidade correta.</div></div></div>
         <div class="two-column-form">
@@ -16541,7 +16559,7 @@ function adminEditorCards() {
         </div>
         <div class="actions"><button class="btn btn-primary" onclick="submitCityUnit()">Salvar cidade</button></div>
         <datalist id="cities-datalist">${cityOpts}</datalist>
-      </div>
+      </div>` : ""}
     </div>
   `;
 }
@@ -16721,8 +16739,9 @@ administracaoView = function administracaoViewOverride() {
       <div class="stack">
         ${adminSectionNav}
         ${territoriosView()}
-        <!-- Mapeamento de cidades vivia em outra aba, o que fazia procurar em
+        <!-- Cidade × unidade vivia na aba de cadastros, o que fazia procurar em
              dois lugares a mesma pergunta: que unidade atende esta cidade? -->
+        ${adminEditorCards(["cidade"])}
         ${adminTableCard("Cidades já mapeadas (referência)",
           ["city_name", "principal_unit", "valid_from", "valid_to", "source"],
           state.admin.cityMappings || [])}
@@ -16739,19 +16758,27 @@ administracaoView = function administracaoViewOverride() {
       </div>`;
   }
 
-  // EQUIPE — padrão. É a frente que se opera no dia a dia.
+  // EQUIPE — padrão, é a frente que se opera no dia a dia.
+  //
+  // Um caminho por ação: a LISTA resolve desligar, reclassificar e associar
+  // (por pessoa, valendo para todas as grafias); o formulário abaixo serve só
+  // para quem AINDA NÃO existe. Os cards antigos de desligamento e de ajustar
+  // unidade saíram daqui — faziam a mesma coisa por um caminho paralelo, e ter
+  // dois jeitos de desligar foi como um desligamento acabou sem efeito.
+  const pendencias = `${cidadesPendentesEmLote()}${pendingIssueCards()}`.trim();
   return `
     <div class="stack">
       ${associarModal()}
       ${adminSectionNav}
-      ${adminEditorCards()}
-      <div class="form-card">
-        <div class="section-title"><div><h3>Pendências de vínculo</h3>
-          <div class="text-small">Vendedor ou cidade que o importador não conseguiu resolver sozinho.</div></div></div>
-        <div class="stack">${cidadesPendentesEmLote()}${pendingIssueCards()}</div>
-      </div>
+      ${pendencias ? `
+        <div class="form-card" style="border-left:4px solid #e74c3c">
+          <div class="section-title"><div><h3>⚠ Pendências de vínculo</h3>
+            <div class="text-small">Vendedor ou cidade que o importador não conseguiu
+              resolver sozinho. Resolver aqui evita faturamento sem unidade.</div></div></div>
+          <div class="stack">${pendencias}</div>
+        </div>` : ""}
       ${rosterView()}
-      ${personEditorCard()}
+      ${adminEditorCards(["pessoa"])}
     </div>
   `;
 };
@@ -17352,6 +17379,11 @@ function acessosView() {
   `;
 }
 
+/* TERCEIRO formulário de cadastrar pessoa que existia na Administração — os
+ * outros dois estão em adminEditorCards ("Cadastrar pessoa") e na tela de
+ * Equipe. Deixou de ser renderizado em 25/09/2026; fica aqui só porque
+ * `savePerson` ainda é usado por outro caminho. Não devolver à tela sem antes
+ * remover um dos outros dois. */
 function personEditorCard() {
   return `
         <div class="form-card">
