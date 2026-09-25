@@ -66,7 +66,7 @@ const state = {
   teamScore: null,
   missionProgress: { contactsToday: 0 },
   activeTab: "executivo",
-  adminSection: "cadastros",
+  adminSection: "equipe",
   filters: {
     competenceStart: "",
     competenceEnd: "",
@@ -393,6 +393,9 @@ async function setCrmClientDetailTab(tab) {
 }
 
 function setAdminSection(section) {
+  // "cadastros" foi a aba-depósito que deixou de existir; quem tiver o valor
+  // antigo guardado no estado cai na Equipe, que é onde aquele conteúdo foi.
+  if (section === "cadastros") section = "equipe";
   state.adminSection = section;
   if (section === "territorios" && !state.territories && !state.ui.loading.territories) {
     void loadTerritories();
@@ -16676,62 +16679,79 @@ function territoriosView() {
   `;
 }
 
+/* Administração em TRÊS frentes, cada uma com um assunto.
+ *
+ * Eram quatro, e a de "Cadastros e pendências" virou depósito: tinha o cadastro
+ * de pessoas (que a tela de Equipe agora faz com ações), o mapeamento de
+ * cidades (que Territórios já edita), uma tabela de 100 mil clientes sem ação
+ * possível, as pendências de importação (que se resolvem em Importações) e um
+ * card cujo único conteúdo era um link. Cada bloco existia por um motivo, mas
+ * juntos não formavam uma tela — formavam uma gaveta.
+ *
+ * Agora: QUEM (equipe) · ONDE (territórios) · O QUE ACONTECEU (auditoria).
+ */
 administracaoView = function administracaoViewOverride() {
   if (!state.admin) return `<div class="loader panel">Carregando administração...</div>`;
-  const section = state.adminSection || "cadastros";
+  const section = state.adminSection || "equipe";
+  const aba = (id, rotulo, descricao) => `
+    <button class="btn ${section === id ? "btn-primary" : "btn-ghost"}"
+      title="${escapeHtml(descricao)}" onclick="setAdminSection('${id}')">${rotulo}</button>`;
   const adminSectionNav = `
     <div class="form-card">
       <div class="section-title">
         <div>
           <h3>Administração</h3>
-          <div class="text-small">Escolha a frente de governança que deseja operar.</div>
+          <div class="text-small">Três frentes: quem é a equipe, onde ela atende e o que aconteceu no sistema.</div>
         </div>
       </div>
       <div class="actions">
-        <button class="btn ${section === "cadastros" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('cadastros')">Cadastros e pendências</button>
-        <button class="btn ${section === "territorios" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('territorios')">Territórios</button>
-        <button class="btn ${section === "equipe" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('equipe')">Equipe e desligamentos</button>
-        <button class="btn ${section === "auditoria-integridade" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('auditoria-integridade')">Auditoria de Integridade</button>
+        ${aba("equipe", "👥 Equipe", "Cadastrar, desligar, reclassificar e associar pessoas")}
+        ${aba("territorios", "🗺️ Territórios", "Qual unidade atende cada cidade e bairro")}
+        ${aba("auditoria-integridade", "🔍 Auditoria", "Integridade dos dados e histórico de alterações")}
+        ${userCanManageUsers() ? `
+          <span style="flex:1"></span>
+          <button class="btn btn-secondary btn-sm" onclick="switchTab('acessos')">
+            Usuários e Perfis →</button>` : ""}
       </div>
     </div>
   `;
-  if (section === "equipe") {
-    return `<div class="stack">${associarModal()}${adminSectionNav}${rosterView()}</div>`;
-  }
-  if (section === "auditoria-integridade") {
-    return `<div class="stack">${adminSectionNav}${integrityAuditView()}</div>`;
-  }
+
   if (section === "territorios") {
-    return `<div class="stack">${adminSectionNav}${territoriosView()}</div>`;
+    return `
+      <div class="stack">
+        ${adminSectionNav}
+        ${territoriosView()}
+        <!-- Mapeamento de cidades vivia em outra aba, o que fazia procurar em
+             dois lugares a mesma pergunta: que unidade atende esta cidade? -->
+        ${adminTableCard("Cidades já mapeadas (referência)",
+          ["city_name", "principal_unit", "valid_from", "valid_to", "source"],
+          state.admin.cityMappings || [])}
+      </div>`;
   }
+
+  if (section === "auditoria-integridade") {
+    return `
+      <div class="stack">
+        ${adminSectionNav}
+        ${integrityAuditView()}
+        ${adminTableCard("Histórico de alterações",
+          ["entity_type", "action", "entity_id", "created_at"], state.admin.audit)}
+      </div>`;
+  }
+
+  // EQUIPE — padrão. É a frente que se opera no dia a dia.
   return `
     <div class="stack">
+      ${associarModal()}
       ${adminSectionNav}
       ${adminEditorCards()}
       <div class="form-card">
-        <div class="section-title"><div><h3>Pendências</h3><div class="text-small">Resolva vínculos e correspondências sem abrir telas gigantes.</div></div></div>
+        <div class="section-title"><div><h3>Pendências de vínculo</h3>
+          <div class="text-small">Vendedor ou cidade que o importador não conseguiu resolver sozinho.</div></div></div>
         <div class="stack">${cidadesPendentesEmLote()}${pendingIssueCards()}</div>
       </div>
-      ${userCanManageUsers() ? `
-      <div class="form-card">
-        <div class="section-title">
-          <div><h3>Usuários e permissões</h3>
-          <div class="text-small">A gestão de contas e perfis fica em uma tela dedicada.</div></div>
-          <button class="btn btn-primary btn-sm" onclick="switchTab('acessos')">Abrir Usuários e Perfis →</button>
-        </div>
-      </div>` : ""}
-      <div class="grid-2">
-        ${personEditorCard()}
-        ${adminTableCard("Cadastros de pessoas", ["person_name", "role_classification", "base_unit", "valid_from", "valid_to", "source"], state.admin.people)}
-      </div>
-      <div class="grid-2">
-        ${adminTableCard("Base de clientes PF/PJ", ["client_name", "document_number", "person_type", "source", "confidence_score", "notes"], state.admin.clients)}
-        ${adminTableCard("Mapeamento de cidades", ["city_name", "principal_unit", "valid_from", "valid_to", "source"], state.admin.cityMappings || [])}
-      </div>
-      <div class="grid-2">
-        ${adminTableCard("Pendências de importação", ["issue_type", "reference_value", "status", "competence"], state.admin.issues)}
-        ${adminTableCard("Auditoria", ["entity_type", "action", "entity_id", "created_at"], state.admin.audit)}
-      </div>
+      ${rosterView()}
+      ${personEditorCard()}
     </div>
   `;
 };

@@ -21031,7 +21031,11 @@ def list_admin_data(conn: sqlite3.Connection, company_id: int) -> dict[str, Any]
         "accessModules": ACCESS_MODULES,
         "dataScopes": DATA_SCOPES,
         "units": sorted(unidades),
-        "clients": [dict(row) for row in conn.execute("SELECT * FROM client_registry WHERE company_id = ? ORDER BY updated_at DESC, client_name LIMIT 300", (company_id,)).fetchall()],
+        # A tabela "Base de clientes PF/PJ" saiu da Administração em 25/09/2026:
+        # eram 300 linhas sem nenhuma ação possível, num lugar onde ninguém
+        # consultava cliente — para isso existe a Carteira, com busca e filtro.
+        # A chave fica devolvendo lista vazia para não quebrar tela antiga.
+        "clients": [],
         "people": [dict(row) for row in conn.execute("SELECT * FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from DESC", (company_id,)).fetchall()],
         "salesSellers": [row["seller_name"] for row in conn.execute("SELECT DISTINCT seller_name FROM fact_sales_detail WHERE company_id = ? AND seller_name IS NOT NULL AND TRIM(seller_name) <> '' ORDER BY seller_name", (company_id,)).fetchall()],
         "salesCities": [row["city_name"] for row in conn.execute("SELECT DISTINCT city_name FROM fact_sales_detail WHERE company_id = ? AND city_name IS NOT NULL AND TRIM(city_name) <> '' ORDER BY city_name", (company_id,)).fetchall()],
