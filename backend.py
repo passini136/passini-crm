@@ -21454,14 +21454,42 @@ def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, p
         dup = conn.execute("SELECT id FROM users WHERE username = ? AND id <> ?", (username, user_id)).fetchone()
         if dup:
             raise ValueError("Já existe um usuário com esse login.")
+        # DESATIVAR é o caminho para desligar alguém — apagar não é.
+        #
+        # A coluna existia mas nunca era escrita, e a tela não tinha o controle:
+        # quem precisava desligar um vendedor só tinha o botão de excluir, que
+        # leva junto o histórico de acesso, o vínculo com a pessoa e o registro
+        # de auditoria. Pior: sem a conta, o sistema perde a única evidência de
+        # que a pessoa saiu, e ela continua sendo cobrada na Missão do Dia.
+        ativo = payload.get("is_active")
+        ativo = 1 if ativo is None else (1 if ativo else 0)
+        # Não deixar a última conta de administração se trancar para fora.
+        if not ativo:
+            outros_admins = conn.execute(
+                "SELECT COUNT(*) n FROM users u JOIN access_profiles p ON p.id = u.profile_id "
+                "WHERE u.company_id = ? AND u.is_active = 1 AND u.id <> ? "
+                "AND p.can_manage_users = 1", (company_id, user_id)).fetchone()["n"]
+            eu_gerencio = bool(profile_row["can_manage_users"])
+            if eu_gerencio and not outros_admins:
+                raise ValueError(
+                    "Esta é a última conta ativa que pode gerenciar usuários. "
+                    "Desativá-la deixaria o sistema sem administrador.")
         conn.execute(
-            "UPDATE users SET username = ?, full_name = ?, role = ?, profile_id = ?, linked_person_name = ?, linked_units_json = ? WHERE company_id = ? AND id = ?",
-            (username, full_name, role, profile_id, linked_person, linked_units_json, company_id, user_id),
+            "UPDATE users SET username = ?, full_name = ?, role = ?, profile_id = ?, "
+            "linked_person_name = ?, linked_units_json = ?, is_active = ? "
+            "WHERE company_id = ? AND id = ?",
+            (username, full_name, role, profile_id, linked_person, linked_units_json,
+             ativo, company_id, user_id),
         )
+        if not ativo:
+            # Sessão aberta continuaria funcionando por até 24h depois de
+            # desativar — a pessoa desligada seguiria dentro do sistema.
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
         if password:
             pwd_hash, salt = pbkdf2_hash(password)
             conn.execute("UPDATE users SET password_hash = ?, password_salt = ? WHERE company_id = ? AND id = ?", (pwd_hash, salt, company_id, user_id))
-        audit_log(conn, company_id, actor_user_id, "atualizar", "users", str(user_id), {"username": username, "role": role})
+        audit_log(conn, company_id, actor_user_id, "atualizar", "users", str(user_id),
+                  {"username": username, "role": role, "is_active": ativo})
         aplicar_unidade_da_pessoa()
         return {"id": user_id, "created": False}
 

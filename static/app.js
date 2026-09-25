@@ -16848,6 +16848,27 @@ function userEditorCard() {
             <label>${passwordLabel}</label>
             <input id="user-password" type="password" value="${escapeHtml(editor.password || "")}" oninput="state.userEditor.password=this.value" ${editor.id ? "" : "required"} />
           </div>
+
+          <!-- DESATIVAR em vez de apagar.
+               O campo is_active já existia no banco e no editor, mas não tinha
+               controle na tela: quem precisava desligar alguém só tinha o botão
+               de excluir. Apagar leva junto o histórico de acesso, o vínculo com
+               a pessoa e o registro de quem fez o quê — e o sistema perde a
+               única evidência de que a pessoa saiu. -->
+          ${editor.id ? `
+            <div class="field field-span-2">
+              <label>Situação da conta</label>
+              <label class="check-row" style="font-weight:500">
+                <input type="checkbox" ${editor.isActive ? "checked" : ""}
+                  onchange="state.userEditor.isActive=this.checked;requestRender()" />
+                <span>Conta ativa — pode entrar no sistema</span>
+              </label>
+              <div class="text-small" style="color:var(--muted);margin-top:4px">
+                ${editor.isActive
+                  ? "Desmarque para desligar a pessoa: ela perde o acesso, sai da Missão do Dia e da cobrança do gerente, mas o histórico fica preservado."
+                  : "<strong>Conta desativada.</strong> A pessoa não entra no sistema e não aparece mais na cobrança do dia. Marque de novo para reativar."}
+              </div>
+            </div>` : ""}
         </div>
         <div class="actions">
           <button class="btn btn-primary" type="submit">${submitLabel}</button>
@@ -18964,6 +18985,9 @@ async function saveUser(event) {
     linked_units: linkedUnits,
     base_unit: scope === "proprio" ? (editor.baseUnit || "") : "",
     password,
+    // Conta nova nasce ativa; na edição vale o que está na tela. Sem enviar,
+    // desmarcar "conta ativa" não surtia efeito nenhum.
+    is_active: editor.id ? Boolean(editor.isActive) : true,
   };
   try {
     const result = await api("/api/admin/users", { method: "POST", body: JSON.stringify(payload) });
