@@ -6708,6 +6708,34 @@ def count_pending_acknowledgements(conn: sqlite3.Connection, company_id: int, us
     return int(row["n"] or 0)
 
 
+def pending_acknowledgements(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+) -> list[dict[str, Any]]:
+    """As atas que esperam a ciência desta pessoa, com o que ela precisa ver.
+
+    Existe separado do contador porque o aviso precisa dizer QUAL reunião —
+    "você tem 3 pendências" não faz ninguém agir; "Reunião de equipe de 24/09"
+    faz. Mesma regra do contador: ata publicada em que a pessoa consta.
+    """
+    chaves = user_person_keys(user)
+    marcadores = ",".join("?" for _ in chaves) or "''"
+    return [
+        {"id": int(r["id"]), "title": r["title"], "kind": r["kind"],
+         "occurredAt": r["occurred_at"], "unitName": r["unit_name"] or ""}
+        for r in conn.execute(
+            f"""
+            SELECT m.id, m.title, m.kind, m.occurred_at, m.unit_name
+            FROM meeting_participants p
+            JOIN meetings m ON m.id = p.meeting_id
+            WHERE m.company_id = ? AND m.status = 'PUBLICADA'
+              AND (p.user_id = ? OR p.person_key IN ({marcadores}))
+              AND (p.acknowledged_at IS NULL OR p.acknowledged_at = '')
+            ORDER BY datetime(m.occurred_at) DESC
+            """,
+            (company_id, user["id"], *chaves)).fetchall()
+    ]
+
+
 def save_meeting(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -24327,6 +24355,26 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json_dumps(data)
                 self._set_headers(200)
                 self.wfile.write(payload)
+                return
+            if path == "/api/crm/pendencias":
+                user = self._require_auth()
+                if not user:
+                    return
+                # Consulta enxuta de propósito: roda em toda carga do sistema,
+                # para todo mundo. Carregar a tela inteira de reuniões só para
+                # saber se há pendência custaria em cada abertura do CRM.
+                with closing(get_connection()) as conn:
+                    atas = pending_acknowledgements(conn, user["company_id"], user)
+                    fb = count_pending_feedback_ack(conn, user["company_id"], user)
+                    notas = count_pending_note_ack(conn, user["company_id"], user)
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "meetings": atas,
+                    "meetingCount": len(atas),
+                    "feedbackCount": int(fb),
+                    "noteCount": int(notas),
+                    "total": len(atas) + int(fb) + int(notas),
+                }))
                 return
             if path == "/api/crm/watch":
                 user = self._require_auth()

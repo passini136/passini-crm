@@ -28,6 +28,7 @@ const state = {
   atividade: null,         // log de fichas abertas + acessos ao CRM
   atividadeFiltros: { days: 7, person: "" },
   watch: null,             // o que a gestão fez nos clientes deste vendedor
+  pendencias: null,        // atas e feedbacks esperando ciência desta pessoa
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -95,6 +96,7 @@ const state = {
       visitRoute: false,
       atividade: false,
       watch: false,
+      pendencias: false,
       prospects: false,
       territories: false,
       contacts: false,
@@ -755,6 +757,9 @@ async function bootstrap() {
     loadFeedback(true);
     loadVisits(true);
     loadProspects(true);
+    // Consulta própria e enxuta: o aviso de ciência não pode depender de a
+    // tela pesada de reuniões terminar de carregar.
+    loadPendencias();
     // Assistente e tutorial: carregam por último e abrem sozinhos só na
     // primeira entrada daquele perfil.
     loadAssistant(true).then(() => {
@@ -1687,6 +1692,9 @@ async function handleLogin(event) {
     await Promise.all(loginLoads);
     loadPortfolioSummary();
     loadCoverages();
+    loadMeetings(true);
+    loadFeedback(true);
+    loadPendencias();
     if (state.user.role !== "Vendedor") {
       loadAdmin();
       if (placarEnabled()) loadTeamScore();
@@ -12236,6 +12244,101 @@ function visitaEditorModal() {
     </div>`;
 }
 
+/* ─── Pendências de ciência ──────────────────────────────────────────────────
+ *
+ * O contador no menu só aparecia DEPOIS de abrir a tela de Reuniões — quem
+ * nunca entrava lá nunca via que tinha ata esperando ciência. Este aviso é
+ * carregado na abertura do sistema, para todo mundo.
+ *
+ * Aparece UMA VEZ POR DIA por pessoa. Todo dia seria ruído, e ruído a pessoa
+ * aprende a fechar sem ler — que é exatamente o que não se quer numa
+ * confirmação de leitura de ata.
+ */
+function chaveAvisoPendencia() {
+  return `pendencias-vistas-${state.user?.username || "x"}-${new Date().toISOString().slice(0, 10)}`;
+}
+
+async function loadPendencias() {
+  if (state.ui.loading.pendencias) return;
+  setLoading("pendencias", true);
+  try {
+    state.pendencias = await api("/api/crm/pendencias");
+    if ((state.pendencias.total || 0) > 0 && !safeStorageGet(chaveAvisoPendencia())) {
+      state.ui.pendenciaAberta = true;
+    }
+  } catch (e) {
+    state.pendencias = null;
+  } finally {
+    setLoading("pendencias", false);
+  }
+  requestRender();
+}
+
+function fecharPendencias(naoMostrarHoje) {
+  if (naoMostrarHoje) safeStorageSet(chaveAvisoPendencia(), "1");
+  state.ui.pendenciaAberta = false;
+  requestRender();
+}
+
+function irParaPendencia(aba) {
+  // Não marca como visto: a pessoa está indo resolver, não dispensando.
+  state.ui.pendenciaAberta = false;
+  switchTab(aba);
+}
+
+function pendenciasModal() {
+  if (!state.ui.pendenciaAberta) return "";
+  const p = state.pendencias;
+  if (!p || !(p.total > 0)) return "";
+  const atas = p.meetings || [];
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharPendencias(false)">
+      <div class="panel modal-panel" style="max-width:560px;margin:10vh auto;padding:22px"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>✋ Você tem ${number(p.total)} pendência(s) de ciência</h3>
+            <div class="text-small">Dar ciência confirma que você leu — leva um clique.</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharPendencias(false)">Fechar</button>
+        </div>
+
+        ${atas.length ? `
+          <div class="table-card" style="margin-top:12px;padding:0">
+            <div class="text-small" style="font-weight:700;padding:10px 12px 4px">
+              🗓️ Atas de reunião e treinamento
+            </div>
+            <div class="timeline-list">
+              ${atas.slice(0, 6).map((m) => `
+                <div class="timeline-item">
+                  <strong>${escapeHtml(m.title)}</strong>
+                  <div class="text-small" style="color:var(--muted)">
+                    ${escapeHtml(dataBr((m.occurredAt || "").slice(0, 10)))}
+                    ${m.unitName ? ` · ${escapeHtml(m.unitName)}` : ""}
+                  </div>
+                </div>`).join("")}
+              ${atas.length > 6 ? `
+                <div class="timeline-item"><div class="text-small">
+                  e mais ${number(atas.length - 6)} ata(s).</div></div>` : ""}
+            </div>
+          </div>` : ""}
+
+        ${(p.feedbackCount || p.noteCount) ? `
+          <div class="message" style="margin-top:10px">
+            🎯 ${number((p.feedbackCount || 0) + (p.noteCount || 0))} item(ns) de
+            Feedback e PDI também esperam sua ciência.
+          </div>` : ""}
+
+        <div class="actions" style="margin-top:18px;flex-wrap:wrap">
+          ${atas.length ? `<button class="btn btn-primary"
+            onclick="irParaPendencia('reunioes')">Ver as atas agora</button>` : ""}
+          ${(p.feedbackCount || p.noteCount) ? `<button class="btn btn-secondary"
+            onclick="irParaPendencia('feedback')">Ver feedback</button>` : ""}
+          <button class="btn btn-ghost" onclick="fecharPendencias(true)">
+            Depois — não mostrar hoje</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 /* ─── O que a gestão andou olhando ───────────────────────────────────────────
  *
  * Faixa na Missão do Dia do vendedor e marca na ficha do cliente. O texto é
@@ -18369,7 +18472,8 @@ function render() {
   const foco = guardarFoco();
 
   app.innerHTML = (state.user ? dashboardView() : loginView())
-    + confirmacaoFechamentoModal();
+    + confirmacaoFechamentoModal()
+    + pendenciasModal();
 
   // Sem nenhuma sobreposição na tela não há texto pendente para proteger. O
   // reset acontece aqui, e não em cada fecharX(), porque são mais de vinte —
