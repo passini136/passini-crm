@@ -138,26 +138,42 @@ if not procurado:
 # DENTRO do período, e num período invertido nenhum mês casa. A pessoa fica sem
 # unidade em toda competência — e "sem unidade" já causou problema em carteira,
 # meta e ranking nesta base.
-print("\n3) VIGÊNCIAS IMPOSSÍVEIS OU SUSPEITAS")
-problemas = []
+print("\n3) VIGÊNCIAS COM PERÍODO INVERTIDO")
+# SÓ o período invertido é defeito.
+#
+# A primeira versão desta seção também acusava "entrada em 2000-03-01" como
+# problema e dizia que isso quebrava o casamento de unidade. Não quebra: a
+# busca procura o mês DENTRO do período (valid_from <= mês <= valid_to), e
+# entrada antiga casa normalmente — é marcador de "está aqui desde sempre" da
+# carga inicial. O JOSE LUIS XAVIER RAMOS, gerente ativo, tem entrada em 2000 e
+# funciona. Acusar isso mandaria corrigir 13 cadastros à toa.
+invertidos = []
+antigos = 0
 for chave, v in registros.items():
     for x in v:
         ini = str(x["valid_from"] or "")[:10]
         fim = str(x["valid_to"] or "")[:10]
         if fim and ini and fim < ini:
-            problemas.append((chave, x, f"saída ({fim}) ANTES da entrada ({ini})"))
+            invertidos.append((x, ini, fim))
         elif ini and ini < "2015-01-01":
-            problemas.append((chave, x, f"entrada em {ini} — data implausível"))
-        elif fim and fim > "2030-01-01":
-            problemas.append((chave, x, f"saída em {fim} — data implausível"))
-if not problemas:
-    print("   Nenhuma. Todas as vigências têm período coerente.")
+            antigos += 1
+
+if not invertidos:
+    print("   Nenhuma. Todas as vigências têm entrada antes da saída.")
 else:
-    print(f"   {len(problemas)} registro(s) com período inválido:\n")
-    for chave, x, motivo in problemas:
-        print(f"   {x['person_name'][:44]:<46}{motivo}")
-    print("\n   >> Corrigir no cadastro de pessoas. Enquanto estiver assim, a")
-    print("      pessoa não casa com unidade nenhuma em nenhuma competência —")
-    print("      o que afeta carteira, meta e ranking, não só esta tela.")
+    print(f"   {len(invertidos)} registro(s) com saída ANTES da entrada:\n")
+    for x, ini, fim in invertidos:
+        print(f"   {x['person_name'][:44]:<46}{ini} → {fim}")
+    print("\n   >> Corrigir no cadastro. Período invertido não casa com mês")
+    print("      nenhum: se a pessoa ainda estiver ativa, ela fica SEM UNIDADE")
+    print("      em toda competência, o que afeta carteira, meta e ranking.")
+    print("      Nos casos acima, se todos já estão desligados, o efeito hoje")
+    print("      é nenhum — mas o cadastro errado volta a incomodar se a")
+    print("      pessoa for recontratada.")
+
+if antigos:
+    print(f"\n   ({antigos} cadastro(s) com entrada anterior a 2015 — provável")
+    print("    marcador de 'desde sempre' da carga inicial. NÃO é problema:")
+    print("    entrada antiga casa com qualquer mês. Só atrapalha a leitura.)")
 
 conn.close()
