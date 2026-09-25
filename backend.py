@@ -23153,19 +23153,28 @@ def compute_team_activity_today(
     # derrubando o percentual da equipe. O desligamento vive em people_records
     # (`valid_to` anterior ao início da competência), que é a mesma fonte que o
     # resto do sistema usa.
+    # A pessoa só está fora quando NENHUMA vigência dela segue aberta.
+    #
+    # A mesma pessoa tem vários cadastros com sufixos diferentes — "(VENDAS)",
+    # "(TELEVENDAS)", sem sufixo — e trocar de função encerra um e abre outro.
+    # Bastar UMA vigência encerrada para excluir tiraria do painel quem mudou
+    # de função e continua na casa. Vigência aberta em qualquer grafia significa
+    # que a pessoa trabalha aqui.
+    #
+    # E a comparação é contra HOJE, não contra o início da competência: a régua
+    # do `classify_seller` olha o começo do mês, o que faz sentido lá (quem saiu
+    # dia 15 teve meta e resultado naquele mês). Aqui o painel é do DIA.
+    _hoje = date.today().isoformat()
+    _por_pessoa: dict[str, list[str | None]] = defaultdict(list)
+    for r in conn.execute(
+        "SELECT person_name, valid_to FROM people_records WHERE company_id = ?",
+            (company_id,)).fetchall():
+        if r["person_name"]:
+            _por_pessoa[person_key(normalize_whitespace(r["person_name"]))].append(
+                str(r["valid_to"])[:10] if r["valid_to"] else None)
     desligados = {
-        person_key(normalize_whitespace(r["person_name"]))
-        for r in conn.execute(
-            "SELECT person_name, MAX(valid_to) AS fim FROM people_records "
-            "WHERE company_id = ? AND valid_to IS NOT NULL AND TRIM(valid_to) <> '' "
-            "GROUP BY person_name", (company_id,)).fetchall()
-        # Contra HOJE, não contra o início da competência.
-        #
-        # A régua do `classify_seller` compara com o começo do mês, e faz
-        # sentido lá: quem saiu dia 15 teve meta e resultado naquele mês. Aqui
-        # o painel é do DIA — quem saiu dia 15 não tem ligação a fazer no dia
-        # 25, e cobrá-lo é ruído puro para o gerente.
-        if r["person_name"] and str(r["fim"])[:10] < date.today().isoformat()
+        chave for chave, fins in _por_pessoa.items()
+        if fins and all(f for f in fins) and max(fins) < _hoje  # type: ignore[type-var]
     }
 
     # SEGUNDA FONTE: conta de acesso desativada.
