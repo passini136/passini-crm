@@ -16696,7 +16696,7 @@ administracaoView = function administracaoViewOverride() {
     </div>
   `;
   if (section === "equipe") {
-    return `<div class="stack">${adminSectionNav}${rosterView()}</div>`;
+    return `<div class="stack">${associarModal()}${adminSectionNav}${rosterView()}</div>`;
   }
   if (section === "auditoria-integridade") {
     return `<div class="stack">${adminSectionNav}${integrityAuditView()}</div>`;
@@ -16788,6 +16788,103 @@ async function salvarDesligamento(chave, validTo) {
     addMessage("success", r.message);
     await loadRoster();
   } catch (e) { addMessage("error", e.message); }
+}
+
+/* Associar grafias da MESMA pessoa.
+ *
+ * "MATHEUS RODRINEI" e "MATHEUS RODINEI" — um R a mais, venda saiu no nome
+ * errado e depois o cadastro foi corrigido. Para o sistema eram dois
+ * vendedores, dividindo carteira, meta e ranking. */
+function abrirAssociar(chave, nome) {
+  const todos = (state.roster?.people || []).filter((p) => p.personKey !== chave);
+  // Ordena por semelhança: o candidato certo costuma estar a um caractere de
+  // distância, e procurá-lo numa lista de 60 nomes é o que faz desistir.
+  const alvo = normalizarBusca(nome);
+  todos.sort((a, b) => distanciaNome(alvo, normalizarBusca(a.displayName))
+                     - distanciaNome(alvo, normalizarBusca(b.displayName)));
+  state.ui.associar = { chave, nome, candidatos: todos, escolhido: "" };
+  requestRender();
+}
+
+/** Distância aproximada entre nomes — só para ordenar sugestões. */
+function distanciaNome(a, b) {
+  if (a === b) return 0;
+  const m = Math.max(a.length, b.length);
+  let iguais = 0;
+  for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
+    if (a[i] === b[i]) iguais += 1;
+  }
+  return m - iguais;
+}
+
+function fecharAssociar() { state.ui.associar = null; requestRender(); }
+
+async function confirmarAssociar() {
+  const a = state.ui.associar;
+  if (!a || !a.escolhido) return;
+  const certo = (a.candidatos || []).find((c) => c.personKey === a.escolhido);
+  if (!window.confirm(
+    `Associar:\n\n"${a.nome}"  (grafia errada)\npassa a contar para\n"${certo?.displayName}"\n\n`
+    + `O faturamento não é alterado — muda só a leitura. Pode ser desfeito.`)) return;
+  try {
+    const r = await api("/api/admin/roster/merge", {
+      method: "POST",
+      body: JSON.stringify({ aliasKey: a.chave, canonicalKey: a.escolhido }),
+    });
+    addMessage("success", r.message);
+    state.ui.associar = null;
+    await loadRoster();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function associarModal() {
+  const a = state.ui.associar;
+  if (!a) return "";
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharAssociar()">
+      <div class="panel modal-panel" style="max-width:560px;margin:10vh auto;padding:22px"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>Associar grafias da mesma pessoa</h3>
+            <div class="text-small">
+              Use quando a venda saiu com o nome escrito errado e o cadastro foi
+              corrigido depois.
+            </div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharAssociar()">Fechar</button>
+        </div>
+
+        <div class="message" style="margin-top:12px">
+          <strong>${escapeHtml(a.nome)}</strong><br>
+          <span class="text-small">passa a contar para a pessoa escolhida abaixo</span>
+        </div>
+
+        <div class="field" style="margin-top:12px">
+          <label>Grafia correta</label>
+          <select onchange="state.ui.associar.escolhido=this.value;requestRender()">
+            <option value="">Selecione a pessoa…</option>
+            ${(a.candidatos || []).slice(0, 40).map((c) => `
+              <option value="${escapeHtml(c.personKey)}" ${a.escolhido === c.personKey ? "selected" : ""}>
+                ${escapeHtml(c.displayName)}${(c.units || []).length ? ` · ${escapeHtml(c.units.join(", "))}` : ""}
+              </option>`).join("")}
+          </select>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            A lista começa pelos nomes mais parecidos.
+          </div>
+        </div>
+
+        <div class="message" style="margin-top:12px;background:#fef7e0">
+          O faturamento do Alfa <strong>não é alterado</strong> — ele continua fiel ao
+          que veio. O que muda é a leitura: carteira, meta, ranking e ticket passam a
+          somar as duas grafias. Dá para desfazer depois.
+        </div>
+
+        <div class="actions" style="margin-top:16px">
+          <button class="btn btn-primary" ${a.escolhido ? "" : "disabled"}
+            onclick="confirmarAssociar()">Associar</button>
+          <button class="btn btn-ghost" onclick="fecharAssociar()">Cancelar</button>
+        </div>
+      </div>
+    </div>`;
 }
 
 async function reclassificarPessoa(chave, nome, atual) {
@@ -16892,6 +16989,9 @@ function rosterView() {
                           onclick="desligarPessoa('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}')">Desligar</button>`}
                     <button class="btn btn-ghost btn-sm btn-icon" title="Reclassificar"
                       onclick="reclassificarPessoa('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}','${jsAttr((p.roles || [])[0] || "")}')">🏷️</button>
+                    <button class="btn btn-ghost btn-sm btn-icon"
+                      title="É a mesma pessoa que outra da lista — associar as grafias"
+                      onclick="abrirAssociar('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}')">🔗</button>
                   </div>
                 </td>
               </tr>`).join("")

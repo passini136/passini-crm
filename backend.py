@@ -3074,6 +3074,29 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_user_presence_dia
                 ON user_presence(company_id, seen_date DESC);
 
+            -- Mesma pessoa escrita errado no faturamento.
+            --
+            -- "MATHEUS RODRINEI" e "MATHEUS RODINEI" são a mesma pessoa: saiu
+            -- venda com o nome errado, depois o cadastro foi corrigido. O
+            -- person_key normaliza acento e parênteses, mas não conserta
+            -- digitação, então o CRM via dois vendedores e dividia carteira,
+            -- meta e ranking entre eles.
+            --
+            -- A associação vive aqui e é lida por seller_name_variants, que é
+            -- por onde TODA tela resolve nome de vendedor. Assim a correção
+            -- vale em todo lugar sem reescrever o faturamento — o dado do Alfa
+            -- continua fiel ao que veio, e a interpretação é nossa.
+            CREATE TABLE IF NOT EXISTS person_aliases (
+                company_id INTEGER NOT NULL,
+                alias_key TEXT NOT NULL,        -- grafia errada (person_key)
+                canonical_key TEXT NOT NULL,    -- grafia correta (person_key)
+                alias_name TEXT,
+                canonical_name TEXT,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (company_id, alias_key)
+            );
+
             CREATE TABLE IF NOT EXISTS audit_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -7156,6 +7179,39 @@ SELLER_NAME_SOURCES = (
 )
 
 
+def person_alias_map(conn: sqlite3.Connection, company_id: int) -> dict[str, str]:
+    """grafia errada → grafia correta, em person_key. Cache por requisição."""
+    cache = getattr(conn, "_cache_alias_pessoa", None)
+    if cache is not None:
+        return cache
+    mapa: dict[str, str] = {}
+    try:
+        for r in conn.execute(
+            "SELECT alias_key, canonical_key FROM person_aliases WHERE company_id = ?",
+                (company_id,)).fetchall():
+            if r["alias_key"] and r["canonical_key"]:
+                mapa[r["alias_key"]] = r["canonical_key"]
+    except sqlite3.OperationalError:
+        pass
+    conn._cache_alias_pessoa = mapa
+    return mapa
+
+
+def chave_canonica(conn: sqlite3.Connection, company_id: int, nome: str) -> str:
+    """person_key resolvendo a associação de grafias erradas.
+
+    Segue a cadeia (A→B→C) com limite, para uma associação circular feita por
+    engano não travar o sistema.
+    """
+    chave = person_key(nome)
+    mapa = person_alias_map(conn, company_id)
+    vistos = set()
+    while chave in mapa and chave not in vistos:
+        vistos.add(chave)
+        chave = mapa[chave]
+    return chave
+
+
 def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str) -> list[str]:
     """Todas as grafias do mesmo vendedor que existem nas tabelas.
 
@@ -7171,7 +7227,10 @@ def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str)
     juntaria dois "João Silva" diferentes.
     """
     informados = {normalize_whitespace(n) for n in nomes if normalize_whitespace(n)}
-    chaves = {person_key(n) for n in informados}
+    # Resolve pela chave CANÔNICA: grafia errada associada à certa entra no
+    # mesmo balde, e a venda que saiu com o nome errado passa a contar para a
+    # pessoa. Ver person_aliases.
+    chaves = {chave_canonica(conn, company_id, n) for n in informados}
     chaves.discard("")
     if not chaves:
         return []
@@ -7197,7 +7256,7 @@ def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str)
 
     encontrados = set(informados)
     for nome in candidatos:
-        if nome and person_key(nome) in chaves:
+        if nome and chave_canonica(conn, company_id, nome) in chaves:
             encontrados.add(nome)
     if encontrados == informados:
         curtas = {short_person_key(n) for n in informados}
@@ -21395,7 +21454,10 @@ def crm_team_roster(conn: sqlite3.Connection, company_id: int) -> list[dict[str,
         nome = normalize_whitespace(r["person_name"])
         if not nome:
             continue
-        chave = person_key(nome)
+        # Canônica: grafia errada já associada aparece junto da certa, numa
+        # linha só — senão a tela mostra dois "Matheus" e a pessoa não sabe
+        # que já resolveu.
+        chave = chave_canonica(conn, company_id, nome)
         alvo = por_pessoa.setdefault(chave, {
             "personKey": chave, "displayName": nome, "records": [],
             "units": set(), "roles": set(),
@@ -21507,6 +21569,72 @@ def set_person_termination(
                         if reativar else
                         f"Desligamento lançado em {afetados} cadastro(s)."),
             "records": afetados}
+
+
+def merge_person_alias(
+    conn: sqlite3.Connection, company_id: int, actor_user_id: int,
+    alias_key: str, canonical_key: str,
+) -> dict[str, Any]:
+    """Associa uma grafia errada à correta. Não apaga nada.
+
+    O faturamento do Alfa continua como veio — o que muda é a LEITURA: a partir
+    daqui, seller_name_variants devolve as duas grafias juntas, então carteira,
+    meta, ranking e ticket passam a somar a venda que saiu com o nome errado.
+    Reescrever o faturamento seria irreversível e apagaria a evidência do erro.
+    """
+    errada = person_key(alias_key)
+    certa = person_key(canonical_key)
+    if not errada or not certa:
+        raise ValueError("Informe as duas grafias.")
+    if errada == certa:
+        raise ValueError("As duas grafias são a mesma pessoa para o sistema.")
+    # Associação circular deixaria chave_canonica girando até o limite e a
+    # pessoa sem resolução estável.
+    mapa = dict(person_alias_map(conn, company_id))
+    alvo = certa
+    while alvo in mapa:
+        alvo = mapa[alvo]
+        if alvo == errada:
+            raise ValueError(
+                "Isso criaria uma associação circular — a grafia correta já "
+                "aponta para a errada. Desfaça a associação anterior primeiro.")
+
+    nomes = {}
+    for r in conn.execute(
+        "SELECT DISTINCT person_name FROM people_records WHERE company_id = ?",
+            (company_id,)).fetchall():
+        nomes.setdefault(person_key(normalize_whitespace(r["person_name"])),
+                         normalize_whitespace(r["person_name"]))
+    conn.execute(
+        "INSERT INTO person_aliases (company_id, alias_key, canonical_key, "
+        "alias_name, canonical_name, created_by, created_at) VALUES (?,?,?,?,?,?,?) "
+        "ON CONFLICT(company_id, alias_key) DO UPDATE SET "
+        "canonical_key = excluded.canonical_key, created_at = excluded.created_at",
+        (company_id, errada, certa, nomes.get(errada, ""), nomes.get(certa, ""),
+         actor_user_id, now_iso()))
+    audit_log(conn, company_id, actor_user_id, "associar", "person_aliases",
+              errada, {"canonical": certa})
+    conn.commit()
+    conn._cache_alias_pessoa = None
+    invalidate_crm_cache(company_id)
+    return {"message": f"Grafias associadas. O faturamento de "
+                       f"'{nomes.get(errada, errada)}' passa a contar para "
+                       f"'{nomes.get(certa, certa)}'."}
+
+
+def split_person_alias(
+    conn: sqlite3.Connection, company_id: int, actor_user_id: int, alias_key: str
+) -> dict[str, Any]:
+    """Desfaz a associação — a grafia volta a ser tratada como outra pessoa."""
+    errada = person_key(alias_key)
+    conn.execute("DELETE FROM person_aliases WHERE company_id = ? AND alias_key = ?",
+                 (company_id, errada))
+    audit_log(conn, company_id, actor_user_id, "desassociar", "person_aliases",
+              errada, {})
+    conn.commit()
+    conn._cache_alias_pessoa = None
+    invalidate_crm_cache(company_id)
+    return {"message": "Associação desfeita."}
 
 
 def set_person_role(
@@ -26618,7 +26746,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": str(exc)}))
                 return
-            if path in ("/api/admin/roster/termination", "/api/admin/roster/role"):
+            if path in ("/api/admin/roster/termination", "/api/admin/roster/role",
+                        "/api/admin/roster/merge", "/api/admin/roster/split"):
                 user = self._require_auth()
                 if not user:
                     return
@@ -26632,6 +26761,15 @@ class AppHandler(BaseHTTPRequestHandler):
                                 conn, user["company_id"], user["id"],
                                 payload.get("personKey") or "",
                                 payload.get("validTo") or "")
+                        elif path.endswith("/merge"):
+                            res = merge_person_alias(
+                                conn, user["company_id"], user["id"],
+                                payload.get("aliasKey") or "",
+                                payload.get("canonicalKey") or "")
+                        elif path.endswith("/split"):
+                            res = split_person_alias(
+                                conn, user["company_id"], user["id"],
+                                payload.get("aliasKey") or "")
                         else:
                             res = set_person_role(
                                 conn, user["company_id"], user["id"],
