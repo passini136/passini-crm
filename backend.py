@@ -21378,6 +21378,164 @@ def delete_user_record(conn: sqlite3.Connection, company_id: int, actor_user_id:
 ALLOWED_USER_ROLES = {"Administrador", "Gerente", "Analista", "Vendedor"}
 
 
+def crm_team_roster(conn: sqlite3.Connection, company_id: int) -> list[dict[str, Any]]:
+    """Quem o CRM reconhece como pessoa da equipe, e por quê.
+
+    Existe porque "desligar alguém" não tinha tela: o vínculo mora em
+    people_records, com várias grafias por pessoa, e a única saída era mexer no
+    banco. Aqui cada PESSOA aparece uma vez — as grafias vêm juntas — com a
+    situação que o sistema enxerga e o efeito prático dela.
+    """
+    hoje = today_in_brazil().isoformat()
+    por_pessoa: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        "SELECT person_name, role_classification, base_unit, valid_from, valid_to "
+        "FROM people_records WHERE company_id = ? ORDER BY person_name, valid_from",
+            (company_id,)).fetchall():
+        nome = normalize_whitespace(r["person_name"])
+        if not nome:
+            continue
+        chave = person_key(nome)
+        alvo = por_pessoa.setdefault(chave, {
+            "personKey": chave, "displayName": nome, "records": [],
+            "units": set(), "roles": set(),
+        })
+        # O nome mais curto vira o de exibição: é o sem sufixo de função.
+        if len(nome) < len(alvo["displayName"]):
+            alvo["displayName"] = nome
+        alvo["records"].append({
+            "personName": nome,
+            "role": normalize_whitespace(r["role_classification"]),
+            "unitName": normalize_unit(r["base_unit"]),
+            "validFrom": str(r["valid_from"] or "")[:10],
+            "validTo": str(r["valid_to"] or "")[:10],
+        })
+        if r["base_unit"]:
+            alvo["units"].add(normalize_unit(r["base_unit"]))
+        if r["role_classification"]:
+            alvo["roles"].add(normalize_whitespace(r["role_classification"]))
+
+    # Contas de acesso, para a tela mostrar se a pessoa ainda entra no sistema.
+    # SEM filtro de company_id — ver o comentário em compute_team_activity_today.
+    contas: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in conn.execute(
+        "SELECT username, full_name, linked_person_name, is_active FROM users"
+    ).fetchall():
+        for nome in (r["linked_person_name"], r["full_name"]):
+            if nome:
+                contas[person_key(normalize_whitespace(nome))].append(
+                    {"username": r["username"], "active": bool(r["is_active"])})
+
+    saida = []
+    for chave, p in por_pessoa.items():
+        fins = [x["validTo"] for x in p["records"]]
+        tem_aberta = any(not f for f in fins)
+        ultimo_fim = max([f for f in fins if f], default="")
+        # Mesma régua do painel: fora só quem não tem NENHUMA vigência aberta.
+        desligado = (not tem_aberta) and bool(ultimo_fim) and ultimo_fim < hoje
+        minhas = contas.get(chave, [])
+        saida.append({
+            **{k: v for k, v in p.items() if k not in ("units", "roles")},
+            "units": sorted(p["units"]),
+            "roles": sorted(p["roles"]),
+            "isSeller": any("VENDEDOR" in normalize_upper(x) for x in p["roles"]),
+            "terminated": desligado,
+            "terminatedAt": ultimo_fim if desligado else "",
+            "hasOpenPeriod": tem_aberta,
+            "accounts": minhas,
+            "hasActiveAccount": any(a["active"] for a in minhas),
+            "invertedPeriod": any(
+                x["validTo"] and x["validFrom"] and x["validTo"] < x["validFrom"]
+                for x in p["records"]),
+        })
+    saida.sort(key=lambda x: (x["terminated"], not x["isSeller"], x["displayName"]))
+    return saida
+
+
+def set_person_termination(
+    conn: sqlite3.Connection, company_id: int, actor_user_id: int,
+    person_key_alvo: str, data_saida: str,
+) -> dict[str, Any]:
+    """Desliga (ou reativa) a pessoa em TODAS as grafias do cadastro.
+
+    Mexer numa grafia só foi exatamente o que fez um desligamento não surtir
+    efeito: a pessoa tem até três cadastros e basta um aberto para ela seguir
+    ativa. Aqui a ação vale para todas de uma vez.
+    """
+    alvo = person_key(person_key_alvo)
+    if not alvo:
+        raise ValueError("Pessoa não informada.")
+    reativar = not normalize_whitespace(data_saida)
+    if not reativar:
+        try:
+            date.fromisoformat(data_saida[:10])
+        except ValueError:
+            raise ValueError("Data de saída inválida. Use o formato AAAA-MM-DD.")
+
+    afetados = 0
+    for r in conn.execute(
+        "SELECT id, person_name, valid_from, valid_to FROM people_records "
+        "WHERE company_id = ?", (company_id,)).fetchall():
+        if person_key(normalize_whitespace(r["person_name"])) != alvo:
+            continue
+        if reativar:
+            if not r["valid_to"]:
+                continue
+            conn.execute("UPDATE people_records SET valid_to = NULL WHERE id = ?",
+                         (r["id"],))
+        else:
+            # Data de saída antes da entrada gera período impossível: a pessoa
+            # deixa de casar com qualquer competência e some das telas por um
+            # motivo que ninguém entende. Nesse caso, encerra na própria entrada.
+            fim = data_saida[:10]
+            inicio = str(r["valid_from"] or "")[:10]
+            if inicio and fim < inicio:
+                fim = inicio
+            if str(r["valid_to"] or "")[:10] == fim:
+                continue
+            conn.execute("UPDATE people_records SET valid_to = ? WHERE id = ?",
+                         (fim, r["id"]))
+        afetados += 1
+    if not afetados:
+        raise ValueError("Nenhum cadastro para alterar — a situação já é essa.")
+    audit_log(conn, company_id, actor_user_id,
+              "reativar" if reativar else "desligar", "people_records", alvo,
+              {"validTo": None if reativar else data_saida[:10], "records": afetados})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": (f"{afetados} cadastro(s) reabertos."
+                        if reativar else
+                        f"Desligamento lançado em {afetados} cadastro(s)."),
+            "records": afetados}
+
+
+def set_person_role(
+    conn: sqlite3.Connection, company_id: int, actor_user_id: int,
+    person_key_alvo: str, novo_papel: str,
+) -> dict[str, Any]:
+    """Reclassifica a pessoa em todas as grafias (Vendedor, Gerente, Outro…)."""
+    alvo = person_key(person_key_alvo)
+    papel = normalize_whitespace(novo_papel)
+    if not alvo or not papel:
+        raise ValueError("Informe a pessoa e a nova classificação.")
+    afetados = 0
+    for r in conn.execute(
+        "SELECT id, person_name FROM people_records WHERE company_id = ?",
+            (company_id,)).fetchall():
+        if person_key(normalize_whitespace(r["person_name"])) == alvo:
+            conn.execute("UPDATE people_records SET role_classification = ? WHERE id = ?",
+                         (papel, r["id"]))
+            afetados += 1
+    if not afetados:
+        raise ValueError("Pessoa não encontrada no cadastro.")
+    audit_log(conn, company_id, actor_user_id, "reclassificar", "people_records",
+              alvo, {"role": papel, "records": afetados})
+    conn.commit()
+    invalidate_crm_cache(company_id)
+    return {"message": f"{afetados} cadastro(s) reclassificados como {papel}.",
+            "records": afetados}
+
+
 def upsert_user(conn: sqlite3.Connection, company_id: int, actor_user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     """Cria ou atualiza um usuário. Faz o hash da senha quando informada."""
     username = normalize_whitespace(payload.get("username"))
@@ -24437,6 +24595,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(payload)
                 return
+            if path == "/api/admin/roster":
+                user = self._require_auth()
+                if not user:
+                    return
+                if not self._require_admin_area(user):
+                    return
+                with closing(get_connection()) as conn:
+                    itens = crm_team_roster(conn, user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"people": itens}))
+                return
             if path == "/api/crm/pendencias":
                 user = self._require_auth()
                 if not user:
@@ -26447,6 +26616,35 @@ class AppHandler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     traceback.print_exc()
                     self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                return
+            if path in ("/api/admin/roster/termination", "/api/admin/roster/role"):
+                user = self._require_auth()
+                if not user:
+                    return
+                if not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        if path.endswith("/termination"):
+                            res = set_person_termination(
+                                conn, user["company_id"], user["id"],
+                                payload.get("personKey") or "",
+                                payload.get("validTo") or "")
+                        else:
+                            res = set_person_role(
+                                conn, user["company_id"], user["id"],
+                                payload.get("personKey") or "",
+                                payload.get("role") or "")
+                    self._set_headers(200)
+                    self.wfile.write(json_dumps({"ok": True, **res}))
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                except Exception as exc:  # noqa: BLE001
+                    traceback.print_exc()
+                    self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(exc)}))
                 return
             if path == "/api/admin/users/password":

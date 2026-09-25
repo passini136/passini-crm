@@ -29,6 +29,7 @@ const state = {
   atividadeFiltros: { days: 7, person: "" },
   watch: null,             // o que a gestão fez nos clientes deste vendedor
   pendencias: null,        // atas e feedbacks esperando ciência desta pessoa
+  roster: null,            // quem o CRM reconhece como equipe (Administração)
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -97,6 +98,7 @@ const state = {
       atividade: false,
       watch: false,
       pendencias: false,
+      roster: false,
       prospects: false,
       territories: false,
       contacts: false,
@@ -16688,10 +16690,14 @@ administracaoView = function administracaoViewOverride() {
       <div class="actions">
         <button class="btn ${section === "cadastros" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('cadastros')">Cadastros e pendências</button>
         <button class="btn ${section === "territorios" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('territorios')">Territórios</button>
+        <button class="btn ${section === "equipe" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('equipe')">Equipe e desligamentos</button>
         <button class="btn ${section === "auditoria-integridade" ? "btn-primary" : "btn-ghost"}" onclick="setAdminSection('auditoria-integridade')">Auditoria de Integridade</button>
       </div>
     </div>
   `;
+  if (section === "equipe") {
+    return `<div class="stack">${adminSectionNav}${rosterView()}</div>`;
+  }
   if (section === "auditoria-integridade") {
     return `<div class="stack">${adminSectionNav}${integrityAuditView()}</div>`;
   }
@@ -16729,6 +16735,181 @@ administracaoView = function administracaoViewOverride() {
     </div>
   `;
 };
+
+/* ─── Equipe reconhecida pelo CRM ────────────────────────────────────────────
+ *
+ * Desligar alguém não tinha tela: o vínculo mora em people_records, cada pessoa
+ * tem até três grafias, e a única saída era mexer no banco. Aqui cada PESSOA
+ * aparece uma vez, com o que o sistema enxerga dela e o efeito prático — e a
+ * ação vale para todas as grafias de uma vez, que é onde o desligamento manual
+ * falhava.
+ */
+/** Maiúsculas e sem acento dos dois lados — a mesma lição da base de leads. */
+function normalizarBusca(valor) {
+  return String(valor || "").normalize("NFD")
+    .replace(/[̀-ͯ]/g, "").toUpperCase().trim();
+}
+
+async function loadRoster() {
+  if (state.ui.loading.roster) return;
+  setLoading("roster", true);
+  requestRender();
+  try {
+    state.roster = await api("/api/admin/roster");
+  } catch (e) {
+    state.roster = { error: e.message, people: [] };
+  } finally {
+    setLoading("roster", false);
+  }
+  requestRender();
+}
+
+async function desligarPessoa(chave, nome) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const data = window.prompt(
+    `Desligar "${nome}".\n\n`
+    + `A data de saída será lançada em TODOS os cadastros dele — é isso que\n`
+    + `faz a pessoa sair da Missão do Dia e da cobrança do gerente.\n\n`
+    + `Data de saída (AAAA-MM-DD):`, hoje);
+  if (!data) return;
+  await salvarDesligamento(chave, data.trim());
+}
+
+async function reativarPessoa(chave, nome) {
+  if (!window.confirm(`Reativar "${nome}"? Ele volta a aparecer na Missão do Dia.`)) return;
+  await salvarDesligamento(chave, "");
+}
+
+async function salvarDesligamento(chave, validTo) {
+  try {
+    const r = await api("/api/admin/roster/termination", {
+      method: "POST", body: JSON.stringify({ personKey: chave, validTo }),
+    });
+    addMessage("success", r.message);
+    await loadRoster();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function reclassificarPessoa(chave, nome, atual) {
+  const papel = window.prompt(
+    `Como o CRM deve tratar "${nome}"?\n\n`
+    + `Vendedor  — entra na Missão do Dia, carteira, meta e ranking\n`
+    + `Gerente   — gestão da unidade, sem meta individual\n`
+    + `Outro     — não aparece nas telas comerciais\n\n`
+    + `Classificação:`, atual || "Vendedor");
+  if (!papel) return;
+  try {
+    const r = await api("/api/admin/roster/role", {
+      method: "POST", body: JSON.stringify({ personKey: chave, role: papel.trim() }),
+    });
+    addMessage("success", r.message);
+    await loadRoster();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function rosterView() {
+  if (!state.roster) { loadRoster(); return '<div class="loader panel">Carregando equipe…</div>'; }
+  if (state.roster.error) return `<div class="message error">${escapeHtml(state.roster.error)}</div>`;
+  const todos = state.roster.people || [];
+  const f = state.ui.rosterFiltro || "ativos";
+  const busca = normalizarBusca(state.ui.rosterBusca || "");
+
+  const lista = todos.filter((p) => {
+    if (f === "ativos" && p.terminated) return false;
+    if (f === "desligados" && !p.terminated) return false;
+    if (f === "vendedores" && (!p.isSeller || p.terminated)) return false;
+    if (busca && !normalizarBusca(p.displayName).includes(busca)) return false;
+    return true;
+  });
+
+  const chip = (id, rotulo, n) => `
+    <button type="button" onclick="state.ui.rosterFiltro='${id}';requestRender()"
+      style="border:1px solid ${f === id ? "#0f3044" : "var(--line)"};
+             background:${f === id ? "#0f3044" : "#fff"};color:${f === id ? "#fff" : "var(--muted)"};
+             border-radius:14px;padding:5px 13px;font-size:12px;
+             font-weight:${f === id ? "700" : "500"};cursor:pointer">${rotulo} · ${number(n)}</button>`;
+
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div><h3>👥 Equipe reconhecida pelo CRM</h3>
+          <div class="text-small">
+            É esta lista que alimenta Missão do Dia, carteira, meta e ranking.
+            Quem está aqui como Vendedor e ativo é cobrado todo dia.
+          </div></div>
+        ${botaoAtualizar("roster", "loadRoster()", { mensagem: "Equipe atualizada." })}
+      </div>
+
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:10px 0">
+        ${chip("ativos", "Ativos", todos.filter((p) => !p.terminated).length)}
+        ${chip("vendedores", "Vendedores ativos", todos.filter((p) => p.isSeller && !p.terminated).length)}
+        ${chip("desligados", "Desligados", todos.filter((p) => p.terminated).length)}
+        ${chip("todos", "Todos", todos.length)}
+        <input style="flex:1;min-width:180px" placeholder="Buscar por nome"
+          value="${escapeHtml(state.ui.rosterBusca || "")}"
+          oninput="state.ui.rosterBusca=this.value;requestRender()" />
+      </div>
+
+      <div class="table-wrap">
+        <table class="table-sticky-actions">
+          <thead><tr>
+            <th>Pessoa</th><th>Classificação</th><th>Unidade</th>
+            <th>Situação</th><th>Acesso</th><th style="text-align:right">Ações</th>
+          </tr></thead>
+          <tbody>
+            ${lista.length ? lista.map((p) => `
+              <tr>
+                <td>
+                  <strong>${escapeHtml(p.displayName)}</strong>
+                  ${p.records.length > 1 ? `
+                    <div class="text-small" style="color:var(--muted)">
+                      ${p.records.length} cadastros:
+                      ${p.records.map((r) => escapeHtml(r.personName)).join(" · ")}
+                    </div>` : ""}
+                  ${p.invertedPeriod ? `
+                    <div class="text-small" style="color:var(--bad);font-weight:600">
+                      ⚠ período invertido no cadastro — corrigir
+                    </div>` : ""}
+                </td>
+                <td class="text-small">${escapeHtml((p.roles || []).join(", ") || "—")}</td>
+                <td class="text-small">${escapeHtml((p.units || []).join(", ") || "—")}</td>
+                <td class="text-small">
+                  ${p.terminated
+                    ? `<span class="status-tag">desligado em ${escapeHtml(dataBr(p.terminatedAt))}</span>`
+                    : '<span class="status-tag good">ativo</span>'}
+                </td>
+                <td class="text-small">
+                  ${(p.accounts || []).length
+                    ? p.accounts.map((a) => `${escapeHtml(a.username)}${a.active ? "" : " (inativa)"}`).join(", ")
+                    : '<span style="color:var(--muted)">sem conta</span>'}
+                </td>
+                <td style="text-align:right;white-space:nowrap">
+                  <div class="table-actions">
+                    ${p.terminated
+                      ? `<button class="btn btn-ghost btn-sm"
+                          onclick="reativarPessoa('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}')">Reativar</button>`
+                      : `<button class="btn btn-secondary btn-sm"
+                          onclick="desligarPessoa('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}')">Desligar</button>`}
+                    <button class="btn btn-ghost btn-sm btn-icon" title="Reclassificar"
+                      onclick="reclassificarPessoa('${jsAttr(p.personKey)}','${jsAttr(p.displayName)}','${jsAttr((p.roles || [])[0] || "")}')">🏷️</button>
+                  </div>
+                </td>
+              </tr>`).join("")
+              : '<tr><td colspan="6" class="text-small">Ninguém com esse filtro.</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="text-small" style="color:var(--muted);margin-top:10px;line-height:1.6">
+        <strong>Desligar</strong> lança a data de saída em todos os cadastros da pessoa —
+        é o que faz ela sair da Missão do Dia. Desativar a conta de acesso tem o mesmo
+        efeito, mas <strong>apagar a conta não</strong>: sem conta, o sistema perde a
+        evidência e a pessoa continua sendo cobrada.<br>
+        <strong>Reclassificar</strong> muda como o CRM trata a pessoa: só quem está como
+        <em>Vendedor</em> entra na cobrança diária, na carteira e no ranking.
+      </div>
+    </div>`;
+}
 
 function userEditorCard() {
   const profiles = accessProfiles();
