@@ -23758,30 +23758,62 @@ def resultados_concentracao(
                 for r in conn.execute(sql, params).fetchall() if r["chave"]}
 
     atual, ant = mapa(par_a), mapa(par_b)
-    deltas = [(k, atual.get(k, 0.0) - ant.get(k, 0.0))
-              for k in set(atual) | set(ant)
-              if atual.get(k, 0.0) > 0 or ant.get(k, 0.0) > 0]
-    if not deltas:
+    itens = []
+    for k in set(atual) | set(ant):
+        a, b = atual.get(k, 0.0), ant.get(k, 0.0)
+        if a <= 0 and b <= 0:
+            continue
+        itens.append({"name": k, "delta": a - b,
+                      "pct": (100 * (a - b) / b) if b else None})
+    if not itens:
         return {}
-    caiu = sorted([d for d in deltas if d[1] < 0], key=lambda x: x[1])
-    subiu = [d for d in deltas if d[1] > 0]
-    queda_total = sum(abs(d[1]) for d in caiu)
-    top2 = sum(abs(d[1]) for d in caiu[:2])
-    liquido = sum(d[1] for d in deltas)
+    caiu = sorted([i for i in itens if i["delta"] < 0], key=lambda x: x["delta"])
+    subiu = [i for i in itens if i["delta"] > 0]
+    queda_total = sum(abs(i["delta"]) for i in caiu)
+    top2 = sum(abs(i["delta"]) for i in caiu[:2])
+    liquido = sum(i["delta"] for i in itens)
+
+    # A LEITURA VEM DO PERCENTUAL, NÃO DO VALOR ABSOLUTO.
+    #
+    # Medir concentração por reais faz a maior unidade liderar sempre: a Matriz
+    # cai R$ 290 mil e as outras R$ 60 mil, e o painel conclui "problema da
+    # Matriz". Mas em setembro/2026 as quatro caíram entre 10% e 15% — queda
+    # uniforme, que é sinal de mercado, estoque ou calendário, e pede ação
+    # sistêmica. Apontar a Matriz mandaria o gestor conversar com quem não tem
+    # nada de diferente dos outros.
+    pcts = sorted(i["pct"] for i in caiu if i["pct"] is not None)
+    mediana = pcts[len(pcts) // 2] if pcts else 0.0
+    # Quantos caíram MUITO mais que a mediana de quem caiu.
+    destoam = [i for i in caiu
+               if i["pct"] is not None and mediana < 0 and i["pct"] <= mediana * 1.8]
+    maioria_caiu = len(caiu) >= max(2, len(itens) * 0.6)
+    uniforme = bool(pcts) and (max(pcts) - min(pcts)) <= 12  # pontos percentuais
+
+    if maioria_caiu and uniforme:
+        leitura, acao = "uniforme", "sistemica"
+    elif destoam and len(destoam) <= 2:
+        leitura, acao = "concentrada", "individual"
+    elif maioria_caiu:
+        leitura, acao = "espalhada", "sistemica"
+    else:
+        leitura, acao = "mista", "mista"
+
     return {
         "label": rotulo,
-        "total": len(deltas),
+        "total": len(itens),
         "down": len(caiu),
         "up": len(subiu),
         "netChange": round(liquido, 2),
         "dropTotal": round(queda_total, 2),
-        # Quanto da queda está em apenas dois nomes. Acima de 60% a conversa é
-        # individual; abaixo de 40% é de processo, e a ação é outra.
         "top2SharePct": round(100 * top2 / queda_total, 1) if queda_total else 0.0,
-        "top2": [{"name": k, "delta": round(v, 2)} for k, v in caiu[:2]],
-        "reading": ("concentrada" if queda_total and top2 / queda_total >= 0.6
-                    else "espalhada" if queda_total and top2 / queda_total <= 0.4
-                    else "mista"),
+        "top2": [{"name": i["name"], "delta": round(i["delta"], 2),
+                  "pct": round(i["pct"], 1) if i["pct"] is not None else None}
+                 for i in caiu[:2]],
+        "medianDropPct": round(mediana, 1),
+        "spreadPct": round(max(pcts) - min(pcts), 1) if pcts else 0.0,
+        "outliers": [{"name": i["name"], "pct": round(i["pct"], 1)} for i in destoam[:3]],
+        "reading": leitura,
+        "actionKind": acao,
     }
 
 
@@ -23842,8 +23874,28 @@ def resultados_causas(
                 par = nomes
         sql_v = (f"SELECT seller_name chave, SUM(net_value) v FROM fact_vendor_summary "
                  f"WHERE company_id = ? AND competence = ?{onde} GROUP BY seller_name")
-        causas["vendedor"] = variacao(soma(sql_v, [company_id, competencia, *par]),
-                                      soma(sql_v, [company_id, anterior, *par]))
+        vendedores = variacao(soma(sql_v, [company_id, competencia, *par]),
+                              soma(sql_v, [company_id, anterior, *par]))
+        # QUEM SAIU DA EMPRESA NÃO É QUEDA DE DESEMPENHO.
+        #
+        # Em setembro/2026 o Cristian (-87%) e o Marcelo (-75%) lideravam a
+        # lista de "quem deixou de faturar" — os dois estavam desligados. Sem a
+        # marca, a reunião discute um problema que não existe e não enxerga que
+        # aquele faturamento precisa ser REDISTRIBUÍDO, que é outra ação.
+        saidas = {
+            person_key(normalize_whitespace(r["person_name"])): str(r["fim"])[:10]
+            for r in conn.execute(
+                "SELECT person_name, MAX(valid_to) fim FROM people_records "
+                "WHERE company_id = ? AND valid_to IS NOT NULL AND TRIM(valid_to) <> '' "
+                "GROUP BY person_name", (company_id,)).fetchall()
+            if r["person_name"]
+        }
+        fim_mes = last_day_of_competence(competencia).isoformat()
+        for v in vendedores:
+            saida = saidas.get(person_key(v["name"]))
+            if saida and saida <= fim_mes:
+                v["leftAt"] = saida
+        causas["vendedor"] = vendedores
 
     # 3. Por MARCA e por LINHA — o que a oficina deixou de comprar. É a causa
     # que mais vira ação concreta: falta de estoque, preço, ou concorrente que

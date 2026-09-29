@@ -113,18 +113,42 @@ print("\n4) CONCENTRAÇÃO — a média esconde isto")
 conc = backend.resultados_concentracao(conn, company_id, nivel, alvo, ultimo, anterior)
 if conc:
     print(f"   {conc['down']} de {conc['total']} {conc['label']} caíram "
-          f"({conc['up']} subiram)")
-    print(f"   Variação líquida: {backend.brl(conc['netChange'])}")
-    print(f"   Os 2 maiores respondem por {conc['top2SharePct']:.0f}% da queda:")
+          f"({conc['up']} subiram) · líquido {backend.brl(conc['netChange'])}")
+    print(f"   Queda mediana {conc['medianDropPct']:.0f}% · "
+          f"amplitude {conc['spreadPct']:.0f} pontos percentuais")
+    print(f"\n   Maiores quedas em REAIS ({conc['top2SharePct']:.0f}% do total):")
     for t in conc["top2"]:
-        print(f"      {str(t['name'])[:34]:<36}{backend.brl(t['delta']):>14}")
+        pct = f"{t['pct']:+.0f}%" if t["pct"] is not None else "—"
+        print(f"      {str(t['name'])[:32]:<34}{backend.brl(t['delta']):>14}  {pct}")
+    if conc["outliers"]:
+        print("\n   Quem caiu MUITO mais que os outros:")
+        for o in conc["outliers"]:
+            print(f"      {str(o['name'])[:32]:<34}{o['pct']:+.0f}%")
     leitura = {
-        "concentrada": "CONCENTRADA — é conversa individual, não problema da empresa.",
-        "espalhada": "ESPALHADA — todo mundo caiu junto; a causa é de processo,\n"
-                     "      mercado ou estoque, e a ação tem de ser sistêmica.",
-        "mista": "MISTA — há um caso grave E um movimento geral.",
+        "uniforme": ("UNIFORME — caíram todos na mesma proporção. Isso NÃO é\n"
+                     "      problema de quem caiu mais em reais: é mercado, estoque,\n"
+                     "      calendário ou preço. A ação tem de ser sistêmica."),
+        "concentrada": ("CONCENTRADA — um ou dois destoam do resto. A conversa é\n"
+                        "      individual, e o restante da equipe não precisa ser cobrado."),
+        "espalhada": ("ESPALHADA — a maioria caiu, mas em proporções diferentes.\n"
+                      "      Vale olhar causa comum E os piores casos."),
+        "mista": "MISTA — parte caiu, parte subiu. Ver caso a caso.",
     }
     print(f"\n   >> Queda {leitura[conc['reading']]}")
-    print("      Essa distinção muda a AÇÃO, que é o ponto do FCA.")
+
+# ── 5. Quem saiu da empresa não é queda ─────────────────────────────────────
+print("\n5) DESLIGADOS NA LISTA DE QUEDA")
+saiu = [i for i in causas.get("vendedor", []) if i.get("leftAt") and i["delta"] < 0]
+if saiu:
+    total_saiu = sum(abs(i["delta"]) for i in saiu)
+    print(f"   {len(saiu)} vendedor(es) desligado(s) somam {backend.brl(total_saiu)}")
+    for i in saiu:
+        print(f"      {str(i['name'])[:32]:<34}{backend.brl(i['delta']):>14}"
+              f"   saiu em {i['leftAt']}")
+    print("\n   >> Isso NÃO é queda de desempenho — é carteira sem dono. A ação é")
+    print("      REDISTRIBUIR, não cobrar. Sem essa marca a reunião discutiria")
+    print("      um problema que não existe.")
+else:
+    print("   Nenhum desligado entre as quedas.")
 
 conn.close()
