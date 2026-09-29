@@ -30,6 +30,8 @@ const state = {
   watch: null,             // o que a gestão fez nos clientes deste vendedor
   pendencias: null,        // atas e feedbacks esperando ciência desta pessoa
   roster: null,            // quem o CRM reconhece como equipe (Administração)
+  resultados: null,        // painel de resultados da reunião mensal (FCA)
+  resultadosFiltros: { level: "empresa", target: "", competence: "" },
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -99,6 +101,7 @@ const state = {
       watch: false,
       pendencias: false,
       roster: false,
+      resultados: false,
       prospects: false,
       territories: false,
       contacts: false,
@@ -12416,6 +12419,219 @@ function marcaGestaoNaFicha(clientKey) {
     </div>`;
 }
 
+/* ─── Painel de Resultados (FCA) ─────────────────────────────────────────────
+ *
+ * Feito para a reunião mensal, não para consulta solta: a tela abre pelo que
+ * FUGIU do esperado, explica com nomes, e só depois mostra a série. A ordem
+ * importa — painel que começa pelo gráfico faz a reunião descrever o mês em vez
+ * de decidir o que fazer.
+ */
+async function loadResultados() {
+  if (state.ui.loading.resultados) return;
+  setLoading("resultados", true);
+  requestRender();
+  try {
+    const q = new URLSearchParams();
+    q.set("level", state.resultadosFiltros.level || "empresa");
+    if (state.resultadosFiltros.target) q.set("target", state.resultadosFiltros.target);
+    if (state.resultadosFiltros.competence) q.set("competence", state.resultadosFiltros.competence);
+    state.resultados = await api(`/api/resultados?${q.toString()}`);
+    state.resultadosFiltros.level = state.resultados.level;
+    state.resultadosFiltros.target = state.resultados.target || "";
+  } catch (e) {
+    state.resultados = { error: e.message };
+  } finally {
+    setLoading("resultados", false);
+  }
+  requestRender();
+}
+
+function setResultadoNivel(level, target) {
+  state.resultadosFiltros.level = level;
+  state.resultadosFiltros.target = target || "";
+  state.resultadosFiltros.competence = "";
+  void loadResultados();
+}
+
+function formatoIndicador(v, f) {
+  if (v === null || v === undefined) return "—";
+  if (f === "moeda") return currency(v);
+  if (f === "pct") return `${Number(v).toFixed(2)}%`;
+  if (f === "mult") return `${Number(v).toFixed(3)}x`;
+  return number(Math.round(v));
+}
+
+function resultadosView() {
+  if (!state.resultados) { loadResultados(); return '<div class="loader panel">Montando o painel…</div>'; }
+  const d = state.resultados;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  const serie = d.series || [];
+  const fatos = d.facts?.facts || [];
+  const conc = d.concentration || {};
+  const f = state.resultadosFiltros;
+  const atual = serie.find((r) => r.competence === d.facts.competence) || serie[serie.length - 1];
+  if (!atual) return '<div class="message">Sem competência com resultado.</div>';
+
+  const leituras = {
+    saidas: { cor: "#8a6100", fundo: "#fef7e0", titulo: "Queda explicada por saídas",
+      texto: "A maior parte não é desempenho: é carteira que ficou sem dono. Antes de investigar preço, estoque ou mercado, redistribua." },
+    uniforme: { cor: "#a4262c", fundo: "#fdecea", titulo: "Queda uniforme",
+      texto: "Caíram todos na mesma proporção. Não é problema de quem caiu mais em reais — é mercado, estoque, calendário ou preço. A ação precisa ser sistêmica." },
+    concentrada: { cor: "#8a6100", fundo: "#fef7e0", titulo: "Queda concentrada",
+      texto: "Um ou dois destoam do resto. A conversa é individual; o restante da equipe não precisa ser cobrado." },
+    espalhada: { cor: "#a4262c", fundo: "#fdecea", titulo: "Queda espalhada",
+      texto: "A maioria caiu, em proporções diferentes. Vale olhar causa comum e também os piores casos." },
+    mista: { cor: "#0f3044", fundo: "#eef4fa", titulo: "Movimento misto",
+      texto: "Parte caiu, parte subiu. Ver caso a caso." },
+  };
+  const leitura = leituras[conc.reading];
+
+  const cartaoFato = (x) => `
+    <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;
+                border-left:5px solid ${x.worse ? (x.severity === "alta" ? "var(--bad)" : "#e0a800") : "var(--good)"}">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+        <strong style="font-size:13px">${x.worse ? "▼" : "▲"} ${escapeHtml(x.label)}</strong>
+        <span style="font-weight:800;font-size:15px;color:${x.worse ? "var(--bad)" : "var(--good)"}">
+          ${x.variationPct > 0 ? "+" : ""}${x.variationPct.toFixed(1)}%</span>
+      </div>
+      <div class="text-small" style="margin-top:4px">
+        ${formatoIndicador(x.value, x.format)} contra ${formatoIndicador(x.reference, x.format)}
+      </div>
+      <div class="text-small" style="color:var(--muted)">${escapeHtml(x.referenceLabel)}</div>
+    </div>`;
+
+  const blocoCausa = (rotulo, itens) => {
+    const piores = (itens || []).filter((i) => i.delta < 0).slice(0, 6);
+    if (!piores.length) return "";
+    return `
+      <div class="table-card" style="padding:12px 14px">
+        <div style="font-weight:800;font-size:13px;margin-bottom:6px">Por ${escapeHtml(rotulo)}</div>
+        ${piores.map((i) => `
+          <div style="display:flex;justify-content:space-between;gap:8px;padding:5px 0;
+                      border-bottom:1px solid var(--line);font-size:12px">
+            <span>${escapeHtml(String(i.name))}
+              ${i.leftAt ? `<span class="status-tag" style="margin-left:4px">saiu ${escapeHtml(dataBr(i.leftAt))}</span>` : ""}</span>
+            <span style="white-space:nowrap;color:var(--bad);font-weight:700">
+              ${currency(i.delta)}${i.variationPct !== null ? ` <span style="font-weight:400;color:var(--muted)">${i.variationPct.toFixed(0)}%</span>` : ""}
+            </span>
+          </div>`).join("")}
+      </div>`;
+  };
+
+  const maxFat = Math.max(...serie.map((r) => Math.max(r.revenueNet, r.revenueGoal || 0)), 1);
+
+  return `
+    <div class="stack">
+      <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;
+                                border:none;padding:18px 22px">
+        <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:4px">PAINEL DE RESULTADOS</div>
+        <h3 style="color:#fff;margin:0 0 8px">
+          ${escapeHtml(d.level === "empresa" ? "Passini — consolidado"
+            : d.level === "unidade" ? d.target : d.target)}
+          · ${escapeHtml(d.facts.competence)}
+        </h3>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          ${d.canChooseCompany ? `
+            <button class="btn btn-sm ${f.level === "empresa" ? "btn-primary" : "btn-ghost"}"
+              onclick="setResultadoNivel('empresa','')"
+              style="${f.level === "empresa" ? "" : "background:rgba(255,255,255,.15);color:#fff;border:none"}">
+              Empresa</button>` : ""}
+          ${(d.units || []).map((u) => `
+            <button class="btn btn-sm ${f.level === "unidade" && f.target === u ? "btn-primary" : "btn-ghost"}"
+              onclick="setResultadoNivel('unidade','${jsAttr(u)}')"
+              style="${f.level === "unidade" && f.target === u ? "" : "background:rgba(255,255,255,.15);color:#fff;border:none"}">
+              ${escapeHtml(u)}</button>`).join("")}
+          <span style="flex:1"></span>
+          <select onchange="state.resultadosFiltros.competence=this.value;loadResultados()"
+            style="background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.25);
+                   border-radius:6px;padding:5px 9px;font-size:12px">
+            ${serie.map((r) => `<option value="${r.competence}" ${r.competence === d.facts.competence ? "selected" : ""}
+              style="color:#0f3044">${r.competence}</option>`).reverse().join("")}
+          </select>
+        </div>
+      </div>
+
+      ${d.facts.monthProgress < 0.999 ? `
+        <div class="message" style="background:#fef7e0;color:#8a6100">
+          ⏳ Mês em andamento — ${Math.round(d.facts.monthProgress * 100)}% dos dias úteis.
+          As comparações de volume estão ajustadas a essa fatia.
+        </div>` : ""}
+
+      ${leitura ? `
+        <div class="panel" style="background:${leitura.fundo};border-left:5px solid ${leitura.cor};padding:14px 18px">
+          <div style="font-weight:800;font-size:15px;color:${leitura.cor}">${escapeHtml(leitura.titulo)}</div>
+          <div style="font-size:13px;margin-top:4px">${escapeHtml(leitura.texto)}</div>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            ${conc.down} de ${conc.total} ${escapeHtml(conc.label)} caíram ·
+            queda mediana ${conc.medianDropPct}% · amplitude ${conc.spreadPct} pontos
+            ${conc.departuresSharePct ? ` · <strong>${conc.departuresSharePct}% da queda é de quem saiu</strong>` : ""}
+          </div>
+        </div>` : ""}
+
+      <div>
+        <div class="section-title"><div><h3>1. Fato — o que fugiu do esperado</h3>
+          <div class="text-small">Comparado com a meta e com a média dos ${d.facts.comparedWith} meses anteriores.</div></div></div>
+        ${fatos.length ? `
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px">
+            ${fatos.map(cartaoFato).join("")}
+          </div>`
+        : '<div class="message" style="background:#e6f4ea;color:#1e6b34">✅ Nenhum desvio relevante no período.</div>'}
+      </div>
+
+      <div>
+        <div class="section-title"><div><h3>2. Causa — quem puxou</h3>
+          <div class="text-small">Variação contra ${escapeHtml(d.previousCompetence || "—")},
+            ordenada pelo que mais MUDOU (não pelo que é maior).</div></div></div>
+        <div class="grid-2">
+          ${blocoCausa("unidade", d.causes?.unidade)}
+          ${blocoCausa("vendedor", d.causes?.vendedor)}
+          ${blocoCausa("marca", d.causes?.marca)}
+          ${blocoCausa("linha de produto", d.causes?.linha)}
+        </div>
+      </div>
+
+      <div class="table-card">
+        <div class="section-title"><div><h3>3. Série histórica</h3>
+          <div class="text-small">Faturamento contra meta, mês a mês.</div></div></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Mês</th><th style="text-align:right">Líquido</th><th style="text-align:right">Meta</th>
+              <th style="text-align:right">%</th><th style="text-align:right">Dev. comercial</th>
+              <th style="text-align:right">Ticket</th><th style="text-align:right">Clientes</th>
+              <th style="width:120px"></th>
+            </tr></thead>
+            <tbody>
+              ${serie.slice().reverse().map((r) => `
+                <tr style="${r.competence === d.facts.competence ? "background:#eef4fa;font-weight:600" : ""}">
+                  <td>${escapeHtml(r.competence)}</td>
+                  <td style="text-align:right">${currency(r.revenueNet)}</td>
+                  <td style="text-align:right;color:var(--muted)">${r.revenueGoal ? currency(r.revenueGoal) : "—"}</td>
+                  <td style="text-align:right;font-weight:700;color:${
+                    r.attainmentPct === null ? "var(--muted)"
+                    : r.attainmentPct >= 95 ? "var(--good)" : r.attainmentPct >= 80 ? "#b06000" : "var(--bad)"}">
+                    ${r.attainmentPct === null ? "—" : `${r.attainmentPct.toFixed(0)}%`}</td>
+                  <td style="text-align:right">${currency(r.returnsCommercial)}
+                    <div style="font-size:10px;color:var(--muted)">${r.returnRatioPct.toFixed(2)}%</div></td>
+                  <td style="text-align:right">${currency(r.ticketAverage)}</td>
+                  <td style="text-align:right">${number(r.clients)}</td>
+                  <td>
+                    <div style="background:#eef2f5;border-radius:4px;height:14px;overflow:hidden">
+                      <div style="width:${Math.min(100, r.revenueNet / maxFat * 100)}%;height:100%;
+                                  background:${r.attainmentPct !== null && r.attainmentPct < 80 ? "#e74c3c" : "#5b9bd5"}"></div>
+                    </div>
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Devolução comercial já exclui garantia. Mês sem meta cadastrada aparece com "—".
+        </div>
+      </div>
+    </div>`;
+}
+
 /* ─── Atividade no CRM ───────────────────────────────────────────────────────
  *
  * Duas perguntas na mesma tela: o que a equipe olhou, e quem não está entrando.
@@ -18607,6 +18823,7 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
+    { id: "resultados", title: "Painel de Resultados", desc: "Fato, causa e ação", icon: "🎯" },
     { id: "executivo",  title: "Executivo",  desc: "Panorama e KPIs",          icon: "📊" },
     { id: "vendedores", title: "Vendedores", desc: "Ranking e score",           icon: "👤" },
     { id: "unidades",   title: "Unidades",   desc: "Comparativo",               icon: "🏢" },
@@ -18741,6 +18958,7 @@ function dashboardView() {
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "novidades"     ? novidadesView()      : ""}
           ${state.activeTab === "atividade"     ? atividadeView()      : ""}
+          ${state.activeTab === "resultados"    ? resultadosView()     : ""}
           ${state.activeTab === "reunioes"      ? reunioesView()       : ""}
           ${state.activeTab === "feedback"      ? feedbackView()       : ""}
           ${state.activeTab === "visitas"       ? visitasView()        : ""}

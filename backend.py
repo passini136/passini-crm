@@ -256,6 +256,7 @@ ACCESS_MODULES: list[dict[str, str]] = [
     {"id": "feedback",       "label": "Feedback e PDI",      "group": "Equipe"},
     {"id": "atividade",      "label": "Atividade no CRM",    "group": "Equipe"},
     # Resultados — o diário visível, o ocasional recolhido em Análises
+    {"id": "resultados",     "label": "Painel de Resultados","group": "Resultados"},
     {"id": "executivo",      "label": "Executivo",          "group": "Resultados"},
     {"id": "vendedores",     "label": "Vendedores",         "group": "Resultados"},
     {"id": "unidades",       "label": "Unidades",           "group": "Resultados"},
@@ -310,7 +311,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "modules": [
             "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "novidades", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback", "atividade",
-            "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
+            "resultados", "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
         "data_scope": "unidade_consolidado",
         "can_manage_users": 0,
@@ -25364,6 +25365,51 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json_dumps(data)
                 self._set_headers(200)
                 self.wfile.write(payload)
+                return
+            if path == "/api/resultados":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                nivel = normalize_whitespace(query.get("level", ["empresa"])[0]).lower()
+                alvo = normalize_whitespace(query.get("target", [""])[0])
+                comp = normalize_whitespace(query.get("competence", [""])[0])
+                with closing(get_connection()) as conn:
+                    # Gerente não escolhe "empresa": o painel de resultados
+                    # segue o mesmo escopo do resto do CRM.
+                    permitidas = crm_allowed_units_for_user(conn, user)
+                    escopo = data_scope_for_user(conn, user)
+                    if escopo == "proprio":
+                        nivel, alvo = "vendedor", seller_identity_for_user(user)
+                    elif permitidas is not None:
+                        if nivel == "empresa" or (nivel == "unidade"
+                                                  and normalize_unit(alvo) not in
+                                                  {normalize_unit(u) for u in permitidas}):
+                            nivel = "unidade"
+                            alvo = permitidas[0] if permitidas else ""
+                    serie = resultados_serie(conn, user["company_id"], nivel, alvo)
+                    fatos = resultados_fatos(conn, user["company_id"], serie, comp, nivel)
+                    idx = next((i for i, r in enumerate(serie)
+                                if r["competence"] == fatos["competence"]), len(serie) - 1)
+                    anterior = serie[idx - 1]["competence"] if idx > 0 else ""
+                    causas = resultados_causas(conn, user["company_id"], nivel, alvo,
+                                               fatos["competence"], anterior)
+                    conc = resultados_concentracao(conn, user["company_id"], nivel, alvo,
+                                                   fatos["competence"], anterior)
+                    unidades = sorted({normalize_unit(r["unit_name"]) for r in conn.execute(
+                        "SELECT DISTINCT unit_name FROM fact_unit_summary WHERE company_id = ?",
+                        (user["company_id"],)).fetchall() if r["unit_name"]})
+                    if permitidas is not None:
+                        _p = {normalize_unit(u) for u in permitidas}
+                        unidades = [u for u in unidades if u in _p]
+                self._set_headers(200)
+                self.wfile.write(json_dumps({
+                    "level": nivel, "target": alvo,
+                    "series": serie, "facts": fatos, "causes": causas,
+                    "concentration": conc, "previousCompetence": anterior,
+                    "units": unidades,
+                    "canChooseCompany": permitidas is None and escopo != "proprio",
+                }))
                 return
             if path == "/api/admin/roster":
                 user = self._require_auth()
