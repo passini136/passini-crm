@@ -12769,7 +12769,19 @@ def seller_award_indicators(
     # de comparar com a meta. Sem isto o vendedor teria um atingimento aqui e
     # outro no painel, pela mesma venda.
     garantia = warranty_returns_for(conn, company_id, competence, seller_names=variantes)
+    garantia = min(garantia, devolvido)
     liquido += garantia
+    # A GARANTIA TAMBÉM SAI DO DEVOLVIDO — e não só volta para o líquido.
+    #
+    # Aqui ela era devolvida ao faturamento mas continuava somando no valor
+    # devolvido, e é esse valor que vira o % de devolução da premiação. Ou seja:
+    # defeito de peça descontava ponto do vendedor. Em setembro/2026 foram
+    # R$ 44.549 de garantia na equipe — o Eduardo sozinho tinha R$ 8.127 de
+    # garantia dentro de R$ 14.842 de devolução total, mais da metade.
+    #
+    # O painel e o ranking já faziam a dedução; só a premiação não fazia, então
+    # o mesmo vendedor via um número no dashboard e outro no placar.
+    devolvido = max(devolvido - garantia, 0.0)
     margem = oficial["margem"]
     # "nan" no relatório do Alfa vira 0: é ausência de venda, não margem ruim.
     margem = float(margem) if margem not in (None, 0) else None
@@ -12843,6 +12855,9 @@ def seller_award_indicators(
                 extra += 1
     positivacao_pct = (100 * positivados / len(carteira)) if carteira else None
 
+    # `devolvido` já está líquido de garantia (ver acima). O que sobra aqui é a
+    # devolução COMERCIAL — desistência, vendido errado, separado errado —, que
+    # é a única que fala da venda e, portanto, a única que cabe pontuar.
     devolucao_pct = (100 * devolvido / bruto) if bruto else None
 
     inicio = first_day_of_competence(competence).isoformat()
@@ -12929,7 +12944,11 @@ def seller_award_indicators(
          "points": points_for_band(positivacao_pct, faixas("positivacao")),
          "max": teto("positivacao"), "missing": not carteira},
         {"code": "devolucoes", "label": "Devoluções", "value": devolucao_pct, "format": "pct",
-         "detail": f"{brl(devolvido)} sobre {brl(bruto)}",
+         # O detalhe cita a garantia SEMPRE que houver: sem isso o vendedor vê
+         # um valor menor que o do relatório de devoluções e acha que o sistema
+         # errou. Dizer quanto saiu, e por quê, é o que evita a discussão.
+         "detail": (f"{brl(devolvido)} comercial sobre {brl(bruto)}"
+                    + (f" · {brl(garantia)} de garantia não conta" if garantia else "")),
          "points": points_for_band(devolucao_pct, faixas("devolucoes"), menor_e_melhor=True),
          "max": teto("devolucoes"), "missing": bruto <= 0},
         {"code": "extraPositivacao", "label": "Extra positivação", "value": extra,
@@ -19515,6 +19534,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         summary_gross = float(official_totals_unit["revenueGross"] or 0.0)
         summary_return_cost = float(official_totals_unit["returnCost"] or 0.0)
         summary_cost_value = float(official_totals_unit["costValue"] or 0.0)
+        _ = None  # marcador: a dedução de garantia acontece logo abaixo
         summary_profit_value = float(official_totals_unit["profitValue"] or 0.0)
         summary_net_profit_value = float(official_totals_unit["netProfitValue"] or 0.0)
 
