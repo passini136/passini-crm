@@ -23628,9 +23628,16 @@ RESULTADOS_INDICADORES = [
 ]
 
 
+# Agregado é MENOS volátil: a queda de uma unidade é compensada pela alta de
+# outra, e a média da empresa quase não se mexe. Com o mesmo limite do vendedor,
+# o consolidado acusava só a meta — o painel da diretoria ficava cego para uma
+# queda de 2,3% que, em R$ 4,8 milhões, são R$ 110 mil.
+RESULTADOS_SENSIBILIDADE = {"empresa": 0.45, "unidade": 0.75, "vendedor": 1.0}
+
+
 def resultados_fatos(
     conn: sqlite3.Connection, company_id: int, serie: list[dict[str, Any]],
-    competencia: str = "",
+    competencia: str = "", nivel: str = "empresa",
 ) -> dict[str, Any]:
     """O que fugiu do esperado no mês — o FATO do FCA.
 
@@ -23659,6 +23666,7 @@ def resultados_fatos(
     # Indicador de VOLUME escala com o mês; indicador de TAXA não. Aplicar o
     # ritmo ao % de devolução acusaria queda onde o comportamento é igual.
     escala = {"revenueNet", "clients", "mixSku"}
+    sensib = RESULTADOS_SENSIBILIDADE.get(normalize_whitespace(nivel).lower(), 1.0)
 
     fatos = []
     for ind in RESULTADOS_INDICADORES:
@@ -23676,7 +23684,7 @@ def resultados_fatos(
             continue
         variacao = safe_div(valor - referencia, referencia) if referencia else 0.0
         piorou = variacao < 0 if ind["melhor"] == "maior" else variacao > 0
-        if abs(variacao) < ind["desvio"]:
+        if abs(variacao) < ind["desvio"] * sensib:
             continue
         fatos.append({
             "id": ind["id"], "label": ind["label"], "format": ind["formato"],
@@ -23686,7 +23694,8 @@ def resultados_fatos(
                                   and ind["id"] in escala else "")),
             "variationPct": round(variacao * 100, 1),
             "worse": piorou,
-            "severity": ("alta" if abs(variacao) >= ind["desvio"] * 2 else "media"),
+            "severity": ("alta" if abs(variacao) >= ind["desvio"] * sensib * 2
+                         else "media"),
         })
 
     # A meta entra como fato próprio: é o compromisso, não a tendência.
@@ -23710,6 +23719,70 @@ def resultados_fatos(
     return {"competence": atual["competence"], "facts": fatos,
             "monthProgress": round(ritmo, 4),
             "comparedWith": len(anteriores)}
+
+
+def resultados_concentracao(
+    conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str,
+    competencia: str, anterior: str,
+) -> dict[str, Any]:
+    """A queda foi de todos ou de poucos? — a pergunta que a média esconde.
+
+    No consolidado, unidade que cai e unidade que sobe se cancelam: a empresa
+    aparece estável enquanto quatro das seis pioraram. E o contrário engana
+    igual — uma queda inteira concentrada em dois vendedores não é "problema
+    da empresa", é conversa com duas pessoas.
+
+    Separar as duas situações muda a AÇÃO, que é o ponto do FCA.
+    """
+    if not competencia or not anterior:
+        return {}
+    if nivel == "empresa":
+        sql = ("SELECT unit_name chave, SUM(net_value) v FROM fact_unit_summary "
+               "WHERE company_id = ? AND competence = ? GROUP BY unit_name")
+        par_a, par_b = [company_id, competencia], [company_id, anterior]
+        rotulo = "unidades"
+    else:
+        nomes = sorted(set((sellers_of_unit(conn, company_id, competencia, alvo) or [])
+                           + (sellers_of_unit(conn, company_id, anterior, alvo) or [])))
+        if not nomes and nivel == "unidade":
+            return {}
+        onde = f" AND seller_name IN ({','.join('?' for _ in nomes)})" if nomes else ""
+        sql = (f"SELECT seller_name chave, SUM(net_value) v FROM fact_vendor_summary "
+               f"WHERE company_id = ? AND competence = ?{onde} GROUP BY seller_name")
+        par_a = [company_id, competencia, *nomes]
+        par_b = [company_id, anterior, *nomes]
+        rotulo = "vendedores"
+
+    def mapa(params):
+        return {normalize_whitespace(r["chave"]): float(r["v"] or 0)
+                for r in conn.execute(sql, params).fetchall() if r["chave"]}
+
+    atual, ant = mapa(par_a), mapa(par_b)
+    deltas = [(k, atual.get(k, 0.0) - ant.get(k, 0.0))
+              for k in set(atual) | set(ant)
+              if atual.get(k, 0.0) > 0 or ant.get(k, 0.0) > 0]
+    if not deltas:
+        return {}
+    caiu = sorted([d for d in deltas if d[1] < 0], key=lambda x: x[1])
+    subiu = [d for d in deltas if d[1] > 0]
+    queda_total = sum(abs(d[1]) for d in caiu)
+    top2 = sum(abs(d[1]) for d in caiu[:2])
+    liquido = sum(d[1] for d in deltas)
+    return {
+        "label": rotulo,
+        "total": len(deltas),
+        "down": len(caiu),
+        "up": len(subiu),
+        "netChange": round(liquido, 2),
+        "dropTotal": round(queda_total, 2),
+        # Quanto da queda está em apenas dois nomes. Acima de 60% a conversa é
+        # individual; abaixo de 40% é de processo, e a ação é outra.
+        "top2SharePct": round(100 * top2 / queda_total, 1) if queda_total else 0.0,
+        "top2": [{"name": k, "delta": round(v, 2)} for k, v in caiu[:2]],
+        "reading": ("concentrada" if queda_total and top2 / queda_total >= 0.6
+                    else "espalhada" if queda_total and top2 / queda_total <= 0.4
+                    else "mista"),
+    }
 
 
 def resultados_causas(

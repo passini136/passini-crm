@@ -47,7 +47,7 @@ print(f"Nível: {nivel}{' · ' + alvo if alvo else ''}\n")
 print("1) A RÉGUA ACUSA NA MEDIDA CERTA?")
 print(f"   {'MÊS':<10}{'FATOS':>7}{'PIORA':>7}{'MELHORA':>9}   PRINCIPAL")
 for alvo_comp in [r["competence"] for r in serie][-3:]:
-    d = backend.resultados_fatos(conn, company_id, serie, alvo_comp)
+    d = backend.resultados_fatos(conn, company_id, serie, alvo_comp, nivel)
     f = d["facts"]
     piora = [x for x in f if x["worse"]]
     principal = (f"{piora[0]['label']} {piora[0]['variationPct']:+.0f}%"
@@ -58,7 +58,7 @@ print("      frouxa demais; mais de 8 vira lista que ninguém lê.")
 
 # ── 2. O mês corrente é tratado com justiça? ────────────────────────────────
 ultimo = serie[-1]["competence"]
-d = backend.resultados_fatos(conn, company_id, serie, ultimo)
+d = backend.resultados_fatos(conn, company_id, serie, ultimo, nivel)
 print(f"\n2) FATOS DE {ultimo}")
 if d["monthProgress"] < 0.999:
     print(f"   Mês em curso: {d['monthProgress'] * 100:.0f}% dos dias úteis.")
@@ -88,10 +88,43 @@ for rotulo, itens in causas.items():
         var = f"{i['variationPct']:+.0f}%" if i["variationPct"] is not None else "novo"
         print(f"      {str(i['name'])[:34]:<36}{backend.brl(i['delta']):>14}  ({var})")
 
-total_explicado = sum(
-    abs(i["delta"]) for itens in causas.values() for i in itens if i["delta"] < 0)
-print(f"\n   Soma das quedas apontadas: {backend.brl(total_explicado)}")
-print("   >> Se nenhum nome aparecer acima, a causa não está explicando e o")
-print("      painel não serve para a reunião.")
+# COBERTURA, não soma.
+#
+# A primeira versão somava as quedas das QUATRO dimensões e imprimia
+# R$ 1,67 milhão para uma empresa que caiu R$ 290 mil — o mesmo dinheiro
+# contado quatro vezes, porque a queda do Tiago também está dentro da queda da
+# Matriz, da NAKATA e da linha ÓLEO. Número inflado num painel de reunião é
+# pior que número ausente: alguém repete em voz alta.
+atual_v = next(r["revenueNet"] for r in serie if r["competence"] == ultimo)
+ant_v = next(r["revenueNet"] for r in serie if r["competence"] == anterior)
+variacao_real = atual_v - ant_v
+print(f"\n   Variação real do período: {backend.brl(variacao_real)}")
+print(f"   {'DIMENSÃO':<14}{'QUEDAS SOMADAS':>18}{'COBERTURA':>12}")
+for rotulo, itens in causas.items():
+    queda = sum(abs(i["delta"]) for i in itens if i["delta"] < 0)
+    cob = (100 * queda / abs(variacao_real)) if variacao_real else 0
+    print(f"   {rotulo:<14}{backend.brl(queda):>18}{cob:>11.0f}%")
+print("\n   Cada dimensão explica a MESMA queda por um ângulo — não somar entre")
+print("   si. Cobertura perto de 100% (ou acima, por causa de quem subiu)")
+print("   significa que aquele recorte explica o mês.")
+
+# ── 4. A queda é de poucos ou de todos? ─────────────────────────────────────
+print("\n4) CONCENTRAÇÃO — a média esconde isto")
+conc = backend.resultados_concentracao(conn, company_id, nivel, alvo, ultimo, anterior)
+if conc:
+    print(f"   {conc['down']} de {conc['total']} {conc['label']} caíram "
+          f"({conc['up']} subiram)")
+    print(f"   Variação líquida: {backend.brl(conc['netChange'])}")
+    print(f"   Os 2 maiores respondem por {conc['top2SharePct']:.0f}% da queda:")
+    for t in conc["top2"]:
+        print(f"      {str(t['name'])[:34]:<36}{backend.brl(t['delta']):>14}")
+    leitura = {
+        "concentrada": "CONCENTRADA — é conversa individual, não problema da empresa.",
+        "espalhada": "ESPALHADA — todo mundo caiu junto; a causa é de processo,\n"
+                     "      mercado ou estoque, e a ação tem de ser sistêmica.",
+        "mista": "MISTA — há um caso grave E um movimento geral.",
+    }
+    print(f"\n   >> Queda {leitura[conc['reading']]}")
+    print("      Essa distinção muda a AÇÃO, que é o ponto do FCA.")
 
 conn.close()
