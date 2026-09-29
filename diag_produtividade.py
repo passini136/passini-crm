@@ -70,18 +70,14 @@ if emp.get("clientsNegative"):
     print(f"   {emp['clientsNegative']} cliente(s) só devolveram no mês "
           f"({backend.brl(emp['negativeValue'])}) — fora da contagem de faturados,"
           f" dentro do total oficial")
-if cob is not None and cob > 100:
-    sobra = emp["detailRevenue"] - emp["revenueNet"]
-    print(f"   >> A composição soma {backend.brl(sobra)} a MAIS que o oficial.")
-    print(f"      Devoluções excluídas: {backend.brl(abs(emp['negativeValue']))}.")
-    if abs(abs(emp["negativeValue"]) - sobra) > max(1.0, sobra * 0.1):
-        print("      NÃO explica a diferença. Há outra fonte de desvio entre")
-        print("      crm_client_summary e o custo × venda — achar antes da tela.")
-    else:
-        print("      Explicado. A diferença é só o cliente que devolveu.")
-elif cob is not None and cob < 95:
-    print("   >> Os tickets e a divisão PF/PJ descrevem só essa fatia. Abaixo de")
-    print("      95% convém dizer isso na tela, não deixar o gerente supor.")
+print(f"   Desvio do arquivo de composição: {emp['compositionDeviationPct']:+.1f}% "
+      f"— {'dentro do padrão' if emp['compositionReliable'] else 'FORA DO PADRÃO'}")
+if not emp["compositionReliable"]:
+    print("   >> Ticket e divisão PF/PJ deste mês NÃO são confiáveis: o arquivo")
+    print("      de composição destoa dos outros meses. A tela precisa avisar.")
+else:
+    print("   >> Proporções confiáveis. Os valores são alocados do oficial, então")
+    print("      o ticket não carrega o desvio do arquivo.")
 if seg > 2:
     print("   >> LENTO. Confira se a classificação PF/PJ não voltou a varrer a")
     print("      base inteira — é o padrão que já custou 1,6s numa consulta.")
@@ -102,6 +98,28 @@ for k, d in emp["byOrigin"].items():
 
 # ── 2. A soma bate com a série do painel? ───────────────────────────────────
 # Esta é a pergunta que decide se a tela pode ir para a reunião.
+print("\n1b) A COMPOSIÇÃO SOMA O OFICIAL?")
+soma_baldes = sum(d["revenue"] for d in emp["byOrigin"].values())
+print(f"   Soma dos baldes {backend.brl(soma_baldes)} · "
+      f"oficial {backend.brl(emp['revenueNet'])} · "
+      f"diferença {backend.brl(soma_baldes - emp['revenueNet'])}")
+if abs(soma_baldes - emp["revenueNet"]) > 1:
+    print("   >> A alocação não fechou. Os baldes precisam somar o oficial.")
+else:
+    print("   >> Fecha. Tickets e segmentos falam a mesma moeda do painel.")
+
+print("\n1c) ALGUM MÊS COM COMPOSIÇÃO QUEBRADA?")
+desvios = backend.composicao_desvio(conn, company_id)
+for c in sorted(desvios):
+    ok, _ = backend.composicao_confiavel(conn, company_id, c)
+    print(f"   {c:<10}{desvios[c]:+7.1f}%   {'ok' if ok else 'FORA DO PADRÃO'}")
+quebrados = [c for c in sorted(desvios)
+             if not backend.composicao_confiavel(conn, company_id, c)[0]]
+if quebrados:
+    print(f"\n   >> {', '.join(quebrados)} com arquivo incompleto. Reimportar o")
+    print("      faturamento por cliente desses meses destrava o histórico de")
+    print("      ticket e de carteira x balcão.")
+
 print("\n2) BATE COM A SÉRIE DO PAINEL?")
 serie = backend.resultados_serie(conn, company_id, "empresa", "")
 oficial = next((r["revenueNet"] for r in serie if r["competence"] == comp), None)

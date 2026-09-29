@@ -23722,6 +23722,54 @@ def resultados_fatos(
             "comparedWith": len(anteriores)}
 
 
+def composicao_desvio(conn: sqlite3.Connection, company_id: int) -> dict[str, float]:
+    """Desvio % do resumo por cliente contra o custo × venda, por competência.
+
+    Os dois relatórios do Alfa medem critérios ligeiramente diferentes e o
+    resumo por cliente fica sistematicamente ACIMA do oficial — de forma
+    estável, entre +4,6% e +5,3% ao longo de sete meses. Estável é o que
+    importa: um desvio constante não estraga proporção nenhuma.
+
+    O que estraga é o mês que foge do padrão. Maio/2026 veio a -15,8%, ou seja,
+    com quase um quinto do faturamento ausente do arquivo — e nesse mês
+    qualquer ticket ou divisão PF/PJ calculada em cima dele estaria errada sem
+    dar sinal. Por isso a régua é o DESVIO MEDIANO dos próprios meses, não um
+    limite fixo: se o critério do Alfa mudar, a régua acompanha sozinha.
+
+    Duas consultas agrupadas por competência, não uma por mês. Fica no cache da
+    conexão porque a tela chama isto uma vez por vendedor.
+    """
+    cache = getattr(conn, "_cache_composicao_desvio", None)
+    if cache is not None:
+        return cache
+    cli = {r["competence"]: float(r["v"] or 0) for r in conn.execute(
+        "SELECT competence, SUM(net_value) v FROM crm_client_summary "
+        "WHERE company_id = ? GROUP BY competence", (company_id,)).fetchall()}
+    ofi = {r["competence"]: float(r["v"] or 0) for r in conn.execute(
+        "SELECT competence, SUM(net_value) v FROM fact_unit_summary "
+        "WHERE company_id = ? GROUP BY competence", (company_id,)).fetchall()}
+    desvios = {c: 100 * (cli[c] - v) / v for c, v in ofi.items() if v and c in cli}
+    conn._cache_composicao_desvio = desvios
+    return desvios
+
+
+def composicao_confiavel(conn: sqlite3.Connection, company_id: int,
+                         competencia: str) -> tuple[bool, float]:
+    """A composição daquele mês pode sustentar ticket e proporção?"""
+    desvios = composicao_desvio(conn, company_id)
+    atual = desvios.get(competencia)
+    if atual is None:
+        return False, 0.0
+    outros = sorted(v for c, v in desvios.items() if c != competencia)
+    if len(outros) < 3:
+        return True, atual
+    mediana = outros[len(outros) // 2]
+    # 5 pontos de folga em torno da mediana: cobre a variação normal (0,7 ponto
+    # de amplitude nos meses bons) com margem larga, e ainda pega maio, que
+    # ficou 21 pontos fora.
+    return abs(atual - mediana) <= 5.0, atual
+
+
 def resultados_produtividade(
     conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str, competencia: str,
 ) -> dict[str, Any]:
@@ -23872,6 +23920,17 @@ def resultados_produtividade(
     liquido = (float(conn.execute(of_sql, of_par).fetchone()["v"] or 0)
                + float(conn.execute(gar_sql, gar_par).fetchone()["v"] or 0))
 
+    # ── Proporção vem do resumo por cliente; VALOR vem do oficial ────────────
+    # O resumo por cliente fica ~5% acima do custo × venda, mês após mês. Um
+    # desvio constante não atrapalha PROPORÇÃO nenhuma — atrapalha NÍVEL. Então
+    # cada balde entra com a sua participação e recebe o dinheiro do oficial.
+    # Assim o ticket não sai 5% inflado e a tela não abre diferença contra o
+    # painel de resultados, que é o que faria a reunião discutir a tela.
+    fator = (liquido / detalhe) if detalhe else 0.0
+    for b in baldes.values():
+        b["revenue"] = b["revenue"] * fator
+    confiavel, desvio_pct = composicao_confiavel(conn, company_id, competencia)
+
     # ── Mix de itens distintos no recorte ────────────────────────────────────
     # Única coisa que ainda vem do detalhado, e a única que ele sabe melhor:
     # contar item não depende de identificar cliente nenhum.
@@ -23931,6 +23990,11 @@ def resultados_produtividade(
         # descobrir na reunião.
         "detailRevenue": round(detalhe, 2),
         "detailCoveragePct": round(100 * detalhe / liquido, 1) if liquido else None,
+        # Quando o arquivo de composição do mês foge do padrão, ticket e divisão
+        # PF/PJ descrevem uma fatia e não o mês. A tela precisa DIZER isso: um
+        # ticket errado sem aviso é pior que um ticket ausente.
+        "compositionReliable": confiavel,
+        "compositionDeviationPct": round(desvio_pct, 1),
         "clientsUnregistered": sum(
             1 for r in linhas if normalize_client_key(r["client_code"]) not in tipos),
         "clientsNegative": len(negativos),
