@@ -23786,11 +23786,14 @@ def resultados_produtividade(
         par = list(donos)
     item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
             "NULLIF(gtin_value,''), 'ITEM')")
-    linhas = conn.execute(
+    # Sem filtro de valor na linha: soma TUDO do cliente e só depois decide se
+    # ele foi faturado. Filtrar linha a linha por net_value > 0 descartava as
+    # devoluções e inflava o total — foi o que abriu R$ 279 mil contra a série.
+    linhas = [r for r in conn.execute(
         f"SELECT client_name, SUM(net_value) v, COUNT(DISTINCT {item}) mix "
-        f"FROM fact_sales_detail WHERE company_id = ? AND competence = ? "
-        f"AND net_value > 0{onde} GROUP BY client_name",
-        [company_id, competencia, *par]).fetchall()
+        f"FROM fact_sales_detail WHERE company_id = ? AND competence = ?{onde} "
+        f"GROUP BY client_name",
+        [company_id, competencia, *par]).fetchall() if float(r["v"] or 0) > 0]
 
     nomes = [r["client_name"] for r in linhas if r["client_name"]]
     tipos = client_person_type_map(conn, company_id, nomes)
@@ -23810,8 +23813,43 @@ def resultados_produtividade(
         b["clients"] += 1
         b["revenue"] += float(r["v"] or 0)
 
-    liquido = sum(b["revenue"] for b in baldes.values())
+    detalhe = sum(b["revenue"] for b in baldes.values())
     clientes = sum(b["clients"] for b in baldes.values())
+
+    # ── O total é o OFICIAL, não o detalhado ─────────────────────────────────
+    # Custo × venda e faturamento detalhado são dois arquivos diferentes do Alfa
+    # e não fecham entre si. A regra do projeto já está firmada: resultado sai do
+    # custo × venda; o detalhado entra só para o que ele sabe melhor — cliente
+    # distinto, tipo de pessoa e mix. Misturar as duas fontes num mesmo número
+    # faria esta tela divergir do painel de resultados, e a reunião passaria a
+    # discutir qual tela está certa.
+    if nivel == "vendedor" and donos:
+        mv = ",".join("?" for _ in donos)
+        of_sql = (f"SELECT COALESCE(SUM(net_value),0) v FROM fact_vendor_summary "
+                  f"WHERE company_id = ? AND competence = ? AND seller_name IN ({mv})")
+        of_par = [company_id, competencia, *donos]
+        gar_sql = (f"SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
+                   f"WHERE company_id = ? AND competence = ? AND reason = ? "
+                   f"AND seller_name IN ({mv})")
+        gar_par = [company_id, competencia, RETURN_REASON_WARRANTY, *donos]
+    elif nivel == "unidade" and alvo:
+        of_sql = ("SELECT COALESCE(SUM(net_value),0) v FROM fact_unit_summary "
+                  "WHERE company_id = ? AND competence = ? AND unit_name = ?")
+        of_par = [company_id, competencia, normalize_unit(alvo)]
+        gar_sql = ("SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
+                   "WHERE company_id = ? AND competence = ? AND reason = ? AND unit_name = ?")
+        gar_par = [company_id, competencia, RETURN_REASON_WARRANTY, normalize_unit(alvo)]
+    else:
+        of_sql = ("SELECT COALESCE(SUM(net_value),0) v FROM fact_unit_summary "
+                  "WHERE company_id = ? AND competence = ?")
+        of_par = [company_id, competencia]
+        gar_sql = ("SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
+                   "WHERE company_id = ? AND competence = ? AND reason = ?")
+        gar_par = [company_id, competencia, RETURN_REASON_WARRANTY]
+    # Garantia volta para o líquido, igual à série: defeito de peça não é erro
+    # comercial do vendedor.
+    liquido = (float(conn.execute(of_sql, of_par).fetchone()["v"] or 0)
+               + float(conn.execute(gar_sql, gar_par).fetchone()["v"] or 0))
 
     # ── Mix de itens distintos no recorte ────────────────────────────────────
     mix = int(conn.execute(
@@ -23862,6 +23900,12 @@ def resultados_produtividade(
         "totalWorkingDays": dias_totais,
         "revenueNet": round(liquido, 2),
         "revenuePerDay": round(liquido / dias, 2),
+        # Quanto do oficial o detalhado enxerga. Os tickets e a divisão PF/PJ
+        # saem do detalhado; se a cobertura estiver baixa, eles descrevem uma
+        # fatia, não o mês — e é melhor a tela dizer isso do que o gerente
+        # descobrir na reunião.
+        "detailRevenue": round(detalhe, 2),
+        "detailCoveragePct": round(100 * detalhe / liquido, 1) if liquido else None,
         "clients": clientes,
         "mixSku": mix,
         "portfolioSize": len(carteira),
