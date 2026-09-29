@@ -23608,6 +23608,197 @@ def resultados_serie(
     return serie
 
 
+# Indicadores avaliados na reunião. `melhor` diz a direção; `minimo` evita
+# alarme em número pequeno (variar 30% de R$ 800 não é pauta de reunião).
+RESULTADOS_INDICADORES = [
+    {"id": "revenueNet",        "label": "Faturamento líquido", "melhor": "maior",
+     "formato": "moeda", "minimo": 50_000, "desvio": 0.05},
+    {"id": "returnRatioPct",    "label": "% Devolução comercial", "melhor": "menor",
+     "formato": "pct", "minimo": 0.5, "desvio": 0.15},
+    {"id": "marginValue",       "label": "Margem", "melhor": "maior",
+     "formato": "mult", "minimo": 0.5, "desvio": 0.03},
+    {"id": "ticketAverage",     "label": "Ticket médio", "melhor": "maior",
+     "formato": "moeda", "minimo": 100, "desvio": 0.08},
+    {"id": "clients",           "label": "Clientes atendidos", "melhor": "maior",
+     "formato": "num", "minimo": 30, "desvio": 0.08},
+    {"id": "mixSku",            "label": "Mix de itens", "melhor": "maior",
+     "formato": "num", "minimo": 50, "desvio": 0.08},
+    {"id": "discountPct",       "label": "% Desconto", "melhor": "menor",
+     "formato": "pct", "minimo": 1.0, "desvio": 0.10},
+]
+
+
+def resultados_fatos(
+    conn: sqlite3.Connection, company_id: int, serie: list[dict[str, Any]],
+    competencia: str = "",
+) -> dict[str, Any]:
+    """O que fugiu do esperado no mês — o FATO do FCA.
+
+    Compara com DUAS referências, porque elas respondem perguntas diferentes:
+    a META diz se entregamos o combinado; a MÉDIA DOS 3 MESES ANTERIORES diz se
+    mudou alguma coisa. Um mês pode bater a meta e ainda assim ter uma queda
+    relevante — e é a queda que vira conversa.
+
+    Mês em curso é comparado PROPORCIONALMENTE aos dias úteis já decorridos.
+    Sem isso todo indicador apareceria em queda no dia 10, e um painel que
+    acusa tudo não acusa nada.
+    """
+    if not serie:
+        return {"competence": "", "facts": [], "monthProgress": 1.0}
+    atual = next((r for r in serie if r["competence"] == competencia), serie[-1])
+    idx = serie.index(atual)
+    anteriores = serie[max(0, idx - 3):idx]
+
+    ritmo = 1.0
+    if atual["competence"] == today_in_brazil().strftime("%Y-%m"):
+        _cal = get_business_calendar(conn, company_id, atual["competence"])
+        _tot = int(_cal.get("totalWorkingDays") or 0)
+        _pas = int(_cal.get("elapsedWorkingDays") or 0)
+        if _tot > 0 and _pas > 0:
+            ritmo = min(_pas / _tot, 1.0)
+    # Indicador de VOLUME escala com o mês; indicador de TAXA não. Aplicar o
+    # ritmo ao % de devolução acusaria queda onde o comportamento é igual.
+    escala = {"revenueNet", "clients", "mixSku"}
+
+    fatos = []
+    for ind in RESULTADOS_INDICADORES:
+        valor = atual.get(ind["id"])
+        if valor is None:
+            continue
+        valor = float(valor)
+        base = [float(r[ind["id"]]) for r in anteriores
+                if r.get(ind["id"]) is not None]
+        if not base:
+            continue
+        media = sum(base) / len(base)
+        referencia = media * ritmo if ind["id"] in escala else media
+        if referencia < ind["minimo"] and valor < ind["minimo"]:
+            continue
+        variacao = safe_div(valor - referencia, referencia) if referencia else 0.0
+        piorou = variacao < 0 if ind["melhor"] == "maior" else variacao > 0
+        if abs(variacao) < ind["desvio"]:
+            continue
+        fatos.append({
+            "id": ind["id"], "label": ind["label"], "format": ind["formato"],
+            "value": round(valor, 3), "reference": round(referencia, 3),
+            "referenceLabel": ("média dos últimos 3 meses"
+                               + (" (ajustada ao mês em curso)" if ritmo < 0.999
+                                  and ind["id"] in escala else "")),
+            "variationPct": round(variacao * 100, 1),
+            "worse": piorou,
+            "severity": ("alta" if abs(variacao) >= ind["desvio"] * 2 else "media"),
+        })
+
+    # A meta entra como fato próprio: é o compromisso, não a tendência.
+    if atual.get("revenueGoal"):
+        esperado = float(atual["revenueGoal"]) * ritmo
+        v = safe_div(float(atual["revenueNet"]) - esperado, esperado)
+        if abs(v) >= 0.05:
+            fatos.append({
+                "id": "goal", "label": "Atingimento da meta", "format": "moeda",
+                "value": round(float(atual["revenueNet"]), 2),
+                "reference": round(esperado, 2),
+                "referenceLabel": ("meta do mês"
+                                   + (" proporcional aos dias úteis" if ritmo < 0.999 else "")),
+                "variationPct": round(v * 100, 1),
+                "worse": v < 0,
+                "severity": "alta" if abs(v) >= 0.10 else "media",
+            })
+
+    # Pior primeiro: a reunião tem tempo limitado e começa pelo que dói.
+    fatos.sort(key=lambda f: (not f["worse"], -abs(f["variationPct"])))
+    return {"competence": atual["competence"], "facts": fatos,
+            "monthProgress": round(ritmo, 4),
+            "comparedWith": len(anteriores)}
+
+
+def resultados_causas(
+    conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str,
+    competencia: str, anterior: str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Quem puxou o número para baixo (ou para cima) — a CAUSA do FCA.
+
+    A decomposição é sempre a MESMA pergunta em recortes diferentes: onde o
+    dinheiro deixou de entrar em relação ao mês anterior. Sem isto o painel
+    devolve "caiu 8%", que o gestor já sabia antes de abrir a tela.
+
+    Cada lista vem ordenada pelo que mais MUDOU, não pelo que é maior: a maior
+    unidade sempre lideraria o ranking de faturamento e nunca explicaria nada.
+    """
+    if not competencia or not anterior:
+        return {}
+
+    def variacao(rows_atual: dict[str, float], rows_ant: dict[str, float],
+                 limite: int = 8) -> list[dict[str, Any]]:
+        chaves = set(rows_atual) | set(rows_ant)
+        itens = []
+        for k in chaves:
+            a, b = rows_atual.get(k, 0.0), rows_ant.get(k, 0.0)
+            if a <= 0 and b <= 0:
+                continue
+            itens.append({"name": k, "current": round(a, 2), "previous": round(b, 2),
+                          "delta": round(a - b, 2),
+                          "variationPct": round(safe_div(a - b, b) * 100, 1) if b else None})
+        itens.sort(key=lambda x: x["delta"])
+        piores = itens[:limite]
+        melhores = [i for i in reversed(itens[-limite:]) if i["delta"] > 0]
+        return piores + melhores
+
+    def soma(sql: str, params: list[Any]) -> dict[str, float]:
+        return {normalize_whitespace(r["chave"]): float(r["v"] or 0)
+                for r in conn.execute(sql, params).fetchall() if r["chave"]}
+
+    causas: dict[str, list[dict[str, Any]]] = {}
+
+    # 1. Por UNIDADE — só faz sentido no consolidado da empresa.
+    if nivel == "empresa":
+        sql_u = ("SELECT unit_name chave, SUM(net_value) v FROM fact_unit_summary "
+                 "WHERE company_id = ? AND competence = ? GROUP BY unit_name")
+        causas["unidade"] = variacao(soma(sql_u, [company_id, competencia]),
+                                     soma(sql_u, [company_id, anterior]))
+
+    # 2. Por VENDEDOR — no consolidado e na unidade.
+    if nivel in ("empresa", "unidade"):
+        onde, par = "", []
+        if nivel == "unidade" and alvo:
+            nomes = sellers_of_unit(conn, company_id, competencia, alvo) or []
+            nomes += sellers_of_unit(conn, company_id, anterior, alvo) or []
+            nomes = sorted(set(nomes))
+            if nomes:
+                onde = f" AND seller_name IN ({','.join('?' for _ in nomes)})"
+                par = nomes
+        sql_v = (f"SELECT seller_name chave, SUM(net_value) v FROM fact_vendor_summary "
+                 f"WHERE company_id = ? AND competence = ?{onde} GROUP BY seller_name")
+        causas["vendedor"] = variacao(soma(sql_v, [company_id, competencia, *par]),
+                                      soma(sql_v, [company_id, anterior, *par]))
+
+    # 3. Por MARCA e por LINHA — o que a oficina deixou de comprar. É a causa
+    # que mais vira ação concreta: falta de estoque, preço, ou concorrente que
+    # entrou naquela linha.
+    ensure_catalogo_temp(conn, company_id)
+    escopo_det, par_det = "", []
+    if nivel == "vendedor" and alvo:
+        _v = seller_name_variants(conn, company_id, alvo) or [alvo]
+        escopo_det = f" AND f.seller_name IN ({','.join('?' for _ in _v)})"
+        par_det = list(_v)
+    elif nivel == "unidade" and alvo:
+        nomes = sorted(set((sellers_of_unit(conn, company_id, competencia, alvo) or [])
+                           + (sellers_of_unit(conn, company_id, anterior, alvo) or [])))
+        if nomes:
+            escopo_det = f" AND f.seller_name IN ({','.join('?' for _ in nomes)})"
+            par_det = nomes
+    for rotulo, coluna in (("marca", "UPPER(TRIM(f.brand_name))"),
+                           ("linha", "UPPER(TRIM(COALESCE(c.item_subgroup,'')))")):
+        sql_m = (f"SELECT {coluna} chave, SUM(f.net_value) v FROM fact_sales_detail f "
+                 f"{CATALOGO_JOIN_SQL} WHERE f.company_id = ? AND f.competence = ? "
+                 f"AND f.net_value > 0 AND TRIM(COALESCE({coluna},'')) <> ''{escopo_det} "
+                 f"GROUP BY chave")
+        causas[rotulo] = variacao(soma(sql_m, [company_id, competencia, *par_det]),
+                                  soma(sql_m, [company_id, anterior, *par_det]))
+
+    return causas
+
+
 def compute_team_activity_today(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 ) -> dict[str, Any]:
