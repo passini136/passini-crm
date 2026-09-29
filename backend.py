@@ -23800,11 +23800,19 @@ def resultados_produtividade(
     if donos:
         onde = f" AND seller_name IN ({','.join('?' for _ in donos)})"
         par = list(donos)
-    linhas = [r for r in conn.execute(
+    todas = conn.execute(
         f"SELECT client_code, client_name, SUM(net_value) v "
         f"FROM crm_client_summary WHERE company_id = ? AND competence = ?{onde} "
         f"GROUP BY client_code, client_name",
-        [company_id, competencia, *par]).fetchall() if float(r["v"] or 0) > 0]
+        [company_id, competencia, *par]).fetchall()
+    linhas = [r for r in todas if float(r["v"] or 0) > 0]
+    # Cliente que só devolveu no mês tem líquido negativo. Ele NÃO é cliente
+    # faturado — contá-lo estragaria ticket e positivação. Mas o valor dele
+    # continua no total oficial, e é por isso que a composição soma mais que o
+    # oficial. Guardar o número faz a diferença ser explicada em vez de virar
+    # suspeita de erro na reunião.
+    negativos = [r for r in todas if float(r["v"] or 0) < 0]
+    valor_negativo = sum(float(r["v"] or 0) for r in negativos)
 
     # Baldes: PF/PJ × dentro/fora da carteira. Quatro números que respondem
     # perguntas diferentes e costumam ser somados errado quando ficam juntos.
@@ -23925,6 +23933,8 @@ def resultados_produtividade(
         "detailCoveragePct": round(100 * detalhe / liquido, 1) if liquido else None,
         "clientsUnregistered": sum(
             1 for r in linhas if normalize_client_key(r["client_code"]) not in tipos),
+        "clientsNegative": len(negativos),
+        "negativeValue": round(valor_negativo, 2),
         "clients": clientes,
         "mixSku": mix,
         "portfolioSize": len(carteira),
@@ -23940,6 +23950,21 @@ def resultados_produtividade(
         "byOrigin": {
             k: {**v, "ticket": ticket(v)} for k, v in baldes.items()
         },
+        # Carteira x BALCÃO. Cliente sem vendedor interno não é falha de
+        # cadastro: é venda de balcão, e por isso fica fora do denominador da
+        # positivação — cobrar o vendedor por quem nunca foi dele seria inventar
+        # um problema. Mas o balcão é um terço dos clientes e vale acompanhar
+        # como segmento próprio: ticket de balcão caindo é sinal de outra coisa.
+        **{chave: {**dados, "ticket": ticket(dados),
+                   "sharePct": round(100 * dados["revenue"] / detalhe, 1) if detalhe else None}
+           for chave, dados in {
+               "portfolio": {
+                   "clients": baldes["PF_carteira"]["clients"] + baldes["PJ_carteira"]["clients"],
+                   "revenue": baldes["PF_carteira"]["revenue"] + baldes["PJ_carteira"]["revenue"]},
+               "counter": {
+                   "clients": baldes["PF_fora"]["clients"] + baldes["PJ_fora"]["clients"],
+                   "revenue": baldes["PF_fora"]["revenue"] + baldes["PJ_fora"]["revenue"]},
+           }.items()},
         "activeCalls": ligacoes,
         "clientsCalled": len(contatados),
         "converted": len(converteram),

@@ -66,7 +66,20 @@ print(f"   Composição por cliente cobre {cob:.1f}% do oficial "
 if emp.get("clientsUnregistered"):
     print(f"   {emp['clientsUnregistered']} cliente(s) faturado(s) SEM cadastro — "
           f"classificados pelo nome")
-if cob is not None and cob < 95:
+if emp.get("clientsNegative"):
+    print(f"   {emp['clientsNegative']} cliente(s) só devolveram no mês "
+          f"({backend.brl(emp['negativeValue'])}) — fora da contagem de faturados,"
+          f" dentro do total oficial")
+if cob is not None and cob > 100:
+    sobra = emp["detailRevenue"] - emp["revenueNet"]
+    print(f"   >> A composição soma {backend.brl(sobra)} a MAIS que o oficial.")
+    print(f"      Devoluções excluídas: {backend.brl(abs(emp['negativeValue']))}.")
+    if abs(abs(emp["negativeValue"]) - sobra) > max(1.0, sobra * 0.1):
+        print("      NÃO explica a diferença. Há outra fonte de desvio entre")
+        print("      crm_client_summary e o custo × venda — achar antes da tela.")
+    else:
+        print("      Explicado. A diferença é só o cliente que devolveu.")
+elif cob is not None and cob < 95:
     print("   >> Os tickets e a divisão PF/PJ descrevem só essa fatia. Abaixo de")
     print("      95% convém dizer isso na tela, não deixar o gerente supor.")
 if seg > 2:
@@ -109,23 +122,26 @@ else:
 # Positivação sobre carteira vazia é divisão por quase-zero: dá número grande e
 # sem sentido. Se o vínculo cadastral estiver furado, é melhor não mostrar o
 # indicador do que mostrar um que engana.
-print("\n3) A CARTEIRA SUSTENTA A POSITIVAÇÃO?")
-print(f"   Carteira da empresa: {emp['portfolioSize']} cliente(s) com vendedor interno")
-fora = emp["byOrigin"]["PF_fora"]["clients"] + emp["byOrigin"]["PJ_fora"]["clients"]
-pct_fora = 100 * fora / emp["clients"] if emp["clients"] else 0
-print(f"   Faturados no mês: {emp['portfolioServed']} da carteira · "
-      f"{fora} fora dela ({pct_fora:.0f}%)")
+print("\n3) CARTEIRA x BALCÃO")
+# Cliente sem vendedor interno é BALCÃO, não falha de cadastro — regra de
+# negócio confirmada pela diretoria. Fica fora do denominador da positivação:
+# cobrar o vendedor por quem nunca foi dele seria inventar um problema.
+print(f"   {'SEGMENTO':<12}{'CLIENTES':>10}{'LÍQUIDO':>16}{'TICKET':>13}{'% FAT.':>9}")
+for chave, rot in (("portfolio", "Carteira"), ("counter", "Balcão")):
+    d = emp[chave]
+    sh = f"{d['sharePct']:.0f}%" if d["sharePct"] is not None else "—"
+    print(f"   {rot:<12}{d['clients']:>10}{backend.brl(d['revenue']):>16}"
+          f"{backend.brl(d['ticket']):>13}{sh:>9}")
+print(f"\n   Carteira nominal: {emp['portfolioSize']} cliente(s) com vendedor interno")
+print(f"   Compraram no mês: {emp['portfolioServed']}")
 if emp["positivationPct"] is not None:
     print(f"   Positivação: {emp['positivationPct']:.1f}%")
-if pct_fora > 40:
-    print("   >> MAIS DE 40% DO FATURAMENTO É DE CLIENTE SEM DONO. A positivação")
-    print("      fica subestimada e a 'carteira' não representa quem a equipe")
-    print("      realmente atende. Vincular vendedor interno vem antes da tela.")
-elif emp["portfolioSize"] < emp["clients"]:
-    print("   >> A carteira é MENOR que o número de clientes faturados no mês.")
-    print("      Positivação acima de 100% é sintoma disso, não desempenho.")
-else:
-    print("   >> Vínculo suficiente para o indicador significar alguma coisa.")
+    ocioso = emp["portfolioSize"] - emp["portfolioServed"]
+    print(f"   >> {ocioso} cliente(s) da carteira NÃO compraram. Esse é o número")
+    print("      que vira ação na reunião — não o total de clientes atendidos.")
+if emp["portfolioSize"] < emp["portfolioServed"]:
+    print("   >> Carteira menor que os atendidos dela: positivação acima de 100%")
+    print("      é sintoma de vínculo quebrado, não desempenho.")
 
 # ── 4. Ligação vira venda? ──────────────────────────────────────────────────
 print("\n4) LIGAÇÃO ATIVA E CONVERSÃO")
