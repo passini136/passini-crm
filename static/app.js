@@ -18977,9 +18977,9 @@ function dashboardView() {
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
-    { id: "resultados", title: "Painel de Resultados", desc: "Fato, causa e ação", icon: "🎯" },
     { id: "executivo",  title: "Executivo",  desc: "Panorama e KPIs",          icon: "📊" },
     { id: "vendedores", title: "Vendedores", desc: "Ranking e score",           icon: "👤" },
+    { id: "resultados", title: "Painel de Resultados", desc: "Fato, causa e ação", icon: "🎯" },
     { id: "unidades",   title: "Unidades",   desc: "Comparativo",               icon: "🏢" },
     { id: "marcas",     title: "Marcas",     desc: "Ranking por marca",         icon: "🏷️" },
     { id: "devolucoes", title: "Devoluções", desc: "Comercial x garantia",      icon: "↩️" },
