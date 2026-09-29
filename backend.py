@@ -23789,7 +23789,65 @@ def resultados_concentracao(
     maioria_caiu = len(caiu) >= max(2, len(itens) * 0.6)
     uniforme = bool(pcts) and (max(pcts) - min(pcts)) <= 12  # pontos percentuais
 
-    if maioria_caiu and uniforme:
+    # DESLIGAMENTO EXPLICA ANTES DE QUALQUER HIPÓTESE DE MERCADO.
+    #
+    # Em setembro/2026 as seis unidades caíram entre 10% e 15% — leitura de
+    # livro para "queda sistêmica". Só que três vendedores saíram no mês, em
+    # três unidades diferentes, somando 69% da queda da empresa. A uniformidade
+    # não vinha do mercado: vinha de cada loja ter perdido alguém.
+    #
+    # Sem esta verificação o painel manda a diretoria investigar preço e estoque
+    # enquanto a resposta é redistribuir carteira.
+    saiu_total = 0.0
+    saidas_nomes: list[dict[str, Any]] = []
+    fim_mes = last_day_of_competence(competencia).isoformat()
+    desligados = {
+        person_key(normalize_whitespace(r["person_name"])): str(r["fim"])[:10]
+        for r in conn.execute(
+            "SELECT person_name, MAX(valid_to) fim FROM people_records "
+            "WHERE company_id = ? AND valid_to IS NOT NULL AND TRIM(valid_to) <> '' "
+            "GROUP BY person_name", (company_id,)).fetchall()
+        if r["person_name"]
+    }
+    if desligados:
+        onde_v, par_v = "", []
+        if nivel == "unidade" and alvo:
+            _n = sorted(set((sellers_of_unit(conn, company_id, competencia, alvo) or [])
+                            + (sellers_of_unit(conn, company_id, anterior, alvo) or [])))
+            if _n:
+                onde_v = f" AND seller_name IN ({','.join('?' for _ in _n)})"
+                par_v = _n
+        sql_sv = (f"SELECT seller_name chave, SUM(net_value) v FROM fact_vendor_summary "
+                  f"WHERE company_id = ? AND competence = ?{onde_v} GROUP BY seller_name")
+        v_at = mapa_generico = {
+            normalize_whitespace(r["chave"]): float(r["v"] or 0)
+            for r in conn.execute(sql_sv, [company_id, competencia, *par_v]).fetchall()
+            if r["chave"]}
+        v_an = {normalize_whitespace(r["chave"]): float(r["v"] or 0)
+                for r in conn.execute(sql_sv, [company_id, anterior, *par_v]).fetchall()
+                if r["chave"]}
+        for nome in set(v_at) | set(v_an):
+            saida = desligados.get(person_key(nome))
+            if not saida or saida > fim_mes:
+                continue
+            d = v_at.get(nome, 0.0) - v_an.get(nome, 0.0)
+            if d < 0:
+                saiu_total += abs(d)
+                saidas_nomes.append({"name": nome, "delta": round(d, 2), "leftAt": saida})
+    saidas_nomes.sort(key=lambda x: x["delta"])
+    # O DENOMINADOR É A QUEDA LÍQUIDA, não a soma das quedas.
+    #
+    # A pergunta da reunião é "caímos R$ 292 mil; quanto disso é gente que
+    # saiu?" — e a resposta é 69%. Dividir pela soma das quedas (R$ 515 mil,
+    # que ignora as unidades que subiram) devolvia 39% e deixava o caso passar
+    # raspando do corte. O número que decide a leitura tem de ser o número que
+    # a reunião discute.
+    base_queda = abs(liquido) if liquido < 0 else queda_total
+    parte_saidas = (saiu_total / base_queda) if base_queda else 0.0
+
+    if parte_saidas >= 0.4:
+        leitura, acao = "saidas", "redistribuir"
+    elif maioria_caiu and uniforme:
         leitura, acao = "uniforme", "sistemica"
     elif destoam and len(destoam) <= 2:
         leitura, acao = "concentrada", "individual"
@@ -23812,6 +23870,10 @@ def resultados_concentracao(
         "medianDropPct": round(mediana, 1),
         "spreadPct": round(max(pcts) - min(pcts), 1) if pcts else 0.0,
         "outliers": [{"name": i["name"], "pct": round(i["pct"], 1)} for i in destoam[:3]],
+        # Quanto da queda é saída de gente, e não desempenho.
+        "departuresValue": round(saiu_total, 2),
+        "departuresSharePct": round(parte_saidas * 100, 1),
+        "departures": saidas_nomes[:5],
         "reading": leitura,
         "actionKind": acao,
     }

@@ -124,7 +124,14 @@ if conc:
         print("\n   Quem caiu MUITO mais que os outros:")
         for o in conc["outliers"]:
             print(f"      {str(o['name'])[:32]:<34}{o['pct']:+.0f}%")
+    if conc.get("departuresSharePct"):
+        print(f"\n   Desligamentos respondem por {conc['departuresSharePct']:.0f}% "
+              f"da queda ({backend.brl(conc['departuresValue'])})")
     leitura = {
+        "saidas": ("EXPLICADA POR SAÍDAS — a maior parte não é desempenho, é\n"
+                   "      carteira que ficou sem dono. Antes de investigar preço,\n"
+                   "      estoque ou mercado, redistribua. Só o que sobra depois\n"
+                   "      disso é queda de verdade."),
         "uniforme": ("UNIFORME — caíram todos na mesma proporção. Isso NÃO é\n"
                      "      problema de quem caiu mais em reais: é mercado, estoque,\n"
                      "      calendário ou preço. A ação tem de ser sistêmica."),
