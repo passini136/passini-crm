@@ -23865,6 +23865,10 @@ def resultados_produtividade(
                + float(conn.execute(gar_sql, gar_par).fetchone()["v"] or 0))
 
     # ── Mix de itens distintos no recorte ────────────────────────────────────
+    # Única coisa que ainda vem do detalhado, e a única que ele sabe melhor:
+    # contar item não depende de identificar cliente nenhum.
+    item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
+            "NULLIF(gtin_value,''), 'ITEM')")
     mix = int(conn.execute(
         f"SELECT COUNT(DISTINCT {item}) n FROM fact_sales_detail "
         f"WHERE company_id = ? AND competence = ? AND net_value > 0{onde}",
