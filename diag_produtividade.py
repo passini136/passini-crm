@@ -60,6 +60,15 @@ print(f"   Dias úteis: {emp['workingDays']} de {emp['totalWorkingDays']}"
 print(f"   Líquido {backend.brl(emp['revenueNet'])}  ·  "
       f"por dia útil {backend.brl(emp['revenuePerDay'])}")
 print(f"   {emp['clients']} cliente(s) faturado(s)  ·  {emp['mixSku']} item(ns) distintos")
+cob = emp.get("detailCoveragePct")
+print(f"   Composição por cliente cobre {cob:.1f}% do oficial "
+      f"({backend.brl(emp['detailRevenue'])})" if cob else "")
+if emp.get("clientsUnregistered"):
+    print(f"   {emp['clientsUnregistered']} cliente(s) faturado(s) SEM cadastro — "
+          f"classificados pelo nome")
+if cob is not None and cob < 95:
+    print("   >> Os tickets e a divisão PF/PJ descrevem só essa fatia. Abaixo de")
+    print("      95% convém dizer isso na tela, não deixar o gerente supor.")
 if seg > 2:
     print("   >> LENTO. Confira se a classificação PF/PJ não voltou a varrer a")
     print("      base inteira — é o padrão que já custou 1,6s numa consulta.")

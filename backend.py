@@ -23766,37 +23766,45 @@ def resultados_produtividade(
 
     chaves_donos = {_canon(n) for n in donos}
 
-    # ── A carteira: clientes com vendedor interno do recorte ─────────────────
-    carteira: dict[str, str] = {}      # chave do cliente → nome do vendedor dono
+    # ── O cliente é identificado pelo CÓDIGO, não pelo nome ──────────────────
+    # Três grafias do mesmo cliente convivem na base: a interação grava o código
+    # ("20661"), o cadastro grava o nome limpo ("ROMA AGENCIA DE TURISMO") e o
+    # faturamento detalhado às vezes cola o documento na frente ("03.746.953
+    # WALDIR IEQUE"). Casar por nome fazia a conversão dar zero absoluto — 733
+    # clientes contatados, nenhum reconhecido, em todos os meses. O código é a
+    # única chave que os três lados compartilham.
+    carteira: dict[str, str] = {}      # código do cliente → nome do vendedor dono
+    tipos: dict[str, str] = {}         # código do cliente → PF | PJ
     for r in conn.execute(
-        "SELECT client_name, NULLIF(TRIM(internal_seller_name),'') dono "
+        "SELECT client_code, client_name, document_number, "
+        "NULLIF(TRIM(internal_seller_name),'') dono "
         "FROM crm_client_profiles WHERE company_id = ?", (company_id,)).fetchall():
-        if not r["client_name"]:
+        codigo = normalize_client_key(r["client_code"])
+        if not codigo:
             continue
+        # Mesma cascata do resto do sistema: documento manda; sem documento,
+        # heurística do nome. Os dois lugares precisam classificar igual.
+        tipo, _ = person_type_from_document(r["document_number"])
+        if not tipo:
+            tipo, _, _ = infer_person_type_from_name(r["client_name"])
+        tipos[codigo] = tipo or "PF"
         dono = normalize_whitespace(r["dono"])
-        if not dono:
-            continue
-        if not chaves_donos or _canon(dono) in chaves_donos:
-            carteira[normalize_client_key(r["client_name"])] = dono
+        if dono and (not chaves_donos or _canon(dono) in chaves_donos):
+            carteira[codigo] = dono
 
     # ── Faturamento do mês no recorte, por cliente ───────────────────────────
+    # crm_client_summary é o faturamento por cliente na fonte oficial, já com o
+    # código. O detalhado entra só para o mix, que não depende de identificar
+    # cliente nenhum.
     onde, par = "", []
     if donos:
         onde = f" AND seller_name IN ({','.join('?' for _ in donos)})"
         par = list(donos)
-    item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
-            "NULLIF(gtin_value,''), 'ITEM')")
-    # Sem filtro de valor na linha: soma TUDO do cliente e só depois decide se
-    # ele foi faturado. Filtrar linha a linha por net_value > 0 descartava as
-    # devoluções e inflava o total — foi o que abriu R$ 279 mil contra a série.
     linhas = [r for r in conn.execute(
-        f"SELECT client_name, SUM(net_value) v, COUNT(DISTINCT {item}) mix "
-        f"FROM fact_sales_detail WHERE company_id = ? AND competence = ?{onde} "
-        f"GROUP BY client_name",
+        f"SELECT client_code, client_name, SUM(net_value) v "
+        f"FROM crm_client_summary WHERE company_id = ? AND competence = ?{onde} "
+        f"GROUP BY client_code, client_name",
         [company_id, competencia, *par]).fetchall() if float(r["v"] or 0) > 0]
-
-    nomes = [r["client_name"] for r in linhas if r["client_name"]]
-    tipos = client_person_type_map(conn, company_id, nomes)
 
     # Baldes: PF/PJ × dentro/fora da carteira. Quatro números que respondem
     # perguntas diferentes e costumam ser somados errado quando ficam juntos.
@@ -23804,8 +23812,13 @@ def resultados_produtividade(
               for t in ("PF", "PJ") for o in ("carteira", "fora")}
     atendidos_carteira: set[str] = set()
     for r in linhas:
-        chave = normalize_client_key(r["client_name"])
-        tipo = tipos.get(chave, "PF")
+        chave = normalize_client_key(r["client_code"])
+        tipo = tipos.get(chave)
+        if not tipo:
+            # Cliente faturado sem cadastro: classifica pelo nome, como a
+            # carteira faz, em vez de assumir PF e distorcer o ticket.
+            tipo, _, _ = infer_person_type_from_name(r["client_name"])
+            tipo = tipo or "PF"
         origem = "carteira" if chave in carteira else "fora"
         if origem == "carteira":
             atendidos_carteira.add(chave)
@@ -23883,7 +23896,7 @@ def resultados_produtividade(
         ligacoes += 1
         if r["client_key"]:
             contatados.add(normalize_client_key(r["client_key"]))
-    compraram = {normalize_client_key(r["client_name"]) for r in linhas if r["client_name"]}
+    compraram = {normalize_client_key(r["client_code"]) for r in linhas if r["client_code"]}
     converteram = contatados & compraram
 
     def ticket(b):
@@ -23906,6 +23919,8 @@ def resultados_produtividade(
         # descobrir na reunião.
         "detailRevenue": round(detalhe, 2),
         "detailCoveragePct": round(100 * detalhe / liquido, 1) if liquido else None,
+        "clientsUnregistered": sum(
+            1 for r in linhas if normalize_client_key(r["client_code"]) not in tipos),
         "clients": clientes,
         "mixSku": mix,
         "portfolioSize": len(carteira),
