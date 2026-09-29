@@ -12520,6 +12520,158 @@ function resultadosView() {
 
   const maxFat = Math.max(...serie.map((r) => Math.max(r.revenueNet, r.revenueGoal || 0)), 1);
 
+  /* ── Produtividade ─────────────────────────────────────────────────────────
+   *
+   * Faturamento já aparece em quatro telas. O que falta na reunião é o COMO:
+   * quem entrega sem tocar na carteira, quem liga muito e não converte, quem
+   * sustenta o ticket. Por isso nada aqui repete a coluna de faturamento.
+   */
+  const p = d.productivity || {};
+  const pct = (v) => (v === null || v === undefined ? "—" : `${v.toFixed(0)}%`);
+
+  // LIGAÇÃO POUCA NÃO É CONVERSÃO BOA. Com 3 ligações registradas, 2 vendas dão
+  // "67%" e colocam o vendedor no topo à frente de quem ligou 60 vezes. Marcar
+  // o volume baixo evita que a reunião premie quem simplesmente não usou o CRM.
+  const LIGACAO_MINIMA = 10;
+  const conversaoCel = (x) => {
+    if (x.conversionPct === null || x.conversionPct === undefined) {
+      return '<span style="color:var(--muted)">sem registro</span>';
+    }
+    const fraco = x.activeCalls < LIGACAO_MINIMA;
+    return `<span style="font-weight:700;color:${fraco ? "var(--muted)" : "var(--ink)"}">
+        ${x.conversionPct.toFixed(0)}%</span>${fraco
+      ? ' <span class="status-tag" title="Poucas ligações registradas: o percentual não é comparável">amostra baixa</span>' : ""}`;
+  };
+
+  const cartaoProd = (rot, valor, apoio, cor) => `
+    <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 13px;
+                border-left:4px solid ${cor || "#5b9bd5"}">
+      <div class="text-small" style="color:var(--muted);text-transform:uppercase;
+           letter-spacing:.4px;font-size:10px;font-weight:700">${escapeHtml(rot)}</div>
+      <div style="font-size:18px;font-weight:800;margin-top:2px">${valor}</div>
+      <div class="text-small" style="color:var(--muted)">${apoio}</div>
+    </div>`;
+
+  const blocoProdutividade = !p.competence ? "" : `
+    <div>
+      <div class="section-title"><div><h3>3. Produtividade — como o resultado foi feito</h3>
+        <div class="text-small">Faturamento diz o quanto; estes números dizem se veio de
+          trabalho repetível. ${p.monthOpen ? `Médias sobre ${p.workingDays} dias úteis decorridos.`
+            : `Sobre ${p.workingDays} dias úteis do mês.`}</div></div></div>
+
+      ${p.compositionReliable ? "" : `
+        <div class="message" style="background:#fdecea;color:#a4262c">
+          ⚠️ O arquivo de faturamento por cliente de ${escapeHtml(p.competence)} está
+          ${p.compositionDeviationPct > 0 ? "acima" : "abaixo"} do padrão
+          (${p.compositionDeviationPct > 0 ? "+" : ""}${p.compositionDeviationPct}%).
+          <strong>Ticket e divisão PF/PJ deste mês não são confiáveis</strong> — reimportar
+          o faturamento por cliente desta competência corrige. Faturamento e meta não
+          são afetados: saem do custo × venda.
+        </div>`}
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px">
+        ${cartaoProd("Faturamento por dia útil", currency(p.revenuePerDay),
+          `${number(p.clients)} clientes no mês`, "#2e7d32")}
+        ${cartaoProd("Positivação da carteira", pct(p.positivationPct),
+          `${number(p.portfolioServed)} de ${number(p.portfolioSize)} compraram`,
+          p.positivationPct !== null && p.positivationPct < 40 ? "#e74c3c" : "#5b9bd5")}
+        ${cartaoProd("Carteira parada", number(Math.max(p.portfolioSize - p.portfolioServed, 0)),
+          "clientes sem compra no mês", "#e0a800")}
+        ${cartaoProd("Mix de itens", number(p.mixSku), "códigos distintos vendidos", "#7b5ea7")}
+        ${cartaoProd("Ligações ativas", number(p.activeCalls),
+          `${p.callsPerDay.toFixed(1)} por dia útil`, "#0f7b8a")}
+        ${cartaoProd("Conversão", pct(p.conversionPct),
+          `${number(p.converted)} de ${number(p.clientsCalled)} contatados compraram`, "#0f7b8a")}
+      </div>
+
+      <div class="grid-2" style="margin-top:10px">
+        <div class="table-card" style="padding:12px 14px">
+          <div style="font-weight:800;font-size:13px;margin-bottom:6px">Carteira x balcão</div>
+          <table style="width:100%;font-size:12px">
+            <thead><tr><th style="text-align:left">Segmento</th>
+              <th style="text-align:right">Clientes</th><th style="text-align:right">Líquido</th>
+              <th style="text-align:right">Ticket</th><th style="text-align:right">%</th></tr></thead>
+            <tbody>
+              ${[["portfolio", "Carteira"], ["counter", "Balcão"]].map(([k, rot]) => `
+                <tr><td>${rot}</td>
+                  <td style="text-align:right">${number(p[k].clients)}</td>
+                  <td style="text-align:right">${currency(p[k].revenue)}</td>
+                  <td style="text-align:right;font-weight:700">${currency(p[k].ticket)}</td>
+                  <td style="text-align:right;color:var(--muted)">${pct(p[k].sharePct)}</td></tr>`).join("")}
+            </tbody>
+          </table>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            Balcão é cliente sem vendedor interno — não entra na positivação, porque
+            nunca foi carteira de ninguém.
+          </div>
+        </div>
+
+        <div class="table-card" style="padding:12px 14px">
+          <div style="font-weight:800;font-size:13px;margin-bottom:6px">PF x PJ</div>
+          <table style="width:100%;font-size:12px">
+            <thead><tr><th style="text-align:left">Tipo</th>
+              <th style="text-align:right">Clientes</th><th style="text-align:right">Líquido</th>
+              <th style="text-align:right">Ticket</th></tr></thead>
+            <tbody>
+              ${["PJ", "PF"].map((t) => `
+                <tr><td>${t}</td>
+                  <td style="text-align:right">${number(p.byType[t].clients)}</td>
+                  <td style="text-align:right">${currency(p.byType[t].revenue)}</td>
+                  <td style="text-align:right;font-weight:700">${currency(p.byType[t].ticket)}</td></tr>`).join("")}
+            </tbody>
+          </table>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            Ticket de balcão muito acima do normal é sinal de cliente de carteira
+            perdendo vínculo — aí sim é cadastro.
+          </div>
+        </div>
+      </div>
+
+      ${!(d.team || []).length ? "" : `
+        <div class="table-card" style="margin-top:10px">
+          <div style="font-weight:800;font-size:13px;margin-bottom:2px">Produtividade por vendedor</div>
+          <div class="text-small" style="color:var(--muted);margin-bottom:8px">
+            Ordenado por faturamento diário. As colunas à direita é que mostram se o
+            resultado veio de carteira trabalhada — compare-as com a primeira.
+          </div>
+          <div class="table-wrap">
+            <table class="table-sticky-actions">
+              <thead><tr>
+                <th>Vendedor</th><th style="text-align:right">R$/dia útil</th>
+                <th style="text-align:right">Clientes</th><th style="text-align:right">Mix</th>
+                <th style="text-align:right">Carteira</th><th style="text-align:right">Positivação</th>
+                <th style="text-align:right">Ligações</th><th style="text-align:right">Conversão</th>
+                <th style="text-align:right">Ticket PJ</th><th style="text-align:right">Ticket PF</th>
+              </tr></thead>
+              <tbody>
+                ${d.team.map((x) => `
+                  <tr>
+                    <td>${escapeHtml(x.seller)}</td>
+                    <td style="text-align:right;font-weight:700">${currency(x.revenuePerDay)}</td>
+                    <td style="text-align:right">${number(x.clients)}</td>
+                    <td style="text-align:right">${number(x.mixSku)}</td>
+                    <td style="text-align:right;color:var(--muted)">${number(x.portfolioSize)}</td>
+                    <td style="text-align:right;font-weight:700;color:${
+                      x.positivationPct === null ? "var(--muted)"
+                      : x.positivationPct >= 50 ? "var(--good)"
+                      : x.positivationPct >= 35 ? "#b06000" : "var(--bad)"}">
+                      ${pct(x.positivationPct)}</td>
+                    <td style="text-align:right">${number(x.activeCalls)}</td>
+                    <td style="text-align:right">${conversaoCel(x)}</td>
+                    <td style="text-align:right">${currency(x.byType.PJ.ticket)}</td>
+                    <td style="text-align:right">${currency(x.byType.PF.ticket)}</td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:8px">
+            Conversão com menos de ${LIGACAO_MINIMA} ligações registradas aparece marcada:
+            o percentual não é comparável e não deve valer prêmio nem cobrança.
+            O registro de ligações começou em agosto/2026.
+          </div>
+        </div>`}
+    </div>`;
+
   return `
     <div class="stack">
       <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;
@@ -12590,8 +12742,10 @@ function resultadosView() {
         </div>
       </div>
 
+      ${blocoProdutividade}
+
       <div class="table-card">
-        <div class="section-title"><div><h3>3. Série histórica</h3>
+        <div class="section-title"><div><h3>4. Série histórica</h3>
           <div class="text-small">Faturamento contra meta, mês a mês.</div></div></div>
         <div class="table-wrap">
           <table>

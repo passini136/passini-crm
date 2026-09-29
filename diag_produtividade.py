@@ -226,6 +226,28 @@ for v in vendedores:
           f"{p['portfolioSize']:>6}{pos:>7}{p['activeCalls']:>6}{cv:>7}"
           f"{backend.brl(p['byType']['PJ']['ticket']):>12}")
 
+# ── 7. A tela aguenta? ──────────────────────────────────────────────────────
+# O endpoint monta uma linha por vendedor. Se cada linha custar meio segundo, a
+# tela leva 20 segundos para abrir e o gerente desiste antes de ver o número.
+print("\n7) CUSTO DA TELA — uma chamada por vendedor")
+todos = [r["seller_name"] for r in conn.execute(
+    "SELECT DISTINCT seller_name FROM fact_vendor_summary "
+    "WHERE company_id = ? AND competence = ?", (company_id, comp)).fetchall()
+    if r["seller_name"]]
+t0 = time.time()
+for v in todos:
+    backend.resultados_produtividade(conn, company_id, "vendedor", v, comp)
+gasto = time.time() - t0
+print(f"   {len(todos)} vendedor(es) em {gasto:.2f}s "
+      f"({gasto / len(todos) * 1000 if todos else 0:.0f}ms cada)")
+if gasto > 4:
+    print("   >> LENTO DEMAIS para uma tela. Algum trecho ainda repete trabalho")
+    print("      por vendedor — provável varredura de tabela grande sem cache.")
+elif gasto > 2:
+    print("   >> No limite. Aceitável, mas não crescerá bem com mais vendedores.")
+else:
+    print("   >> Rápido. Os caches por conexão estão segurando.")
+
 print("\n   >> O teste da tela: se as colunas de produtividade apenas repetirem a")
 print("      ordem do faturamento, elas não acrescentam nada à reunião. O valor")
 print("      está em achar quem fatura bem com carteira abandonada — e quem")

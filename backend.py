@@ -23805,7 +23805,9 @@ def resultados_produtividade(
     # linhas e as interações do mês, centenas — resolver por linha transformaria
     # esta função no mesmo N+1 que já derrubou a carteira e o histórico. Nomes
     # distintos de vendedor são algumas dezenas: memoriza por nome.
-    _memo: dict[str, str] = {}
+    _memo = getattr(conn, "_cache_canon_nome", None)
+    if _memo is None:
+        _memo = conn._cache_canon_nome = {}
 
     def _canon(nome: str) -> str:
         if nome not in _memo:
@@ -23821,22 +23823,31 @@ def resultados_produtividade(
     # WALDIR IEQUE"). Casar por nome fazia a conversão dar zero absoluto — 733
     # clientes contatados, nenhum reconhecido, em todos os meses. O código é a
     # única chave que os três lados compartilham.
+    # O cadastro é varrido UMA vez por requisição e fica no cache da conexão.
+    # A tela lista dezenas de vendedores; sem isto, cada linha do ranking
+    # varreria 100 mil clientes de novo — o N+1 que já derrubou a carteira.
+    perfis = getattr(conn, "_cache_perfis_carteira", None)
+    if perfis is None:
+        perfis = []
+        for r in conn.execute(
+            "SELECT client_code, client_name, document_number, "
+            "NULLIF(TRIM(internal_seller_name),'') dono "
+            "FROM crm_client_profiles WHERE company_id = ?", (company_id,)).fetchall():
+            codigo = normalize_client_key(r["client_code"])
+            if not codigo:
+                continue
+            # Mesma cascata do resto do sistema: documento manda; sem documento,
+            # heurística do nome. Os dois lugares precisam classificar igual.
+            tipo, _ = person_type_from_document(r["document_number"])
+            if not tipo:
+                tipo, _, _ = infer_person_type_from_name(r["client_name"])
+            perfis.append((codigo, tipo or "PF", normalize_whitespace(r["dono"])))
+        conn._cache_perfis_carteira = perfis
+
     carteira: dict[str, str] = {}      # código do cliente → nome do vendedor dono
     tipos: dict[str, str] = {}         # código do cliente → PF | PJ
-    for r in conn.execute(
-        "SELECT client_code, client_name, document_number, "
-        "NULLIF(TRIM(internal_seller_name),'') dono "
-        "FROM crm_client_profiles WHERE company_id = ?", (company_id,)).fetchall():
-        codigo = normalize_client_key(r["client_code"])
-        if not codigo:
-            continue
-        # Mesma cascata do resto do sistema: documento manda; sem documento,
-        # heurística do nome. Os dois lugares precisam classificar igual.
-        tipo, _ = person_type_from_document(r["document_number"])
-        if not tipo:
-            tipo, _, _ = infer_person_type_from_name(r["client_name"])
-        tipos[codigo] = tipo or "PF"
-        dono = normalize_whitespace(r["dono"])
+    for codigo, tipo, dono in perfis:
+        tipos[codigo] = tipo
         if dono and (not chaves_donos or _canon(dono) in chaves_donos):
             carteira[codigo] = dono
 
@@ -24019,8 +24030,11 @@ def resultados_produtividade(
         # positivação — cobrar o vendedor por quem nunca foi dele seria inventar
         # um problema. Mas o balcão é um terço dos clientes e vale acompanhar
         # como segmento próprio: ticket de balcão caindo é sinal de outra coisa.
+        # Participação sobre o LÍQUIDO OFICIAL, não sobre o bruto do arquivo de
+        # composição: os baldes já foram alocados, e dividir pelo denominador
+        # antigo fazia carteira + balcão somar 97%.
         **{chave: {**dados, "ticket": ticket(dados),
-                   "sharePct": round(100 * dados["revenue"] / detalhe, 1) if detalhe else None}
+                   "sharePct": round(100 * dados["revenue"] / liquido, 1) if liquido else None}
            for chave, dados in {
                "portfolio": {
                    "clients": baldes["PF_carteira"]["clients"] + baldes["PJ_carteira"]["clients"],
@@ -25717,12 +25731,36 @@ class AppHandler(BaseHTTPRequestHandler):
                     if permitidas is not None:
                         _p = {normalize_unit(u) for u in permitidas}
                         unidades = [u for u in unidades if u in _p]
+                    prod = resultados_produtividade(conn, user["company_id"], nivel,
+                                                    alvo, fatos["competence"])
+                    # Ranking de produtividade dos vendedores do recorte. É o
+                    # que transforma o painel em conversa: faturamento sozinho
+                    # já existe em quatro telas; o que falta é ver quem entrega
+                    # sem trabalhar a carteira.
+                    equipe = []
+                    if nivel != "vendedor":
+                        nomes = sellers_of_unit(conn, user["company_id"],
+                                                fatos["competence"], alvo) if alvo else None
+                        if nomes is None:
+                            nomes = [r["seller_name"] for r in conn.execute(
+                                "SELECT DISTINCT seller_name FROM fact_vendor_summary "
+                                "WHERE company_id = ? AND competence = ?",
+                                (user["company_id"], fatos["competence"])).fetchall()
+                                if r["seller_name"]]
+                        for nome in nomes:
+                            p = resultados_produtividade(conn, user["company_id"],
+                                                         "vendedor", nome,
+                                                         fatos["competence"])
+                            if p and p["revenueNet"]:
+                                equipe.append({"seller": normalize_whitespace(nome), **p})
+                        equipe.sort(key=lambda x: x["revenuePerDay"], reverse=True)
                 self._set_headers(200)
                 self.wfile.write(json_dumps({
                     "level": nivel, "target": alvo,
                     "series": serie, "facts": fatos, "causes": causas,
                     "concentration": conc, "previousCompetence": anterior,
                     "units": unidades,
+                    "productivity": prod, "team": equipe,
                     "canChooseCompany": permitidas is None and escopo != "proprio",
                 }))
                 return
