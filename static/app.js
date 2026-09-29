@@ -15623,8 +15623,27 @@ function autoImportPanel() {
         ${(f.types || []).map(selosDoTipo).join("")}
         ${f.hint ? `<div style="font-size:11px;color:var(--muted);margin:6px 0;line-height:1.4">${escapeHtml(f.hint)}</div>` : ""}
         ${hasPending ? `<div style="font-size:12px;color:var(--accent)">${f.pendingFiles.map((n) => `📄 ${escapeHtml(n)}`).join("<br>")}</div>` : ""}
+        ${/* POR QUE não importou, no próprio card.
+              O Felipe trocou os arquivos de faturamento de pasta, nada entrou,
+              e a tela seguiu mostrando só "2 pendentes". O motivo existia no
+              histórico geral, misturado com as outras pastas — ou seja, não
+              existia para quem estava olhando. */""}
+        ${f.lastProblem && hasPending ? `
+          <div style="margin-top:8px;padding:8px 10px;border-radius:8px;line-height:1.45;
+                      background:${f.lastProblem.status === "erro" ? "#fdecea" : "#fef7e0"};
+                      color:${f.lastProblem.status === "erro" ? "#a4262c" : "#8a6100"};
+                      font-size:12px">
+            <strong>${f.lastProblem.status === "erro" ? "❌ Não importou" : "⏳ Aguardando"}</strong>
+            · ${escapeHtml(String(f.lastProblem.ranAt || "").slice(0, 16).replace("T", " "))}
+            <div style="margin-top:3px">${escapeHtml(f.lastProblem.message)}</div>
+          </div>` : ""}
       </div>`;
   }
+
+  // Resumo no topo: quem abre a tela precisa ver que algo falhou ANTES de
+  // procurar card por card.
+  const comProblema = folders.filter((f) => f.lastProblem && f.pendingFiles.length
+                                            && f.lastProblem.status === "erro");
 
   const recentLogs = logs.slice(0, 10);
 
@@ -15634,6 +15653,14 @@ function autoImportPanel() {
         <div>
           <h3>🤖 Auto-Import</h3>
           <div class="text-small">Coloque o CSV na pasta correspondente — o sistema verifica automaticamente a cada ${ai?.intervalMinutes || 60} minutos. Use "Importar agora" para antecipar.</div>
+          ${comProblema.length ? `
+            <div class="message error" style="margin-top:10px">
+              <strong>${comProblema.length} pasta(s) com arquivo que NÃO foi importado.</strong>
+              <div style="margin-top:4px;font-size:12px;line-height:1.5">
+                ${comProblema.map((f) => `
+                  <div>• <strong>${escapeHtml(f.label)}</strong> — ${escapeHtml(f.lastProblem.message)}</div>`).join("")}
+              </div>
+            </div>` : ""}
         </div>
         <div style="display:flex;gap:8px">
           <button class="btn btn-primary btn-sm" id="btn-auto-import-run" onclick="runAutoImportNow()">▶ Importar agora</button>

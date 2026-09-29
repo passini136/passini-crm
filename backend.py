@@ -18936,13 +18936,25 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     # O FILTRO DE MOTIVO É OBRIGATÓRIO. A tabela guarda TODAS as devoluções desde
     # que o relatório passou a ser importado inteiro; somá-la sem filtrar faz a
     # garantia engolir o total e a devolução comercial aparecer como zero.
+    # A CHAVE É CANÔNICA, NÃO O NOME CRU.
+    #
+    # A garantia vem do relatório de devoluções e o total vem do custo × venda —
+    # dois arquivos do Alfa, que escrevem o mesmo vendedor de jeitos diferentes
+    # ("FULANO (VENDAS)" num, "FULANO" no outro). Com casamento por nome exato a
+    # dedução achava zero e o vendedor levava a garantia inteira como se fosse
+    # devolução comercial dele: defeito de peça virava nota baixa no farol e
+    # ponto perdido na premiação, sem que ninguém conseguisse explicar de onde
+    # vinha o número.
     warranty_by_seller: dict[str, float] = {}
     for _w in conn.execute(
         "SELECT seller_name, SUM(total_value) AS total FROM fact_warranty_returns "
         "WHERE company_id = ? AND competence = ? AND reason = ? GROUP BY seller_name",
         (company_id, primary_competence, RETURN_REASON_WARRANTY),
     ).fetchall():
-        warranty_by_seller[normalize_whitespace(_w["seller_name"])] = float(_w["total"] or 0.0)
+        _chave = chave_canonica(conn, company_id, normalize_whitespace(_w["seller_name"]))
+        if _chave:
+            warranty_by_seller[_chave] = (warranty_by_seller.get(_chave, 0.0)
+                                          + float(_w["total"] or 0.0))
 
     warranty_by_unit: dict[str, float] = {}
     for _w in conn.execute(
@@ -19209,7 +19221,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         returns_total = float(official_row.get("return_value") or 0.0)
         # Devolução em garantia é defeito de peça, não erro de venda: sai do
         # resultado comercial e é devolvida ao líquido do vendedor.
-        warranty_value = min(warranty_by_seller.get(seller_name, 0.0), returns_total)
+        warranty_value = min(
+            warranty_by_seller.get(chave_canonica(conn, company_id, seller_name), 0.0),
+            returns_total)
         returns_value = max(returns_total - warranty_value, 0.0)
         revenue_net = revenue_net_raw + warranty_value
         qty_sold = float(official_row.get("qty_sold") or 0)
@@ -24257,6 +24271,18 @@ class AppHandler(BaseHTTPRequestHandler):
                             "scope": cfg["scope"], "path": str(p),
                             "hint": cfg.get("hint", ""),
                             "pendingFiles": pending,
+                        # O último recado NÃO-sucesso desta pasta, para o card
+                        # dizer na cara por que o arquivo não entrou. Antes isso
+                        # só existia no histórico geral, misturado com as outras
+                        # pastas: o Felipe trocou os arquivos de faturamento de
+                        # lugar, nada importou, e a tela seguiu mostrando só
+                        # "2 pendentes" — sem dizer que havia recusa.
+                        "lastProblem": next(
+                            ({"status": l["status"], "message": l["message"],
+                              "ranAt": l["ranAt"], "files": l["files"]}
+                             for l in logs
+                             if l["folder"] == cfg["folder"] and l["status"] != "sucesso"),
+                            None),
                             "types": [tipos_status[t] for t in _tipos if t in tipos_status],
                             "lastRunAt": ultimo_por_pasta.get(cfg["folder"], ""),
                         })
