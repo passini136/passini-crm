@@ -23429,6 +23429,159 @@ def compute_manager_mission(
     }
 
 
+RESULTADOS_MESES = 12
+
+
+def resultados_serie(
+    conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
+    alvo: str = "", meses: int = RESULTADOS_MESES,
+) -> list[dict[str, Any]]:
+    """Série mês a mês dos indicadores oficiais, no nível pedido.
+
+    `nivel`: empresa | unidade | vendedor. `alvo`: o nome, quando não é empresa.
+
+    CINCO consultas para TODOS os meses, não uma por mês. Montar isso chamando
+    o dashboard por competência custaria segundos por mês e derrubaria a tela —
+    é o mesmo N+1 que já derrubou a carteira. Aqui cada consulta agrupa por
+    competência e o Python só junta.
+
+    A fonte é o CUSTO × VENDA (fact_vendor_summary / fact_unit_summary), que é a
+    fonte oficial de resultado da empresa. O faturamento detalhado entra só para
+    o que ele sabe melhor: clientes distintos e mix de itens.
+    """
+    competencias = sorted(query_competences(conn, company_id))[-int(meses):]
+    if not competencias:
+        return []
+    marc = ",".join("?" for _ in competencias)
+    nivel = normalize_whitespace(nivel).lower() or "empresa"
+
+    # ── 1. Oficial: faturamento, devolução, margem ────────────────────────────
+    if nivel == "unidade" and alvo:
+        oficial_sql = (f"SELECT competence, SUM(net_value) liq, SUM(sale_value) bruto, "
+                       f"SUM(return_value) dev, SUM(qty_sold) qtd, AVG(margin_value) margem "
+                       f"FROM fact_unit_summary WHERE company_id = ? AND unit_name = ? "
+                       f"AND competence IN ({marc}) GROUP BY competence")
+        oficial_par = [company_id, normalize_unit(alvo), *competencias]
+    elif nivel == "vendedor" and alvo:
+        variantes = seller_name_variants(conn, company_id, alvo) or [alvo]
+        mv = ",".join("?" for _ in variantes)
+        oficial_sql = (f"SELECT competence, SUM(net_value) liq, SUM(sale_value) bruto, "
+                       f"SUM(return_value) dev, SUM(qty_sold) qtd, AVG(margin_value) margem "
+                       f"FROM fact_vendor_summary WHERE company_id = ? "
+                       f"AND seller_name IN ({mv}) AND competence IN ({marc}) "
+                       f"GROUP BY competence")
+        oficial_par = [company_id, *variantes, *competencias]
+    else:
+        # Empresa: soma as UNIDADES, não os vendedores — vendedor sem unidade
+        # resolvida ficaria de fora e o total não bateria com o oficial.
+        oficial_sql = (f"SELECT competence, SUM(net_value) liq, SUM(sale_value) bruto, "
+                       f"SUM(return_value) dev, SUM(qty_sold) qtd, AVG(margin_value) margem "
+                       f"FROM fact_unit_summary WHERE company_id = ? "
+                       f"AND competence IN ({marc}) GROUP BY competence")
+        oficial_par = [company_id, *competencias]
+    oficial = {r["competence"]: dict(r) for r in conn.execute(oficial_sql, oficial_par).fetchall()}
+
+    # ── 2. Garantia, para separar da devolução comercial ──────────────────────
+    gar_onde, gar_par = "", []
+    if nivel == "unidade" and alvo:
+        gar_onde, gar_par = " AND unit_name = ?", [normalize_unit(alvo)]
+    elif nivel == "vendedor" and alvo:
+        _v = seller_name_variants(conn, company_id, alvo) or [alvo]
+        gar_onde = f" AND seller_name IN ({','.join('?' for _ in _v)})"
+        gar_par = list(_v)
+    garantia = {
+        r["competence"]: float(r["v"] or 0)
+        for r in conn.execute(
+            f"SELECT competence, SUM(total_value) v FROM fact_warranty_returns "
+            f"WHERE company_id = ? AND reason = ? AND competence IN ({marc}){gar_onde} "
+            f"GROUP BY competence",
+            [company_id, RETURN_REASON_WARRANTY, *competencias, *gar_par]).fetchall()
+    }
+
+    # ── 3. Clientes distintos e mix, do faturamento detalhado ─────────────────
+    det_onde, det_par = "", []
+    if nivel == "vendedor" and alvo:
+        _v = seller_name_variants(conn, company_id, alvo) or [alvo]
+        det_onde = f" AND seller_name IN ({','.join('?' for _ in _v)})"
+        det_par = list(_v)
+    item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
+            "NULLIF(gtin_value,''), 'ITEM')")
+    detalhe = {
+        r["competence"]: dict(r)
+        for r in conn.execute(
+            f"SELECT competence, COUNT(DISTINCT client_name) clientes, "
+            f"COUNT(DISTINCT {item}) mix "
+            f"FROM fact_sales_detail WHERE company_id = ? AND net_value > 0 "
+            f"AND competence IN ({marc}){det_onde} GROUP BY competence",
+            [company_id, *competencias, *det_par]).fetchall()
+    }
+
+    # ── 4. Metas ──────────────────────────────────────────────────────────────
+    if nivel == "unidade" and alvo:
+        meta_sql = (f"SELECT competence, SUM(revenue_goal) meta FROM goals_unit "
+                    f"WHERE company_id = ? AND unit_name = ? AND competence IN ({marc}) "
+                    f"GROUP BY competence")
+        meta_par = [company_id, normalize_unit(alvo), *competencias]
+    elif nivel == "vendedor" and alvo:
+        _v = seller_name_variants(conn, company_id, alvo) or [alvo]
+        meta_sql = (f"SELECT competence, SUM(revenue_goal) meta FROM goals_seller "
+                    f"WHERE company_id = ? AND seller_name IN ({','.join('?' for _ in _v)}) "
+                    f"AND competence IN ({marc}) GROUP BY competence")
+        meta_par = [company_id, *_v, *competencias]
+    else:
+        meta_sql = (f"SELECT competence, SUM(revenue_goal) meta FROM goals_unit "
+                    f"WHERE company_id = ? AND competence IN ({marc}) GROUP BY competence")
+        meta_par = [company_id, *competencias]
+    metas = {r["competence"]: float(r["meta"] or 0)
+             for r in conn.execute(meta_sql, meta_par).fetchall()}
+
+    # ── 5. Execução: ligações ativas registradas ──────────────────────────────
+    lig_onde, lig_par = "", []
+    if nivel == "vendedor" and alvo:
+        _c, _p = seller_filter_sql(conn, company_id, alvo)
+        lig_onde, lig_par = f" AND {_c}", list(_p)
+    ligacoes = {
+        r["comp"]: int(r["n"] or 0)
+        for r in conn.execute(
+            f"SELECT substr(replace(occurred_at,'T',' '),1,7) comp, COUNT(*) n "
+            f"FROM crm_interactions WHERE company_id = ? AND initiative = 'ATIVO' "
+            f"AND contact_type_code = 'LIGACAO'{lig_onde} GROUP BY comp",
+            [company_id, *lig_par]).fetchall()
+    }
+
+    serie = []
+    for comp in competencias:
+        o = oficial.get(comp, {})
+        liq_bruto = float(o.get("liq") or 0)
+        gar = min(float(garantia.get(comp, 0.0)), float(o.get("dev") or 0))
+        # Mesma regra do painel e da premiação: garantia é defeito de peça,
+        # volta para o líquido e sai da devolução.
+        liq = liq_bruto + gar
+        dev_comercial = max(float(o.get("dev") or 0) - gar, 0.0)
+        bruto = float(o.get("bruto") or 0)
+        meta = metas.get(comp, 0.0)
+        d = detalhe.get(comp, {})
+        clientes = int(d.get("clientes") or 0)
+        serie.append({
+            "competence": comp,
+            "revenueNet": round(liq, 2),
+            "revenueGross": round(bruto, 2),
+            "revenueGoal": round(meta, 2),
+            "attainmentPct": round(safe_div(liq, meta) * 100, 1) if meta else None,
+            "returnsCommercial": round(dev_comercial, 2),
+            "returnsWarranty": round(gar, 2),
+            "returnRatioPct": round(safe_div(dev_comercial, liq) * 100, 2) if liq else 0.0,
+            "marginValue": round(float(o["margem"]), 3) if o.get("margem") else None,
+            "discountPct": round(safe_div(bruto - liq, bruto) * 100, 2) if bruto else 0.0,
+            "qtySold": round(float(o.get("qtd") or 0), 0),
+            "clients": clientes,
+            "ticketAverage": round(safe_div(liq, clientes), 2) if clientes else 0.0,
+            "mixSku": int(d.get("mix") or 0),
+            "activeCalls": ligacoes.get(comp, 0),
+        })
+    return serie
+
+
 def compute_team_activity_today(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 ) -> dict[str, Any]:
