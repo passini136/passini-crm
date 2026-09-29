@@ -23499,11 +23499,31 @@ def resultados_serie(
     }
 
     # ── 3. Clientes distintos e mix, do faturamento detalhado ─────────────────
+    # O RECORTE DE UNIDADE PRECISA CHEGAR AQUI TAMBÉM.
+    #
+    # Sem ele, a MATRIZ mostrava os 4.466 clientes da EMPRESA e o ticket dela
+    # saía dividindo o faturamento da unidade por todos os clientes do grupo —
+    # R$ 425 contra os R$ 1.093 do grupo, um número que parece informação e não
+    # é. O faturamento detalhado não tem coluna de unidade: ela vem do vendedor,
+    # e POR COMPETÊNCIA, senão quem mudou de loja leva a carteira antiga junto.
     det_onde, det_par = "", []
     if nivel == "vendedor" and alvo:
         _v = seller_name_variants(conn, company_id, alvo) or [alvo]
         det_onde = f" AND seller_name IN ({','.join('?' for _ in _v)})"
         det_par = list(_v)
+    elif nivel == "unidade" and alvo:
+        conn.execute("DROP TABLE IF EXISTS temp.serie_unidade")
+        conn.execute("CREATE TEMP TABLE serie_unidade "
+                     "(competence TEXT, seller_name TEXT, "
+                     " PRIMARY KEY (competence, seller_name))")
+        pares = []
+        for _comp in competencias:
+            for _nome in (sellers_of_unit(conn, company_id, _comp, alvo) or []):
+                pares.append((_comp, _nome))
+        conn.executemany("INSERT OR IGNORE INTO serie_unidade VALUES (?, ?)", pares)
+        det_onde = (" AND EXISTS (SELECT 1 FROM serie_unidade u "
+                    " WHERE u.competence = fact_sales_detail.competence "
+                    "   AND u.seller_name = fact_sales_detail.seller_name)")
     item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
             "NULLIF(gtin_value,''), 'ITEM')")
     detalhe = {
@@ -23552,6 +23572,12 @@ def resultados_serie(
     serie = []
     for comp in competencias:
         o = oficial.get(comp, {})
+        # Competência sem faturamento E sem meta não é mês de resultado: é a
+        # linha solta com data errada que já nos apareceu (2025-01, uma linha).
+        # Deixá-la na série põe um R$ 0,00 no gráfico da reunião e faz a
+        # contagem de anos mentir sobre o histórico disponível.
+        if not float(o.get("liq") or 0) and not metas.get(comp, 0.0):
+            continue
         liq_bruto = float(o.get("liq") or 0)
         gar = min(float(garantia.get(comp, 0.0)), float(o.get("dev") or 0))
         # Mesma regra do painel e da premiação: garantia é defeito de peça,

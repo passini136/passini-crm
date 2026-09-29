@@ -94,12 +94,37 @@ else:
 
 # ── 4. O histórico dá para comparar? ────────────────────────────────────────
 print("\n4) O HISTÓRICO ALCANÇA O QUE A REUNIÃO PEDE?")
-anos = sorted({r["competence"][:4] for r in serie})
-print(f"   {len(serie)} competência(s), ano(s): {', '.join(anos)}")
-if len(anos) < 2:
-    print("   >> Só um ano na base. Dá para comparar mês contra mês e contra a")
-    print("      média, mas NÃO ano contra ano. Importar 2025 destrava isso.")
+# CONTA ANO COM FATURAMENTO DE VERDADE, não ano presente.
+#
+# A primeira versão contava anos distintos e concluiu "dá para comparar ano
+# contra ano" porque existia UMA linha solta em 2025-01, com R$ 0,00. Contar
+# presença em vez de substância é o mesmo erro que já me fez acusar 13
+# cadastros inofensivos e culpar o casamento de nomes por uma média zerada.
+por_ano: dict[str, float] = {}
+for r in serie:
+    por_ano[r["competence"][:4]] = por_ano.get(r["competence"][:4], 0.0) + r["revenueNet"]
+print(f"   {len(serie)} competência(s) com resultado")
+for ano, v in sorted(por_ano.items()):
+    meses_ano = sum(1 for r in serie if r["competence"].startswith(ano))
+    print(f"      {ano}: {meses_ano} mês(es) · {backend.brl(v)}")
+completos = [a for a, v in por_ano.items() if v > 0]
+if len(completos) < 2:
+    print("\n   >> Só um ano com faturamento. Dá para comparar mês contra mês e")
+    print("      contra a média, mas NÃO ano contra ano — e sazonalidade de")
+    print("      autopeças não se lê sem o ano anterior. Importar 2025 destrava.")
 else:
-    print("   >> Dá para comparar o mesmo mês de anos diferentes.")
+    print("\n   >> Dá para comparar o mesmo mês de anos diferentes.")
+
+# ── 5. As metas cobrem a série? ─────────────────────────────────────────────
+# Sem meta não há atingimento, e atingimento é o primeiro número da reunião.
+print("\n5) AS METAS COBREM O PERÍODO?")
+sem_meta = [r["competence"] for r in serie if not r["revenueGoal"]]
+if sem_meta:
+    print(f"   {len(sem_meta)} de {len(serie)} mês(es) SEM meta cadastrada:")
+    print(f"      {', '.join(sem_meta)}")
+    print("   >> Nesses meses o painel não mostra % de atingimento. Para o")
+    print("      histórico servir à reunião, as metas antigas precisam entrar.")
+else:
+    print("   >> Todos os meses têm meta.")
 
 conn.close()
