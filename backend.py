@@ -23722,6 +23722,169 @@ def resultados_fatos(
             "comparedWith": len(anteriores)}
 
 
+def resultados_produtividade(
+    conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str, competencia: str,
+) -> dict[str, Any]:
+    """Produtividade da unidade ou do vendedor no mês — o "como", não o "quanto".
+
+    Faturamento diz o resultado; estes indicadores dizem se ele veio de trabalho
+    repetível ou de sorte. Um vendedor pode bater a meta com três clientes
+    grandes e ter abandonado a carteira — e é isso que a reunião precisa
+    enxergar antes de premiar ou cobrar.
+
+    DEFINIÇÕES, porque cada uma vira discussão se ficar implícita:
+      · faturamento/dia → líquido ÷ dias ÚTEIS (decorridos, se o mês está aberto)
+      · PF/PJ           → documento do cadastro; sem documento, heurística do nome
+      · da carteira     → cliente cujo vendedor interno é esta pessoa (ou alguém
+                          da unidade). Fora dela é atendimento de apoio, que conta
+                          faturamento mas NÃO conta positivação
+      · positivação     → clientes da carteira que compraram ÷ tamanho da carteira
+      · conversão       → dos clientes que receberam ligação ativa no mês, quantos
+                          compraram no mês
+    """
+    if not competencia:
+        return {}
+    nivel = normalize_whitespace(nivel).lower()
+
+    # ── Quem é "da casa" neste recorte ────────────────────────────────────────
+    if nivel == "vendedor" and alvo:
+        donos = seller_name_variants(conn, company_id, alvo) or [alvo]
+    elif nivel == "unidade" and alvo:
+        donos = sellers_of_unit(conn, company_id, competencia, alvo) or []
+    else:
+        donos = []
+    # chave_canonica consulta o banco a cada chamada. A carteira tem milhares de
+    # linhas e as interações do mês, centenas — resolver por linha transformaria
+    # esta função no mesmo N+1 que já derrubou a carteira e o histórico. Nomes
+    # distintos de vendedor são algumas dezenas: memoriza por nome.
+    _memo: dict[str, str] = {}
+
+    def _canon(nome: str) -> str:
+        if nome not in _memo:
+            _memo[nome] = chave_canonica(conn, company_id, nome)
+        return _memo[nome]
+
+    chaves_donos = {_canon(n) for n in donos}
+
+    # ── A carteira: clientes com vendedor interno do recorte ─────────────────
+    carteira: dict[str, str] = {}      # chave do cliente → nome do vendedor dono
+    for r in conn.execute(
+        "SELECT client_name, NULLIF(TRIM(internal_seller_name),'') dono "
+        "FROM crm_client_profiles WHERE company_id = ?", (company_id,)).fetchall():
+        if not r["client_name"]:
+            continue
+        dono = normalize_whitespace(r["dono"])
+        if not dono:
+            continue
+        if not chaves_donos or _canon(dono) in chaves_donos:
+            carteira[normalize_client_key(r["client_name"])] = dono
+
+    # ── Faturamento do mês no recorte, por cliente ───────────────────────────
+    onde, par = "", []
+    if donos:
+        onde = f" AND seller_name IN ({','.join('?' for _ in donos)})"
+        par = list(donos)
+    item = ("COALESCE(NULLIF(manufacturer_sku,''), NULLIF(sku_key,''), "
+            "NULLIF(gtin_value,''), 'ITEM')")
+    linhas = conn.execute(
+        f"SELECT client_name, SUM(net_value) v, COUNT(DISTINCT {item}) mix "
+        f"FROM fact_sales_detail WHERE company_id = ? AND competence = ? "
+        f"AND net_value > 0{onde} GROUP BY client_name",
+        [company_id, competencia, *par]).fetchall()
+
+    nomes = [r["client_name"] for r in linhas if r["client_name"]]
+    tipos = client_person_type_map(conn, company_id, nomes)
+
+    # Baldes: PF/PJ × dentro/fora da carteira. Quatro números que respondem
+    # perguntas diferentes e costumam ser somados errado quando ficam juntos.
+    baldes = {f"{t}_{o}": {"clients": 0, "revenue": 0.0}
+              for t in ("PF", "PJ") for o in ("carteira", "fora")}
+    atendidos_carteira: set[str] = set()
+    for r in linhas:
+        chave = normalize_client_key(r["client_name"])
+        tipo = tipos.get(chave, "PF")
+        origem = "carteira" if chave in carteira else "fora"
+        if origem == "carteira":
+            atendidos_carteira.add(chave)
+        b = baldes[f"{tipo}_{origem}"]
+        b["clients"] += 1
+        b["revenue"] += float(r["v"] or 0)
+
+    liquido = sum(b["revenue"] for b in baldes.values())
+    clientes = sum(b["clients"] for b in baldes.values())
+
+    # ── Mix de itens distintos no recorte ────────────────────────────────────
+    mix = int(conn.execute(
+        f"SELECT COUNT(DISTINCT {item}) n FROM fact_sales_detail "
+        f"WHERE company_id = ? AND competence = ? AND net_value > 0{onde}",
+        [company_id, competencia, *par]).fetchone()["n"] or 0)
+
+    # ── Dias úteis: o denominador do faturamento por dia ─────────────────────
+    cal = get_business_calendar(conn, company_id, competencia)
+    dias_totais = int(cal.get("totalWorkingDays") or 0)
+    dias_corridos = int(cal.get("elapsedWorkingDays") or 0)
+    mes_aberto = competencia == today_in_brazil().strftime("%Y-%m")
+    dias = (dias_corridos if mes_aberto and dias_corridos else dias_totais) or 1
+
+    # ── Execução: ligações ativas e conversão ────────────────────────────────
+    # O recorte do vendedor é feito em Python por chave canônica, não por
+    # seller_filter_sql: aquele resolve UM nome, e a unidade tem dezenas. Além
+    # disso a interação é gravada com a grafia que o usuário tinha no dia, que
+    # nem sempre é a do faturamento — comparar chave canônica casa as duas.
+    inicio = first_day_of_competence(competencia).isoformat()
+    fim = last_day_of_competence(competencia).isoformat()
+    ligacoes = 0
+    contatados: set[str] = set()
+    for r in conn.execute(
+        "SELECT seller_name, client_key FROM crm_interactions "
+        "WHERE company_id = ? AND initiative = 'ATIVO' AND contact_type_code = 'LIGACAO' "
+        "AND date(substr(replace(occurred_at,'T',' '),1,10)) BETWEEN date(?) AND date(?)",
+            (company_id, inicio, fim)).fetchall():
+        if chaves_donos and _canon(normalize_whitespace(r["seller_name"])) not in chaves_donos:
+            continue
+        ligacoes += 1
+        if r["client_key"]:
+            contatados.add(normalize_client_key(r["client_key"]))
+    compraram = {normalize_client_key(r["client_name"]) for r in linhas if r["client_name"]}
+    converteram = contatados & compraram
+
+    def ticket(b):
+        return round(safe_div(b["revenue"], b["clients"]), 2) if b["clients"] else 0.0
+
+    pf = {"clients": baldes["PF_carteira"]["clients"] + baldes["PF_fora"]["clients"],
+          "revenue": baldes["PF_carteira"]["revenue"] + baldes["PF_fora"]["revenue"]}
+    pj = {"clients": baldes["PJ_carteira"]["clients"] + baldes["PJ_fora"]["clients"],
+          "revenue": baldes["PJ_carteira"]["revenue"] + baldes["PJ_fora"]["revenue"]}
+
+    return {
+        "competence": competencia,
+        "workingDays": dias, "monthOpen": mes_aberto,
+        "totalWorkingDays": dias_totais,
+        "revenueNet": round(liquido, 2),
+        "revenuePerDay": round(liquido / dias, 2),
+        "clients": clientes,
+        "mixSku": mix,
+        "portfolioSize": len(carteira),
+        # Positivação só conta cliente DA CARTEIRA: atender cliente de outro
+        # vendedor é apoio, e contar como positivação premiaria quem não cuida
+        # da própria base.
+        "portfolioServed": len(atendidos_carteira),
+        "positivationPct": round(100 * len(atendidos_carteira) / len(carteira), 1) if carteira else None,
+        "byType": {
+            "PF": {**pf, "ticket": ticket(pf)},
+            "PJ": {**pj, "ticket": ticket(pj)},
+        },
+        "byOrigin": {
+            k: {**v, "ticket": ticket(v)} for k, v in baldes.items()
+        },
+        "activeCalls": ligacoes,
+        "clientsCalled": len(contatados),
+        "converted": len(converteram),
+        "conversionPct": round(100 * len(converteram) / len(contatados), 1) if contatados else None,
+        "callsPerDay": round(ligacoes / dias, 1),
+    }
+
+
 def resultados_concentracao(
     conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str,
     competencia: str, anterior: str,
