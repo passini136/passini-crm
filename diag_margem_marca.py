@@ -176,14 +176,26 @@ else:
 
 # ── 4. O ranking por marca ──────────────────────────────────────────────────
 print("\n4) MARGEM POR MARCA — as 15 maiores em faturamento")
+# POR CÓDIGO é a coluna decisiva: custo casado pelo código interno vem da
+# embalagem exata. Casado só pela referência, mistura caixa com litro.
 print(f"   {'MARCA':<22}{'LÍQUIDO':>15}{'PEÇAS':>10}{'R$/PEÇA':>11}"
-      f"{'MARGEM':>9}{'COBERT':>9}")
+      f"{'MARGEM':>9}{'P/CÓDIGO':>10}")
 for b in d["brands"][:15]:
     mg = f"{b['marginPct']:.1f}%" if b["marginPct"] is not None else "—"
     print(f"   {b['brand'][:21]:<22}{backend.brl(b['revenue']):>15}"
           f"{b['pieces']:>10,.0f}{backend.brl(b['ticketPerPiece']):>11}"
-          f"{mg:>9}{b['coveragePct']:>8.0f}%"
-          f"{'' if b['reliable'] else '  ← pouca cobertura'}")
+          f"{mg:>9}{b.get('byCodePct', 0):>9.0f}%"
+          f"{'' if not b['costSuspect'] else '  ← revisar custo'}")
+
+por_codigo = sum(b["revenue"] * b.get("byCodePct", 0) / 100 for b in d["brands"])
+pct_cod = 100 * por_codigo / d["totalRevenue"] if d["totalRevenue"] else 0
+print(f"\n   Custo casado pelo CÓDIGO INTERNO: {pct_cod:.1f}% do faturamento")
+if pct_cod < 50:
+    print("   >> A maior parte ainda casa pela REFERÊNCIA, que mistura caixa com")
+    print("      litro. Reimportar a competência traz o código da coluna E e")
+    print("      corrige a margem dos lubrificantes.")
+else:
+    print("   >> A embalagem exata está sendo usada na maior parte da venda.")
 
 confiaveis = [b for b in d["brands"] if b["reliable"] and b["marginPct"] is not None]
 if len(confiaveis) >= 4:

@@ -1247,6 +1247,13 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         # A coluna "Marca" sempre veio no arquivo do Alfa, mas não era gravada.
         # Fica NULL nas linhas antigas: só reimportar o mês traz a marca dele.
         conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN brand_name TEXT")
+    if bool(sales_columns) and "item_code" not in sales_columns:
+        # Código interno do item — coluna E do arquivo, sem cabeçalho. É a ÚNICA
+        # coisa que separa a caixa do litro: a referência do fabricante é a
+        # mesma para as duas embalagens, e por isso o custo do lubrificante
+        # saía do balde e caía sobre o litro vendido. Fica NULL nas linhas
+        # antigas; só reimportar o mês traz o código dele.
+        conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN item_code TEXT")
     catalog_columns = {row["name"] for row in conn.execute("PRAGMA table_info(item_catalog)").fetchall()}
     if catalog_columns and "item_name" not in catalog_columns:
         # "JUNTA HOMOCINETICA LADO RODA 22 IN" é o que o vendedor lê e fala;
@@ -1257,6 +1264,9 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sales_brand "
             "ON fact_sales_detail(company_id, competence, brand_name)")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sales_item_code "
+            "ON fact_sales_detail(company_id, competence, item_code)")
 
     # Roda quando AINDA HOUVER linha no formato antigo — olhando o dado, não a
     # ordem dos deploys. O gatilho anterior era a criação da coluna da marca, e
@@ -2949,6 +2959,7 @@ def init_db() -> None:
                 client_name TEXT NOT NULL,
                 city_name TEXT,
                 gtin_value TEXT,
+                item_code TEXT,            -- coluna E, sem cabeçalho: separa caixa de litro
                 manufacturer_sku TEXT,
                 brand_name TEXT,
                 sku_key TEXT,
@@ -4533,10 +4544,61 @@ def rehash_sales_detail(conn: sqlite3.Connection) -> int:
     return len(remover)
 
 
+def coluna_excel(indice: int) -> str:
+    """0 → A, 4 → E. Para o código falar a mesma língua da planilha."""
+    nome = ""
+    indice += 1
+    while indice:
+        indice, resto = divmod(indice - 1, 26)
+        nome = chr(65 + resto) + nome
+    return nome
+
+
 def parse_csv_bytes(content: bytes) -> list[dict[str, str]]:
+    """Lê o CSV do Alfa devolvendo TAMBÉM as colunas sem cabeçalho.
+
+    O faturamento detalhado tem DUAS colunas sem nome: a E (o código interno do
+    item) e a S (sobra no fim da linha). `csv.DictReader` usa o cabeçalho como
+    chave de dicionário, então as duas viram a mesma chave "" e a última
+    sobrescreve a primeira — o código pedia a coluna E e recebia a S, vazia.
+
+    O estrago passou meses invisível: o campo simplesmente ficava em branco,
+    sem erro nem linha perdida. E o custo do lubrificante depende justamente
+    dessa coluna, porque a referência do fabricante é a mesma para a caixa e
+    para o litro; o que separa as embalagens é o código do item.
+
+    Cada coluna sem nome ganha a chave `__col_<LETRA>` (`__col_E`), além de
+    continuar disponível sob "" para não quebrar quem já lê assim. Cabeçalho
+    com nome é preservado como está: renomear coluna nomeada mudaria o
+    comportamento de todos os outros importadores.
+    """
     text = decode_text_content(content)
-    reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=";")
-    return [dict(row) for row in reader]
+    reader = csv.reader(io.StringIO(text, newline=""), delimiter=";")
+    try:
+        cabecalho = next(reader)
+    except StopIteration:
+        return []
+    chaves = []
+    for i, nome in enumerate(cabecalho):
+        limpo = (nome or "").strip().strip('"').strip()
+        chaves.append(limpo if limpo else f"__col_{coluna_excel(i)}")
+
+    linhas = []
+    for valores in reader:
+        linha = {}
+        for i, chave in enumerate(chaves):
+            linha[chave] = valores[i] if i < len(valores) else None
+        # Sobra de colunas além do cabeçalho: mantém o comportamento do
+        # DictReader, que joga o excedente em None.
+        if len(valores) > len(chaves):
+            linha[None] = valores[len(chaves):]
+        # Compatibilidade: quem lê row.get("") continua recebendo a última
+        # coluna sem nome, como antes.
+        sem_nome = [c for c in chaves if c.startswith("__col_")]
+        if sem_nome:
+            linha[""] = linha.get(sem_nome[-1])
+        linhas.append(linha)
+    return linhas
 
 
 def unwrap_excel_text(value: Any) -> str:
@@ -5069,7 +5131,13 @@ def import_package(
                 seller_name = normalize_whitespace(row.get("Vendedor"))
                 client_name = normalize_whitespace(row.get("Cliente") or row.get("CLIENTE") or row.get("Razao Social/Nome")) or "CLIENTE NÃO INFORMADO"
                 city_name = normalize_upper(row.get("Cidade"))
-                gtin_value = normalize_whitespace(row.get(""))
+                # Coluna E, sem cabeçalho: o CÓDIGO INTERNO do item. Lida por
+                # posição porque o arquivo tem duas colunas sem nome (E e S) e
+                # o leitor por nome devolvia a S, vazia. `row.get("")` ficou
+                # como retaguarda para arquivo antigo com uma coluna só.
+                item_code = normalize_whitespace(
+                    unwrap_excel_text(row.get("__col_E") or row.get("") or ""))
+                gtin_value = normalize_whitespace(row.get("GTIN") or row.get("Gtin"))
                 manufacturer_sku = normalize_whitespace(row.get("Fabricante"))
                 brand_name = normalize_upper(row.get("Marca"))
                 dt_value = parse_sales_row_date(row)
@@ -5117,9 +5185,9 @@ def import_package(
                         """
                         INSERT INTO fact_sales_detail (
                             company_id, competence, import_id, row_hash, seller_name, client_name, city_name,
-                            gtin_value, manufacturer_sku, brand_name, sku_key, issue_date, quantity, gross_value,
+                            gtin_value, item_code, manufacturer_sku, brand_name, sku_key, issue_date, quantity, gross_value,
                             discount_value, freight_value, return_quantity, return_value, net_value, sale_share, created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             company_id,
@@ -5130,6 +5198,7 @@ def import_package(
                             client_name,
                             city_name,
                             gtin_value,
+                            item_code,
                             manufacturer_sku,
                             brand_name,
                             sku_key,
@@ -24094,6 +24163,27 @@ def ensure_catalogo_custo_temp(conn: sqlite3.Connection, company_id: int) -> Non
         (company_id,),
     )
     conn.execute("CREATE INDEX temp.idx_catalogo_custo ON catalogo_custo(ref, marca)")
+
+    # Custo pelo CÓDIGO INTERNO — a chave exata, uma linha por embalagem.
+    # A tabela por referência acima mistura caixa e litro numa média, o que
+    # produzia margem de -300% em lubrificante. Ela continua existindo só como
+    # retaguarda para as competências antigas, importadas antes de a coluna E
+    # passar a ser lida.
+    conn.execute("DROP TABLE IF EXISTS temp.catalogo_custo_codigo")
+    conn.execute(
+        """
+        CREATE TEMP TABLE catalogo_custo_codigo AS
+        SELECT UPPER(TRIM(item_code))      AS codigo,
+               AVG(NULLIF(cost_price, 0))  AS custo,
+               MIN(unit_of_measure)        AS unidade
+        FROM item_catalog
+        WHERE company_id = ? AND TRIM(COALESCE(item_code, '')) <> ''
+        GROUP BY codigo
+        """,
+        (company_id,),
+    )
+    conn.execute(
+        "CREATE INDEX temp.idx_catalogo_custo_codigo ON catalogo_custo_codigo(codigo)")
     conn._catalogo_custo_temp = company_id
 
 
@@ -24131,16 +24221,25 @@ def resultados_margem_marca(
         onde = f" AND f.seller_name IN ({','.join('?' for _ in nomes)})"
         par = list(nomes)
 
+    # CÓDIGO INTERNO PRIMEIRO, referência só como retaguarda. O código
+    # identifica a embalagem exata; a referência é a mesma para caixa e litro e
+    # por isso entregava o custo do balde para o litro vendido. Linhas antigas
+    # não têm código — foram importadas antes de a coluna E ser lida — e para
+    # elas a referência continua sendo o melhor disponível.
     linhas = conn.execute(
         f"""
         SELECT UPPER(TRIM(COALESCE(f.brand_name,'(SEM MARCA)'))) AS marca,
                COALESCE(SUM(f.net_value), 0)      AS liquido,
                COALESCE(SUM(f.quantity), 0)       AS pecas,
-               COALESCE(SUM(CASE WHEN c.custo IS NOT NULL
-                            THEN f.quantity * c.custo END), 0) AS custo,
-               COALESCE(SUM(CASE WHEN c.custo IS NOT NULL
-                            THEN f.net_value END), 0)          AS liquido_com_custo
+               COALESCE(SUM(CASE WHEN COALESCE(k.custo, c.custo) IS NOT NULL
+                            THEN f.quantity * COALESCE(k.custo, c.custo) END), 0) AS custo,
+               COALESCE(SUM(CASE WHEN COALESCE(k.custo, c.custo) IS NOT NULL
+                            THEN f.net_value END), 0)          AS liquido_com_custo,
+               COALESCE(SUM(CASE WHEN k.custo IS NOT NULL
+                            THEN f.net_value END), 0)          AS liquido_por_codigo
         FROM fact_sales_detail f
+        LEFT JOIN catalogo_custo_codigo k
+               ON k.codigo = UPPER(TRIM(COALESCE(f.item_code, '')))
         LEFT JOIN catalogo_custo c
                ON c.ref = UPPER(TRIM(f.sku_key))
               AND c.marca = UPPER(TRIM(COALESCE(f.brand_name, '')))
@@ -24178,6 +24277,12 @@ def resultados_margem_marca(
             # reunião discutir a rentabilidade de uma marca que está apenas mal
             # cadastrada, e esconderia a marca que realmente perde dinheiro.
             "costSuspect": margem is not None and not (-20.0 <= margem <= 80.0),
+            # Quanto do custo veio do código interno (embalagem exata) e não da
+            # referência (média de caixa com litro). Marca com este número baixo
+            # e margem estranha é quase sempre lubrificante de mês antigo, ainda
+            # não reimportado — não desempenho.
+            "byCodePct": round(100 * float(r["liquido_por_codigo"] or 0) / liquido, 1)
+            if liquido else 0.0,
             "ticketPerPiece": round(liquido / float(r["pecas"]), 2) if r["pecas"] else None,
         })
 
