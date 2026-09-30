@@ -26442,6 +26442,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     if permitidas is not None:
                         _p = {normalize_unit(u) for u in permitidas}
                         unidades = [u for u in unidades if u in _p]
+                    # Cada aba paga só o que mostra. A série de 12 meses e o
+                    # ranking da equipe custam segundos cada; calcular os dois
+                    # sempre fazia quem abre em "fato e causa" esperar por
+                    # gráficos que não vai ver, e vice-versa.
+                    aba = normalize_whitespace(q.get("tab", ["fca"])[0]).lower()
+                    quer_evolucao = aba == "evolucao"
                     prod = resultados_produtividade(conn, user["company_id"], nivel,
                                                     alvo, fatos["competence"])
                     # Ranking de produtividade dos vendedores do recorte. É o
@@ -26449,7 +26455,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     # já existe em quatro telas; o que falta é ver quem entrega
                     # sem trabalhar a carteira.
                     equipe = []
-                    if nivel != "vendedor":
+                    if nivel != "vendedor" and not quer_evolucao:
                         nomes = sellers_of_unit(conn, user["company_id"],
                                                 fatos["competence"], alvo) if alvo else None
                         if nomes is None:
@@ -26465,17 +26471,17 @@ class AppHandler(BaseHTTPRequestHandler):
                             if p and p["revenueNet"]:
                                 equipe.append({"seller": normalize_whitespace(nome), **p})
                         equipe.sort(key=lambda x: x["revenuePerDay"], reverse=True)
-                    prod_serie = resultados_produtividade_serie(conn, user["company_id"],
-                                                                nivel, alvo)
-                    tendencias = resultados_evolucao(prod_serie)
-                    margem = resultados_margem_marca(conn, user["company_id"], nivel,
-                                                     alvo, fatos["competence"])
+                    prod_serie = (resultados_produtividade_serie(
+                        conn, user["company_id"], nivel, alvo) if quer_evolucao else [])
+                    tendencias = resultados_evolucao(prod_serie) if quer_evolucao else []
+                    margem = ({} if quer_evolucao else resultados_margem_marca(
+                        conn, user["company_id"], nivel, alvo, fatos["competence"]))
                     # Mix só faz sentido comparando unidades entre si; no
                     # recorte de um vendedor não há com o que comparar.
                     mix_unidades = (resultados_mix_unidade(
                         conn, user["company_id"], fatos["competence"],
                         permitidas if permitidas is not None else None)
-                        if nivel != "vendedor" else {})
+                        if nivel != "vendedor" and not quer_evolucao else {})
                 self._set_headers(200)
                 self.wfile.write(json_dumps({
                     "level": nivel, "target": alvo,
@@ -26484,7 +26490,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "units": unidades,
                     "productivity": prod, "team": equipe,
                     "productivitySeries": prod_serie, "trends": tendencias,
-                    "brandMargin": margem, "unitMix": mix_unidades,
+                    "brandMargin": margem, "unitMix": mix_unidades, "tab": aba,
                     "canChooseCompany": permitidas is None and escopo != "proprio",
                 }))
                 return

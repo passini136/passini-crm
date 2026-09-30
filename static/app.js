@@ -12518,6 +12518,7 @@ async function loadResultados() {
     q.set("level", state.resultadosFiltros.level || "empresa");
     if (state.resultadosFiltros.target) q.set("target", state.resultadosFiltros.target);
     if (state.resultadosFiltros.competence) q.set("competence", state.resultadosFiltros.competence);
+    q.set("tab", state.resultadosFiltros.tab || "fca");
     state.resultados = await api(`/api/resultados?${q.toString()}`);
     state.resultadosFiltros.level = state.resultados.level;
     state.resultadosFiltros.target = state.resultados.target || "";
@@ -12536,9 +12537,18 @@ function setResultadoNivel(level, target) {
   void loadResultados();
 }
 
-function setResultadoAba(aba) {
+/* Trocar de aba busca os dados daquela aba.
+ *
+ * Cada aba custa segundos diferentes — a série de 12 meses e o ranking da
+ * equipe são caros — e carregar as duas sempre fazia quem abre em "fato e
+ * causa" esperar por gráficos que não vai ver. O preço é uma ida ao servidor
+ * na troca; em compensação a tela abre na metade do tempo. */
+async function setResultadoAba(aba) {
+  if (state.resultadosFiltros.tab === aba) return;
   state.resultadosFiltros.tab = aba;
+  state.resultados = null;          // força o "Montando o painel…"
   render();
+  await loadResultados();
 }
 
 /* ─── Gráficos do painel de evolução ─────────────────────────────────────────
