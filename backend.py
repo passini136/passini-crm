@@ -13640,6 +13640,8 @@ BRAND_DIMENSIONS = [
      "hint": "AMORTECEDOR, KITS EMBREAGEM, FILTROS — como o vendedor conversa com o mecânico."},
     {"id": "grupo", "label": "Grupo",
      "hint": "SUSPENSAO, FREIO, TRANSMISSAO — a visão macro do mix."},
+    {"id": "tipo", "label": "Tipo de peça",
+     "hint": "AMORTECEDOR, PASTILHA, CORREIA — a peça em si, dentro da linha."},
 ]
 BRAND_DIMENSION_IDS = {d["id"] for d in BRAND_DIMENSIONS}
 
@@ -13690,7 +13692,8 @@ def ensure_catalogo_temp(conn: sqlite3.Connection, company_id: int) -> None:
         SELECT UPPER(TRIM(manufacturer_ref))            AS ref,
                UPPER(TRIM(COALESCE(brand_name, '')))    AS marca,
                MIN(NULLIF(TRIM(item_subgroup), ''))     AS item_subgroup,
-               MIN(NULLIF(TRIM(item_group), ''))        AS item_group
+               MIN(NULLIF(TRIM(item_group), ''))        AS item_group,
+               MIN(NULLIF(TRIM(item_type), ''))         AS item_type
         FROM item_catalog
         WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref, '')) <> ''
         GROUP BY ref, marca
@@ -13704,13 +13707,43 @@ _DIMENSION_EXPR = {
     "marca": "f.brand_name",
     "linha": "c.item_subgroup",
     "grupo": "c.item_group",
+    "tipo": "c.item_type",
 }
+
+# Filtros combináveis da tela de Marcas. São os MESMOS campos que servem de
+# dimensão, e é de propósito: o gestor troca de pergunta sem trocar de tela —
+# "ranking de marca dentro da linha FILTROS", "quais linhas a NAKATA vende",
+# "quem vende AMORTECEDOR". Filtrar e agrupar pelo mesmo campo é permitido e
+# devolve uma linha só, o que é resposta legítima.
+BRAND_FILTER_EXPR = {
+    "brand": "f.brand_name",
+    "line": "c.item_subgroup",
+    "group": "c.item_group",
+    "type": "c.item_type",
+}
+
+
+def brand_filter_sql(filtros: dict[str, str] | None) -> tuple[list[str], list[Any]]:
+    """Condições e parâmetros dos filtros de marca/linha/grupo/tipo.
+
+    Comparação em UPPER(TRIM(...)) dos dois lados. Comparar um lado limpo com o
+    outro cru é o erro que já deixou 184 cidades invisíveis neste projeto.
+    """
+    onde: list[str] = []
+    params: list[Any] = []
+    for chave, expr in BRAND_FILTER_EXPR.items():
+        valor = normalize_upper((filtros or {}).get(chave))
+        if not valor:
+            continue
+        onde.append(f"UPPER(TRIM(COALESCE({expr},''))) = ?")
+        params.append(valor)
+    return onde, params
 
 
 def brand_ranking_rows(
     conn: sqlite3.Connection, company_id: int, competence: str,
     vendedores: list[str] | None = None, dimensao: str = "marca",
-    competence_prev: str = "",
+    competence_prev: str = "", filtros: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Ranking cru de uma competência, indexado pela dimensão escolhida.
 
@@ -13734,6 +13767,9 @@ def brand_ranking_rows(
         marcadores = ",".join("?" for _ in vendedores)
         onde.append(f"f.seller_name IN ({marcadores})")
         params.extend(vendedores)
+    _f_onde, _f_par = brand_filter_sql(filtros)
+    onde.extend(_f_onde)
+    params.extend(_f_par)
     item = ("COALESCE(NULLIF(f.manufacturer_sku, ''), NULLIF(f.sku_key, ''), "
             "NULLIF(f.gtin_value, ''), 'ITEM')")
     atual = "f.competence = ?"
@@ -13771,7 +13807,7 @@ def brand_ranking_rows(
 def brand_seller_breakdown(
     conn: sqlite3.Connection, company_id: int, competence: str,
     vendedores: list[str] | None, unidade_por_vendedor: dict[str, str],
-    dimensao: str = "marca",
+    dimensao: str = "marca", filtros: dict[str, str] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Marca × vendedor numa consulta só, indexado pela marca.
 
@@ -13790,6 +13826,9 @@ def brand_seller_breakdown(
         marcadores = ",".join("?" for _ in vendedores)
         onde.append(f"f.seller_name IN ({marcadores})")
         params.extend(vendedores)
+    _f_onde, _f_par = brand_filter_sql(filtros)
+    onde.extend(_f_onde)
+    params.extend(_f_par)
     item = ("COALESCE(NULLIF(f.manufacturer_sku, ''), NULLIF(f.sku_key, ''), "
             "NULLIF(f.gtin_value, ''), 'ITEM')")
     saida: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -13921,10 +13960,51 @@ def return_rows_by_dimension(
     ]
 
 
+def brand_filter_options(
+    conn: sqlite3.Connection, company_id: int, competence: str,
+    vendedores: list[str] | None, filtros: dict[str, str] | None,
+) -> dict[str, list[str]]:
+    """Valores disponíveis em cada filtro, já considerando os OUTROS filtros.
+
+    Cada lista é montada aplicando os demais filtros, menos o próprio. É o que
+    faz os combos conversarem: escolher a marca NAKATA reduz a lista de linhas
+    às que a NAKATA realmente vende, mas a lista de marcas continua inteira —
+    senão o usuário escolheria uma marca e ficaria preso nela, sem conseguir
+    trocar sem limpar tudo.
+
+    Só entram valores com venda na competência. Oferecer as 57 mil linhas do
+    catálogo, a maioria sem venda no mês, transformaria o filtro numa lista
+    interminável onde quase toda escolha devolve tela vazia.
+    """
+    ensure_catalogo_temp(conn, company_id)
+    opcoes: dict[str, list[str]] = {}
+    for chave, expr in BRAND_FILTER_EXPR.items():
+        outros = {k: v for k, v in (filtros or {}).items() if k != chave}
+        onde = ["f.company_id = ?", "f.competence = ?", "f.net_value > 0",
+                f"TRIM(COALESCE({expr},'')) <> ''"]
+        params: list[Any] = [company_id, competence]
+        if vendedores is not None:
+            if not vendedores:
+                opcoes[chave] = []
+                continue
+            onde.append(f"f.seller_name IN ({','.join('?' for _ in vendedores)})")
+            params.extend(vendedores)
+        _o, _p = brand_filter_sql(outros)
+        onde.extend(_o)
+        params.extend(_p)
+        opcoes[chave] = [r["v"] for r in conn.execute(
+            f"""SELECT DISTINCT UPPER(TRIM({expr})) AS v
+                FROM fact_sales_detail f
+                {CATALOGO_JOIN_SQL}
+                WHERE {" AND ".join(onde)}
+                ORDER BY v""", params).fetchall() if r["v"]]
+    return opcoes
+
+
 def brand_sales_report(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     competence: str = "", scope: str = "", unit: str = "", seller: str = "",
-    dimension: str = "",
+    dimension: str = "", filtros: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Vendas por marca nos três recortes: grupo, unidade e vendedor.
 
@@ -13986,8 +14066,10 @@ def brand_sales_report(
         filtro = (None if permitidas is None
                   else sellers_of_unit(conn, company_id, comp, minha_unidade))
 
-    agora = brand_ranking_rows(conn, company_id, comp, filtro, dim)
-    antes = brand_ranking_rows(conn, company_id, anterior, filtro, dim)
+    filtros = {k: normalize_upper(v) for k, v in (filtros or {}).items()
+               if k in BRAND_FILTER_EXPR and normalize_upper(v)}
+    agora = brand_ranking_rows(conn, company_id, comp, filtro, dim, filtros=filtros)
+    antes = brand_ranking_rows(conn, company_id, anterior, filtro, dim, filtros=filtros)
     total = sum(v["revenue"] for v in agora.values())
     total_antes = sum(v["revenue"] for v in antes.values())
 
@@ -14035,7 +14117,8 @@ def brand_sales_report(
     # aparece seria trabalho jogado fora.
     exibidas = {r["brand"] for r in linhas}
     if atual == "equipe":
-        detalhe = brand_seller_breakdown(conn, company_id, comp, filtro, mapa_unidades, dim)
+        detalhe = brand_seller_breakdown(conn, company_id, comp, filtro, mapa_unidades,
+                                         dim, filtros=filtros)
         for r in linhas:
             r["breakdown"] = detalhe.get(r["brand"], [])
     elif atual == "grupo":
@@ -14046,7 +14129,8 @@ def brand_sales_report(
                 # Os dois meses numa consulta só: buscar separado dobraria as
                 # idas ao banco, uma por unidade por mês.
                 por_unidade[un] = brand_ranking_rows(
-                    conn, company_id, comp, nomes, dim, competence_prev=anterior)
+                    conn, company_id, comp, nomes, dim, competence_prev=anterior,
+                    filtros=filtros)
         for r in linhas:
             itens = []
             for un, rank in por_unidade.items():
@@ -14098,6 +14182,8 @@ def brand_sales_report(
         "monthProgress": round(ritmo, 4),
         "dimension": dim,
         "dimensions": BRAND_DIMENSIONS,
+        "filters": filtros,
+        "filterOptions": brand_filter_options(conn, company_id, comp, filtro, filtros),
         "hasCatalog": tem_catalogo,
         "scope": atual,
         "scopes": escopos,
@@ -26880,7 +26966,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         scope=q.get("scope", [""])[0],
                         unit=q.get("unit", [""])[0],
                         seller=q.get("seller", [""])[0],
-                        dimension=q.get("dimension", [""])[0])
+                        dimension=q.get("dimension", [""])[0],
+                        filtros={k: q.get(f"f_{k}", [""])[0]
+                                 for k in BRAND_FILTER_EXPR})
                 self._set_headers(200)
                 self.wfile.write(json_dumps(res))
                 return

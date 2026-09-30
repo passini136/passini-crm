@@ -50,7 +50,7 @@ const state = {
   awardPeriodDraft: null,
   awardEdits: {},
   awardTipOpen: null,
-  brandFilters: { scope: "", dimension: "" },
+  brandFilters: { scope: "", dimension: "", brand: "", line: "", group: "", type: "" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
   returnLoadingScope: null,
@@ -3091,6 +3091,7 @@ async function loadBrands(silencioso) {
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
   if (f.dimension) q.set("dimension", f.dimension);
+  ["brand", "line", "group", "type"].forEach((k) => { if (f[k]) q.set(`f_${k}`, f[k]); });
   const meuPedido = ++brandRequestSeq;
   if (!silencioso) {
     state.ui.loading.brands = true;
@@ -3182,6 +3183,87 @@ async function setBrandDimension(id) {
     state.brandLoadingScope = "";
     requestRender();
   }
+}
+
+/* Filtros combináveis de marca, linha, grupo e tipo.
+ *
+ * Recarregam do servidor em vez de filtrar a lista já carregada: a tela mostra
+ * só as maiores linhas, então filtrar no navegador esconderia justamente o que
+ * o filtro existe para revelar — a linha que não entrou no top. */
+async function setBrandFilter(chave, valor) {
+  if (state.brandLoadingScope) return;
+  if ((state.brandFilters[chave] || "") === (valor || "")) return;
+  state.brandFilters[chave] = valor || "";
+  state.brandOpen = {};
+  state.brandLoadingScope = "filtro";
+  requestRender();
+  try {
+    await loadBrands();
+  } finally {
+    state.brandLoadingScope = "";
+    requestRender();
+  }
+}
+
+async function limparBrandFiltros() {
+  ["brand", "line", "group", "type"].forEach((k) => { state.brandFilters[k] = ""; });
+  state.brandOpen = {};
+  state.brandLoadingScope = "filtro";
+  requestRender();
+  try {
+    await loadBrands();
+  } finally {
+    state.brandLoadingScope = "";
+    requestRender();
+  }
+}
+
+function blocoFiltrosMarca(d) {
+  const f = state.brandFilters;
+  const op = d.filterOptions || {};
+  const campos = [
+    ["brand", "Marca", "Todas as marcas"],
+    ["line", "Linha", "Todas as linhas"],
+    ["group", "Grupo", "Todos os grupos"],
+    ["type", "Tipo de peça", "Todos os tipos"],
+  ];
+  const ativos = campos.filter(([k]) => f[k]).length;
+  const ocupado = !!state.brandLoadingScope;
+  return `
+    <div class="panel" style="padding:12px 18px">
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        ${campos.map(([chave, rotulo, vazio]) => {
+          const lista = op[chave] || [];
+          const atual = f[chave] || "";
+          return `
+            <label style="display:flex;flex-direction:column;gap:3px;min-width:170px">
+              <span class="text-small" style="color:var(--muted);font-weight:700">
+                ${rotulo}${atual ? "" : ` <span style="font-weight:400">(${lista.length})</span>`}</span>
+              <select ${ocupado ? "disabled" : ""}
+                onchange="setBrandFilter('${chave}', this.value)"
+                style="border:1px solid ${atual ? "var(--accent)" : "var(--line)"};
+                       border-radius:8px;padding:6px 9px;font-size:13px;
+                       font-weight:${atual ? "700" : "400"};background:#fff;min-width:170px">
+                <option value="">${vazio}</option>
+                ${lista.map((v) => `
+                  <option value="${jsAttr(v)}" ${v === atual ? "selected" : ""}>
+                    ${escapeHtml(v)}</option>`).join("")}
+                ${atual && !lista.includes(atual) ? `
+                  <option value="${jsAttr(atual)}" selected>${escapeHtml(atual)} (sem venda no mês)</option>` : ""}
+              </select>
+            </label>`;
+        }).join("")}
+        ${ativos ? `
+          <button type="button" class="btn btn-sm btn-ghost" ${ocupado ? "disabled" : ""}
+            onclick="limparBrandFiltros()" style="margin-bottom:1px">
+            Limpar ${ativos} filtro${ativos > 1 ? "s" : ""}</button>` : ""}
+      </div>
+      ${!ativos ? "" : `
+        <div class="text-small" style="color:var(--muted);margin-top:7px">
+          Os totais e o comparativo abaixo já consideram o filtro — inclusive a
+          comparação com o mês anterior, que usa o mesmo recorte.
+        </div>`}
+    </div>`;
 }
 
 function toggleBrand(marca) {
@@ -3471,6 +3553,7 @@ function marcasView() {
   return `
     <div class="stack">
       ${blocoDimensaoMarca(d)}
+      ${blocoFiltrosMarca(d)}
 
       <div class="panel" style="padding:14px 18px">
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
