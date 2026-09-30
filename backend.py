@@ -26446,7 +26446,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     # ranking da equipe custam segundos cada; calcular os dois
                     # sempre fazia quem abre em "fato e causa" esperar por
                     # gráficos que não vai ver, e vice-versa.
-                    aba = normalize_whitespace(q.get("tab", ["fca"])[0]).lower()
+                    aba = normalize_whitespace(query.get("tab", ["fca"])[0]).lower()
                     quer_evolucao = aba == "evolucao"
                     prod = resultados_produtividade(conn, user["company_id"], nivel,
                                                     alvo, fatos["competence"])
