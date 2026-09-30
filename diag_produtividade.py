@@ -253,6 +253,26 @@ elif gasto > 2:
 else:
     print("   >> Rápido. Os caches por conexão estão segurando.")
 
+# ── 8. A aba de evolução aguenta? ───────────────────────────────────────────
+# Doze competências, cada uma com cache próprio: o que é barato numa tela pode
+# ficar caro multiplicado por doze. É o custo real de abrir "Evolução".
+print("\n8) CUSTO DA ABA EVOLUÇÃO — série de 12 meses")
+t0 = time.time()
+serie12 = backend.resultados_produtividade_serie(conn, company_id, "empresa", "")
+gasto12 = time.time() - t0
+print(f"   {len(serie12)} competência(s) em {gasto12:.2f}s "
+      f"({gasto12 / len(serie12) * 1000 if serie12 else 0:.0f}ms cada)")
+t0 = time.time()
+backend.resultados_evolucao(serie12)
+print(f"   Leitura de tendência: {(time.time() - t0) * 1000:.0f}ms")
+if gasto12 > 6:
+    print("   >> LENTO DEMAIS. O gerente desiste antes de a tela abrir.")
+    print("      A janela de recorrência está sendo relida a cada competência.")
+elif gasto12 > 3:
+    print("   >> No limite. Aceitável hoje, mas piora conforme o histórico cresce.")
+else:
+    print("   >> Aceitável para uma tela que se abre uma vez por reunião.")
+
 print("\n   >> O teste da tela: se as colunas de produtividade apenas repetirem a")
 print("      ordem do faturamento, elas não acrescentam nada à reunião. O valor")
 print("      está em achar quem fatura bem com carteira abandonada — e quem")
