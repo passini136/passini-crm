@@ -13203,6 +13203,8 @@ function resultadosView() {
           p.positivationPct !== null && p.positivationPct < 40 ? "#e74c3c" : "#5b9bd5")}
         ${cartaoProd("Carteira parada", number(Math.max(p.portfolioSize - p.portfolioServed, 0)),
           "clientes sem compra no mês", "#e0a800")}
+        ${!p.portfolioOrphan ? "" : cartaoProd("Carteira sem dono", number(p.portfolioOrphan),
+          `${number(p.portfolioOrphanServed)} compraram assim mesmo`, "#a4262c")}
         ${cartaoProd("Peças vendidas", number(Math.round(p.pieces)),
           `${number(Math.round(p.piecesPerDay))} por dia útil · ${p.piecesPerClient} por cliente`, "#0f3044")}
         ${cartaoProd("Ticket por peça", currency(p.ticketPerPiece),
@@ -13234,8 +13236,13 @@ function resultadosView() {
             </tbody>
           </table>
           <div class="text-small" style="color:var(--muted);margin-top:6px">
-            Balcão é cliente sem vendedor interno — não entra na positivação, porque
-            nunca foi carteira de ninguém.
+            Balcão é <strong>PF sem vendedor</strong> — e PJ que passou uma vez. PJ com
+            hábito de compra e sem vendedor no cadastro conta como carteira sem dono,
+            não como balcão: some aqui, viraria "crescimento de varejo" e ninguém veria
+            a conta deixada na mesa.
+            ${!p.portfolioOrphan ? "" : `<br><strong style="color:var(--bad)">
+              ${number(p.portfolioOrphan)} cliente(s) da carteira estão sem responsável</strong>
+              — vendedor desligado ou nunca vinculado. É lista de redistribuição.`}
           </div>
         </div>
 

@@ -23925,6 +23925,113 @@ def composicao_confiavel(conn: sqlite3.Connection, company_id: int,
     return abs(atual - mediana) <= 5.0, atual
 
 
+def seller_unit_map_ultimo(conn: sqlite3.Connection, company_id: int) -> dict[str, str]:
+    """Vendedor → última unidade conhecida, IGNORANDO a vigência.
+
+    Existe para não perder a carteira de quem saiu. `build_seller_unit_map`
+    filtra pela vigência da competência, o que está certo para atribuir
+    faturamento — mas errado para atribuir CARTEIRA: no mês seguinte ao
+    desligamento o vendedor some do mapa, e os clientes dele deixariam de
+    pertencer a qualquer unidade. Na tela isso apareceria como um degrau súbito
+    de carteira virando balcão, sem nada ter acontecido na rua.
+    """
+    cache = getattr(conn, "_cache_unidade_ultima", None)
+    if cache is not None:
+        return cache
+    mapa: dict[str, str] = {}
+    for row in conn.execute(
+        "SELECT person_name, base_unit FROM people_records "
+        "WHERE company_id = ? AND base_unit IS NOT NULL AND TRIM(base_unit) <> '' "
+        "ORDER BY date(valid_from) DESC", (company_id,)).fetchall():
+        for chave in (person_key(row["person_name"]), short_person_key(row["person_name"])):
+            if chave and chave not in mapa:
+                mapa[chave] = normalize_unit(row["base_unit"])
+    conn._cache_unidade_ultima = mapa
+    return mapa
+
+
+def pessoas_ativas_na_competencia(
+    conn: sqlite3.Connection, company_id: int, competencia: str
+) -> set[str]:
+    """Chaves canônicas de quem tinha vigência ABERTA na competência."""
+    chave_cache = f"_cache_ativos_{competencia}"
+    cache = getattr(conn, chave_cache, None)
+    if cache is not None:
+        return cache
+    inicio, fim = competence_window(competencia)
+    ativos = set()
+    for row in conn.execute(
+        "SELECT DISTINCT person_name FROM people_records "
+        "WHERE company_id = ? AND date(valid_from) <= date(?) "
+        "  AND (valid_to IS NULL OR valid_to = '' OR date(valid_to) >= date(?))",
+        (company_id, fim, inicio)).fetchall():
+        nome = normalize_whitespace(row["person_name"])
+        if nome:
+            ativos.add(chave_canonica(conn, company_id, nome))
+    setattr(conn, chave_cache, ativos)
+    return ativos
+
+
+def clientes_recorrentes(
+    conn: sqlite3.Connection, company_id: int, competencia: str
+) -> set[str]:
+    """Códigos de cliente com hábito de compra na janela que termina na competência.
+
+    Mesma régua já usada na tela de inativos: pelo menos
+    INACTIVE_RECURRING_MIN meses com compra em INACTIVE_RECURRING_MONTHS, e os
+    meses NÃO precisam ser seguidos — oficina compra por necessidade, e três
+    meses espalhados em ano e meio já é hábito.
+
+    A janela termina na competência ANALISADA, não no mês de hoje: senão a
+    série de 12 meses classificaria janeiro com informação que só existiu em
+    setembro, e o histórico mudaria de forma retroativa a cada mês novo.
+    """
+    chave_cache = f"_cache_recorrentes_{competencia}"
+    cache = getattr(conn, chave_cache, None)
+    if cache is not None:
+        return cache
+    desde = shift_competence(competencia, -(INACTIVE_RECURRING_MONTHS - 1))
+    achados = {
+        normalize_client_key(r["client_code"])
+        for r in conn.execute(
+            "SELECT client_code, COUNT(DISTINCT competence) n FROM crm_client_summary "
+            "WHERE company_id = ? AND net_value > 0 "
+            "  AND competence >= ? AND competence <= ? "
+            "GROUP BY client_code HAVING n >= ?",
+            (company_id, desde, competencia, INACTIVE_RECURRING_MIN)).fetchall()
+        if r["client_code"]
+    }
+    setattr(conn, chave_cache, achados)
+    return achados
+
+
+def ultimo_vendedor_por_cliente(
+    conn: sqlite3.Connection, company_id: int, competencia: str
+) -> dict[str, str]:
+    """Código do cliente → vendedor que o atendeu por último até a competência.
+
+    Serve para dar endereço ao cliente que não tem vendedor no cadastro. Sem
+    isso, o PJ recorrente sem dono existiria no total da empresa e em unidade
+    nenhuma — e a soma das unidades deixaria de fechar com a empresa, que é o
+    tipo de divergência que faz a reunião discutir a tela.
+    """
+    chave_cache = f"_cache_ultimo_vendedor_{competencia}"
+    cache = getattr(conn, chave_cache, None)
+    if cache is not None:
+        return cache
+    mapa: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT client_code, seller_name FROM crm_client_summary "
+        "WHERE company_id = ? AND competence <= ? AND net_value > 0 "
+        "  AND TRIM(COALESCE(seller_name,'')) <> '' "
+        "ORDER BY competence ASC", (company_id, competencia)).fetchall():
+        codigo = normalize_client_key(r["client_code"])
+        if codigo:
+            mapa[codigo] = normalize_whitespace(r["seller_name"])
+    setattr(conn, chave_cache, mapa)
+    return mapa
+
+
 def resultados_produtividade(
     conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str, competencia: str,
 ) -> dict[str, Any]:
@@ -23999,12 +24106,61 @@ def resultados_produtividade(
             perfis.append((codigo, tipo or "PF", normalize_whitespace(r["dono"])))
         conn._cache_perfis_carteira = perfis
 
+    # CARTEIRA NÃO É A MESMA COISA QUE FATURAMENTO, e separar as duas foi o
+    # conserto de um degrau falso. O valor vendido tem de sair de quem
+    # realmente faturou no mês; a carteira sai do CADASTRO — de quem é dono do
+    # cliente. Quando as duas usavam a mesma lista, o vendedor desligado sumia
+    # no mês seguinte e os clientes dele viravam "balcão" de um mês para o
+    # outro. Cliente órfão não é balcão: é carteira sem dono, e a ação é
+    # redistribuir, não comemorar positivação maior.
+    ativos = pessoas_ativas_na_competencia(conn, company_id, competencia)
+    unidade_alvo = normalize_unit(alvo) if nivel == "unidade" and alvo else ""
+    mapa_comp = build_seller_unit_map(conn, company_id, competencia) if unidade_alvo else {}
+    mapa_ultimo = seller_unit_map_ultimo(conn, company_id) if unidade_alvo else {}
+
+    def unidade_do_dono(nome: str) -> str:
+        for chave in (person_key(nome), short_person_key(nome)):
+            if chave and chave in mapa_comp:
+                return mapa_comp[chave]
+        # Retaguarda: quem já saiu não está no mapa da competência, mas a
+        # carteira dele continua sendo daquela unidade até ser redistribuída.
+        for chave in (person_key(nome), short_person_key(nome)):
+            if chave and chave in mapa_ultimo:
+                return mapa_ultimo[chave]
+        return ""
+
+    # BALCÃO É PF SEM DONO. Regra da diretoria, e ela muda o que o painel
+    # cobra: PJ recorrente sem vendedor no cadastro NÃO é balcão — é oficina
+    # que compra com hábito e não tem ninguém responsável por ela. Some no
+    # balcão, vira "crescimento de varejo", e a empresa nunca vê a conta que
+    # está deixando na mesa. PF sem dono é balcão de verdade; PJ que passou uma
+    # vez, também.
+    recorrentes = clientes_recorrentes(conn, company_id, competencia)
+    ultimo_vend = ultimo_vendedor_por_cliente(conn, company_id, competencia)
+
     carteira: dict[str, str] = {}      # código do cliente → nome do vendedor dono
     tipos: dict[str, str] = {}         # código do cliente → PF | PJ
+    orfaos: set[str] = set()           # carteira sem dono ativo (desligado ou em branco)
     for codigo, tipo, dono in perfis:
         tipos[codigo] = tipo
-        if dono and (not chaves_donos or _canon(dono) in chaves_donos):
+        sem_dono = not dono
+        if sem_dono:
+            # Só entra na carteira o PJ com hábito de compra. O endereço dele é
+            # quem o atendeu por último — sem isso ele existiria no total da
+            # empresa e em unidade nenhuma.
+            if tipo != "PJ" or codigo not in recorrentes:
+                continue
+            dono = ultimo_vend.get(codigo, "")
+            if not dono:
+                continue
+        if unidade_alvo:
+            se_conta = unidade_do_dono(dono) == unidade_alvo
+        else:
+            se_conta = not chaves_donos or _canon(dono) in chaves_donos
+        if se_conta:
             carteira[codigo] = dono
+            if sem_dono or _canon(dono) not in ativos:
+                orfaos.add(codigo)
 
     # ── Faturamento do mês no recorte, por cliente ───────────────────────────
     # crm_client_summary é o faturamento por cliente na fonte oficial, já com o
@@ -24143,6 +24299,7 @@ def resultados_produtividade(
         if r["client_key"]:
             contatados.add(normalize_client_key(r["client_key"]))
     compraram = {normalize_client_key(r["client_code"]) for r in linhas if r["client_code"]}
+    compraram_codigos = compraram
     converteram = contatados & compraram
 
     def ticket(b):
@@ -24184,6 +24341,11 @@ def resultados_produtividade(
         "piecesPerClient": round(pecas / clientes, 1) if clientes else None,
         "mixSku": mix,
         "portfolioSize": len(carteira),
+        # Carteira sem responsável: vendedor desligado, ou PJ recorrente que
+        # nunca teve dono no cadastro. É lista de redistribuição, não métrica
+        # de desempenho — por isso sai separada da positivação.
+        "portfolioOrphan": len(orfaos),
+        "portfolioOrphanServed": len(orfaos & compraram_codigos),
         # Positivação só conta cliente DA CARTEIRA: atender cliente de outro
         # vendedor é apoio, e contar como positivação premiaria quem não cuida
         # da própria base.

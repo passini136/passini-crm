@@ -150,8 +150,13 @@ for chave, rot in (("portfolio", "Carteira"), ("counter", "Balcão")):
     sh = f"{d['sharePct']:.0f}%" if d["sharePct"] is not None else "—"
     print(f"   {rot:<12}{d['clients']:>10}{backend.brl(d['revenue']):>16}"
           f"{backend.brl(d['ticket']):>13}{sh:>9}")
-print(f"\n   Carteira nominal: {emp['portfolioSize']} cliente(s) com vendedor interno")
+print(f"\n   Carteira: {emp['portfolioSize']} cliente(s)")
 print(f"   Compraram no mês: {emp['portfolioServed']}")
+print(f"   SEM DONO: {emp['portfolioOrphan']} "
+      f"({emp['portfolioOrphanServed']} compraram mesmo assim)")
+if emp["portfolioOrphan"]:
+    print("   >> Vendedor desligado ou PJ recorrente nunca vinculado. Não é")
+    print("      desempenho: é lista de redistribuição.")
 if emp["positivationPct"] is not None:
     print(f"   Positivação: {emp['positivationPct']:.1f}%")
     ocioso = emp["portfolioSize"] - emp["portfolioServed"]
