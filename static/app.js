@@ -12821,6 +12821,16 @@ function resultadosView() {
         + grafLegenda([["Clientes de carteira", "#2e7d32"], ["Clientes de balcão", "#7b5ea7"]]),
         "Crescer só no balcão é crescimento que não fideliza: o cliente volta se o preço estiver bom.")}
 
+      ${grafCartao("Peças vendidas e ticket por peça", leituraDe("ticketPerPiece"),
+        grafLinhas(meses, [
+          { nome: "Peças vendidas", valores: ps.map((r) => r.pieces), formato: "num", cor: "#0f3044" },
+        ], "num", { parcialIdx, semEixoX: true, altura: 150 })
+        + grafLinhas(meses, [
+          { nome: "Ticket por peça", valores: ps.map((r) => r.ticketPerPiece), cor: "#b06000" },
+        ], "brl", { parcialIdx, altura: 170 })
+        + grafLegenda([["Peças vendidas", "#0f3044"], ["Ticket por peça (R$)", "#b06000"]]),
+        "Os dois juntos separam preço de volume: peças caindo com ticket subindo é preço segurando o faturamento.")}
+
       ${grafCartao("Mix de itens vendidos", leituraDe("mixSku"),
         grafLinhas(meses, [
           { nome: "Códigos distintos", valores: ps.map((r) => r.mixSku), cor: "#7b5ea7" },
@@ -12849,7 +12859,8 @@ function resultadosView() {
           <table>
             <thead><tr>
               <th>Mês</th><th style="text-align:right">R$/dia útil</th>
-              <th style="text-align:right">Clientes</th><th style="text-align:right">Positivação</th>
+              <th style="text-align:right">Clientes</th><th style="text-align:right">Peças</th>
+              <th style="text-align:right">R$/peça</th><th style="text-align:right">Positivação</th>
               <th style="text-align:right">Parados</th><th style="text-align:right">Mix</th>
               <th style="text-align:right">Ticket PJ</th><th style="text-align:right">Ticket PF</th>
               <th style="text-align:right">Balcão</th><th style="text-align:right">Ligações</th>
@@ -12862,6 +12873,8 @@ function resultadosView() {
                     ${r.compositionReliable ? "" : ' <span class="status-tag" style="background:#fdecea;color:#a4262c" title="Arquivo de faturamento por cliente incompleto neste mês">dado incerto</span>'}</td>
                   <td style="text-align:right;font-weight:700">${currency(r.revenuePerDay)}</td>
                   <td style="text-align:right">${number(r.clients)}</td>
+                  <td style="text-align:right">${number(Math.round(r.pieces))}</td>
+                  <td style="text-align:right">${currency(r.ticketPerPiece)}</td>
                   <td style="text-align:right">${r.positivationPct === null ? "—" : `${r.positivationPct.toFixed(1)}%`}</td>
                   <td style="text-align:right">${number(Math.max(r.portfolioSize - r.portfolioServed, 0))}</td>
                   <td style="text-align:right">${number(r.mixSku)}</td>
@@ -12913,6 +12926,79 @@ function resultadosView() {
       <div class="text-small" style="color:var(--muted)">${apoio}</div>
     </div>`;
 
+  /* ── Margem por marca ──────────────────────────────────────────────────────
+   *
+   * Margem ESTIMADA: custo do catálogo (custo de hoje) contra a venda. A margem
+   * oficial da empresa continua sendo a do custo × venda — esta responde outra
+   * pergunta, que a oficial não responde: qual marca sustenta e qual corrói.
+   *
+   * Marca com margem fora de -20% a 80% não aparece como desempenho. Autopeça
+   * não vende com 300% de prejuízo: isso é unidade de medida trocada entre
+   * venda e catálogo. Mostrar o número cru faria a reunião discutir a
+   * rentabilidade de uma marca mal cadastrada — e esconderia a que de fato
+   * perde dinheiro.
+   */
+  const mg = d.brandMargin || {};
+  const marcasOk = (mg.brands || []).filter((b) => !b.costSuspect);
+  const marcasSuspeitas = (mg.brands || []).filter((b) => b.costSuspect);
+
+  const blocoMarca = !(mg.brands || []).length ? "" : `
+    <div class="table-card" style="margin-top:10px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
+        <div style="font-weight:800;font-size:13px">Margem estimada por marca</div>
+        <span class="text-small" style="color:var(--muted)">
+          ${mg.brandsTotal} marcas · cobertura de custo ${mg.coveragePct}%</span>
+      </div>
+      <div class="text-small" style="color:var(--muted);margin:2px 0 8px">
+        Custo vem do catálogo (custo de hoje), não da data da venda. Serve para comparar
+        marcas entre si; a margem oficial da empresa continua sendo a do custo × venda.
+      </div>
+
+      ${!marcasSuspeitas.length ? "" : `
+        <div class="message" style="background:#fef7e0;color:#8a6100">
+          ⚠️ ${marcasSuspeitas.length} marca(s) com margem impossível somando
+          ${currency(mg.suspectRevenue)} (${mg.suspectSharePct}% do faturamento):
+          <strong>${escapeHtml(marcasSuspeitas.slice(0, 6).map((b) => b.brand).join(", "))}</strong>.
+          Margem negativa de centenas por cento não é prejuízo — é unidade de medida
+          trocada no cadastro (litro x balde, peça x caixa). Ficam fora da margem
+          consolidada até o custo ser corrigido.
+        </div>`}
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Marca</th><th style="text-align:right">Líquido</th>
+            <th style="text-align:right">Peças</th><th style="text-align:right">R$/peça</th>
+            <th style="text-align:right">Margem</th><th style="text-align:right">R$ de margem</th>
+          </tr></thead>
+          <tbody>
+            ${(mg.brands || []).map((b) => `
+              <tr style="${b.costSuspect ? "background:#fef7e0" : ""}">
+                <td>${escapeHtml(b.brand)}
+                  ${b.costSuspect ? '<span class="status-tag" style="background:#fdecea;color:#a4262c" title="Custo cadastrado incompatível com a unidade de venda">revisar custo</span>' : ""}</td>
+                <td style="text-align:right">${currency(b.revenue)}</td>
+                <td style="text-align:right">${number(Math.round(b.pieces))}</td>
+                <td style="text-align:right">${currency(b.ticketPerPiece)}</td>
+                <td style="text-align:right;font-weight:700;color:${
+                  b.costSuspect ? "var(--muted)"
+                  : b.marginPct === null ? "var(--muted)"
+                  : b.marginPct >= 34 ? "var(--good)" : b.marginPct >= 25 ? "#b06000" : "var(--bad)"}">
+                  ${b.costSuspect ? "—" : b.marginPct === null ? "—" : `${b.marginPct.toFixed(1)}%`}</td>
+                <td style="text-align:right;color:var(--muted)">
+                  ${b.costSuspect || b.marginValue === null ? "—" : currency(b.marginValue)}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      ${marcasOk.length < 4 ? "" : `
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Entre as marcas com custo confiável, a margem vai de
+          <strong>${Math.min(...marcasOk.filter((b) => b.marginPct !== null).map((b) => b.marginPct)).toFixed(1)}%</strong> a
+          <strong>${Math.max(...marcasOk.filter((b) => b.marginPct !== null).map((b) => b.marginPct)).toFixed(1)}%</strong>.
+          Verde marca quem está acima da margem média da empresa.
+        </div>`}
+    </div>`;
+
   const blocoProdutividade = !p.competence ? "" : `
     <div>
       <div class="section-title"><div><h3>3. Produtividade — como o resultado foi feito</h3>
@@ -12938,6 +13024,13 @@ function resultadosView() {
           p.positivationPct !== null && p.positivationPct < 40 ? "#e74c3c" : "#5b9bd5")}
         ${cartaoProd("Carteira parada", number(Math.max(p.portfolioSize - p.portfolioServed, 0)),
           "clientes sem compra no mês", "#e0a800")}
+        ${cartaoProd("Peças vendidas", number(Math.round(p.pieces)),
+          `${number(Math.round(p.piecesPerDay))} por dia útil · ${p.piecesPerClient} por cliente`, "#0f3044")}
+        ${cartaoProd("Ticket por peça", currency(p.ticketPerPiece),
+          `contra ${currency(p.byType.PJ.ticket)} por cliente PJ`, "#0f3044")}
+        ${cartaoProd("Margem estimada", mg.marginPct === null || mg.marginPct === undefined
+            ? "—" : `${mg.marginPct.toFixed(1)}%`,
+          "sobre marcas com custo confiável", "#b06000")}
         ${cartaoProd("Mix de itens", number(p.mixSku), "códigos distintos vendidos", "#7b5ea7")}
         ${cartaoProd("Ligações ativas", number(p.activeCalls),
           `${p.callsPerDay.toFixed(1)} por dia útil`, "#0f7b8a")}
@@ -12999,7 +13092,8 @@ function resultadosView() {
             <table class="table-sticky-actions">
               <thead><tr>
                 <th>Vendedor</th><th style="text-align:right">R$/dia útil</th>
-                <th style="text-align:right">Clientes</th><th style="text-align:right">Mix</th>
+                <th style="text-align:right">Clientes</th><th style="text-align:right">R$/peça</th>
+                <th style="text-align:right">Pç/cliente</th><th style="text-align:right">Mix</th>
                 <th style="text-align:right">Carteira</th><th style="text-align:right">Positivação</th>
                 <th style="text-align:right">Ligações</th><th style="text-align:right">Conversão</th>
                 <th style="text-align:right">Ticket PJ</th><th style="text-align:right">Ticket PF</th>
@@ -13010,6 +13104,8 @@ function resultadosView() {
                     <td>${escapeHtml(x.seller)}</td>
                     <td style="text-align:right;font-weight:700">${currency(x.revenuePerDay)}</td>
                     <td style="text-align:right">${number(x.clients)}</td>
+                    <td style="text-align:right">${currency(x.ticketPerPiece)}</td>
+                    <td style="text-align:right;color:var(--muted)">${x.piecesPerClient ?? "—"}</td>
                     <td style="text-align:right">${number(x.mixSku)}</td>
                     <td style="text-align:right;color:var(--muted)">${number(x.portfolioSize)}</td>
                     <td style="text-align:right;font-weight:700;color:${
@@ -13031,6 +13127,8 @@ function resultadosView() {
             O registro de ligações começou em agosto/2026.
           </div>
         </div>`}
+
+      ${blocoMarca}
     </div>`;
 
   return `

@@ -24205,6 +24205,111 @@ def resultados_margem_marca(
     }
 
 
+def resultados_mix_unidade(
+    conn: sqlite3.Connection, company_id: int, competencia: str,
+    unidades: list[str] | None = None, top: int = 12,
+) -> dict[str, Any]:
+    """Composição de venda por marca dentro de cada unidade.
+
+    Existe para responder por que unidades com faturamento parecido têm
+    comportamento tão diferente: Lajeado vende 23 peças por cliente a R$ 69,
+    Zona Norte vende 9 a R$ 102. Faturamento não distingue as duas coisas, e a
+    diferença muda a decisão — mix de produto se corrige com compra e
+    treinamento, perfil de cliente se corrige com carteira.
+
+    A leitura é por PARTICIPAÇÃO, não por reais. Comparar a Matriz (R$ 1,6 mi)
+    com a Zona Norte (R$ 144 mil) em valor absoluto só mostra que uma é maior
+    que a outra — o que já se sabia. A pergunta é se vendem as MESMAS COISAS em
+    proporções diferentes.
+    """
+    if not competencia:
+        return {}
+    mapa = build_seller_unit_map(conn, company_id, competencia)
+
+    # Uma consulta só, agrupando por vendedor e marca: a unidade é resolvida em
+    # Python pelo mapa da competência. Consultar por unidade seria uma ida ao
+    # banco por unidade, e o detalhado é a maior tabela do sistema.
+    bruto: dict[str, dict[str, dict[str, float]]] = {}
+    for r in conn.execute(
+        "SELECT seller_name, UPPER(TRIM(COALESCE(brand_name,'(SEM MARCA)'))) marca, "
+        "       SUM(net_value) v, SUM(quantity) q "
+        "FROM fact_sales_detail WHERE company_id = ? AND competence = ? AND net_value > 0 "
+        "GROUP BY seller_name, marca", (company_id, competencia)).fetchall():
+        unidade = (mapa.get(person_key(r["seller_name"]))
+                   or mapa.get(short_person_key(r["seller_name"])) or "")
+        if not unidade:
+            continue
+        alvo = bruto.setdefault(unidade, {}).setdefault(
+            r["marca"], {"revenue": 0.0, "pieces": 0.0})
+        alvo["revenue"] += float(r["v"] or 0)
+        alvo["pieces"] += float(r["q"] or 0)
+
+    if unidades:
+        permitidas = {normalize_unit(u) for u in unidades}
+        bruto = {u: v for u, v in bruto.items() if normalize_unit(u) in permitidas}
+
+    # Marcas que entram na comparação: as maiores da EMPRESA, para todas as
+    # unidades aparecerem nas mesmas colunas. Ranking próprio por unidade
+    # impediria comparar linha com linha, que é o objetivo da tela.
+    total_marca: dict[str, float] = {}
+    for marcas in bruto.values():
+        for m, d in marcas.items():
+            total_marca[m] = total_marca.get(m, 0.0) + d["revenue"]
+    principais = [m for m, _ in sorted(total_marca.items(),
+                                       key=lambda kv: kv[1], reverse=True)[:top]]
+    total_geral = sum(total_marca.values())
+
+    linhas = []
+    for unidade, marcas in sorted(bruto.items()):
+        liquido = sum(d["revenue"] for d in marcas.values())
+        pecas = sum(d["pieces"] for d in marcas.values())
+        comp_marcas = []
+        for m in principais:
+            d = marcas.get(m, {"revenue": 0.0, "pieces": 0.0})
+            comp_marcas.append({
+                "brand": m,
+                "revenue": round(d["revenue"], 2),
+                "pieces": round(d["pieces"], 1),
+                "sharePct": round(100 * d["revenue"] / liquido, 1) if liquido else 0.0,
+                # Quanto a participação da unidade se afasta da participação da
+                # empresa. É este número que aponta a unidade que vende
+                # diferente — a participação sozinha só reflete o tamanho.
+                "deltaPp": round(
+                    (100 * d["revenue"] / liquido if liquido else 0)
+                    - (100 * total_marca.get(m, 0) / total_geral if total_geral else 0), 1),
+            })
+        outras = liquido - sum(c["revenue"] for c in comp_marcas)
+        linhas.append({
+            "unit": unidade,
+            "revenue": round(liquido, 2),
+            "pieces": round(pecas, 1),
+            "brandsCount": len(marcas),
+            "ticketPerPiece": round(liquido / pecas, 2) if pecas else None,
+            "brands": comp_marcas,
+            "othersRevenue": round(outras, 2),
+            "othersSharePct": round(100 * outras / liquido, 1) if liquido else 0.0,
+            # Concentração: quanto as 5 maiores marcas respondem pela unidade.
+            # Alta significa venda dependente de poucos fornecedores.
+            "top5SharePct": round(sum(
+                sorted((d["revenue"] for d in marcas.values()), reverse=True)[:5]
+            ) / liquido * 100, 1) if liquido else 0.0,
+        })
+
+    empresa = [{
+        "brand": m,
+        "revenue": round(total_marca.get(m, 0.0), 2),
+        "sharePct": round(100 * total_marca.get(m, 0.0) / total_geral, 1) if total_geral else 0.0,
+    } for m in principais]
+
+    return {
+        "competence": competencia,
+        "units": linhas,
+        "brands": principais,
+        "company": empresa,
+        "totalRevenue": round(total_geral, 2),
+    }
+
+
 def resultados_produtividade_serie(
     conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
     alvo: str = "", meses: int = RESULTADOS_MESES,
@@ -24269,6 +24374,11 @@ def resultados_evolucao(serie: list[dict[str, Any]]) -> list[dict[str, Any]]:
          "Valor por cliente físico. Balcão puxa este número para baixo por natureza."),
         ("mixSku", "Mix de itens", "maior", "num", 50.0,
          "Códigos distintos vendidos. Encolhendo, a venda está concentrando em pouca coisa."),
+        ("ticketPerPiece", "Ticket por peça", "maior", "brl", 5.0,
+         "Valor médio por peça vendida. Separa preço de volume: ticket de cliente pode "
+         "subir só porque cada um levou mais itens baratos."),
+        ("pieces", "Peças vendidas", "maior", "num", 100.0,
+         "Volume físico. Cair com faturamento estável significa preço segurando o número."),
         ("conversionPct", "Conversão de ligação", "maior", "pct", 5.0,
          "Dos clientes que receberam ligação ativa, quantos compraram no mês."),
         ("portfolioIdle", "Carteira parada", "menor", "num", 50.0,
@@ -26015,6 +26125,8 @@ class AppHandler(BaseHTTPRequestHandler):
                     prod_serie = resultados_produtividade_serie(conn, user["company_id"],
                                                                 nivel, alvo)
                     tendencias = resultados_evolucao(prod_serie)
+                    margem = resultados_margem_marca(conn, user["company_id"], nivel,
+                                                     alvo, fatos["competence"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({
                     "level": nivel, "target": alvo,
@@ -26023,6 +26135,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "units": unidades,
                     "productivity": prod, "team": equipe,
                     "productivitySeries": prod_serie, "trends": tendencias,
+                    "brandMargin": margem,
                     "canChooseCompany": permitidas is None and escopo != "proprio",
                 }))
                 return
