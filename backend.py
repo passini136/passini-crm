@@ -23972,64 +23972,55 @@ def pessoas_ativas_na_competencia(
     return ativos
 
 
-def clientes_recorrentes(
+def habito_de_compra(
     conn: sqlite3.Connection, company_id: int, competencia: str
-) -> set[str]:
-    """Códigos de cliente com hábito de compra na janela que termina na competência.
+) -> tuple[set[str], dict[str, str]]:
+    """(códigos recorrentes, código → último vendedor que atendeu), numa passada.
 
-    Mesma régua já usada na tela de inativos: pelo menos
-    INACTIVE_RECURRING_MIN meses com compra em INACTIVE_RECURRING_MONTHS, e os
-    meses NÃO precisam ser seguidos — oficina compra por necessidade, e três
-    meses espalhados em ano e meio já é hábito.
+    RECORRÊNCIA usa a mesma régua da tela de inativos: pelo menos
+    INACTIVE_RECURRING_MIN meses com compra em INACTIVE_RECURRING_MONTHS, sem
+    precisarem ser seguidos — oficina compra por necessidade, e três meses
+    espalhados em ano e meio já é hábito. Duas definições de recorrência no
+    mesmo sistema viraria discussão de reunião.
 
     A janela termina na competência ANALISADA, não no mês de hoje: senão a
     série de 12 meses classificaria janeiro com informação que só existiu em
-    setembro, e o histórico mudaria de forma retroativa a cada mês novo.
+    setembro, e o histórico mudaria retroativamente a cada mês novo.
+
+    O ÚLTIMO VENDEDOR dá endereço ao cliente que não tem dono no cadastro. Sem
+    ele, o PJ recorrente órfão existiria no total da empresa e em unidade
+    nenhuma, e a soma das unidades pararia de fechar.
+
+    UMA consulta para os dois, e não duas. Separadas, elas varriam a mesma
+    tabela duas vezes e a apuração da empresa subiu de 1,44s para 2,12s — o que
+    na aba de evolução viraria doze vezes isso. O truque do MAX sobre
+    'competencia|vendedor' funciona porque a competência tem largura fixa:
+    o maior texto é sempre o da competência mais recente.
     """
-    chave_cache = f"_cache_recorrentes_{competencia}"
+    chave_cache = f"_cache_habito_{competencia}"
     cache = getattr(conn, chave_cache, None)
     if cache is not None:
         return cache
     desde = shift_competence(competencia, -(INACTIVE_RECURRING_MONTHS - 1))
-    achados = {
-        normalize_client_key(r["client_code"])
-        for r in conn.execute(
-            "SELECT client_code, COUNT(DISTINCT competence) n FROM crm_client_summary "
-            "WHERE company_id = ? AND net_value > 0 "
-            "  AND competence >= ? AND competence <= ? "
-            "GROUP BY client_code HAVING n >= ?",
-            (company_id, desde, competencia, INACTIVE_RECURRING_MIN)).fetchall()
-        if r["client_code"]
-    }
-    setattr(conn, chave_cache, achados)
-    return achados
-
-
-def ultimo_vendedor_por_cliente(
-    conn: sqlite3.Connection, company_id: int, competencia: str
-) -> dict[str, str]:
-    """Código do cliente → vendedor que o atendeu por último até a competência.
-
-    Serve para dar endereço ao cliente que não tem vendedor no cadastro. Sem
-    isso, o PJ recorrente sem dono existiria no total da empresa e em unidade
-    nenhuma — e a soma das unidades deixaria de fechar com a empresa, que é o
-    tipo de divergência que faz a reunião discutir a tela.
-    """
-    chave_cache = f"_cache_ultimo_vendedor_{competencia}"
-    cache = getattr(conn, chave_cache, None)
-    if cache is not None:
-        return cache
-    mapa: dict[str, str] = {}
+    recorrentes: set[str] = set()
+    ultimo: dict[str, str] = {}
     for r in conn.execute(
-        "SELECT client_code, seller_name FROM crm_client_summary "
-        "WHERE company_id = ? AND competence <= ? AND net_value > 0 "
-        "  AND TRIM(COALESCE(seller_name,'')) <> '' "
-        "ORDER BY competence ASC", (company_id, competencia)).fetchall():
+        "SELECT client_code, COUNT(DISTINCT competence) n, "
+        "       substr(MAX(competence || '|' || COALESCE(seller_name,'')), 9) vend "
+        "FROM crm_client_summary "
+        "WHERE company_id = ? AND net_value > 0 AND competence BETWEEN ? AND ? "
+        "GROUP BY client_code", (company_id, desde, competencia)).fetchall():
         codigo = normalize_client_key(r["client_code"])
-        if codigo:
-            mapa[codigo] = normalize_whitespace(r["seller_name"])
-    setattr(conn, chave_cache, mapa)
-    return mapa
+        if not codigo:
+            continue
+        if int(r["n"] or 0) >= INACTIVE_RECURRING_MIN:
+            recorrentes.add(codigo)
+        vend = normalize_whitespace(r["vend"])
+        if vend:
+            ultimo[codigo] = vend
+    resultado = (recorrentes, ultimo)
+    setattr(conn, chave_cache, resultado)
+    return resultado
 
 
 def resultados_produtividade(
@@ -24135,8 +24126,7 @@ def resultados_produtividade(
     # balcão, vira "crescimento de varejo", e a empresa nunca vê a conta que
     # está deixando na mesa. PF sem dono é balcão de verdade; PJ que passou uma
     # vez, também.
-    recorrentes = clientes_recorrentes(conn, company_id, competencia)
-    ultimo_vend = ultimo_vendedor_por_cliente(conn, company_id, competencia)
+    recorrentes, ultimo_vend = habito_de_compra(conn, company_id, competencia)
 
     carteira: dict[str, str] = {}      # código do cliente → nome do vendedor dono
     tipos: dict[str, str] = {}         # código do cliente → PF | PJ
