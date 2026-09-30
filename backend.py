@@ -24051,6 +24051,110 @@ def resultados_produtividade(
     }
 
 
+def resultados_produtividade_serie(
+    conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
+    alvo: str = "", meses: int = RESULTADOS_MESES,
+) -> list[dict[str, Any]]:
+    """Produtividade mês a mês — a série que o painel de evolução desenha.
+
+    Chama a apuração por competência, que custa ~25ms com os caches da conexão
+    quentes. Doze meses saem em menos de meio segundo, e o primeiro mês é que
+    paga a varredura do cadastro; os onze seguintes reaproveitam.
+
+    O mês em curso NÃO é comparável aos fechados em indicadores de volume: no
+    dia 20 ele tem 20 dias úteis contra 21. Quem desenha o gráfico precisa
+    saber disso, então cada ponto carrega `monthOpen` — e a média por DIA ÚTIL,
+    que é comparável, é o número que os cartões usam.
+    """
+    competencias = sorted(query_competences(conn, company_id))[-int(meses):]
+    serie = []
+    for c in competencias:
+        p = resultados_produtividade(conn, company_id, nivel, alvo, c)
+        if p and p.get("revenueNet"):
+            serie.append(p)
+    return serie
+
+
+def resultados_evolucao(serie: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Leituras de tendência: o que melhorou, o que piorou, onde há oportunidade.
+
+    Um gráfico mostra a linha; ele não diz se aquilo é bom. Esta função compara
+    os 3 meses mais recentes com os 3 anteriores — janela de trimestre, que
+    aguenta o mês fraco isolado sem virar alarme — e devolve as leituras em
+    linguagem de reunião.
+
+    Por que trimestre contra trimestre, e não mês contra mês: autopeças tem mês
+    de 18 e mês de 23 dias úteis, feriado que muda de semana e cliente grande
+    que antecipa compra. Mês contra mês acusaria movimento em quase todo
+    indicador, todo mês — e um painel que aponta tudo não aponta nada.
+
+    O mês em curso fica FORA da comparação: ele está incompleto e arrastaria a
+    média recente para baixo em todo indicador de volume.
+    """
+    fechados = [r for r in serie if not r.get("monthOpen")]
+    if len(fechados) < 4:
+        return []
+    recentes, antigos = fechados[-3:], fechados[-6:-3]
+    if not antigos:
+        return []
+
+    def media(bloco, ler):
+        vals = [ler(r) for r in bloco if ler(r) is not None]
+        return (sum(vals) / len(vals)) if vals else None
+
+    # `melhor`: para onde o indicador deve andar. `minimo`: abaixo disso a
+    # variação percentual mente (sair de 2 para 3 ligações não é "+50%").
+    indicadores = [
+        ("revenuePerDay", "Faturamento por dia útil", "maior", "brl", 1000.0,
+         "Ritmo de venda por dia trabalhado, sem o efeito de mês curto ou longo."),
+        ("positivationPct", "Positivação da carteira", "maior", "pct", 5.0,
+         "Fatia da carteira que comprou. Cai quando a equipe deixa de ligar para a base."),
+        ("ticketPJ", "Ticket médio PJ", "maior", "brl", 100.0,
+         "Valor por cliente jurídico. Sobe com mix maior ou desconto menor."),
+        ("ticketPF", "Ticket médio PF", "maior", "brl", 50.0,
+         "Valor por cliente físico. Balcão puxa este número para baixo por natureza."),
+        ("mixSku", "Mix de itens", "maior", "num", 50.0,
+         "Códigos distintos vendidos. Encolhendo, a venda está concentrando em pouca coisa."),
+        ("conversionPct", "Conversão de ligação", "maior", "pct", 5.0,
+         "Dos clientes que receberam ligação ativa, quantos compraram no mês."),
+        ("portfolioIdle", "Carteira parada", "menor", "num", 50.0,
+         "Clientes da carteira sem compra no mês. É a lista de trabalho, não uma nota."),
+    ]
+
+    def ler(campo):
+        if campo == "ticketPJ":
+            return lambda r: (r.get("byType", {}).get("PJ") or {}).get("ticket")
+        if campo == "ticketPF":
+            return lambda r: (r.get("byType", {}).get("PF") or {}).get("ticket")
+        if campo == "portfolioIdle":
+            return lambda r: max((r.get("portfolioSize") or 0) - (r.get("portfolioServed") or 0), 0)
+        return lambda r: r.get(campo)
+
+    leituras = []
+    for campo, rotulo, melhor, formato, minimo, explica in indicadores:
+        f = ler(campo)
+        atual, antes = media(recentes, f), media(antigos, f)
+        if atual is None or antes is None or abs(antes) < minimo:
+            continue
+        variacao = (atual - antes) / antes * 100
+        if abs(variacao) < 3:
+            sentido = "estavel"
+        elif (variacao > 0) == (melhor == "maior"):
+            sentido = "evolucao"
+        else:
+            sentido = "involucao"
+        leituras.append({
+            "id": campo, "label": rotulo, "format": formato,
+            "recent": round(atual, 2), "previous": round(antes, 2),
+            "variationPct": round(variacao, 1), "direction": sentido,
+            "note": explica,
+            # Gravidade serve para ORDENAR a lista: o gestor lê os três de cima.
+            "weight": abs(variacao) if sentido != "estavel" else 0.0,
+        })
+    leituras.sort(key=lambda x: (x["direction"] != "involucao", -x["weight"]))
+    return leituras
+
+
 def resultados_concentracao(
     conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str,
     competencia: str, anterior: str,
@@ -25754,6 +25858,9 @@ class AppHandler(BaseHTTPRequestHandler):
                             if p and p["revenueNet"]:
                                 equipe.append({"seller": normalize_whitespace(nome), **p})
                         equipe.sort(key=lambda x: x["revenuePerDay"], reverse=True)
+                    prod_serie = resultados_produtividade_serie(conn, user["company_id"],
+                                                                nivel, alvo)
+                    tendencias = resultados_evolucao(prod_serie)
                 self._set_headers(200)
                 self.wfile.write(json_dumps({
                     "level": nivel, "target": alvo,
@@ -25761,6 +25868,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "concentration": conc, "previousCompetence": anterior,
                     "units": unidades,
                     "productivity": prod, "team": equipe,
+                    "productivitySeries": prod_serie, "trends": tendencias,
                     "canChooseCompany": permitidas is None and escopo != "proprio",
                 }))
                 return

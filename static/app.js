@@ -31,7 +31,7 @@ const state = {
   pendencias: null,        // atas e feedbacks esperando ciência desta pessoa
   roster: null,            // quem o CRM reconhece como equipe (Administração)
   resultados: null,        // painel de resultados da reunião mensal (FCA)
-  resultadosFiltros: { level: "empresa", target: "", competence: "" },
+  resultadosFiltros: { level: "empresa", target: "", competence: "", tab: "fca" },
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
@@ -12453,6 +12453,213 @@ function setResultadoNivel(level, target) {
   void loadResultados();
 }
 
+function setResultadoAba(aba) {
+  state.resultadosFiltros.tab = aba;
+  render();
+}
+
+/* ─── Gráficos do painel de evolução ─────────────────────────────────────────
+ *
+ * SVG à mão, sem biblioteca: o servidor fica na rede interna da Passini e não
+ * tem saída para CDN. Uma dependência externa aqui significaria gráfico em
+ * branco na reunião, justamente quando não dá para depurar.
+ *
+ * Três decisões que valem para todos os gráficos:
+ *
+ *  1. MÊS EM CURSO É DESENHADO DIFERENTE (hachurado, com "parcial" na etiqueta).
+ *     Sem isso o último ponto sempre desce e todo indicador parece em queda no
+ *     dia 10. Já vi essa leitura errada acontecer no próprio painel.
+ *  2. ZERO NA BASE só nas BARRAS. Em barra a área comunica magnitude, e cortar
+ *     o eixo transforma 3% de variação num despenhadeiro. Em linha de TAXA é o
+ *     contrário: forçar o zero achata tudo — a positivação caindo de 43% para
+ *     38% virava uma reta num eixo de 0 a 47%, escondendo justamente o que o
+ *     gráfico existe para mostrar. Linha usa escala ajustada aos dados e
+ *     DECLARA isso no canto, para ninguém ler a inclinação como catástrofe.
+ *  3. BURACO É BURACO. Indicador sem dado no mês (conversão antes de agosto)
+ *     não vira zero nem é interpolado: a linha se interrompe. Zero diria
+ *     "ninguém converteu", quando a verdade é "ninguém registrou".
+ */
+const GRAF = {
+  w: 760, h: 240, ml: 62, mr: 16, mt: 14, mb: 34,
+  cores: ["#1a5276", "#e0a800", "#2e7d32", "#a4262c", "#7b5ea7", "#0f7b8a"],
+};
+
+function grafEscalaY(valores, comZero) {
+  const nums = valores.filter((v) => v !== null && v !== undefined && isFinite(v));
+  if (!nums.length) return { min: 0, max: 1 };
+  let min = Math.min(...nums, comZero ? 0 : Infinity);
+  let max = Math.max(...nums);
+  if (min === max) { max = min + Math.abs(min || 1) * 0.2; }
+  const folga = (max - min) * 0.08;
+  return { min: comZero ? 0 : min - folga, max: max + folga };
+}
+
+function grafFormata(v, f) {
+  if (v === null || v === undefined) return "—";
+  if (f === "brl") return currency(v);
+  if (f === "pct") return `${v.toFixed(1)}%`;
+  return number(Math.round(v));
+}
+
+function grafEixoCurto(v, f) {
+  if (v === null || v === undefined) return "";
+  if (f === "brl") {
+    // Uma casa decimal abaixo de 10 mil: sem ela, um eixo que vai de 276 a
+    // 2.000 imprime "1k" em duas linhas de grade diferentes, e o leitor
+    // desconfia do gráfico inteiro por causa de um arredondamento.
+    if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
+    if (Math.abs(v) >= 1e4) return `${Math.round(v / 1e3)}k`;
+    if (Math.abs(v) >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
+    return String(Math.round(v));
+  }
+  if (f === "pct") return `${Math.round(v)}%`;
+  return number(Math.round(v));
+}
+
+/* Gráfico de linhas (uma ou várias), com grade, eixo e marcação do mês parcial. */
+function grafLinhas(rotulos, series, formato, opts = {}) {
+  const { w, h, ml, mr, mt } = GRAF;
+  // Gráfico emparelhado: o de cima dispensa o eixo X, que o de baixo repete.
+  const mb = opts.semEixoX ? 10 : GRAF.mb;
+  const alt = opts.altura || h;
+  const areaW = w - ml - mr, areaH = alt - mt - mb;
+  const todos = series.flatMap((s) => s.valores);
+  const { min, max } = grafEscalaY(todos, opts.comZero === true);
+  const n = rotulos.length;
+  const x = (i) => ml + (n === 1 ? areaW / 2 : (areaW * i) / (n - 1));
+  const y = (v) => mt + areaH - ((v - min) / (max - min)) * areaH;
+
+  const linhasGrade = [0, 0.25, 0.5, 0.75, 1].map((t) => {
+    const v = min + (max - min) * t;
+    return `<line x1="${ml}" y1="${y(v).toFixed(1)}" x2="${w - mr}" y2="${y(v).toFixed(1)}"
+              stroke="#e4eaef" stroke-width="1"/>
+            <text x="${ml - 7}" y="${(y(v) + 3.5).toFixed(1)}" text-anchor="end"
+              font-size="10" fill="#8797a3">${grafEixoCurto(v, formato)}</text>`;
+  }).join("");
+
+  // Faixa do mês parcial: um retângulo atrás da última coluna diz "este mês
+  // ainda não acabou" sem precisar de nota de rodapé.
+  const faixaParcial = opts.parcialIdx >= 0 && n > 1 ? `
+    <rect x="${(x(opts.parcialIdx) - areaW / (n - 1) / 2).toFixed(1)}" y="${mt}"
+      width="${(areaW / (n - 1)).toFixed(1)}" height="${areaH}"
+      fill="#f4c25f" opacity="0.13"/>` : "";
+
+  const desenhos = series.map((s, si) => {
+    const cor = s.cor || GRAF.cores[si % GRAF.cores.length];
+    // Segmentos quebram onde falta dado: linha interrompida é informação.
+    const segs = [];
+    let atual = [];
+    s.valores.forEach((v, i) => {
+      if (v === null || v === undefined || !isFinite(v)) { if (atual.length) segs.push(atual); atual = []; }
+      else atual.push([x(i), y(v)]);
+    });
+    if (atual.length) segs.push(atual);
+    const linha = segs.map((seg) => seg.length === 1
+      ? `<circle cx="${seg[0][0].toFixed(1)}" cy="${seg[0][1].toFixed(1)}" r="3" fill="${cor}"/>`
+      : `<polyline points="${seg.map(([a, b]) => `${a.toFixed(1)},${b.toFixed(1)}`).join(" ")}"
+           fill="none" stroke="${cor}" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>`
+    ).join("");
+    const pontos = s.valores.map((v, i) => (v === null || v === undefined || !isFinite(v)) ? "" : `
+      <circle cx="${x(i).toFixed(1)}" cy="${y(v).toFixed(1)}" r="3.2" fill="#fff"
+        stroke="${cor}" stroke-width="2">
+        <title>${escapeHtml(rotulos[i])} · ${escapeHtml(s.nome)}: ${grafFormata(v, s.formato || formato)}</title>
+      </circle>`).join("");
+    return linha + pontos;
+  }).join("");
+
+  const eixoX = opts.semEixoX ? "" : rotulos.map((r, i) => {
+    // Em 12 meses, rótulo em todos cria papa visual; alterna.
+    if (n > 8 && i % 2 !== (n - 1) % 2) return "";
+    return `<text x="${x(i).toFixed(1)}" y="${alt - 12}" text-anchor="middle" font-size="10"
+      fill="${i === opts.parcialIdx ? "#8a6100" : "#5b6b78"}"
+      font-weight="${i === opts.parcialIdx ? "700" : "400"}">${escapeHtml(r.slice(2))}</text>`;
+  }).join("");
+
+  // Aviso honesto: o eixo cortado é o que torna a linha legível, mas quem lê
+  // precisa saber que a inclinação está ampliada.
+  const aviso = min > 0 ? `<text x="${w - mr}" y="${mt + 9}" text-anchor="end" font-size="9"
+      fill="#a9b6c0" font-style="italic">escala ampliada · eixo não inicia em zero</text>` : "";
+
+  return `<svg viewBox="0 0 ${w} ${alt}" width="100%" height="${alt}" role="img"
+      style="display:block" preserveAspectRatio="xMidYMid meet">
+      ${faixaParcial}${linhasGrade}
+      <line x1="${ml}" y1="${(mt + areaH).toFixed(1)}" x2="${w - mr}" y2="${(mt + areaH).toFixed(1)}" stroke="#c8d3db"/>
+      ${desenhos}${eixoX}${aviso}
+    </svg>`;
+}
+
+/* Barras (faturamento) com linha sobreposta (meta) — o gráfico de abertura. */
+function grafBarrasComMeta(rotulos, barras, meta, parcialIdx) {
+  const { w, h, ml, mr, mt, mb } = GRAF;
+  const areaW = w - ml - mr, areaH = h - mt - mb;
+  const { max } = grafEscalaY([...barras, ...meta], true);
+  const n = rotulos.length;
+  const passo = areaW / Math.max(n, 1);
+  const larg = Math.min(passo * 0.6, 46);
+  const y = (v) => mt + areaH - (v / max) * areaH;
+  const cx = (i) => ml + passo * i + passo / 2;
+
+  const grade = [0, 0.25, 0.5, 0.75, 1].map((t) => `
+    <line x1="${ml}" y1="${y(max * t).toFixed(1)}" x2="${w - mr}" y2="${y(max * t).toFixed(1)}"
+      stroke="#e4eaef"/>
+    <text x="${ml - 7}" y="${(y(max * t) + 3.5).toFixed(1)}" text-anchor="end" font-size="10"
+      fill="#8797a3">${grafEixoCurto(max * t, "brl")}</text>`).join("");
+
+  const cols = barras.map((v, i) => {
+    const bateu = meta[i] ? v >= meta[i] * 0.95 : null;
+    const cor = i === parcialIdx ? "#9bb8cc" : bateu === null ? "#5b9bd5" : bateu ? "#2e7d32" : "#c0504d";
+    const alt = Math.max(areaH - (y(v) - mt), 1);
+    return `<rect x="${(cx(i) - larg / 2).toFixed(1)}" y="${y(v).toFixed(1)}"
+        width="${larg.toFixed(1)}" height="${alt.toFixed(1)}" rx="3" fill="${cor}"
+        ${i === parcialIdx ? 'opacity="0.75" stroke="#8a6100" stroke-dasharray="3 2"' : ""}>
+        <title>${escapeHtml(rotulos[i])}: ${currency(v)}${meta[i] ? ` · meta ${currency(meta[i])}` : " · sem meta"}${i === parcialIdx ? " (mês parcial)" : ""}</title>
+      </rect>`;
+  }).join("");
+
+  const ptsMeta = meta.map((v, i) => (v ? [cx(i), y(v)] : null));
+  const segs = [];
+  let at = [];
+  ptsMeta.forEach((p) => { if (!p) { if (at.length) segs.push(at); at = []; } else at.push(p); });
+  if (at.length) segs.push(at);
+  const linhaMeta = segs.map((s) => s.length === 1
+    ? `<circle cx="${s[0][0].toFixed(1)}" cy="${s[0][1].toFixed(1)}" r="3" fill="#e0a800"/>`
+    : `<polyline points="${s.map(([a, b]) => `${a.toFixed(1)},${b.toFixed(1)}`).join(" ")}"
+         fill="none" stroke="#e0a800" stroke-width="2.4" stroke-dasharray="6 3"/>`).join("");
+
+  const eixo = rotulos.map((r, i) => (n > 8 && i % 2 !== (n - 1) % 2) ? "" : `
+    <text x="${cx(i).toFixed(1)}" y="${h - 12}" text-anchor="middle" font-size="10"
+      fill="${i === parcialIdx ? "#8a6100" : "#5b6b78"}"
+      font-weight="${i === parcialIdx ? "700" : "400"}">${escapeHtml(r.slice(2))}</text>`).join("");
+
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img"
+      style="display:block" preserveAspectRatio="xMidYMid meet">
+      ${grade}${cols}${linhaMeta}
+      <line x1="${ml}" y1="${mt + areaH}" x2="${w - mr}" y2="${mt + areaH}" stroke="#c8d3db"/>
+      ${eixo}
+    </svg>`;
+}
+
+function grafCartao(titulo, leitura, svg, legenda) {
+  return `
+    <div class="chart-card" style="padding:14px 16px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:2px">
+        <div style="font-weight:800;font-size:13.5px">${escapeHtml(titulo)}</div>
+        ${leitura || ""}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-bottom:8px">${legenda || ""}</div>
+      ${svg}
+    </div>`;
+}
+
+function grafLegenda(itens) {
+  return `<div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">
+    ${itens.map(([nome, cor, tracejado]) => `
+      <span style="display:inline-flex;align-items:center;gap:5px;font-size:11px;color:#5b6b78">
+        <span style="width:16px;height:0;border-top:3px ${tracejado ? "dashed" : "solid"} ${cor};
+                     display:inline-block"></span>${escapeHtml(nome)}</span>`).join("")}
+  </div>`;
+}
+
 function formatoIndicador(v, f) {
   if (v === null || v === undefined) return "—";
   if (f === "moeda") return currency(v);
@@ -12519,6 +12726,160 @@ function resultadosView() {
   };
 
   const maxFat = Math.max(...serie.map((r) => Math.max(r.revenueNet, r.revenueGoal || 0)), 1);
+
+  /* ── Aba Evolução ─────────────────────────────────────────────────────────
+   *
+   * O painel de fato e causa responde "o que aconteceu neste mês". Este
+   * responde outra pergunta: "para onde estamos andando". São leituras
+   * diferentes e por isso não caberiam na mesma tela sem uma virar ruído da
+   * outra.
+   *
+   * A régua é TRIMESTRE contra TRIMESTRE, calculada no backend. Mês contra mês
+   * acusaria movimento em quase todo indicador todo mês — autopeças tem mês de
+   * 18 e mês de 23 dias úteis.
+   */
+  const ps = d.productivitySeries || [];
+  const tend = d.trends || [];
+  const meses = ps.map((r) => r.competence);
+  const parcialIdx = ps.findIndex((r) => r.monthOpen);
+
+  const setaTend = (t) => {
+    const cfg = {
+      evolucao: ["#1e6b34", "#e6f4ea", "▲", "evolução"],
+      involucao: ["#a4262c", "#fdecea", "▼", "involução"],
+      estavel: ["#5b6b78", "#f1f4f6", "=", "estável"],
+    }[t.direction];
+    return `<span style="background:${cfg[1]};color:${cfg[0]};border-radius:5px;padding:2px 7px;
+      font-size:11px;font-weight:800;white-space:nowrap">${cfg[2]} ${
+      t.variationPct > 0 ? "+" : ""}${t.variationPct.toFixed(1)}%</span>`;
+  };
+
+  const serieChart = serie.filter((r) => meses.includes(r.competence));
+  const rotulosOf = serieChart.map((r) => r.competence);
+  const parcialOf = serieChart.findIndex((r) => r.competence === (ps[parcialIdx] || {}).competence);
+
+  const acharTend = (id) => tend.find((t) => t.id === id);
+  const leituraDe = (id) => { const t = acharTend(id); return t ? setaTend(t) : ""; };
+
+  const abaEvolucao = !ps.length ? '<div class="message">Sem histórico suficiente para a evolução.</div>' : `
+    <div class="stack">
+      ${!tend.length ? "" : `
+        <div>
+          <div class="section-title"><div><h3>Leitura do trimestre</h3>
+            <div class="text-small">Média dos 3 últimos meses fechados contra os 3 anteriores.
+              O mês em curso fica fora: incompleto, ele derrubaria todo indicador de volume.
+              Involuções primeiro.</div></div></div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:10px">
+            ${tend.map((t) => `
+              <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px 13px;
+                          border-left:4px solid ${t.direction === "involucao" ? "var(--bad)"
+                            : t.direction === "evolucao" ? "var(--good)" : "#c8d3db"}">
+                <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+                  <strong style="font-size:12.5px">${escapeHtml(t.label)}</strong>${setaTend(t)}
+                </div>
+                <div style="font-size:15px;font-weight:800;margin-top:3px">
+                  ${grafFormata(t.recent, t.format)}
+                  <span style="font-size:11px;font-weight:400;color:var(--muted)">
+                    era ${grafFormata(t.previous, t.format)}</span>
+                </div>
+                <div class="text-small" style="color:var(--muted);margin-top:4px">${escapeHtml(t.note)}</div>
+              </div>`).join("")}
+          </div>
+        </div>`}
+
+      ${grafCartao("Faturamento contra meta", leituraDe("revenuePerDay"),
+        grafBarrasComMeta(rotulosOf, serieChart.map((r) => r.revenueNet),
+          serieChart.map((r) => r.revenueGoal || 0), parcialOf)
+        + grafLegenda([["Bateu a meta (≥95%)", "#2e7d32"], ["Abaixo da meta", "#c0504d"],
+          ["Sem meta cadastrada", "#5b9bd5"], ["Meta", "#e0a800", true]]),
+        "Barra verde bateu a meta, vermelha não, azul é mês sem meta cadastrada. A coluna hachurada é o mês em curso.")}
+
+      ${grafCartao("Positivação da carteira e clientes parados", leituraDe("positivationPct"),
+        grafLinhas(meses, [
+          { nome: "Positivação", valores: ps.map((r) => r.positivationPct), formato: "pct", cor: "#1a5276" },
+        ], "pct", { parcialIdx, semEixoX: true, altura: 150 })
+        + grafLinhas(meses, [
+          { nome: "Carteira parada", valores: ps.map((r) => Math.max(r.portfolioSize - r.portfolioServed, 0)), formato: "num", cor: "#c0504d" },
+        ], "num", { parcialIdx, altura: 170 })
+        + grafLegenda([["Positivação (%)", "#1a5276"], ["Clientes da carteira sem compra", "#c0504d"]]),
+        "Os dois dizem a mesma coisa em unidades diferentes. O número absoluto é o que vira lista de trabalho.")}
+
+      ${grafCartao("Ticket médio por tipo de cliente", leituraDe("ticketPJ"),
+        grafLinhas(meses, [
+          { nome: "Ticket PJ", valores: ps.map((r) => r.byType.PJ.ticket), cor: "#1a5276" },
+          { nome: "Ticket PF", valores: ps.map((r) => r.byType.PF.ticket), cor: "#e0a800" },
+          { nome: "Ticket balcão", valores: ps.map((r) => r.counter.ticket), cor: "#7b5ea7" },
+        ], "brl", { parcialIdx })
+        + grafLegenda([["PJ", "#1a5276"], ["PF", "#e0a800"], ["Balcão", "#7b5ea7"]]),
+        "Ticket de balcão subindo para perto do de carteira é sinal de cliente perdendo vínculo — aí é cadastro, não venda.")}
+
+      ${grafCartao("Clientes atendidos: carteira e balcão", "",
+        grafLinhas(meses, [
+          { nome: "Carteira", valores: ps.map((r) => r.portfolio.clients), cor: "#2e7d32" },
+          { nome: "Balcão", valores: ps.map((r) => r.counter.clients), cor: "#7b5ea7" },
+        ], "num", { parcialIdx })
+        + grafLegenda([["Clientes de carteira", "#2e7d32"], ["Clientes de balcão", "#7b5ea7"]]),
+        "Crescer só no balcão é crescimento que não fideliza: o cliente volta se o preço estiver bom.")}
+
+      ${grafCartao("Mix de itens vendidos", leituraDe("mixSku"),
+        grafLinhas(meses, [
+          { nome: "Códigos distintos", valores: ps.map((r) => r.mixSku), cor: "#7b5ea7" },
+        ], "num", { parcialIdx }),
+        "Mix encolhendo com faturamento estável significa venda concentrando em pouca coisa — risco se aquela linha faltar.")}
+
+      ${grafCartao("Devolução comercial sobre o líquido", "",
+        grafLinhas(rotulosOf, [
+          { nome: "Devolução comercial", valores: serieChart.map((r) => r.returnRatioPct), formato: "pct", cor: "#a4262c" },
+        ], "pct", { parcialIdx: parcialOf, comZero: true }),
+        "Garantia já está excluída: aqui só entra devolução que é erro de venda.")}
+
+      ${grafCartao("Ligação ativa e conversão", leituraDe("conversionPct"),
+        grafLinhas(meses, [
+          { nome: "Ligações ativas", valores: ps.map((r) => r.activeCalls || null), formato: "num", cor: "#0f7b8a" },
+        ], "num", { parcialIdx, semEixoX: true, altura: 150, comZero: true })
+        + grafLinhas(meses, [
+          { nome: "Conversão", valores: ps.map((r) => r.conversionPct), formato: "pct", cor: "#e0a800" },
+        ], "pct", { parcialIdx, altura: 170 })
+        + grafLegenda([["Ligações ativas registradas", "#0f7b8a"], ["Conversão (%)", "#e0a800"]]),
+        "A linha começa em agosto/2026 porque o registro de ligações começou ali. Antes disso não é zero: é ausência de registro.")}
+
+      <div class="table-card">
+        <div style="font-weight:800;font-size:13px;margin-bottom:8px">Histórico completo</div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Mês</th><th style="text-align:right">R$/dia útil</th>
+              <th style="text-align:right">Clientes</th><th style="text-align:right">Positivação</th>
+              <th style="text-align:right">Parados</th><th style="text-align:right">Mix</th>
+              <th style="text-align:right">Ticket PJ</th><th style="text-align:right">Ticket PF</th>
+              <th style="text-align:right">Balcão</th><th style="text-align:right">Ligações</th>
+              <th style="text-align:right">Conversão</th>
+            </tr></thead>
+            <tbody>
+              ${ps.slice().reverse().map((r) => `
+                <tr style="${r.monthOpen ? "background:#fef7e0" : ""}">
+                  <td>${escapeHtml(r.competence)}${r.monthOpen ? ' <span class="status-tag">parcial</span>' : ""}
+                    ${r.compositionReliable ? "" : ' <span class="status-tag" style="background:#fdecea;color:#a4262c" title="Arquivo de faturamento por cliente incompleto neste mês">dado incerto</span>'}</td>
+                  <td style="text-align:right;font-weight:700">${currency(r.revenuePerDay)}</td>
+                  <td style="text-align:right">${number(r.clients)}</td>
+                  <td style="text-align:right">${r.positivationPct === null ? "—" : `${r.positivationPct.toFixed(1)}%`}</td>
+                  <td style="text-align:right">${number(Math.max(r.portfolioSize - r.portfolioServed, 0))}</td>
+                  <td style="text-align:right">${number(r.mixSku)}</td>
+                  <td style="text-align:right">${currency(r.byType.PJ.ticket)}</td>
+                  <td style="text-align:right">${currency(r.byType.PF.ticket)}</td>
+                  <td style="text-align:right;color:var(--muted)">${currency(r.counter.ticket)}</td>
+                  <td style="text-align:right">${number(r.activeCalls)}</td>
+                  <td style="text-align:right">${r.conversionPct === null ? "—" : `${r.conversionPct.toFixed(0)}%`}</td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          Mês em curso aparece destacado e com médias sobre os dias úteis já decorridos.
+          Faturamento e meta saem do custo × venda; ticket e divisão PF/PJ, do faturamento por cliente.
+        </div>
+      </div>
+    </div>`;
 
   /* ── Produtividade ─────────────────────────────────────────────────────────
    *
@@ -12703,11 +13064,31 @@ function resultadosView() {
         </div>
       </div>
 
+      <div style="display:flex;gap:4px;border-bottom:2px solid var(--line)">
+        ${[["fca", "📌 Fato, causa e produtividade"], ["evolucao", "📈 Evolução 12 meses"]]
+          .map(([id, rot]) => `
+            <button onclick="setResultadoAba('${id}')"
+              style="background:${f.tab === id ? "#fff" : "transparent"};border:none;
+                     border-bottom:3px solid ${f.tab === id ? "#1a5276" : "transparent"};
+                     padding:9px 16px;font-size:13px;cursor:pointer;
+                     font-weight:${f.tab === id ? "800" : "500"};
+                     color:${f.tab === id ? "#0f3044" : "#5b6b78"};margin-bottom:-2px">
+              ${rot}</button>`).join("")}
+      </div>
+
       ${d.facts.monthProgress < 0.999 ? `
         <div class="message" style="background:#fef7e0;color:#8a6100">
           ⏳ Mês em andamento — ${Math.round(d.facts.monthProgress * 100)}% dos dias úteis.
           As comparações de volume estão ajustadas a essa fatia.
         </div>` : ""}
+
+      ${f.tab === "evolucao" ? abaEvolucao : `<div class="stack">${montarFca()}</div>`}
+    </div>`;
+
+  // Declaração de função (não const): é içada, então pode ser chamada acima
+  // sem reordenar as 130 linhas do bloco de fato e causa.
+  function montarFca() {
+    return `
 
       ${leitura ? `
         <div class="panel" style="background:${leitura.fundo};border-left:5px solid ${leitura.cor};padding:14px 18px">
@@ -12782,8 +13163,8 @@ function resultadosView() {
         <div class="text-small" style="color:var(--muted);margin-top:8px">
           Devolução comercial já exclui garantia. Mês sem meta cadastrada aparece com "—".
         </div>
-      </div>
-    </div>`;
+      </div>`;
+  }
 }
 
 /* ─── Atividade no CRM ───────────────────────────────────────────────────────
