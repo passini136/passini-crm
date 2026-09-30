@@ -23905,7 +23905,8 @@ def resultados_produtividade(
     # discutir qual tela está certa.
     if nivel == "vendedor" and donos:
         mv = ",".join("?" for _ in donos)
-        of_sql = (f"SELECT COALESCE(SUM(net_value),0) v FROM fact_vendor_summary "
+        of_sql = (f"SELECT COALESCE(SUM(net_value),0) v, COALESCE(SUM(qty_sold),0) q "
+                  f"FROM fact_vendor_summary "
                   f"WHERE company_id = ? AND competence = ? AND seller_name IN ({mv})")
         of_par = [company_id, competencia, *donos]
         gar_sql = (f"SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
@@ -23913,14 +23914,16 @@ def resultados_produtividade(
                    f"AND seller_name IN ({mv})")
         gar_par = [company_id, competencia, RETURN_REASON_WARRANTY, *donos]
     elif nivel == "unidade" and alvo:
-        of_sql = ("SELECT COALESCE(SUM(net_value),0) v FROM fact_unit_summary "
+        of_sql = ("SELECT COALESCE(SUM(net_value),0) v, COALESCE(SUM(qty_sold),0) q "
+                  "FROM fact_unit_summary "
                   "WHERE company_id = ? AND competence = ? AND unit_name = ?")
         of_par = [company_id, competencia, normalize_unit(alvo)]
         gar_sql = ("SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
                    "WHERE company_id = ? AND competence = ? AND reason = ? AND unit_name = ?")
         gar_par = [company_id, competencia, RETURN_REASON_WARRANTY, normalize_unit(alvo)]
     else:
-        of_sql = ("SELECT COALESCE(SUM(net_value),0) v FROM fact_unit_summary "
+        of_sql = ("SELECT COALESCE(SUM(net_value),0) v, COALESCE(SUM(qty_sold),0) q "
+                  "FROM fact_unit_summary "
                   "WHERE company_id = ? AND competence = ?")
         of_par = [company_id, competencia]
         gar_sql = ("SELECT COALESCE(SUM(total_value),0) v FROM fact_warranty_returns "
@@ -23928,8 +23931,14 @@ def resultados_produtividade(
         gar_par = [company_id, competencia, RETURN_REASON_WARRANTY]
     # Garantia volta para o líquido, igual à série: defeito de peça não é erro
     # comercial do vendedor.
-    liquido = (float(conn.execute(of_sql, of_par).fetchone()["v"] or 0)
+    _of = conn.execute(of_sql, of_par).fetchone()
+    liquido = (float(_of["v"] or 0)
                + float(conn.execute(gar_sql, gar_par).fetchone()["v"] or 0))
+    # Peças vendidas: sai do custo × venda, a mesma fonte do faturamento. O
+    # detalhado tem quantidade também, mas mistura as duas fontes num único
+    # indicador — e ticket por peça é razão entre elas, então divergência de
+    # 5% no denominador vira 5% de erro que ninguém consegue rastrear.
+    pecas = float(_of["q"] or 0)
 
     # ── Proporção vem do resumo por cliente; VALOR vem do oficial ────────────
     # O resumo por cliente fica ~5% acima do custo × venda, mês após mês. Um
@@ -24011,6 +24020,13 @@ def resultados_produtividade(
         "clientsNegative": len(negativos),
         "negativeValue": round(valor_negativo, 2),
         "clients": clientes,
+        "pieces": round(pecas, 1),
+        "piecesPerDay": round(pecas / dias, 1),
+        # Ticket por PEÇA responde outra pergunta que o ticket por cliente:
+        # um mês pode ter ticket de cliente alto só porque cada um levou mais
+        # itens baratos. Os dois juntos separam preço de volume.
+        "ticketPerPiece": round(liquido / pecas, 2) if pecas else None,
+        "piecesPerClient": round(pecas / clientes, 1) if clientes else None,
         "mixSku": mix,
         "portfolioSize": len(carteira),
         # Positivação só conta cliente DA CARTEIRA: atender cliente de outro
@@ -24048,6 +24064,124 @@ def resultados_produtividade(
         "converted": len(converteram),
         "conversionPct": round(100 * len(converteram) / len(contatados), 1) if contatados else None,
         "callsPerDay": round(ligacoes / dias, 1),
+    }
+
+
+def ensure_catalogo_custo_temp(conn: sqlite3.Connection, company_id: int) -> None:
+    """Custo por referência + marca, agrupado, na conexão.
+
+    Tabela própria em vez de acrescentar coluna em `catalogo_linha`: aquela é
+    usada pelas telas de linha e grupo, e mexer nela para servir a margem
+    arriscaria mudar número em tela que hoje está certa.
+
+    O GROUP BY não é detalhe: `manufacturer_ref` se repete entre marcas, e
+    referência repetida no lado direito de um LEFT JOIN duplica a linha de
+    venda e infla o faturamento — o mesmo estrago que a tela de linha já sofreu.
+    """
+    if getattr(conn, "_catalogo_custo_temp", None) == company_id:
+        return
+    conn.execute("DROP TABLE IF EXISTS temp.catalogo_custo")
+    conn.execute(
+        """
+        CREATE TEMP TABLE catalogo_custo AS
+        SELECT UPPER(TRIM(manufacturer_ref))         AS ref,
+               UPPER(TRIM(COALESCE(brand_name, ''))) AS marca,
+               AVG(NULLIF(cost_price, 0))            AS custo
+        FROM item_catalog
+        WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref, '')) <> ''
+        GROUP BY ref, marca
+        """,
+        (company_id,),
+    )
+    conn.execute("CREATE INDEX temp.idx_catalogo_custo ON catalogo_custo(ref, marca)")
+    conn._catalogo_custo_temp = company_id
+
+
+def resultados_margem_marca(
+    conn: sqlite3.Connection, company_id: int, nivel: str, alvo: str,
+    competencia: str, limite: int = 20,
+) -> dict[str, Any]:
+    """Margem estimada por marca no recorte.
+
+    ESTA MARGEM É ESTIMADA, e a tela precisa dizer isso. O custo vem do
+    catálogo (`cost_price`), que é o custo de HOJE, não o custo da data da
+    venda. Em peça que teve reajuste no meio do mês, a margem sai deslocada.
+    A margem OFICIAL da empresa continua sendo `margin_value` do custo × venda,
+    que vem pronta do Alfa — esta aqui existe só para responder uma pergunta
+    que a oficial não responde: QUAL MARCA sustenta a margem e qual corrói.
+
+    Duas coberturas são devolvidas junto, e sem elas o número não deve ir para
+    reunião: quanto do faturamento casou com o catálogo, e quanto dos itens
+    casados tem custo cadastrado. Marca com cobertura baixa aparece marcada em
+    vez de exibir uma margem inventada sobre um terço dos itens.
+    """
+    if not competencia:
+        return {}
+    nivel = normalize_whitespace(nivel).lower()
+    ensure_catalogo_custo_temp(conn, company_id)
+
+    onde, par = "", []
+    if nivel == "vendedor" and alvo:
+        nomes = seller_name_variants(conn, company_id, alvo) or [alvo]
+    elif nivel == "unidade" and alvo:
+        nomes = sellers_of_unit(conn, company_id, competencia, alvo) or []
+    else:
+        nomes = []
+    if nomes:
+        onde = f" AND f.seller_name IN ({','.join('?' for _ in nomes)})"
+        par = list(nomes)
+
+    linhas = conn.execute(
+        f"""
+        SELECT UPPER(TRIM(COALESCE(f.brand_name,'(SEM MARCA)'))) AS marca,
+               COALESCE(SUM(f.net_value), 0)      AS liquido,
+               COALESCE(SUM(f.quantity), 0)       AS pecas,
+               COALESCE(SUM(CASE WHEN c.custo IS NOT NULL
+                            THEN f.quantity * c.custo END), 0) AS custo,
+               COALESCE(SUM(CASE WHEN c.custo IS NOT NULL
+                            THEN f.net_value END), 0)          AS liquido_com_custo
+        FROM fact_sales_detail f
+        LEFT JOIN catalogo_custo c
+               ON c.ref = UPPER(TRIM(f.sku_key))
+              AND c.marca = UPPER(TRIM(COALESCE(f.brand_name, '')))
+        WHERE f.company_id = ? AND f.competence = ? AND f.net_value > 0{onde}
+        GROUP BY marca
+        """,
+        [company_id, competencia, *par]).fetchall()
+
+    marcas = []
+    for r in linhas:
+        liquido = float(r["liquido"] or 0)
+        com_custo = float(r["liquido_com_custo"] or 0)
+        custo = float(r["custo"] or 0)
+        cobertura = (100 * com_custo / liquido) if liquido else 0.0
+        # Margem calculada SÓ sobre a parte que tem custo. Dividir o custo
+        # parcial pelo faturamento inteiro daria margem alta e falsa — o erro
+        # andaria na direção que ninguém contesta.
+        margem = (100 * (com_custo - custo) / com_custo) if com_custo > 0 else None
+        marcas.append({
+            "brand": r["marca"],
+            "revenue": round(liquido, 2),
+            "pieces": round(float(r["pecas"] or 0), 1),
+            "cost": round(custo, 2),
+            "marginPct": round(margem, 1) if margem is not None else None,
+            "marginValue": round(com_custo - custo, 2) if com_custo > 0 else None,
+            "coveragePct": round(cobertura, 1),
+            # Abaixo de 60% do faturamento com custo, a margem descreve uma
+            # fatia, não a marca.
+            "reliable": cobertura >= 60.0,
+            "ticketPerPiece": round(liquido / float(r["pecas"]), 2) if r["pecas"] else None,
+        })
+
+    total_liq = sum(m["revenue"] for m in marcas)
+    total_com = sum(m["revenue"] * m["coveragePct"] / 100 for m in marcas)
+    marcas.sort(key=lambda m: m["revenue"], reverse=True)
+    return {
+        "competence": competencia,
+        "brands": marcas[:limite],
+        "totalRevenue": round(total_liq, 2),
+        "coveragePct": round(100 * total_com / total_liq, 1) if total_liq else None,
+        "brandsTotal": len(marcas),
     }
 
 
