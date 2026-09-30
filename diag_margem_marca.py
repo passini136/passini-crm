@@ -170,9 +170,11 @@ else:
         v = float(r["v"] or 0)
         print(f"   {str(r['sku_key'])[:15]:<16}{q:>8,.0f}{backend.brl(v):>13}"
               f"{backend.brl(v / q if q else 0):>13}{backend.brl(r['custo'] or 0):>12}")
-    print("\n   >> Se o CUSTO CADASTRADO for muito maior que o preço unitário")
-    print("      vendido, a unidade de medida está trocada (litro x balde, peça")
-    print("      x caixa) — não é margem negativa, é cadastro.")
+    print("\n   >> Custo MUITO MAIOR que o preço unitário: unidade de medida")
+    print("      trocada (litro x balde, peça x caixa). Custo perto de zero ou")
+    print("      redondo demais (R$ 1,00) com SKU genérico ('.', 'DIVERSOS'):")
+    print("      item sem cadastro real, vendido por um código coringa — o custo")
+    print("      é um valor de fachada e a margem de 95% é ficção.")
 
 # ── 4. O ranking por marca ──────────────────────────────────────────────────
 print("\n4) MARGEM POR MARCA — as 15 maiores em faturamento")

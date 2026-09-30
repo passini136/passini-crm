@@ -12999,6 +12999,102 @@ function resultadosView() {
         </div>`}
     </div>`;
 
+  /* ── Mix por unidade ───────────────────────────────────────────────────────
+   *
+   * Existe para separar duas causas que o faturamento confunde. Lajeado vende
+   * 23 peças por cliente a R$ 69; Zona Norte vende 9 a R$ 102. Se as unidades
+   * venderem as MESMAS marcas em proporções parecidas, a diferença é de
+   * cliente ou de desconto — e a ação é carteira. Se as proporções destoarem,
+   * é sortimento, e a ação é compra e treinamento.
+   *
+   * A leitura é por DESVIO contra a média da empresa, não por participação
+   * bruta: participação alta numa unidade grande só reflete o tamanho dela.
+   */
+  const mx = d.unitMix || {};
+  const corDesvio = (dp) => {
+    const a = Math.abs(dp);
+    if (a < 1) return { fundo: "transparent", cor: "#c8d3db" };
+    const forte = Math.min(a / 8, 1);
+    return dp > 0
+      ? { fundo: `rgba(46,125,50,${0.08 + forte * 0.28})`, cor: "#1e6b34" }
+      : { fundo: `rgba(192,80,77,${0.08 + forte * 0.28})`, cor: "#a4262c" };
+  };
+
+  const blocoMix = !(mx.units || []).length || (mx.units || []).length < 2 ? "" : (() => {
+    const marcas = (mx.brands || []).slice(0, 8);
+    const distancia = (u) => u.brands.reduce((s, c) => s + Math.abs(c.deltaPp), 0) / 2;
+    const maiorDist = Math.max(...mx.units.map(distancia));
+    const tks = mx.units.map((u) => u.ticketPerPiece || 0).filter(Boolean);
+    const faixaTk = tks.length ? Math.max(...tks) / Math.min(...tks) : 0;
+    const leitura = maiorDist >= 15
+      ? ["#a4262c", "#fdecea", "Mix diferente entre as unidades",
+         "Elas vendem produtos distintos, não apenas volumes distintos. A conversa é de compra, campanha e treinamento — e comparar ticket entre elas sem ajustar o mix é injusto."]
+      : faixaTk >= 1.3
+        ? ["#8a6100", "#fef7e0", "Mesmo mix, ticket diferente",
+           "Vendem as mesmas marcas em proporção parecida, mas o valor por peça muda muito. Isso é perfil de cliente ou política de desconto, não sortimento."]
+        : ["#1e6b34", "#e6f4ea", "Unidades parecidas",
+           "Mix e ticket próximos. A diferença de peças por cliente vem do tamanho do pedido, não do que se vende."];
+    return `
+      <div class="table-card" style="margin-top:10px">
+        <div style="font-weight:800;font-size:13px;margin-bottom:2px">Mix de marcas por unidade</div>
+        <div class="text-small" style="color:var(--muted);margin-bottom:8px">
+          Cada célula é a participação da marca na unidade <strong>menos</strong> a participação
+          dela na empresa, em pontos percentuais. Verde vende mais que a média, vermelho menos.
+        </div>
+
+        <div class="panel" style="background:${leitura[1]};border-left:5px solid ${leitura[0]};
+                                  padding:11px 14px;margin-bottom:10px">
+          <div style="font-weight:800;font-size:13.5px;color:${leitura[0]}">${leitura[2]}</div>
+          <div style="font-size:12.5px;margin-top:3px">${leitura[3]}</div>
+          <div class="text-small" style="color:var(--muted);margin-top:5px">
+            Maior distância de mix: ${maiorDist.toFixed(1)} pontos ·
+            ticket por peça varia ${faixaTk.toFixed(1)}x entre a maior e a menor unidade.
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr>
+              <th>Unidade</th><th style="text-align:right">R$/peça</th>
+              <th style="text-align:right">Marcas</th><th style="text-align:right">Top 5</th>
+              ${marcas.map((m) => `<th style="text-align:center">${escapeHtml(m)}</th>`).join("")}
+            </tr></thead>
+            <tbody>
+              <tr style="background:#eef4fa;font-weight:700">
+                <td>EMPRESA</td>
+                <td style="text-align:right">—</td><td style="text-align:right">—</td>
+                <td style="text-align:right">—</td>
+                ${marcas.map((m) => {
+                  const c = (mx.company || []).find((x) => x.brand === m);
+                  return `<td style="text-align:center">${c ? c.sharePct.toFixed(1) : "0"}%</td>`;
+                }).join("")}
+              </tr>
+              ${mx.units.map((u) => `
+                <tr>
+                  <td>${escapeHtml(u.unit)}</td>
+                  <td style="text-align:right">${currency(u.ticketPerPiece)}</td>
+                  <td style="text-align:right;color:var(--muted)">${number(u.brandsCount)}</td>
+                  <td style="text-align:right;color:var(--muted)">${u.top5SharePct.toFixed(0)}%</td>
+                  ${marcas.map((m) => {
+                    const c = u.brands.find((x) => x.brand === m);
+                    const dp = c ? c.deltaPp : 0;
+                    const s = corDesvio(dp);
+                    return `<td style="text-align:center;background:${s.fundo};color:${s.cor};
+                             font-weight:${Math.abs(dp) >= 1 ? "700" : "400"}"
+                             title="${escapeHtml(m)} em ${escapeHtml(u.unit)}: ${c ? c.sharePct.toFixed(1) : 0}% da venda da unidade">
+                      ${Math.abs(dp) >= 1 ? `${dp > 0 ? "+" : ""}${dp.toFixed(1)}` : "·"}</td>`;
+                  }).join("")}
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:8px">
+          "Top 5" é quanto as cinco maiores marcas respondem pela unidade — alto significa
+          venda dependente de poucos fornecedores. "·" significa proporção igual à da empresa.
+        </div>
+      </div>`;
+  })();
+
   const blocoProdutividade = !p.competence ? "" : `
     <div>
       <div class="section-title"><div><h3>3. Produtividade — como o resultado foi feito</h3>
@@ -13129,6 +13225,7 @@ function resultadosView() {
         </div>`}
 
       ${blocoMarca}
+      ${blocoMix}
     </div>`;
 
   return `

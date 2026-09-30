@@ -26232,6 +26232,12 @@ class AppHandler(BaseHTTPRequestHandler):
                     tendencias = resultados_evolucao(prod_serie)
                     margem = resultados_margem_marca(conn, user["company_id"], nivel,
                                                      alvo, fatos["competence"])
+                    # Mix só faz sentido comparando unidades entre si; no
+                    # recorte de um vendedor não há com o que comparar.
+                    mix_unidades = (resultados_mix_unidade(
+                        conn, user["company_id"], fatos["competence"],
+                        permitidas if permitidas is not None else None)
+                        if nivel != "vendedor" else {})
                 self._set_headers(200)
                 self.wfile.write(json_dumps({
                     "level": nivel, "target": alvo,
@@ -26240,7 +26246,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     "units": unidades,
                     "productivity": prod, "team": equipe,
                     "productivitySeries": prod_serie, "trends": tendencias,
-                    "brandMargin": margem,
+                    "brandMargin": margem, "unitMix": mix_unidades,
                     "canChooseCompany": permitidas is None and escopo != "proprio",
                 }))
                 return
