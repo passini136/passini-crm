@@ -24170,18 +24170,38 @@ def resultados_margem_marca(
             # Abaixo de 60% do faturamento com custo, a margem descreve uma
             # fatia, não a marca.
             "reliable": cobertura >= 60.0,
+            # MARGEM DE -300% NÃO É MARGEM RUIM, É CADASTRO ERRADO. Autopeça
+            # não vende com 300% de prejuízo: o que produz esse número é
+            # unidade de medida trocada entre venda e catálogo — óleo vendido a
+            # litro com custo cadastrado por balde, peça vendida a unidade com
+            # custo por caixa. Exibir o valor como se fosse desempenho faria a
+            # reunião discutir a rentabilidade de uma marca que está apenas mal
+            # cadastrada, e esconderia a marca que realmente perde dinheiro.
+            "costSuspect": margem is not None and not (-20.0 <= margem <= 80.0),
             "ticketPerPiece": round(liquido / float(r["pecas"]), 2) if r["pecas"] else None,
         })
 
     total_liq = sum(m["revenue"] for m in marcas)
     total_com = sum(m["revenue"] * m["coveragePct"] / 100 for m in marcas)
     marcas.sort(key=lambda m: m["revenue"], reverse=True)
+
+    # A margem consolidada sai SÓ das marcas plausíveis. Incluir as suspeitas
+    # arrastaria o número da empresa para o negativo por causa de cadastro.
+    sadias = [m for m in marcas if m["marginPct"] is not None and not m["costSuspect"]]
+    rec_s = sum(m["revenue"] * m["coveragePct"] / 100 for m in sadias)
+    cus_s = sum(m["cost"] for m in sadias)
+    suspeitas = [m for m in marcas if m["costSuspect"]]
     return {
         "competence": competencia,
         "brands": marcas[:limite],
         "totalRevenue": round(total_liq, 2),
         "coveragePct": round(100 * total_com / total_liq, 1) if total_liq else None,
         "brandsTotal": len(marcas),
+        "marginPct": round(100 * (rec_s - cus_s) / rec_s, 1) if rec_s else None,
+        "suspectBrands": len(suspeitas),
+        "suspectRevenue": round(sum(m["revenue"] for m in suspeitas), 2),
+        "suspectSharePct": round(
+            100 * sum(m["revenue"] for m in suspeitas) / total_liq, 1) if total_liq else None,
     }
 
 

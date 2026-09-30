@@ -91,26 +91,88 @@ else:
 # Se o custo do catálogo estiver muito defasado, a margem estimada não serve
 # nem para ranquear marca, porque o erro não é uniforme entre elas.
 print("\n3) ESTIMADA CONTRA A MARGEM OFICIAL DO CUSTO x VENDA")
-oficial = conn.execute(
-    "SELECT AVG(margin_value) m FROM fact_unit_summary "
-    "WHERE company_id = ? AND competence = ?", (company_id, comp)).fetchone()["m"]
+# `margin_value` é MULTIPLICADOR, não percentual — a régua do farol trata 1,55
+# como bom. Comparar 1,52 com "35%" e concluir que o catálogo está errado foi
+# exatamente o erro que este bloco cometeu na primeira versão. A margem oficial
+# comparável sai de LUCRO ÷ VENDA, que existe no próprio arquivo.
+of = conn.execute(
+    "SELECT COALESCE(SUM(profit_value),0) lucro, COALESCE(SUM(sale_value),0) venda, "
+    "       COALESCE(SUM(cost_value),0) custo, AVG(margin_value) mult "
+    "FROM fact_vendor_summary WHERE company_id = ? AND competence = ?",
+    (company_id, comp)).fetchone()
+venda_of = float(of["venda"] or 0)
+oficial = (100 * float(of["lucro"] or 0) / venda_of) if venda_of else None
+mult = float(of["mult"] or 0)
+print(f"   Multiplicador médio do Alfa: {mult:.3f}x  "
+      f"(equivale a {100 * (1 - 1 / mult):.1f}% de margem)" if mult > 1 else "")
+print(f"   Oficial (lucro ÷ venda): {oficial:.2f}%" if oficial is not None else "   Oficial: —")
+
 com_custo = sum(b["revenue"] * b["coveragePct"] / 100 for b in d["brands"])
 custo_tot = sum(b["cost"] for b in d["brands"])
 estimada = (100 * (com_custo - custo_tot) / com_custo) if com_custo else None
-print(f"   Oficial (custo × venda): {float(oficial or 0):.2f}%")
 print(f"   Estimada (catálogo):     {estimada:.2f}%" if estimada is not None else "   Estimada: —")
-if estimada is not None and oficial:
-    gap = estimada - float(oficial)
-    print(f"   Diferença: {gap:+.2f} pontos")
+
+# A média geral é contaminada pelas marcas com cadastro furado. A mediana
+# ponderada das marcas plausíveis diz se o catálogo serve para as OUTRAS.
+sadias = [b for b in d["brands"]
+          if b["marginPct"] is not None and -20 <= b["marginPct"] <= 80]
+rec_s = sum(b["revenue"] * b["coveragePct"] / 100 for b in sadias)
+cus_s = sum(b["cost"] for b in sadias)
+est_s = (100 * (rec_s - cus_s) / rec_s) if rec_s else None
+parte = 100 * sum(b["revenue"] for b in sadias) / d["totalRevenue"] if d["totalRevenue"] else 0
+print(f"\n   Excluindo marcas com margem impossível "
+      f"({len(d['brands']) - len(sadias)} de {len(d['brands'])}, "
+      f"{100 - parte:.1f}% do faturamento):")
+print(f"   Estimada nas marcas plausíveis: {est_s:.2f}%" if est_s is not None else "")
+if est_s is not None and oficial is not None:
+    gap = est_s - oficial
+    print(f"   Diferença contra a oficial: {gap:+.2f} pontos")
     if abs(gap) > 10:
-        print("   >> MUITO LONGE. O custo do catálogo não representa o custo real.")
-        print("      Não usar para decidir preço nem mix — no máximo para ver")
-        print("      QUAL marca destoa, e mesmo assim com desconfiança.")
+        print("   >> Longe. O custo do catálogo não representa o custo real.")
     elif abs(gap) > 4:
-        print("   >> Deslocada, mas na mesma faixa. Serve para comparar marcas")
-        print("      entre si; o valor absoluto continua sendo o oficial.")
+        print("   >> Deslocada, mas na mesma faixa. Serve para COMPARAR marcas;")
+        print("      o valor absoluto continua sendo o oficial.")
     else:
-        print("   >> Próxima. A estimativa é utilizável.")
+        print("   >> Próxima. A estimativa é utilizável marca a marca.")
+
+# ── 3b. Quem está com o cadastro furado? ────────────────────────────────────
+# Margem de -300% não é margem ruim: é unidade de medida trocada entre o
+# faturamento e o catálogo. Óleo vendido a litro com custo cadastrado por
+# balde produz exatamente este retrato.
+print("\n3b) MARCAS COM MARGEM IMPOSSÍVEL — cadastro a revisar")
+ruins = [b for b in d["brands"]
+         if b["marginPct"] is not None and not (-20 <= b["marginPct"] <= 80)]
+ruins.sort(key=lambda b: b["revenue"], reverse=True)
+if not ruins:
+    print("   Nenhuma.")
+else:
+    print(f"   {len(ruins)} marca(s), {backend.brl(sum(b['revenue'] for b in ruins))} "
+          f"({100 - parte:.1f}% do faturamento)")
+    print(f"   {'MARCA':<20}{'LÍQUIDO':>14}{'MARGEM':>12}{'R$/PEÇA':>11}")
+    for b in ruins[:10]:
+        print(f"   {b['brand'][:19]:<20}{backend.brl(b['revenue']):>14}"
+              f"{b['marginPct']:>11.0f}%{backend.brl(b['ticketPerPiece']):>11}")
+
+    # Amostra de itens da pior marca: é aqui que a causa aparece.
+    pior = ruins[0]["brand"]
+    print(f"\n   Amostra de itens de {pior} — venda contra custo do catálogo:")
+    print(f"   {'SKU':<16}{'QTD':>8}{'LÍQUIDO':>13}{'R$/UN VEND':>13}{'CUSTO CAD':>12}")
+    for r in conn.execute(
+        """SELECT f.sku_key, SUM(f.quantity) q, SUM(f.net_value) v, MAX(c.custo) custo
+           FROM fact_sales_detail f
+           LEFT JOIN catalogo_custo c ON c.ref = UPPER(TRIM(f.sku_key))
+                                     AND c.marca = UPPER(TRIM(COALESCE(f.brand_name,'')))
+           WHERE f.company_id = ? AND f.competence = ? AND f.net_value > 0
+             AND UPPER(TRIM(COALESCE(f.brand_name,''))) = ?
+           GROUP BY f.sku_key ORDER BY v DESC LIMIT 8""",
+            (company_id, comp, pior)).fetchall():
+        q = float(r["q"] or 0)
+        v = float(r["v"] or 0)
+        print(f"   {str(r['sku_key'])[:15]:<16}{q:>8,.0f}{backend.brl(v):>13}"
+              f"{backend.brl(v / q if q else 0):>13}{backend.brl(r['custo'] or 0):>12}")
+    print("\n   >> Se o CUSTO CADASTRADO for muito maior que o preço unitário")
+    print("      vendido, a unidade de medida está trocada (litro x balde, peça")
+    print("      x caixa) — não é margem negativa, é cadastro.")
 
 # ── 4. O ranking por marca ──────────────────────────────────────────────────
 print("\n4) MARGEM POR MARCA — as 15 maiores em faturamento")
