@@ -6532,6 +6532,59 @@ function sellerGoalsTableCard() {
   `;
 }
 
+/* Competências que já têm meta de unidade lançada → [["2026-09", ["MATRIZ","PELOTAS"]], …]
+ *
+ * A competência era digitada à mão. Além do erro de digitação óbvio, isso
+ * permitia lançar meta de vendedor num mês em que a unidade ainda não tem
+ * meta — e aí o atingimento individual existe sem denominador de unidade para
+ * comparar, o que só aparece na reunião, tarde demais.
+ */
+function competenciasComMetaUnidade() {
+  const porComp = new Map();
+  for (const r of state.admin?.goalsUnit || []) {
+    const comp = String(r.competence || "").trim();
+    if (!comp) continue;
+    if (!porComp.has(comp)) porComp.set(comp, []);
+    const un = String(r.unit_name || "").trim();
+    if (un && !porComp.get(comp).includes(un)) porComp.get(comp).push(un);
+  }
+  // Mais recente primeiro: é quase sempre o mês que se vai lançar.
+  return [...porComp.entries()].sort((a, b) => b[0].localeCompare(a[0]));
+}
+
+/* Esconde as competências que não servem para a unidade escolhida.
+ *
+ * Mexe no DOM em vez de repintar a tela: repintar no meio do preenchimento
+ * tira o foco do campo e faz o usuário clicar de novo — o defeito que o
+ * gerente relatou na tela de visitas.
+ */
+function filtrarCompetenciasMeta() {
+  const selComp = document.getElementById("goal-seller-competence");
+  const selUn = document.getElementById("goal-seller-unit");
+  if (!selComp) return;
+  const unidade = (selUn?.value || "").trim();
+  let escondeuOEscolhido = false;
+  for (const opt of selComp.options) {
+    if (!opt.value) continue;
+    const unidades = (opt.dataset.units || "").split("|").filter(Boolean);
+    const serve = !unidade || unidades.includes(unidade);
+    opt.hidden = !serve;
+    opt.disabled = !serve;
+    if (!serve && opt.selected) escondeuOEscolhido = true;
+  }
+  // Seleção que deixou de valer não pode ficar aparecendo como válida.
+  if (escondeuOEscolhido) selComp.value = "";
+  const aviso = document.getElementById("goal-comp-aviso");
+  if (aviso) {
+    const sobrou = [...selComp.options].filter((o) => o.value && !o.hidden).length;
+    aviso.textContent = !unidade
+      ? "Só aparecem os meses que já têm meta de unidade lançada."
+      : sobrou
+        ? `${sobrou} mês(es) com meta lançada para ${unidade}.`
+        : `${unidade} não tem meta de unidade em nenhum mês. Peça à administração para lançar primeiro.`;
+  }
+}
+
 function unitGoalsTableCard() {
   const rows = state.admin?.goalsUnit || [];
   return `
@@ -18566,17 +18619,23 @@ configuracoesView = function adminViewGoalsSellerUnitFinal() {
               <div class="two-column-form">
                 <div class="field">
                   <label>Competência</label>
-                  <input
-                    id="goal-seller-competence"
-                    placeholder="2026-04"
-                    value="${escapeHtml(sellerGoalEditor.competence)}"
-                    required
-                  />
+                  <select id="goal-seller-competence" required onchange="filtrarCompetenciasMeta()">
+                    <option value="">Selecione o mês</option>
+                    ${competenciasComMetaUnidade().map(([comp, unidades]) => `
+                      <option value="${escapeHtml(comp)}" data-units="${escapeHtml(unidades.join("|"))}"
+                        ${sellerGoalEditor.competence === comp ? "selected" : ""}>
+                        ${escapeHtml(comp)}</option>`).join("")}
+                  </select>
+                  <div class="text-small" id="goal-comp-aviso" style="color:var(--muted);margin-top:3px">
+                    ${competenciasComMetaUnidade().length
+                      ? "Só aparecem os meses que já têm meta de unidade lançada."
+                      : "Nenhuma competência com meta de unidade. Peça à administração para lançar primeiro."}
+                  </div>
                 </div>
 
                 <div class="field">
                   <label>Vendedor</label>
-                  <select id="goal-seller-name" required onchange="(function(){const sel=document.getElementById('goal-seller-name');const opt=sel.options[sel.selectedIndex];const unit=opt?opt.dataset.unit||'':'';const unitSel=document.getElementById('goal-seller-unit');if(unitSel&&unit)unitSel.value=unit;})()">
+                  <select id="goal-seller-name" required onchange="(function(){const sel=document.getElementById('goal-seller-name');const opt=sel.options[sel.selectedIndex];const unit=opt?opt.dataset.unit||'':'';const unitSel=document.getElementById('goal-seller-unit');if(unitSel&&unit)unitSel.value=unit;filtrarCompetenciasMeta();})()">
                     <option value="">Selecione</option>
                     ${sellerPeopleOptions().map(p => `<option value="${escapeHtml(p.person_name)}" data-unit="${escapeHtml(p.base_unit||'')}" ${sellerGoalEditor.sellerName === p.person_name ? "selected" : ""}>${escapeHtml(p.person_name)}${p.base_unit ? ` · ${escapeHtml(p.base_unit)}` : ""}</option>`).join("")}
                   </select>
@@ -18584,7 +18643,7 @@ configuracoesView = function adminViewGoalsSellerUnitFinal() {
 
                 <div class="field">
                   <label>Unidade base</label>
-                  <select id="goal-seller-unit">
+                  <select id="goal-seller-unit" onchange="filtrarCompetenciasMeta()">
                     <option value="">Selecione</option>
                     ${(state.options.units || []).map(u => `<option value="${escapeHtml(u)}" ${sellerGoalEditor.baseUnit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
                   </select>
@@ -18617,6 +18676,17 @@ Cancelar edição
               </div>
             </form>
 
+            <!-- META DE UNIDADE É DO ADM, não do gerente.
+                 Ele cadastra a meta individual da equipe dele; o número da
+                 unidade vem de cima. Deixar o formulário à vista convidava a
+                 mexer no total — e meta de unidade alterada por engano
+                 reescreve o atingimento de todo mundo naquele mês. -->
+            ${!userCanManageUsers() ? `
+            <div class="message" style="background:#eef4fa;color:var(--accent)">
+              A meta da unidade é cadastrada pela administração. Aqui você define
+              a meta individual de cada vendedor, dentro das competências que já
+              têm meta de unidade lançada.
+            </div>` : `
             <form id="unit-goal-form" onsubmit="saveUnitGoal(event)" class="stack">
               <div class="section-title compact">
                 <div>
@@ -18670,7 +18740,7 @@ onclick="cancelUnitGoalEdit()"
 Cancelar edição
 </button>` : ""}
               </div>
-            </form>
+            </form>`}
 
             ${scoreEnabled() && userCanManageUsers() ? `
             <form onsubmit="saveScoreConfig(event)" class="stack">

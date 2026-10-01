@@ -27481,6 +27481,18 @@ class AppHandler(BaseHTTPRequestHandler):
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):
                     return
+                # META DE UNIDADE É DO ADM. O gerente lança a meta individual da
+                # equipe dele; o número da unidade vem de cima. Tirar o
+                # formulário da tela não basta — a rota continuaria aberta para
+                # quem souber chamá-la, e meta de unidade trocada por engano
+                # reescreve o atingimento de todo mundo naquele mês.
+                if path == "/api/admin/goals/unit":
+                    with closing(get_connection()) as _c:
+                        if not user_can_manage_users(_c, user):
+                            self._set_headers(403)
+                            self.wfile.write(json_dumps(
+                                {"error": "A meta da unidade é cadastrada pela administração."}))
+                            return
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 competence = normalize_whitespace(body.get("competence", ""))
                 if not competence:
@@ -27566,6 +27578,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 user = self._require_auth()
                 if not user or not self._require_admin_area(user):
                     return
+                # Apagar a meta da unidade é tão grave quanto trocá-la: o mês
+                # inteiro fica sem denominador e o atingimento some de todos.
+                with closing(get_connection()) as _c:
+                    if not user_can_manage_users(_c, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps(
+                            {"error": "A meta da unidade é cadastrada pela administração."}))
+                        return
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 competence = normalize_whitespace(body.get("competence", ""))
                 unit_name = normalize_unit(body.get("unit_name", ""))
