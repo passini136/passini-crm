@@ -645,6 +645,56 @@ button {
   min-width: 210px;
 }
 
+/* CARTEIRA: seis colunas que cabem, em vez de treze que não cabiam.
+   A regra acima vale para as outras tabelas, onde a 2a coluna é o nome do
+   cliente. Aqui o nome é a 1a, então a largura mínima muda de lugar — sem
+   isto, "Vendedor e cidade" ganhava 210px que o nome precisava mais. */
+.table-carteira td:nth-child(2) {
+  min-width: 0;
+}
+
+.table-carteira th,
+.table-carteira td {
+  vertical-align: top;
+  /* 12px de cada lado em 6 colunas são 144px só de respiro — mais que uma
+     coluna inteira. Com o conteúdo já empilhado em duas linhas, 8px separam
+     igual e devolvem o espaço para o que importa. */
+  padding: 10px 8px;
+}
+
+/* As etiquetas de "No mês" podem empilhar. Cada uma já não quebra por dentro;
+   obrigar as duas na mesma linha é que forçava a coluna a 135px e empurrava a
+   tabela para fora da tela. */
+.table-carteira td:nth-child(5) {
+  white-space: normal;
+}
+
+/* Percentuais, não pixels: a tabela se ajusta à largura disponível em vez de
+   exigir uma tela mínima. Com o menu lateral aberto ou fechado, em notebook ou
+   monitor, as proporções continuam as mesmas. */
+.table-carteira th:nth-child(1) { width: 30%; min-width: 165px; }
+.table-carteira th:nth-child(2) { width: 20%; min-width: 115px; }
+.table-carteira th:nth-child(3) { width: 14%; min-width: 92px; }
+.table-carteira th:nth-child(4) { width: 18%; min-width: 112px; }
+.table-carteira th:nth-child(5) { width: 18%; min-width: 104px; }
+
+/* Nome de cliente é longo e vem em caixa alta do Alfa: sem a quebra, uma
+   razão social de 60 caracteres esticava a coluna e devolvia a rolagem
+   lateral que esta mudança veio eliminar. */
+.table-carteira td:nth-child(1) strong {
+  display: block;
+  overflow-wrap: anywhere;
+  line-height: 1.25;
+}
+
+/* O cabeçalho já é grudado no topo (.table-wrap thead th). Aqui ele ganha
+   fundo próprio, senão as linhas passam por baixo e ficam legíveis através
+   dele ao rolar as 50 linhas da página. */
+.table-carteira thead th {
+  background: #fff;
+  box-shadow: 0 1px 0 var(--line);
+}
+
 .table-sticky-actions tbody tr:nth-child(even) td:last-child {
   background: #fafbfc;
 }

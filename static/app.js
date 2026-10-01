@@ -3266,6 +3266,18 @@ function blocoFiltrosMarca(d) {
     </div>`;
 }
 
+/* "LEONEL RODRIGUES (VENDAS)" → "LEONEL RODRIGUES".
+ *
+ * O sufixo entre parênteses é como o Alfa marca a função, e ele se repete em
+ * toda linha da carteira sem informar nada que o gestor não saiba. Numa coluna
+ * estreita ele quebrava o nome em três linhas e triplicava a altura da tabela.
+ * O nome completo continua no title, para quem precisar conferir. */
+function nomeVendedorCurto(nome) {
+  if (!nome) return "";
+  const limpo = String(nome).replace(/\s*\([^)]*\)\s*/g, " ").replace(/\s+/g, " ").trim();
+  return limpo || String(nome).trim();
+}
+
 function toggleBrand(marca) {
   if (state.brandOpen[marca]) delete state.brandOpen[marca];
   else state.brandOpen[marca] = true;
@@ -15232,39 +15244,55 @@ function crmClientsView() {
           <div class="table-wrap">
             <!-- Carteira é a tabela mais larga do sistema: sem a coluna de ações
                  grudada, "Abrir ficha" fica fora da tela na rolagem horizontal. -->
-            <table class="table-sticky-actions">
+            <!-- SEIS COLUNAS, não treze.
+                 A tabela tinha uma coluna por campo, e o resultado era larga
+                 demais para qualquer tela: a barra de rolagem lateral ficava
+                 no fim de 50 linhas, então para ver "Compra no mês" era
+                 preciso descer a página inteira, rolar para o lado e subir de
+                 novo. Agrupar o que se lê junto — código com o nome, cidade
+                 com o vendedor, telefone com o contato — faz tudo caber sem
+                 esconder nada. Nenhum dado saiu; mudou só o arranjo. -->
+            <table class="table-sticky-actions table-carteira">
               <thead>
                 <tr>
-                  <th>Código</th>
                   <th>Cliente</th>
-                  <th title="Contato ativo, visita, retorno pendente ou nunca contatado">Sinais</th>
-                  <th>Vendedor</th>
-                  <th>Cidade</th>
-                  <th>Status</th>
-                  <th>Classe</th>
-                  <th>Telefone</th>
-                  <th>Contato principal</th>
-                  <th>Compra no mês</th>
-                  <th>Crescimento</th>
-                  <th>Motivo principal</th>
+                  <th>Vendedor e cidade</th>
+                  <th title="Contato ativo, visita, retorno pendente ou nunca contatado">Situação</th>
+                  <th>Contato</th>
+                  <th>No mês</th>
                   <th>Ações</th>
                 </tr>
               </thead>
               <tbody>
                 ${rows.map((item) => `
                   <tr class="${Number(item.currentRevenue || 0) > 0 ? "" : "crm-row-no-purchase"}">
-                    <td><strong>${escapeHtml(item.clientKey || "-")}</strong></td>
-                    <td><strong>${escapeHtml(item.clientName)}</strong><div class="text-small">${escapeHtml(item.unitName || "-")}</div></td>
-                    <td style="white-space:nowrap">${engagementMarks(item.engagement)}</td>
-                    <td><span class="${item.assignedSeller ? "" : "text-small"}" style="${item.assignedSeller ? "" : "color:var(--muted)"}">${escapeHtml(item.assignedSeller || "Sem vendedor")}</span></td>
-                    <td>${escapeHtml(item.cityName || "-")}</td>
-                    <td>${crmStatusBadge(item.statusCode)}</td>
-                    <td>${escapeHtml(item.classCode || "-")}</td>
-                    <td>${escapeHtml(item.phone || "Não informado")}</td>
-                    <td>${escapeHtml(item.primaryContactName || "Não informado")}</td>
-                    <td>${crmPurchaseBadge(item.currentRevenue)}</td>
-                    <td>${crmGrowthBadge(item.growthPct)}</td>
-                    <td>${escapeHtml(item.primaryReason || "-")}</td>
+                    <td>
+                      <strong>${escapeHtml(item.clientName)}</strong>
+                      <div class="text-small" style="color:var(--muted)">
+                        ${escapeHtml(item.clientKey || "-")}${item.unitName ? ` · ${escapeHtml(item.unitName)}` : ""}
+                      </div>
+                    </td>
+                    <td>
+                      <span class="${item.assignedSeller ? "" : "text-small"}"
+                        title="${escapeHtml(item.assignedSeller || "")}"
+                        style="${item.assignedSeller ? "" : "color:var(--muted)"}">
+                        ${escapeHtml(nomeVendedorCurto(item.assignedSeller) || "Sem vendedor")}</span>
+                      <div class="text-small" style="color:var(--muted)">${escapeHtml(item.cityName || "-")}</div>
+                    </td>
+                    <td style="white-space:nowrap">
+                      ${crmStatusBadge(item.statusCode)}
+                      <div class="text-small" style="color:var(--muted);margin-top:3px">
+                        ${escapeHtml(item.classCode || "-")} ${engagementMarks(item.engagement)}
+                      </div>
+                    </td>
+                    <td>
+                      ${escapeHtml(item.phone || "Não informado")}
+                      <div class="text-small" style="color:var(--muted)">${escapeHtml(item.primaryContactName || "Não informado")}</div>
+                    </td>
+                    <td>
+                      ${crmPurchaseBadge(item.currentRevenue)} ${crmGrowthBadge(item.growthPct)}
+                      ${item.primaryReason ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(item.primaryReason)}</div>` : ""}
+                    </td>
                     <td>
                       <div class="table-actions">
                         <button class="btn btn-secondary btn-sm" onclick="openCrmClient('${escapeHtml(item.clientKey)}')">Abrir ficha</button>
@@ -15273,7 +15301,7 @@ function crmClientsView() {
                       </div>
                     </td>
                   </tr>
-                `).join("") || `<tr><td colspan="13">
+                `).join("") || `<tr><td colspan="6">
                     Nenhum cliente encontrado com os filtros selecionados.
                     ${roleIsSeller() ? `
                       <div style="margin-top:8px">
