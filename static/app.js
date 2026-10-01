@@ -14164,11 +14164,26 @@ function crmFilterToolbar() {
             onkeydown="if(event.key==='Enter'){event.preventDefault();runCrmClientSearch();}"
           />
         </div>
+        <div class="field field-grow">
+          <label>🔧 Comprou o item (código)</label>
+          <input
+            value="${escapeHtml(filters.itemCode || "")}"
+            placeholder="Código do fabricante ou interno"
+            title="Mostra só os clientes que compraram essa peça nos últimos 12 meses, com data, quantidade e preço pago"
+            oninput="state.crm.crmClientFilters.itemCode=this.value"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();runCrmClientSearch();}"
+          />
+        </div>
         <div class="actions">
           <button class="btn btn-secondary" onclick="runCrmClientSearch()">Buscar</button>
           <button class="btn btn-ghost" onclick="clearCrmClientFilters()">Limpar filtros</button>
         </div>
       </div>
+      ${!filters.itemCode ? "" : `
+        <div class="message" style="background:#eef4fa;color:var(--accent);font-weight:600;margin:0 0 8px">
+          🔧 Mostrando apenas quem comprou "${escapeHtml(filters.itemCode)}" nos últimos 12 meses.
+          A data, a quantidade e o preço pago aparecem embaixo do nome de cada cliente.
+        </div>`}
       <div class="filter-grid crm-filter-grid">
         <div class="field">
           <label>Unidade</label>
@@ -14429,6 +14444,27 @@ function qtyLabel(valor) {
  * Uma linha com a última compra (quando/quanto/por quanto) e, se houve mais de
  * uma, uma segunda linha discreta com o acumulado dos 12 meses.
  */
+/* A mesma informação da peça, em uma linha, para dentro da tabela.
+ *
+ * `itemPurchaseLine` é um bloco com borda, desenhado para o card do vendedor,
+ * onde há um cliente por vez. Repetido em 50 linhas de tabela ele dobraria a
+ * altura de cada uma e devolveria a rolagem que acabamos de eliminar. Aqui vai
+ * só o que o gestor precisa para decidir: quando comprou, quanto levou e por
+ * quanto — o resto continua na ficha.
+ */
+function itemPurchaseLinhaTabela(item) {
+  const c = item.itemPurchase;
+  if (!c) return "";
+  const preco = c.lastUnitPrice != null ? ` · ${currency(c.lastUnitPrice)}/un` : "";
+  const repetiu = Number(c.purchaseCount || 0) > 1
+    ? ` · ${number(c.purchaseCount)}x em 12m` : "";
+  return `
+    <div class="text-small" style="margin-top:3px;color:var(--accent);font-weight:600"
+      title="${escapeHtml(c.itemCode || "")} — última compra em ${escapeHtml(shortDate(c.lastPurchaseAt))}">
+      🔧 ${escapeHtml(shortDate(c.lastPurchaseAt))} · ${escapeHtml(qtyLabel(c.lastQuantity))}${preco}${repetiu}
+    </div>`;
+}
+
 function itemPurchaseLine(item) {
   const c = item.itemPurchase;
   if (!c) return "";
@@ -15271,6 +15307,7 @@ function crmClientsView() {
                       <div class="text-small" style="color:var(--muted)">
                         ${escapeHtml(item.clientKey || "-")}${item.unitName ? ` · ${escapeHtml(item.unitName)}` : ""}
                       </div>
+                      ${itemPurchaseLinhaTabela(item)}
                     </td>
                     <td>
                       <span class="${item.assignedSeller ? "" : "text-small"}"
