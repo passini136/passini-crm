@@ -24713,6 +24713,12 @@ def resultados_mix_unidade(
 SUGESTAO_META_AMPLITUDE = 0.25
 SUGESTAO_META_MESES = 3
 
+# Abaixo de 1% da base da unidade, a pessoa não é vendedor daquela equipe: é
+# sócio, gerente ou administrativo que emitiu alguma nota no mês. Distribuir
+# meta para ela polui a lista com linhas de R$ 1.200 e, pior, tira esse pedaço
+# de quem de fato vende. Continua aparecendo à parte, para o gerente decidir.
+SUGESTAO_META_PISO_FATIA = 0.01
+
 
 METAS_PAINEL_MESES = 12
 
@@ -24901,6 +24907,17 @@ def sugerir_metas_unidade(
         ultima = crm_latest_competence(conn, company_id)
         equipe = sellers_of_unit(conn, company_id, ultima, unidade) or []
 
+    # DESLIGADO NÃO RECEBE META. A lista de equipe vem de quem FATUROU, e quem
+    # saiu em setembro faturou em setembro — então entrava na distribuição de
+    # outubro. Na primeira apuração isso pôs R$ 121 mil de meta em duas pessoas
+    # que não trabalham mais aqui, e a equipe que ficou recebeu menos do que
+    # precisa entregar.
+    ativos = pessoas_ativas_na_competencia(conn, company_id, competencia)
+    desligados = [n for n in equipe
+                  if chave_canonica(conn, company_id, n) not in ativos] if ativos else []
+    if ativos:
+        equipe = [n for n in equipe if chave_canonica(conn, company_id, n) in ativos]
+
     # Quem cobre quem: lido das férias cadastradas que tocam a competência.
     coberturas: dict[str, str] = {}
     for r in conn.execute(
@@ -24963,8 +24980,14 @@ def sugerir_metas_unidade(
             "hasHistory": bool(hist),
         })
 
-    com_hist = [l for l in linhas if l["hasHistory"]]
-    sem_hist = [l for l in linhas if not l["hasHistory"]]
+    # Separa quem é vendedor da equipe de quem só emitiu nota no mês.
+    _base_bruta = sum(l["baseline"] for l in linhas if l["hasHistory"]) or 1.0
+    for l in linhas:
+        l["residual"] = (l["hasHistory"]
+                         and l["baseline"] / _base_bruta < SUGESTAO_META_PISO_FATIA)
+
+    com_hist = [l for l in linhas if l["hasHistory"] and not l["residual"]]
+    sem_hist = [l for l in linhas if not l["hasHistory"] or l["residual"]]
     base_total = sum(l["baseline"] for l in com_hist)
 
     # ── Ajuste de potencial, limitado e com média zero ────────────────────────
@@ -25060,6 +25083,8 @@ def sugerir_metas_unidade(
         "monthsUsed": meses,
         "rows": linhas,
         "withoutHistory": [l["seller"] for l in sem_hist],
+        "residual": [l["seller"] for l in linhas if l.get("residual")],
+        "excludedLeft": sorted({normalize_whitespace(n) for n in desligados}),
     }
 
 
@@ -27914,6 +27939,67 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
+                return
+            if path == "/api/metas/unidade/lote":
+                # Lançamento do ANO inteiro de uma vez, estilo planilha.
+                # Lançar mês a mês em formulário são 72 submissões para seis
+                # unidades — e cada ida ao servidor é uma chance de parar no
+                # meio e deixar o ano pela metade.
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                with closing(get_connection()) as conn:
+                    if not user_can_manage_users(conn, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps(
+                            {"error": "A meta da unidade é cadastrada pela administração."}))
+                        return
+                    body = json.loads(
+                        self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+                    itens = body.get("items") or []
+                    gravados, apagados, erros = 0, 0, []
+                    for it in itens:
+                        comp = normalize_whitespace(it.get("competence", ""))[:7]
+                        un = normalize_unit(it.get("unit", ""))
+                        try:
+                            datetime.strptime(comp, "%Y-%m")
+                        except ValueError:
+                            erros.append(f"Competência inválida: {comp or '(vazia)'}")
+                            continue
+                        if not un:
+                            erros.append(f"Unidade vazia em {comp}")
+                            continue
+                        bruto = it.get("revenueGoal")
+                        # Célula em branco APAGA a meta. É o que o usuário espera
+                        # de uma planilha, e sem isso não haveria como desfazer
+                        # um lançamento errado sem outra tela.
+                        if bruto in (None, "", "-"):
+                            apagados += conn.execute(
+                                "DELETE FROM goals_unit WHERE company_id = ? "
+                                "AND competence = ? AND unit_name = ?",
+                                (user["company_id"], comp, un)).rowcount or 0
+                            continue
+                        try:
+                            valor = float(bruto)
+                        except (TypeError, ValueError):
+                            erros.append(f"Valor inválido em {un}/{comp}")
+                            continue
+                        if valor < 0:
+                            erros.append(f"Meta negativa em {un}/{comp}")
+                            continue
+                        conn.execute(
+                            "INSERT INTO goals_unit (company_id, competence, unit_name, "
+                            "revenue_goal, returns_goal, created_at) VALUES (?,?,?,?,0,?) "
+                            "ON CONFLICT(company_id, competence, unit_name) "
+                            "DO UPDATE SET revenue_goal = excluded.revenue_goal",
+                            (user["company_id"], comp, un, valor, now_iso()))
+                        gravados += 1
+                    conn.commit()
+                invalidate_dashboard_cache(user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(
+                    {"ok": not erros, "saved": gravados, "deleted": apagados,
+                     "errors": erros[:20]}))
                 return
             if path in ("/api/admin/goals/seller", "/api/admin/goals/unit"):
                 user = self._require_auth()

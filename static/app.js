@@ -62,6 +62,10 @@ const state = {
   brandLoadingScope: "",  // aba de marcas que está sendo carregada agora
   phaseEditor: null,           // fase da unidade (diretoria)
   activityGoalEditor: null,    // metas de atividade
+  metas: null,                 // painel de metas por unidade e equipe
+  metasAberta: "",             // unidade expandida no painel
+  sugestaoMetas: null,         // modal de sugestão de metas da equipe
+  gradeMetas: null,            // grade anual de metas de unidade
   assistant: null,        // tutorial, FAQ e dicas
   helpEditor: null,       // dica/FAQ em edição (diretoria)
   noteEditor: null,       // registro pontual em edição
@@ -93,6 +97,7 @@ const state = {
       crmTasks: false,
       clientDrawer: false,
       admin: false,
+      metas: false,
       integrityAudit: false,
       filters: false,
       meetings: false,
@@ -2286,6 +2291,369 @@ function configFaseModal() {
     </div>`;
 }
 
+/* ─── Sugestão de metas da equipe ────────────────────────────────────────── */
+
+async function abrirSugestaoMetas(unidade, competencia) {
+  state.sugestaoMetas = { unit: unidade, competence: competencia, loading: true, data: null };
+  requestRender();
+  try {
+    const q = new URLSearchParams({ unit: unidade, competence: competencia });
+    state.sugestaoMetas.data = await api(`/api/metas/sugestao?${q.toString()}`);
+  } catch (e) {
+    state.sugestaoMetas.error = e.message;
+  }
+  state.sugestaoMetas.loading = false;
+  requestRender();
+}
+
+function fecharSugestaoMetas() { state.sugestaoMetas = null; requestRender(); }
+
+async function trocarCompetenciaSugestao(valor) {
+  if (!state.sugestaoMetas) return;
+  await abrirSugestaoMetas(state.sugestaoMetas.unit, valor);
+}
+
+/* Grava as sugestões como metas de verdade.
+ *
+ * Uma por vez, em sequência: o endpoint de meta de vendedor já existe e é
+ * validado. Criar um atalho em lote para isto duplicaria a regra de negócio
+ * em dois lugares, e um dia os dois discordariam. */
+async function aplicarSugestaoMetas() {
+  const s = state.sugestaoMetas;
+  if (!s?.data) return;
+  const alvos = (s.data.rows || []).filter((r) => r.suggested !== null);
+  if (!alvos.length) return;
+  if (!confirm(`Gravar ${alvos.length} meta(s) de ${s.unit} para ${s.competence}?\n`
+    + "As metas já lançadas desses vendedores nesse mês serão substituídas.")) return;
+  let ok = 0;
+  for (const r of alvos) {
+    try {
+      await api("/api/admin/goals/seller", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          competence: s.competence, seller_name: r.seller,
+          base_unit: s.unit, revenue_goal: r.suggested,
+        }),
+      });
+      ok += 1;
+    } catch (e) {
+      addMessage("error", `${r.seller}: ${e.message}`);
+    }
+  }
+  addMessage("success", `${ok} meta(s) gravada(s) em ${s.unit} · ${s.competence}.`);
+  fecharSugestaoMetas();
+  state.metas = null;
+  await loadPainelMetas();
+}
+
+function sugestaoMetasModal() {
+  const s = state.sugestaoMetas;
+  if (!s) return "";
+  const d = s.data || {};
+  const linhas = d.rows || [];
+  const comSugestao = linhas.filter((r) => r.suggested !== null);
+  const competencias = (state.metas?.competences || []);
+
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharSugestaoMetas()">
+      <div class="panel modal-panel" style="max-width:980px;margin:5vh auto;padding:22px"
+        onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>💡 Sugestão de metas · ${escapeHtml(s.unit)}</h3>
+            <div class="text-small">
+              Reparte a meta da unidade pelo que cada um vem entregando por dia útil,
+              ajustado pelo que ainda há para colher na carteira. A soma fecha com a
+              meta da unidade.
+            </div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharSugestaoMetas()">Fechar</button>
+        </div>
+
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:10px 0">
+          <label style="display:flex;flex-direction:column;gap:3px">
+            <span class="text-small" style="color:var(--muted);font-weight:700">Competência</span>
+            <select onchange="trocarCompetenciaSugestao(this.value)"
+              style="border:1px solid var(--line);border-radius:8px;padding:6px 9px">
+              ${competencias.map((c) => `<option value="${escapeHtml(c)}"
+                ${c === s.competence ? "selected" : ""}>${escapeHtml(c)}</option>`).join("")}
+            </select>
+          </label>
+        </div>
+
+        ${s.loading ? '<div class="loader">Calculando…</div>' : ""}
+        ${s.error ? `<div class="message error">${escapeHtml(s.error)}</div>` : ""}
+
+        ${!d.competence ? "" : !d.unitGoal ? `
+          <div class="message" style="background:#fef7e0;color:#8a6100">
+            ${escapeHtml(s.unit)} não tem meta de unidade lançada em ${escapeHtml(s.competence)}.
+            Sem o total não há o que distribuir — a administração precisa lançar primeiro.
+          </div>` : `
+          <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px">
+            ${[["Meta da unidade", currency(d.unitGoal), `${d.workingDays} dias úteis`],
+               ["Meta por dia útil", currency(d.unitDailyGoal), "o ritmo necessário"],
+               ["Ritmo atual", currency(d.baselineDaily) + "/dia",
+                `média de ${(d.monthsUsed || []).length} mês(es) fechado(s)`],
+               ["Crescimento pedido", d.unitGrowthPct === null ? "—"
+                 : `${d.unitGrowthPct > 0 ? "+" : ""}${d.unitGrowthPct.toFixed(1)}%`,
+                "sobre o ritmo atual"]].map(([r, v, a]) => `
+              <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px">
+                <div class="text-small" style="color:var(--muted);text-transform:uppercase;
+                     font-size:10px;font-weight:700;letter-spacing:.4px">${r}</div>
+                <div style="font-size:17px;font-weight:800;margin-top:2px">${v}</div>
+                <div class="text-small" style="color:var(--muted)">${a}</div>
+              </div>`).join("")}
+          </div>
+
+          ${(d.unitGrowthPct || 0) <= 35 ? "" : `
+            <div class="message" style="background:#fdecea;color:#a4262c;margin-top:10px">
+              A meta pede <strong>${d.unitGrowthPct.toFixed(0)}%</strong> acima do ritmo atual da
+              unidade. Meta que ninguém acredita não é meta: vale conferir com a diretoria
+              antes de distribuir, porque a equipe vai ler o número e desistir no dia 2.
+            </div>`}
+
+          <div class="table-wrap" style="margin-top:12px;max-height:46vh">
+            <table>
+              <thead><tr>
+                <th>Vendedor</th>
+                <th style="text-align:right">R$/dia hoje</th>
+                <th style="text-align:right">Meta sugerida</th>
+                <th style="text-align:right">R$/dia meta</th>
+                <th style="text-align:right">Cresc.</th>
+                <th style="text-align:right">Fatia</th>
+                <th>Por quê</th>
+              </tr></thead>
+              <tbody>
+                ${comSugestao.map((r) => `
+                  <tr>
+                    <td><strong>${escapeHtml(nomeVendedorCurto(r.seller))}</strong>
+                      ${r.onLeave ? `<div class="text-small" style="color:#b06000;font-weight:700">
+                        férias · ${r.absentDays} dia(s) útil(eis) fora
+                        ${r.coveredBy ? ` · cobre: ${escapeHtml(nomeVendedorCurto(r.coveredBy))}` : ""}
+                      </div>` : ""}
+                      ${(r.coversFor || []).length ? `<div class="text-small" style="color:var(--accent);font-weight:700">
+                        assume a carteira de ${escapeHtml(r.coversFor.map(nomeVendedorCurto).join(", "))}</div>` : ""}
+                    </td>
+                    <td style="text-align:right">${currency(r.dailyAverage)}</td>
+                    <td style="text-align:right;font-weight:800">${currency(r.suggested)}</td>
+                    <td style="text-align:right">${currency(r.dailyTarget)}</td>
+                    <td style="text-align:right;font-weight:700;color:${
+                      r.growthPct === null ? "var(--muted)"
+                      : r.growthPct > 25 ? "var(--bad)" : r.growthPct > 0 ? "#b06000" : "var(--good)"}">
+                      ${r.growthPct === null ? "—" : `${r.growthPct > 0 ? "+" : ""}${r.growthPct.toFixed(0)}%`}</td>
+                    <td style="text-align:right;color:var(--muted)">${r.sharePct?.toFixed(1)}%</td>
+                    <td class="text-small" style="color:var(--muted)">
+                      ${r.portfolioSize ? `${number(r.portfolioIdle)} de ${number(r.portfolioSize)} parados` : "sem carteira"}
+                      ${r.positivationPct !== null && r.positivationPct !== undefined
+                        ? ` · positivação ${r.positivationPct.toFixed(0)}%` : ""}
+                      ${r.counterSharePct ? ` · balcão ${r.counterSharePct.toFixed(0)}%` : ""}
+                    </td>
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+
+          ${!(d.residual || []).length && !(d.withoutHistory || []).length
+             && !(d.excludedLeft || []).length ? "" : `
+            <div class="text-small" style="color:var(--muted);margin-top:8px;line-height:1.6">
+              ${(d.excludedLeft || []).length ? `<div><strong>Fora por desligamento:</strong>
+                ${escapeHtml(d.excludedLeft.map(nomeVendedorCurto).join(", "))} — não recebem meta.</div>` : ""}
+              ${(d.residual || []).length ? `<div><strong>Fora da distribuição:</strong>
+                ${escapeHtml(d.residual.map(nomeVendedorCurto).join(", "))} — faturam menos de 1% da
+                unidade, normalmente sócio, gerente ou administrativo que emitiu alguma nota.
+                Se algum for vendedor de verdade, lance a meta dele à mão.</div>` : ""}
+            </div>`}
+
+          <div class="actions" style="margin-top:14px">
+            <button class="btn btn-primary" onclick="aplicarSugestaoMetas()"
+              ${comSugestao.length ? "" : "disabled"}>
+              Gravar ${comSugestao.length} meta(s)</button>
+            <button class="btn btn-ghost" onclick="fecharSugestaoMetas()">Cancelar</button>
+          </div>
+          <div class="text-small" style="color:var(--muted);margin-top:6px">
+            Gravar substitui as metas já lançadas desses vendedores nesta competência.
+            Depois dá para ajustar um a um no formulário abaixo.
+          </div>`}
+      </div>
+    </div>`;
+}
+
+/* ─── Grade anual de metas de unidade (estilo planilha) ──────────────────── */
+
+function abrirGradeAnual() {
+  const d = state.metas;
+  if (!d) return;
+  const ano = Number(String(d.currentCompetence).slice(0, 4));
+  state.gradeMetas = { year: ano, valores: {}, salvando: false };
+  // Pré-carrega o que já existe, para a grade abrir com o ano atual à vista
+  // em vez de em branco — relançar o que já está lançado é como se perde meta.
+  for (const un of d.units) {
+    for (const c of d.competences) {
+      const m = un.months[c];
+      if (m && m.goal !== null && m.goal !== undefined) {
+        state.gradeMetas.valores[`${un.unit}|${c}`] = m.goal;
+      }
+    }
+  }
+  requestRender();
+}
+
+function fecharGradeAnual() { state.gradeMetas = null; requestRender(); }
+
+function trocarAnoGrade(delta) {
+  if (!state.gradeMetas) return;
+  state.gradeMetas.year += delta;
+  requestRender();
+}
+
+function setGradeValor(unidade, competencia, valor) {
+  if (!state.gradeMetas) return;
+  const chave = `${unidade}|${competencia}`;
+  const limpo = String(valor).trim();
+  if (!limpo) delete state.gradeMetas.valores[chave];
+  else state.gradeMetas.valores[chave] = limpo;
+  // Sem repintar: repintar a cada tecla tiraria o foco da célula, que é
+  // exatamente o que torna uma grade insuportável de preencher.
+  atualizarTotaisGrade();
+}
+
+/* Replica o valor da primeira célula preenchida da linha para o ano inteiro.
+ * Meta costuma ser o mesmo número com ajustes pontuais; digitar doze vezes o
+ * mesmo valor é trabalho que o computador faz melhor. */
+function repetirLinhaGrade(unidade) {
+  const g = state.gradeMetas;
+  if (!g) return;
+  const meses = Array.from({ length: 12 }, (_, i) => `${g.year}-${String(i + 1).padStart(2, "0")}`);
+  const primeiro = meses.map((c) => g.valores[`${unidade}|${c}`]).find((v) => v);
+  if (!primeiro) {
+    addMessage("error", "Preencha o primeiro mês da linha antes de repetir.");
+    return;
+  }
+  for (const c of meses) g.valores[`${unidade}|${c}`] = primeiro;
+  requestRender();
+}
+
+function atualizarTotaisGrade() {
+  const g = state.gradeMetas;
+  if (!g) return;
+  const meses = Array.from({ length: 12 }, (_, i) => `${g.year}-${String(i + 1).padStart(2, "0")}`);
+  for (const un of (state.metas?.units || [])) {
+    const el = document.getElementById(`grade-total-${un.unit.replace(/\W/g, "_")}`);
+    if (el) {
+      const soma = meses.reduce((s, c) => s + (Number(g.valores[`${un.unit}|${c}`]) || 0), 0);
+      el.textContent = soma ? currency(soma) : "—";
+    }
+  }
+  const geral = document.getElementById("grade-total-geral");
+  if (geral) {
+    const soma = Object.entries(g.valores)
+      .filter(([k]) => k.endsWith(`|${g.year}-01`) || k.includes(`|${g.year}-`))
+      .reduce((s, [, v]) => s + (Number(v) || 0), 0);
+    geral.textContent = soma ? currency(soma) : "—";
+  }
+}
+
+async function salvarGradeAnual() {
+  const g = state.gradeMetas;
+  if (!g || g.salvando) return;
+  const itens = [];
+  const meses = Array.from({ length: 12 }, (_, i) => `${g.year}-${String(i + 1).padStart(2, "0")}`);
+  for (const un of (state.metas?.units || [])) {
+    for (const c of meses) {
+      const v = g.valores[`${un.unit}|${c}`];
+      itens.push({ unit: un.unit, competence: c, revenueGoal: v === undefined ? null : v });
+    }
+  }
+  g.salvando = true;
+  requestRender();
+  try {
+    const r = await api("/api/metas/unidade/lote", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: itens }),
+    });
+    if ((r.errors || []).length) {
+      addMessage("error", `${r.errors.length} problema(s): ${r.errors.slice(0, 3).join(" · ")}`);
+    }
+    addMessage("success",
+      `${r.saved} meta(s) gravada(s)${r.deleted ? ` · ${r.deleted} apagada(s)` : ""} em ${g.year}.`);
+    fecharGradeAnual();
+    state.metas = null;
+    await loadPainelMetas();
+  } catch (e) {
+    addMessage("error", e.message);
+    g.salvando = false;
+    requestRender();
+  }
+}
+
+function gradeMetasModal() {
+  const g = state.gradeMetas;
+  if (!g || !state.metas) return "";
+  const unidades = state.metas.units || [];
+  const meses = Array.from({ length: 12 }, (_, i) => `${g.year}-${String(i + 1).padStart(2, "0")}`);
+  const total = (un) => meses.reduce((s, c) => s + (Number(g.valores[`${un}|${c}`]) || 0), 0);
+
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharGradeAnual)">
+      <div class="panel modal-panel" style="max-width:1180px;margin:4vh auto;padding:22px"
+        onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>📅 Metas de unidade · ${g.year}</h3>
+            <div class="text-small">
+              Digite direto nas células, como numa planilha. Célula em branco apaga a meta
+              daquele mês. Nada é gravado até clicar em salvar.
+            </div></div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="btn btn-ghost btn-sm" onclick="trocarAnoGrade(-1)">◀ ${g.year - 1}</button>
+            <button class="btn btn-ghost btn-sm" onclick="trocarAnoGrade(1)">${g.year + 1} ▶</button>
+            <button class="btn btn-ghost btn-sm" onclick="fecharGradeAnual()">Fechar</button>
+          </div>
+        </div>
+
+        <div class="table-wrap" style="margin-top:12px;max-height:56vh">
+          <table class="table-grade">
+            <thead><tr>
+              <th style="min-width:150px">Unidade</th>
+              ${meses.map((c) => `<th style="text-align:center">${metaMesLabel(c)}</th>`).join("")}
+              <th style="text-align:right;min-width:120px">Total do ano</th>
+              <th></th>
+            </tr></thead>
+            <tbody>
+              ${unidades.map((un) => `
+                <tr>
+                  <td><strong>${escapeHtml(un.unit)}</strong></td>
+                  ${meses.map((c) => `
+                    <td style="padding:3px">
+                      <input type="number" step="1000" inputmode="numeric"
+                        value="${escapeHtml(String(g.valores[`${un.unit}|${c}`] ?? ""))}"
+                        oninput="setGradeValor('${jsAttr(un.unit)}','${c}', this.value)"
+                        style="width:100%;min-width:84px;border:1px solid var(--line);
+                               border-radius:6px;padding:5px 6px;font-size:12px;text-align:right" />
+                    </td>`).join("")}
+                  <td style="text-align:right;font-weight:800"
+                    id="grade-total-${un.unit.replace(/\W/g, "_")}">
+                    ${total(un.unit) ? currency(total(un.unit)) : "—"}</td>
+                  <td><button class="btn btn-ghost btn-sm" type="button"
+                    title="Repetir o primeiro mês preenchido em todo o ano"
+                    onclick="repetirLinhaGrade('${jsAttr(un.unit)}')">⇥ repetir</button></td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+
+        <div class="actions" style="margin-top:14px">
+          <button class="btn btn-primary" onclick="salvarGradeAnual()" ${g.salvando ? "disabled" : ""}>
+            ${g.salvando ? "Salvando…" : `Salvar metas de ${g.year}`}</button>
+          <button class="btn btn-ghost" onclick="fecharGradeAnual()">Cancelar</button>
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:6px">
+          Salvar grava os 12 meses de todas as unidades de uma vez. Meses deixados em
+          branco têm a meta <strong>apagada</strong> — é assim que se desfaz um lançamento errado.
+        </div>
+      </div>
+    </div>`;
+}
+
 function metasAtividadeModal() {
   const g = state.activityGoalEditor;
   if (!g) return "";
@@ -2980,6 +3348,8 @@ function prospeccaoView() {
       ${pedidoCadastroModal()}
       ${configFaseModal()}
       ${metasAtividadeModal()}
+      ${sugestaoMetasModal()}
+      ${gradeMetasModal()}
 
       ${blocoConfiguracaoUnidade()}
 
@@ -6633,6 +7003,180 @@ function sellerGoalsTableCard() {
  * meta — e aí o atingimento individual existe sem denominador de unidade para
  * comparar, o que só aparece na reunião, tarde demais.
  */
+/* ─── Painel de metas ────────────────────────────────────────────────────────
+ *
+ * Uma tabela por unidade, meses nas colunas e vendedores nas linhas. A meta da
+ * unidade fica na primeira linha, em leitura para o gerente — ele distribui,
+ * não define o total.
+ *
+ * A coluna que manda é a diferença entre a meta da unidade e a soma das
+ * individuais. Enquanto ela não zerar, a equipe está perseguindo um número
+ * diferente do que foi combinado com a diretoria, e ninguém percebe até o
+ * fechamento.
+ */
+async function loadPainelMetas() {
+  if (state.ui.loading.metas) return;
+  setLoading("metas", true);
+  requestRender();
+  try {
+    state.metas = await api("/api/metas/painel");
+  } catch (e) {
+    state.metas = { error: e.message, units: [], competences: [] };
+  }
+  setLoading("metas", false);
+  requestRender();
+}
+
+function metaMesLabel(c) {
+  const [ano, mes] = String(c).split("-");
+  return `${MONTH_ABBR[Number(mes) - 1] || mes}/${String(ano).slice(2)}`;
+}
+
+function setMetaUnidadeAberta(unidade) {
+  state.metasAberta = state.metasAberta === unidade ? "" : unidade;
+  requestRender();
+}
+
+function painelMetasView() {
+  if (!state.metas) {
+    if (!state.ui.loading.metas) loadPainelMetas();
+    return '<div class="loader panel">Carregando metas…</div>';
+  }
+  const d = state.metas;
+  if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
+  if (!(d.units || []).length) return "";
+
+  // Só os meses que interessam: do atual para a frente, mais os três
+  // anteriores para comparar. Doze colunas de histórico não cabem e ninguém
+  // relança meta de janeiro.
+  const idxAtual = Math.max(d.competences.indexOf(d.currentCompetence), 0);
+  const meses = d.competences.slice(Math.max(idxAtual - 3, 0));
+
+  const celulaMeta = (m) => {
+    if (m.goal === null || m.goal === undefined) {
+      return '<span style="color:var(--muted)">—</span>';
+    }
+    return `<strong>${currency(m.goal)}</strong>`;
+  };
+
+  const celulaAtingimento = (m) => {
+    if (m.attainmentPct === null || m.attainmentPct === undefined) return "";
+    const cor = m.attainmentPct >= 95 ? "var(--good)"
+      : m.attainmentPct >= 80 ? "#b06000" : "var(--bad)";
+    return `<div class="text-small" style="color:${cor};font-weight:700">
+      ${m.attainmentPct.toFixed(0)}%</div>`;
+  };
+
+  return `
+    <div class="stack">
+      <div class="section-title">
+        <div><h3>Metas por unidade e equipe</h3>
+          <div class="text-small">
+            Meta da unidade ${d.canEditUnitGoal ? "lançada pela administração" : "em leitura — quem define é a administração"}.
+            A linha <strong>Falta distribuir</strong> precisa chegar a zero: enquanto não chegar,
+            a equipe persegue um número diferente do combinado.
+          </div>
+        </div>
+        ${!d.canEditUnitGoal ? "" : `
+          <button class="btn btn-secondary btn-sm" onclick="abrirGradeAnual()">
+            📅 Lançar metas do ano</button>`}
+      </div>
+
+      ${d.units.map((un) => {
+        const aberta = state.metasAberta === un.unit;
+        return `
+        <div class="table-card">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+                      cursor:pointer" onclick="setMetaUnidadeAberta('${jsAttr(un.unit)}')">
+            <div style="font-weight:800;font-size:14px">
+              ${aberta ? "▾" : "▸"} ${escapeHtml(un.unit)}
+              <span class="text-small" style="font-weight:400;color:var(--muted)">
+                · ${un.sellers.length} vendedor(es)</span>
+            </div>
+            <div class="text-small" style="color:var(--muted)">
+              ${(() => {
+                const m = un.months[d.currentCompetence];
+                if (!m) return "";
+                if (m.goal === null) return "sem meta no mês atual";
+                return `${metaMesLabel(d.currentCompetence)}: ${currency(m.goal)}`
+                  + (m.gap ? ` · falta distribuir ${currency(m.gap)}` : " · distribuída");
+              })()}
+            </div>
+          </div>
+
+          ${!aberta ? "" : `
+          <div class="table-wrap" style="margin-top:10px">
+            <table class="table-metas">
+              <thead><tr>
+                <th>Quem</th>
+                ${meses.map((c) => `
+                  <th style="text-align:right;${c === d.currentCompetence
+                    ? "background:#eef4fa" : ""}">${metaMesLabel(c)}</th>`).join("")}
+              </tr></thead>
+              <tbody>
+                <tr style="background:#f6f9fc">
+                  <td><strong>Meta da unidade</strong>
+                    <div class="text-small" style="color:var(--muted)">realizado e atingimento</div></td>
+                  ${meses.map((c) => {
+                    const m = un.months[c];
+                    return `<td style="text-align:right;${c === d.currentCompetence ? "background:#eef4fa" : ""}">
+                      ${celulaMeta(m)}
+                      ${m.actual !== null && m.actual !== undefined
+                        ? `<div class="text-small" style="color:var(--muted)">${currency(m.actual)}</div>` : ""}
+                      ${celulaAtingimento(m)}
+                    </td>`;
+                  }).join("")}
+                </tr>
+                <tr style="background:#fdfaf3">
+                  <td><strong>Falta distribuir</strong>
+                    <div class="text-small" style="color:var(--muted)">meta da unidade menos a soma da equipe</div></td>
+                  ${meses.map((c) => {
+                    const m = un.months[c];
+                    const g = m.gap;
+                    const cor = g === null || g === undefined ? "var(--muted)"
+                      : Math.abs(g) < 0.01 ? "var(--good)"
+                      : g > 0 ? "#b06000" : "var(--bad)";
+                    return `<td style="text-align:right;font-weight:700;color:${cor};
+                      ${c === d.currentCompetence ? "background:#eef4fa" : ""}">
+                      ${g === null || g === undefined ? "—"
+                        : Math.abs(g) < 0.01 ? "✓ zerada" : currency(g)}
+                      ${m.goal !== null && !d.canEditUnitGoal ? "" : ""}
+                    </td>`;
+                  }).join("")}
+                </tr>
+                ${un.sellers.map((v) => `
+                  <tr ${v.active ? "" : 'style="opacity:.6"'}>
+                    <td>${escapeHtml(v.seller)}
+                      ${v.active ? "" : '<span class="status-tag">fora da equipe</span>'}</td>
+                    ${meses.map((c) => {
+                      const m = v.months[c];
+                      return `<td style="text-align:right;${c === d.currentCompetence ? "background:#eef4fa" : ""}">
+                        ${m.goal === null || m.goal === undefined
+                          ? '<span style="color:var(--muted)">—</span>'
+                          : currency(m.goal)}
+                        ${m.actual !== null && m.actual !== undefined
+                          ? `<div class="text-small" style="color:var(--muted)">${currency(m.actual)}</div>` : ""}
+                        ${m.attainmentPct === null || m.attainmentPct === undefined ? "" : `
+                          <div class="text-small" style="font-weight:700;color:${
+                            m.attainmentPct >= 95 ? "var(--good)"
+                            : m.attainmentPct >= 80 ? "#b06000" : "var(--bad)"}">
+                            ${m.attainmentPct.toFixed(0)}%</div>`}
+                      </td>`;
+                    }).join("")}
+                  </tr>`).join("")}
+              </tbody>
+            </table>
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+            <button class="btn btn-primary btn-sm"
+              onclick="abrirSugestaoMetas('${jsAttr(un.unit)}','${jsAttr(d.currentCompetence)}')">
+              💡 Sugerir metas da equipe</button>
+          </div>`}
+        </div>`;
+      }).join("")}
+    </div>`;
+}
+
 function competenciasComMetaUnidade() {
   const porComp = new Map();
   for (const r of state.admin?.goalsUnit || []) {
@@ -18697,6 +19241,7 @@ configuracoesView = function adminViewGoalsSellerUnitFinal() {
 
   return `
     <div class="stack">
+      ${painelMetasView()}
       <div class="stack">
         <div class="form-card">
           <div class="section-title"><div><h3>Metas e score</h3><div class="text-small">Metas por vendedor, unidade e pesos do score.</div></div></div>

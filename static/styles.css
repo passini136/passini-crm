@@ -695,6 +695,49 @@ button {
   box-shadow: 0 1px 0 var(--line);
 }
 
+/* METAS: a primeira coluna fica grudada à esquerda.
+   Com doze meses na horizontal, rolar para ver dezembro fazia perder de vista
+   de quem era a linha — e meta trocada de vendedor é erro que só aparece no
+   fechamento. */
+.table-metas td:first-child,
+.table-metas th:first-child,
+.table-grade td:first-child,
+.table-grade th:first-child {
+  position: sticky;
+  left: 0;
+  background: #fff;
+  z-index: 2;
+  min-width: 150px;
+}
+
+.table-metas thead th,
+.table-grade thead th {
+  background: #fff;
+  box-shadow: 0 1px 0 var(--line);
+}
+
+.table-metas thead th:first-child,
+.table-grade thead th:first-child {
+  z-index: 3;
+}
+
+.table-metas td,
+.table-grade td {
+  padding: 8px 10px;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+/* Linha da unidade e linha do que falta distribuir herdam o fundo próprio
+   mesmo na coluna grudada, senão a célula do nome destoa do resto da linha. */
+.table-metas tbody tr[style*="f6f9fc"] td:first-child { background: #f6f9fc; }
+.table-metas tbody tr[style*="fdfaf3"] td:first-child { background: #fdfaf3; }
+
+.table-grade input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
 .table-sticky-actions tbody tr:nth-child(even) td:last-child {
   background: #fafbfc;
 }
