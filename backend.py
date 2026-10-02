@@ -1247,6 +1247,14 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         # A coluna "Marca" sempre veio no arquivo do Alfa, mas não era gravada.
         # Fica NULL nas linhas antigas: só reimportar o mês traz a marca dele.
         conn.execute("ALTER TABLE fact_sales_detail ADD COLUMN brand_name TEXT")
+    vacation_columns = {row["name"] for row in conn.execute("PRAGMA table_info(vacations)").fetchall()}
+    if vacation_columns and "cover_person_name" not in vacation_columns:
+        # Quem assume a carteira durante as férias. Sem isso, a meta que o
+        # ausente deixa de carregar se dilui por toda a equipe — o que é certo
+        # quando ninguém assume, e errado quando alguém assume: o substituto
+        # fica com o trabalho e sem o reconhecimento na meta.
+        conn.execute("ALTER TABLE vacations ADD COLUMN cover_person_name TEXT")
+
     if bool(sales_columns) and "item_code" not in sales_columns:
         # Código interno do item — coluna E do arquivo, sem cabeçalho. É a ÚNICA
         # coisa que separa a caixa do litro: a referência do fabricante é a
@@ -24698,6 +24706,363 @@ def resultados_mix_unidade(
     }
 
 
+# Quanto o potencial pode mexer na fatia de cada vendedor, para cima ou para
+# baixo. Sem teto, um vendedor com carteira enorme e parada levaria metade da
+# meta da unidade e desistiria no dia 2 — meta que ninguém acredita não é meta,
+# é papel. 25% desloca o suficiente para a conversa existir sem virar absurdo.
+SUGESTAO_META_AMPLITUDE = 0.25
+SUGESTAO_META_MESES = 3
+
+
+METAS_PAINEL_MESES = 12
+
+
+def metas_painel(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, meses: int = METAS_PAINEL_MESES,
+) -> dict[str, Any]:
+    """Metas da unidade e da equipe, mês a mês, no escopo do usuário.
+
+    O gerente vê as unidades dele; a diretoria vê todas. A meta da unidade é
+    LEITURA para o gerente — ele distribui, não define o total.
+
+    Quatro consultas agregadas para a tela inteira: metas de unidade, metas de
+    vendedor, realizado da unidade e realizado do vendedor. Montar isso mês a
+    mês seria 12 idas ao banco por unidade, e com seis unidades a tela
+    demoraria mais que a reunião.
+    """
+    permitidas = crm_allowed_units_for_user(conn, user)
+    pode_tudo = permitidas is None
+    competencias = sorted(query_competences(conn, company_id))
+    # Inclui o mês corrente e o seguinte mesmo sem faturamento: meta se lança
+    # ANTES do mês começar, e a tela existe justamente para isso.
+    hoje = today_in_brazil().strftime("%Y-%m")
+    for extra in (hoje, shift_competence(hoje, 1)):
+        if extra not in competencias:
+            competencias.append(extra)
+    competencias = sorted(set(competencias))[-int(meses):]
+    marc = ",".join("?" for _ in competencias) or "''"
+
+    metas_un: dict[tuple[str, str], float] = {
+        (normalize_unit(r["unit_name"]), r["competence"]): float(r["revenue_goal"] or 0)
+        for r in conn.execute(
+            f"SELECT unit_name, competence, revenue_goal FROM goals_unit "
+            f"WHERE company_id = ? AND competence IN ({marc})",
+            (company_id, *competencias)).fetchall()}
+    real_un: dict[tuple[str, str], float] = {
+        (normalize_unit(r["unit_name"]), r["competence"]): float(r["v"] or 0)
+        for r in conn.execute(
+            f"SELECT unit_name, competence, SUM(net_value) v FROM fact_unit_summary "
+            f"WHERE company_id = ? AND competence IN ({marc}) GROUP BY unit_name, competence",
+            (company_id, *competencias)).fetchall()}
+
+    # Vendedor indexado pela CHAVE CANÔNICA: o Alfa escreve o nome com sufixo
+    # de função e o cadastro de metas às vezes sem. Comparar cru deixaria a
+    # meta órfã da realização, e a tela mostraria meta sem resultado ao lado.
+    metas_vend: dict[tuple[str, str], dict[str, Any]] = {}
+    for r in conn.execute(
+        f"SELECT seller_name, base_unit, competence, revenue_goal FROM goals_seller "
+        f"WHERE company_id = ? AND competence IN ({marc})",
+            (company_id, *competencias)).fetchall():
+        chave = chave_canonica(conn, company_id, normalize_whitespace(r["seller_name"]))
+        metas_vend[(chave, r["competence"])] = {
+            "goal": float(r["revenue_goal"] or 0),
+            "savedAs": normalize_whitespace(r["seller_name"]),
+            "unit": normalize_unit(r["base_unit"]),
+        }
+    real_vend: dict[tuple[str, str], float] = {}
+    for r in conn.execute(
+        f"SELECT seller_name, competence, SUM(net_value) v FROM fact_vendor_summary "
+        f"WHERE company_id = ? AND competence IN ({marc}) GROUP BY seller_name, competence",
+            (company_id, *competencias)).fetchall():
+        chave = chave_canonica(conn, company_id, normalize_whitespace(r["seller_name"]))
+        k = (chave, r["competence"])
+        real_vend[k] = real_vend.get(k, 0.0) + float(r["v"] or 0)
+
+    unidades = sorted({normalize_unit(r["unit_name"]) for r in conn.execute(
+        "SELECT DISTINCT unit_name FROM fact_unit_summary WHERE company_id = ?",
+        (company_id,)).fetchall() if r["unit_name"]})
+    if not pode_tudo:
+        _p = {normalize_unit(u) for u in permitidas}
+        unidades = [u for u in unidades if u in _p]
+
+    # Equipe por unidade na competência MAIS RECENTE: é a foto de quem está lá
+    # hoje. Quem saiu continua aparecendo nos meses em que tem meta, porque o
+    # histórico não se reescreve.
+    ultima = competencias[-1] if competencias else ""
+    ref_equipe = ultima if ultima in set(query_competences(conn, company_id)) else \
+        (crm_latest_competence(conn, company_id) or ultima)
+
+    saida = []
+    for un in unidades:
+        equipe = sellers_of_unit(conn, company_id, ref_equipe, un) or []
+        chaves = {chave_canonica(conn, company_id, n): normalize_whitespace(n) for n in equipe}
+        # Quem tem meta lançada naquela unidade mas já não fatura — não some.
+        for (chave, _comp), meta in metas_vend.items():
+            if meta["unit"] == un and chave not in chaves:
+                chaves[chave] = meta["savedAs"]
+
+        linhas_vend = []
+        for chave, nome in sorted(chaves.items(), key=lambda kv: kv[1]):
+            por_mes = {}
+            for c in competencias:
+                m = metas_vend.get((chave, c))
+                real = real_vend.get((chave, c))
+                por_mes[c] = {
+                    "goal": round(m["goal"], 2) if m else None,
+                    "actual": round(real, 2) if real is not None else None,
+                    "attainmentPct": (round(100 * real / m["goal"], 1)
+                                      if m and m["goal"] and real is not None else None),
+                }
+            linhas_vend.append({"seller": nome, "months": por_mes,
+                                "active": chave in {chave_canonica(conn, company_id, n)
+                                                    for n in equipe}})
+
+        por_mes_un = {}
+        for c in competencias:
+            meta = metas_un.get((un, c))
+            real = real_un.get((un, c))
+            soma = sum((v["months"][c]["goal"] or 0) for v in linhas_vend)
+            por_mes_un[c] = {
+                "goal": round(meta, 2) if meta is not None else None,
+                "actual": round(real, 2) if real is not None else None,
+                "attainmentPct": (round(100 * real / meta, 1)
+                                  if meta and real is not None else None),
+                "sellerGoalSum": round(soma, 2),
+                # A diferença entre a meta da unidade e a soma das individuais
+                # é o número que o gerente precisa zerar. Positivo = falta
+                # distribuir; negativo = distribuiu mais do que tem.
+                "gap": round((meta or 0) - soma, 2) if meta is not None else None,
+            }
+
+        saida.append({"unit": un, "months": por_mes_un, "sellers": linhas_vend})
+
+    return {
+        "competences": competencias,
+        "currentCompetence": hoje,
+        "units": saida,
+        "canEditUnitGoal": user_can_manage_users(conn, user),
+        "canEditSellerGoal": True,
+    }
+
+
+def sugerir_metas_unidade(
+    conn: sqlite3.Connection, company_id: int, unidade: str, competencia: str,
+) -> dict[str, Any]:
+    """Reparte a meta da unidade entre os vendedores dela.
+
+    A meta da unidade é o teto E o piso: a soma das sugestões fecha com ela ao
+    centavo. Sugestão que não soma o combinado obriga o gerente a refazer a
+    conta na mão, que é exatamente o trabalho que esta tela veio tirar.
+
+    A repartição tem duas camadas:
+
+      BASE — o que cada um vem entregando, em faturamento por DIA ÚTIL nos
+      últimos meses fechados, projetado para os dias úteis do mês alvo. É o
+      ponto de partida honesto: quem fatura mais recebe meta maior.
+
+      POTENCIAL — um ajuste de no máximo ±25% sobre essa fatia, olhando o que
+      ainda há para colher. Carteira grande e parada puxa para cima; carteira
+      já bem trabalhada puxa para baixo, porque o espaço dela é menor; muita
+      dependência de balcão também puxa para baixo, porque balcão é o pedaço
+      que o vendedor menos controla.
+
+    O que NÃO entra: resultado do mês corrente (incompleto, derrubaria quem
+    ainda não faturou) e vendedor sem histórico (aparece à parte, para o gerente
+    decidir — inventar meta para quem nunca vendeu é chutar com cara de cálculo).
+    """
+    unidade = normalize_unit(unidade)
+    if not unidade or not competencia:
+        return {}
+
+    meta_unidade = float(conn.execute(
+        "SELECT COALESCE(SUM(revenue_goal),0) v FROM goals_unit "
+        "WHERE company_id = ? AND competence = ? AND unit_name = ?",
+        (company_id, competencia, unidade)).fetchone()["v"] or 0)
+
+    cal = get_business_calendar(conn, company_id, competencia)
+    dias_alvo = int(cal.get("totalWorkingDays") or 0) or 21
+
+    # Meses FECHADOS anteriores à competência alvo. O mês corrente mente: no
+    # dia 5 ele diria que todo mundo caiu 80%.
+    hoje = today_in_brazil().strftime("%Y-%m")
+    meses = []
+    c = competencia
+    while len(meses) < SUGESTAO_META_MESES:
+        c = shift_competence(c, -1)
+        if c < "2000-01":
+            break
+        if c != hoje:
+            meses.append(c)
+
+    equipe = sellers_of_unit(conn, company_id, competencia, unidade) or []
+    if not equipe:
+        # Competência futura ainda não tem faturamento: usa a última conhecida
+        # para saber quem é da equipe.
+        ultima = crm_latest_competence(conn, company_id)
+        equipe = sellers_of_unit(conn, company_id, ultima, unidade) or []
+
+    # Quem cobre quem: lido das férias cadastradas que tocam a competência.
+    coberturas: dict[str, str] = {}
+    for r in conn.execute(
+        "SELECT person_name, cover_person_name FROM vacations "
+        "WHERE company_id = ? AND date(end_date) >= date(?) AND date(start_date) <= date(?)",
+        (company_id, first_day_of_competence(competencia).isoformat(),
+         last_day_of_competence(competencia).isoformat())).fetchall():
+        cobre = normalize_whitespace(r["cover_person_name"])
+        if cobre:
+            coberturas[chave_canonica(conn, company_id,
+                                      normalize_whitespace(r["person_name"]))] = cobre
+
+    linhas = []
+    for nome in sorted(set(equipe)):
+        variantes = seller_name_variants(conn, company_id, nome) or [nome]
+        marc = ",".join("?" for _ in variantes)
+        hist = []
+        for m in meses:
+            v = float(conn.execute(
+                f"SELECT COALESCE(SUM(net_value),0) v FROM fact_vendor_summary "
+                f"WHERE company_id = ? AND competence = ? AND seller_name IN ({marc})",
+                (company_id, m, *variantes)).fetchone()["v"] or 0)
+            # Dias úteis DELE no mês histórico: quem esteve de férias faturou
+            # menos por calendário, e dividir pelo mês cheio rebaixaria a média
+            # dele para sempre — a férias de março viraria meta menor em outubro.
+            _cal_m = get_business_calendar(conn, company_id, m, nome)
+            du = int(_cal_m.get("sellerWorkingDays") or _cal_m.get("totalWorkingDays") or 0)
+            if v > 0 and du > 0:
+                hist.append(v / du)
+        por_dia = (sum(hist) / len(hist)) if hist else 0.0
+
+        # Dias que ELE tem no mês alvo — já sem as férias cadastradas.
+        cal_alvo = get_business_calendar(conn, company_id, competencia, nome)
+        dias_dele = int(cal_alvo.get("sellerWorkingDays") or dias_alvo)
+        dias_fora = max(dias_alvo - dias_dele, 0)
+
+        p = resultados_produtividade(conn, company_id, "vendedor", nome,
+                                     meses[0] if meses else competencia)
+        carteira = int(p.get("portfolioSize") or 0)
+        atendidos = int(p.get("portfolioServed") or 0)
+        parados = max(carteira - atendidos, 0)
+        positivacao = p.get("positivationPct")
+        balcao_pct = ((p.get("counter") or {}).get("sharePct") or 0.0)
+
+        linhas.append({
+            "seller": normalize_whitespace(nome),
+            "dailyAverage": round(por_dia, 2),
+            # A base usa os dias DELE, não os do mês. Quem fica fora metade do
+            # mês entra com metade da base — e como os pesos são normalizados,
+            # o que ele deixa de carregar passa sozinho para os outros.
+            "baseline": round(por_dia * dias_dele, 2),
+            "workingDays": dias_dele,
+            "absentDays": dias_fora,
+            "onLeave": dias_fora > 0,
+            "coveredBy": coberturas.get(chave_canonica(conn, company_id, nome), ""),
+            "portfolioSize": carteira,
+            "portfolioIdle": parados,
+            "positivationPct": positivacao,
+            "counterSharePct": round(balcao_pct, 1),
+            "hasHistory": bool(hist),
+        })
+
+    com_hist = [l for l in linhas if l["hasHistory"]]
+    sem_hist = [l for l in linhas if not l["hasHistory"]]
+    base_total = sum(l["baseline"] for l in com_hist)
+
+    # ── Ajuste de potencial, limitado e com média zero ────────────────────────
+    # Cada vendedor recebe uma nota de espaço para crescer entre -1 e +1; ela é
+    # CENTRADA na média da equipe, de modo que o ajuste redistribui entre eles
+    # em vez de inflar ou esvaziar o total. O total continua sendo a meta da
+    # unidade; o potencial só decide quem puxa mais dela.
+    def nota(l):
+        partes = []
+        if l["positivationPct"] is not None:
+            # Positivação baixa = espaço. 60% é o alvo prático observado nas
+            # melhores unidades; acima disso o espaço é pequeno.
+            partes.append(max(min((60.0 - l["positivationPct"]) / 60.0, 1.0), -1.0))
+        if l["portfolioSize"]:
+            # Carteira grande e parada tem mais a colher que carteira pequena.
+            partes.append(max(min(l["portfolioIdle"] / max(l["portfolioSize"], 1), 1.0), 0.0))
+        # Dependência de balcão reduz o que o vendedor controla.
+        partes.append(-max(min(l["counterSharePct"] / 100.0, 1.0), 0.0))
+        return sum(partes) / len(partes) if partes else 0.0
+
+    if com_hist:
+        notas = {l["seller"]: nota(l) for l in com_hist}
+        media = sum(notas.values()) / len(notas)
+        for l in com_hist:
+            l["potentialScore"] = round(notas[l["seller"]] - media, 3)
+
+    # Peso = fatia histórica ajustada pelo potencial, e normalizada para somar 1.
+    pesos = {}
+    for l in com_hist:
+        fatia = (l["baseline"] / base_total) if base_total else (1 / len(com_hist))
+        pesos[l["seller"]] = max(fatia * (1 + SUGESTAO_META_AMPLITUDE * l["potentialScore"]), 0.0)
+
+    # ── Cobertura de férias: o que o ausente não carrega vai para quem assume ──
+    # Sem substituto designado, a normalização já dilui entre todos — o que é
+    # o certo quando ninguém assume. Com substituto, diluir por igual seria
+    # injusto duas vezes: ele fica com o trabalho e sem o reconhecimento, e os
+    # outros ganham meta por uma carteira que não vão atender.
+    por_chave = {chave_canonica(conn, company_id, l["seller"]): l for l in com_hist}
+    for l in com_hist:
+        if not l["absentDays"] or not l["coveredBy"]:
+            continue
+        substituto = por_chave.get(chave_canonica(conn, company_id, l["coveredBy"]))
+        if not substituto or substituto is l or not base_total:
+            continue
+        # O que ele deixou de carregar, na mesma moeda dos pesos.
+        deixou = (l["dailyAverage"] * l["absentDays"]) / base_total
+        pesos[substituto["seller"]] = pesos.get(substituto["seller"], 0.0) + deixou
+        substituto["coversFor"] = (substituto.get("coversFor") or []) + [l["seller"]]
+
+    soma_pesos = sum(pesos.values())
+
+    for l in com_hist:
+        peso = (pesos[l["seller"]] / soma_pesos) if soma_pesos else 0.0
+        sugerida = meta_unidade * peso
+        l["suggested"] = round(sugerida, 2)
+        l["sharePct"] = round(peso * 100, 1)
+        l["dailyTarget"] = round(sugerida / dias_alvo, 2) if dias_alvo else None
+        # Quanto a sugestão pede a mais (ou a menos) do que ele vem fazendo.
+        l["growthPct"] = (round((sugerida - l["baseline"]) / l["baseline"] * 100, 1)
+                          if l["baseline"] > 0 else None)
+    for l in sem_hist:
+        l["suggested"] = None
+        l["sharePct"] = None
+        l["dailyTarget"] = None
+        l["growthPct"] = None
+        l["potentialScore"] = None
+
+    # CENTAVOS. Arredondar linha a linha deixa a soma fora da meta por alguns
+    # centavos, e "a soma não bate" é o tipo de coisa que destrói a confiança
+    # na tela inteira. A diferença vai para o maior.
+    if com_hist and meta_unidade:
+        resto = round(meta_unidade - sum(l["suggested"] for l in com_hist), 2)
+        if abs(resto) >= 0.01:
+            maior = max(com_hist, key=lambda l: l["suggested"])
+            maior["suggested"] = round(maior["suggested"] + resto, 2)
+            if dias_alvo:
+                maior["dailyTarget"] = round(maior["suggested"] / dias_alvo, 2)
+
+    linhas.sort(key=lambda l: (l["suggested"] is None, -(l["suggested"] or 0)))
+    base_dia = (base_total / dias_alvo) if dias_alvo else 0.0
+    return {
+        "unit": unidade,
+        "competence": competencia,
+        "unitGoal": round(meta_unidade, 2),
+        "workingDays": dias_alvo,
+        "unitDailyGoal": round(meta_unidade / dias_alvo, 2) if dias_alvo else None,
+        "baselineTotal": round(base_total, 2),
+        "baselineDaily": round(base_dia, 2),
+        # Quanto a meta pede a mais que o ritmo atual da unidade. É o número
+        # que o gerente leva para a conversa com a diretoria.
+        "unitGrowthPct": (round((meta_unidade - base_total) / base_total * 100, 1)
+                          if base_total > 0 else None),
+        "monthsUsed": meses,
+        "rows": linhas,
+        "withoutHistory": [l["seller"] for l in sem_hist],
+    }
+
+
 def resultados_produtividade_serie(
     conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
     alvo: str = "", meses: int = RESULTADOS_MESES,
@@ -26450,6 +26815,34 @@ class AppHandler(BaseHTTPRequestHandler):
                 payload = json_dumps(data)
                 self._set_headers(200)
                 self.wfile.write(payload)
+                return
+            if path == "/api/metas/painel":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                with closing(get_connection()) as conn:
+                    res = metas_painel(conn, user["company_id"], user)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
+                return
+            if path == "/api/metas/sugestao":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                consulta = parse_qs(parsed.query)
+                unidade = normalize_unit(consulta.get("unit", [""])[0])
+                comp = normalize_whitespace(consulta.get("competence", [""])[0])
+                with closing(get_connection()) as conn:
+                    permitidas = crm_allowed_units_for_user(conn, user)
+                    if permitidas is not None and unidade not in {
+                            normalize_unit(u) for u in permitidas}:
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps(
+                            {"error": "Unidade fora do seu escopo."}))
+                        return
+                    res = sugerir_metas_unidade(conn, user["company_id"], unidade, comp)
+                self._set_headers(200)
+                self.wfile.write(json_dumps(res))
                 return
             if path == "/api/resultados":
                 user = self._require_auth()
