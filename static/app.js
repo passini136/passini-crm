@@ -52,6 +52,7 @@ const state = {
   awardTipOpen: null,
   brandFilters: { scope: "", dimension: "", brand: "", line: "", group: "", type: "",
                   unit: "", seller: "", city: "" },
+  brandSort: { key: "revenue", dir: "desc" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
   returnLoadingScope: null,
@@ -3313,6 +3314,64 @@ function nomeVendedorCurto(nome) {
   return limpo || String(nome).trim();
 }
 
+/* ─── Ordenação do ranking de Marcas ─────────────────────────────────────────
+ *
+ * No navegador, não no servidor: a lista vem inteira (só corta marca abaixo de
+ * R$ 50), então ordenar aqui é exato e instantâneo. Se a lista fosse um
+ * top-N, ordenar no cliente seria mentira — "menor valor" mostraria o menor
+ * DOS MAIORES, e ninguém perceberia.
+ */
+const BRAND_SORT_TEXTO = new Set(["brand"]);
+
+function setBrandSort(chave) {
+  const s = state.brandSort;
+  if (s.key === chave) {
+    s.dir = s.dir === "desc" ? "asc" : "desc";
+  } else {
+    s.key = chave;
+    // Texto começa em A→Z; número começa do maior, que é o que se procura
+    // num ranking. Obrigar dois cliques para ver o topo seria perder tempo.
+    s.dir = BRAND_SORT_TEXTO.has(chave) ? "asc" : "desc";
+  }
+  requestRender();
+}
+
+function cabecalhoOrdenavel(chave, rotulo, alinhamento) {
+  const s = state.brandSort;
+  const ativo = s.key === chave;
+  const seta = !ativo ? "↕" : (s.dir === "asc" ? "▲" : "▼");
+  const dir = alinhamento === "esq" ? "left" : "right";
+  return `
+    <th style="text-align:${dir};cursor:pointer;user-select:none;white-space:nowrap"
+      onclick="setBrandSort('${chave}')"
+      title="Ordenar por ${escapeHtml(rotulo)}${ativo ? (s.dir === "asc" ? " (crescente)" : " (decrescente)") : ""}">
+      ${escapeHtml(rotulo)}
+      <span style="color:${ativo ? "var(--accent)" : "#c8d3db"};font-size:10px;margin-left:3px">${seta}</span>
+    </th>`;
+}
+
+function ordenarLinhasMarca(linhas) {
+  const { key, dir } = state.brandSort;
+  const sinal = dir === "asc" ? 1 : -1;
+  return linhas.slice().sort((a, b) => {
+    if (BRAND_SORT_TEXTO.has(key)) {
+      return sinal * String(a[key] ?? "").localeCompare(String(b[key] ?? ""), "pt-BR");
+    }
+    const va = a[key];
+    const vb = b[key];
+    // SEM BASE DE COMPARAÇÃO NÃO É ZERO. A variação é nula para marca que não
+    // vendeu no mês anterior; tratá-la como 0% a jogaria no meio da lista,
+    // entre quem caiu e quem subiu, fingindo um desempenho que não foi medido.
+    // Essas linhas vão sempre para o fim, nos dois sentidos.
+    const na = va === null || va === undefined;
+    const nb = vb === null || vb === undefined;
+    if (na && nb) return 0;
+    if (na) return 1;
+    if (nb) return -1;
+    return sinal * (Number(va) - Number(vb));
+  });
+}
+
 function toggleBrand(marca) {
   if (state.brandOpen[marca]) delete state.brandOpen[marca];
   else state.brandOpen[marca] = true;
@@ -3553,7 +3612,7 @@ function marcasView() {
 
   const f = state.brandFilters;
   const t = d.totals || {};
-  const linhas = d.rows || [];
+  const linhas = ordenarLinhasMarca(d.rows || []);
   // Enquanto troca, vale a aba clicada — não a que o servidor ainda devolve.
   const trocando = state.brandLoadingScope;
   const escopoAtual = trocando || d.scope;
@@ -3673,14 +3732,14 @@ function marcasView() {
           <table class="data-table">
             <thead><tr>
               <th style="width:34px"></th>
-              <th style="width:44px">#</th>
-              <th>${escapeHtml(rotuloDim)}</th>
-              <th style="text-align:right">Itens vendidos</th>
-              <th style="text-align:right">Códigos distintos</th>
-              <th style="text-align:right">Clientes</th>
-              <th style="text-align:right">Valor</th>
-              <th style="text-align:right">% do total</th>
-              <th style="text-align:right">vs mês anterior</th>
+              <th style="width:44px" title="Posição no ranking por valor">#</th>
+              ${cabecalhoOrdenavel("brand", rotuloDim, "esq")}
+              ${cabecalhoOrdenavel("items", "Itens vendidos")}
+              ${cabecalhoOrdenavel("skus", "Códigos distintos")}
+              ${cabecalhoOrdenavel("clients", "Clientes")}
+              ${cabecalhoOrdenavel("revenue", "Valor")}
+              ${cabecalhoOrdenavel("share", "% do total")}
+              ${cabecalhoOrdenavel("deltaPct", "vs mês anterior")}
             </tr></thead>
             <tbody>
               ${linhas.map((r) => {
@@ -3691,7 +3750,7 @@ function marcasView() {
                   <td>${abre ? `<span style="display:inline-block;width:20px;height:20px;line-height:18px;
                         text-align:center;border:1px solid var(--line);border-radius:5px;
                         font-weight:700;color:var(--muted)">${aberto ? "−" : "+"}</span>` : ""}</td>
-                  <td>${r.rank}</td>
+                  <td title="${r.rank}º em valor">${r.rank}</td>
                   <td><strong>${escapeHtml(r.brand)}</strong></td>
                   <td style="text-align:right">${number(r.items)}</td>
                   <td style="text-align:right">${number(r.skus)}</td>
