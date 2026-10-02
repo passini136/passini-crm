@@ -50,7 +50,8 @@ const state = {
   awardPeriodDraft: null,
   awardEdits: {},
   awardTipOpen: null,
-  brandFilters: { scope: "", dimension: "", brand: "", line: "", group: "", type: "" },
+  brandFilters: { scope: "", dimension: "", brand: "", line: "", group: "", type: "",
+                  unit: "", seller: "", city: "" },
   returns: null,
   returnFilters: { scope: "", dimension: "" },
   returnLoadingScope: null,
@@ -3091,7 +3092,11 @@ async function loadBrands(silencioso) {
   if (mes) q.set("competence", mes);
   if (f.scope) q.set("scope", f.scope);
   if (f.dimension) q.set("dimension", f.dimension);
-  ["brand", "line", "group", "type"].forEach((k) => { if (f[k]) q.set(`f_${k}`, f[k]); });
+  // Unidade e vendedor estreitam o recorte de PESSOAS; os demais filtram a
+  // LINHA de venda. Por isso viajam em parâmetros diferentes.
+  if (f.unit) q.set("unit", f.unit);
+  if (f.seller) q.set("seller", f.seller);
+  ["brand", "line", "group", "type", "city"].forEach((k) => { if (f[k]) q.set(`f_${k}`, f[k]); });
   const meuPedido = ++brandRequestSeq;
   if (!silencioso) {
     state.ui.loading.brands = true;
@@ -3194,6 +3199,9 @@ async function setBrandFilter(chave, valor) {
   if (state.brandLoadingScope) return;
   if ((state.brandFilters[chave] || "") === (valor || "")) return;
   state.brandFilters[chave] = valor || "";
+  // Trocar de unidade invalida o vendedor escolhido: ele é de outra equipe, e
+  // o cruzamento devolveria tela vazia sem explicar por quê.
+  if (chave === "unit") state.brandFilters.seller = "";
   state.brandOpen = {};
   state.brandLoadingScope = "filtro";
   requestRender();
@@ -3206,7 +3214,8 @@ async function setBrandFilter(chave, valor) {
 }
 
 async function limparBrandFiltros() {
-  ["brand", "line", "group", "type"].forEach((k) => { state.brandFilters[k] = ""; });
+  ["brand", "line", "group", "type", "city", "unit", "seller"]
+    .forEach((k) => { state.brandFilters[k] = ""; });
   state.brandOpen = {};
   state.brandLoadingScope = "filtro";
   requestRender();
@@ -3218,50 +3227,76 @@ async function limparBrandFiltros() {
   }
 }
 
+/* Filtros da tela de Marcas, em duas famílias.
+ *
+ * ONDE se vende (unidade, vendedor, cidade) e O QUE se vende (marca, linha,
+ * grupo, tipo). Separados visualmente porque respondem perguntas diferentes e
+ * se combinam: "quais linhas a NAKATA vende em Pelotas", "quem vende
+ * AMORTECEDOR na Zona Sul". Juntos numa fileira só, viravam sete caixas iguais
+ * e ninguém achava a que queria.
+ */
 function blocoFiltrosMarca(d) {
   const f = state.brandFilters;
   const op = d.filterOptions || {};
-  const campos = [
-    ["brand", "Marca", "Todas as marcas"],
-    ["line", "Linha", "Todas as linhas"],
-    ["group", "Grupo", "Todos os grupos"],
-    ["type", "Tipo de peça", "Todos os tipos"],
-  ];
-  const ativos = campos.filter(([k]) => f[k]).length;
   const ocupado = !!state.brandLoadingScope;
+
+  const seletor = (chave, rotulo, vazio, lista, atual) => `
+    <label style="display:flex;flex-direction:column;gap:3px;min-width:168px;flex:1 1 168px">
+      <span class="text-small" style="color:var(--muted);font-weight:700">
+        ${rotulo}${atual ? "" : ` <span style="font-weight:400">(${lista.length})</span>`}</span>
+      <select ${ocupado ? "disabled" : ""} onchange="setBrandFilter('${chave}', this.value)"
+        style="border:1px solid ${atual ? "var(--accent)" : "var(--line)"};
+               border-radius:8px;padding:6px 9px;font-size:13px;
+               font-weight:${atual ? "700" : "400"};background:#fff;width:100%">
+        <option value="">${vazio}</option>
+        ${lista.map((v) => `
+          <option value="${jsAttr(v)}" ${v === atual ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+        ${atual && !lista.includes(atual) ? `
+          <option value="${jsAttr(atual)}" selected>${escapeHtml(atual)} (sem venda no mês)</option>` : ""}
+      </select>
+    </label>`;
+
+  const onde = [
+    ["unit", "Unidade", "Todas as unidades", d.units || []],
+    ["seller", "Vendedor", "Todos os vendedores", d.sellerOptions || []],
+    ["city", "Cidade", "Todas as cidades", op.city || []],
+  ];
+  const oque = [
+    ["brand", "Marca", "Todas as marcas", op.brand || []],
+    ["line", "Linha", "Todas as linhas", op.line || []],
+    ["group", "Grupo", "Todos os grupos", op.group || []],
+    ["type", "Tipo de peça", "Todos os tipos", op.type || []],
+  ];
+  const chaves = [...onde, ...oque].map(([k]) => k);
+  const ativos = chaves.filter((k) => f[k]).length;
+
+  // Título ACIMA da fileira, não ao lado: ao lado, ele fica preso à primeira
+  // linha e some das seguintes quando os campos quebram em tela estreita —
+  // aí "Cidade" aparece solta, sem dizer a que família pertence.
+  const fileira = (titulo, campos) => `
+    <div>
+      <div class="text-small" style="color:var(--muted);font-weight:800;text-transform:uppercase;
+           letter-spacing:.5px;font-size:10px;margin-bottom:4px">${titulo}</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+        ${campos.map(([k, r, v, l]) => seletor(k, r, v, l, f[k] || "")).join("")}
+      </div>
+    </div>`;
+
   return `
     <div class="panel" style="padding:12px 18px">
-      <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
-        ${campos.map(([chave, rotulo, vazio]) => {
-          const lista = op[chave] || [];
-          const atual = f[chave] || "";
-          return `
-            <label style="display:flex;flex-direction:column;gap:3px;min-width:170px">
-              <span class="text-small" style="color:var(--muted);font-weight:700">
-                ${rotulo}${atual ? "" : ` <span style="font-weight:400">(${lista.length})</span>`}</span>
-              <select ${ocupado ? "disabled" : ""}
-                onchange="setBrandFilter('${chave}', this.value)"
-                style="border:1px solid ${atual ? "var(--accent)" : "var(--line)"};
-                       border-radius:8px;padding:6px 9px;font-size:13px;
-                       font-weight:${atual ? "700" : "400"};background:#fff;min-width:170px">
-                <option value="">${vazio}</option>
-                ${lista.map((v) => `
-                  <option value="${jsAttr(v)}" ${v === atual ? "selected" : ""}>
-                    ${escapeHtml(v)}</option>`).join("")}
-                ${atual && !lista.includes(atual) ? `
-                  <option value="${jsAttr(atual)}" selected>${escapeHtml(atual)} (sem venda no mês)</option>` : ""}
-              </select>
-            </label>`;
-        }).join("")}
-        ${ativos ? `
-          <button type="button" class="btn btn-sm btn-ghost" ${ocupado ? "disabled" : ""}
-            onclick="limparBrandFiltros()" style="margin-bottom:1px">
-            Limpar ${ativos} filtro${ativos > 1 ? "s" : ""}</button>` : ""}
+      <div class="stack" style="gap:10px">
+        ${fileira("Onde se vende", onde)}
+        ${fileira("O que se vende", oque)}
       </div>
       ${!ativos ? "" : `
-        <div class="text-small" style="color:var(--muted);margin-top:7px">
-          Os totais e o comparativo abaixo já consideram o filtro — inclusive a
-          comparação com o mês anterior, que usa o mesmo recorte.
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;
+                    flex-wrap:wrap;margin-top:9px">
+          <span class="text-small" style="color:var(--muted)">
+            Os totais e o comparativo abaixo já consideram os filtros — inclusive a
+            comparação com o mês anterior, que usa o mesmo recorte.
+          </span>
+          <button type="button" class="btn btn-sm btn-ghost" ${ocupado ? "disabled" : ""}
+            onclick="limparBrandFiltros()">Limpar ${ativos} filtro${ativos > 1 ? "s" : ""}</button>
         </div>`}
     </div>`;
 }

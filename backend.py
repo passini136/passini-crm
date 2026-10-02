@@ -13720,6 +13720,10 @@ BRAND_FILTER_EXPR = {
     "line": "c.item_subgroup",
     "group": "c.item_group",
     "type": "c.item_type",
+    # Cidade responde a pergunta que unidade não responde: a unidade atende
+    # várias cidades, e marca forte numa cidade específica é decisão de
+    # estoque de filial, não de política da unidade inteira.
+    "city": "f.city_name",
 }
 
 
@@ -14066,6 +14070,29 @@ def brand_sales_report(
         filtro = (None if permitidas is None
                   else sellers_of_unit(conn, company_id, comp, minha_unidade))
 
+    # ── Recorte por UNIDADE e por VENDEDOR ────────────────────────────────────
+    # Os dois parâmetros já existiam na assinatura e nunca eram usados: a tela
+    # pedia e o relatório ignorava. Aqui eles ESTREITAM o que a permissão já
+    # permitiu — nunca ampliam. Quem só enxerga a própria unidade continua preso
+    # a ela mesmo pedindo outra, senão o filtro viraria porta lateral para a
+    # base inteira.
+    unidade_pedida = normalize_unit(unit) if unit else ""
+    vendedor_pedido = normalize_whitespace(seller)
+
+    def _estreitar(base: list[str] | None, novos: list[str] | None) -> list[str] | None:
+        if novos is None:
+            return base
+        if base is None:
+            return list(novos)
+        permitidos = {person_key(n) for n in base}
+        return [n for n in novos if person_key(n) in permitidos]
+
+    if unidade_pedida and atual != "vendedor":
+        filtro = _estreitar(filtro, sellers_of_unit(conn, company_id, comp, unidade_pedida) or [])
+    if vendedor_pedido and atual != "vendedor":
+        filtro = _estreitar(
+            filtro, seller_name_variants(conn, company_id, vendedor_pedido) or [vendedor_pedido])
+
     filtros = {k: normalize_upper(v) for k, v in (filtros or {}).items()
                if k in BRAND_FILTER_EXPR and normalize_upper(v)}
     agora = brand_ranking_rows(conn, company_id, comp, filtro, dim, filtros=filtros)
@@ -14184,6 +14211,24 @@ def brand_sales_report(
         "dimensions": BRAND_DIMENSIONS,
         "filters": filtros,
         "filterOptions": brand_filter_options(conn, company_id, comp, filtro, filtros),
+        "selectedUnit": unidade_pedida,
+        "selectedSeller": vendedor_pedido,
+        # Vendedores que o usuário PODE ver, não todos da empresa: a lista do
+        # filtro não deve revelar nome de quem está fora do escopo dele.
+        "sellerOptions": sorted({
+            normalize_whitespace(r["seller_name"]) for r in conn.execute(
+                "SELECT DISTINCT seller_name FROM fact_sales_detail "
+                "WHERE company_id = ? AND competence = ?", (company_id, comp)).fetchall()
+            if r["seller_name"] and (
+                permitidas is None
+                or (mapa_unidades.get(person_key(r["seller_name"]))
+                    or mapa_unidades.get(short_person_key(r["seller_name"]))) in
+                {normalize_unit(u) for u in permitidas})
+            and (not unidade_pedida
+                 or (mapa_unidades.get(person_key(r["seller_name"]))
+                     or mapa_unidades.get(short_person_key(r["seller_name"])))
+                 == unidade_pedida)
+        }),
         "hasCatalog": tem_catalogo,
         "scope": atual,
         "scopes": escopos,
