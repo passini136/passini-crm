@@ -64,6 +64,7 @@ const state = {
   activityGoalEditor: null,    // metas de atividade
   metas: null,                 // painel de metas por unidade e equipe
   metasAberta: "",             // unidade expandida no painel
+  metasAno: "",                // ano exibido no painel de metas
   sugestaoMetas: null,         // modal de sugestão de metas da equipe
   gradeMetas: null,            // grade anual de metas de unidade
   assistant: null,        // tutorial, FAQ e dicas
@@ -2482,7 +2483,9 @@ function sugestaoMetasModal() {
 function abrirGradeAnual() {
   const d = state.metas;
   if (!d) return;
-  const ano = Number(String(d.currentCompetence).slice(0, 4));
+  // Abre no ano que o painel está mostrando, não no ano corrente: se o gerente
+  // está olhando 2027, é 2027 que ele quer lançar.
+  const ano = Number(state.metasAno || String(d.currentCompetence).slice(0, 4));
   state.gradeMetas = { year: ano, valores: {}, salvando: false };
   // Pré-carrega o que já existe, para a grade abrir com o ano atual à vista
   // em vez de em branco — relançar o que já está lançado é como se perde meta.
@@ -3348,8 +3351,6 @@ function prospeccaoView() {
       ${pedidoCadastroModal()}
       ${configFaseModal()}
       ${metasAtividadeModal()}
-      ${sugestaoMetasModal()}
-      ${gradeMetasModal()}
 
       ${blocoConfiguracaoUnidade()}
 
@@ -7032,6 +7033,11 @@ function metaMesLabel(c) {
   return `${MONTH_ABBR[Number(mes) - 1] || mes}/${String(ano).slice(2)}`;
 }
 
+function setMetasAno(ano) {
+  state.metasAno = String(ano);
+  requestRender();
+}
+
 function setMetaUnidadeAberta(unidade) {
   state.metasAberta = state.metasAberta === unidade ? "" : unidade;
   requestRender();
@@ -7046,11 +7052,17 @@ function painelMetasView() {
   if (d.error) return `<div class="message error">${escapeHtml(d.error)}</div>`;
   if (!(d.units || []).length) return "";
 
-  // Só os meses que interessam: do atual para a frente, mais os três
-  // anteriores para comparar. Doze colunas de histórico não cabem e ninguém
-  // relança meta de janeiro.
-  const idxAtual = Math.max(d.competences.indexOf(d.currentCompetence), 0);
-  const meses = d.competences.slice(Math.max(idxAtual - 3, 0));
+  // O ANO INTEIRO, não uma janela móvel.
+  //
+  // A tela mostrava o mês atual e três para trás. Meta de dezembro, lançada em
+  // outubro, ficava fora — e quem lançou achou que tinha perdido o trabalho.
+  // Pior: não dava para saber se os meses antigos simplesmente não tinham meta
+  // ou se a tela é que não mostrava. Doze colunas com o nome grudado à
+  // esquerda resolvem os dois.
+  const anos = [...new Set(d.competences.map((c) => c.slice(0, 4)))].sort();
+  const ano = state.metasAno || String(d.currentCompetence).slice(0, 4);
+  const meses = Array.from({ length: 12 }, (_, i) => `${ano}-${String(i + 1).padStart(2, "0")}`)
+    .filter((c) => d.competences.includes(c));
 
   const celulaMeta = (m) => {
     if (m.goal === null || m.goal === undefined) {
@@ -7077,9 +7089,14 @@ function painelMetasView() {
             a equipe persegue um número diferente do combinado.
           </div>
         </div>
-        ${!d.canEditUnitGoal ? "" : `
-          <button class="btn btn-secondary btn-sm" onclick="abrirGradeAnual()">
-            📅 Lançar metas do ano</button>`}
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          ${anos.map((a) => `
+            <button class="btn btn-sm ${a === ano ? "btn-primary" : "btn-ghost"}"
+              onclick="setMetasAno('${a}')">${a}</button>`).join("")}
+          ${!d.canEditUnitGoal ? "" : `
+            <button class="btn btn-secondary btn-sm" onclick="abrirGradeAnual()">
+              📅 Lançar metas do ano</button>`}
+        </div>
       </div>
 
       ${d.units.map((un) => {
@@ -19241,6 +19258,10 @@ configuracoesView = function adminViewGoalsSellerUnitFinal() {
 
   return `
     <div class="stack">
+      <!-- Os modais ficam NA TELA QUE OS ABRE. Pendurados em prospeccaoView,
+           o clique mudava o estado e nada aparecia — o botão parecia morto. -->
+      ${sugestaoMetasModal()}
+      ${gradeMetasModal()}
       ${painelMetasView()}
       <div class="stack">
         <div class="form-card">

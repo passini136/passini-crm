@@ -24738,14 +24738,24 @@ def metas_painel(
     """
     permitidas = crm_allowed_units_for_user(conn, user)
     pode_tudo = permitidas is None
-    competencias = sorted(query_competences(conn, company_id))
-    # Inclui o mês corrente e o seguinte mesmo sem faturamento: meta se lança
-    # ANTES do mês começar, e a tela existe justamente para isso.
+    # COMPETÊNCIA COM META TAMBÉM CONTA, não só a que tem faturamento.
+    #
+    # A lista vinha de `query_competences`, que só conhece mês com venda
+    # importada. Meta de dezembro, lançada em outubro, simplesmente não
+    # aparecia — e quem lançou ficava achando que tinha perdido o trabalho.
+    # Meta existe ANTES do faturamento; é esse o ponto dela.
+    competencias = set(query_competences(conn, company_id))
+    for tabela in ("goals_unit", "goals_seller"):
+        competencias |= {r["competence"] for r in conn.execute(
+            f"SELECT DISTINCT competence FROM {tabela} WHERE company_id = ?",
+            (company_id,)).fetchall() if r["competence"]}
     hoje = today_in_brazil().strftime("%Y-%m")
-    for extra in (hoje, shift_competence(hoje, 1)):
-        if extra not in competencias:
-            competencias.append(extra)
-    competencias = sorted(set(competencias))[-int(meses):]
+    competencias |= {hoje, shift_competence(hoje, 1)}
+    # Anos inteiros: a tela mostra 12 colunas por ano, e meio ano faria o
+    # gerente achar que o resto não existe — foi o que acabou de acontecer.
+    anos = {c[:4] for c in competencias if c}
+    competencias |= {f"{a}-{str(m).zfill(2)}" for a in anos for m in range(1, 13)}
+    competencias = sorted(c for c in competencias if c)
     marc = ",".join("?" for _ in competencias) or "''"
 
     metas_un: dict[tuple[str, str], float] = {
