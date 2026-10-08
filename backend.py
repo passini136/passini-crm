@@ -10887,13 +10887,18 @@ def prospect_counts(
             por_status[r["status"]] = int(r["n"] or 0)
     total = sum(por_status.values())
 
+    # A interação do prospect não é gravada com o código do cliente: ele ainda
+    # não tem um. A chave é "P-<id>" (ver prospect_client_key), e montá-la aqui
+    # é o que liga as duas tabelas.
+    chave = f"'{PROSPECT_KEY_PREFIX}' || p.id"
+
     # Sem contato nenhum, entre os que ainda são trabalho de prospecção.
     sem_contato = int(conn.execute(
         f"""SELECT COUNT(*) n {base}
             AND p.status NOT IN ('CADASTRADO','PERDIDO')
             AND NOT EXISTS (SELECT 1 FROM crm_interactions i
                             WHERE i.company_id = p.company_id
-                              AND i.client_key = p.client_key)""",
+                              AND i.client_key = {chave})""",
         params).fetchone()["n"] or 0)
 
     # Parados: na fila de trabalho e sem contato há 7 dias ou mais.
@@ -10904,7 +10909,7 @@ def prospect_counts(
             AND COALESCE((SELECT MAX(date(substr(replace(i.occurred_at,'T',' '),1,10)))
                           FROM crm_interactions i
                           WHERE i.company_id = p.company_id
-                            AND i.client_key = p.client_key), '0000-00-00') <= ?""",
+                            AND i.client_key = {chave}), '0000-00-00') <= ?""",
         [*params, limite]).fetchone()["n"] or 0)
 
     convertidos = por_status.get("CADASTRADO", 0)
