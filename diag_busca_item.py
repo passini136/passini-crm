@@ -21,6 +21,7 @@ que ela mesma tem, não vai achar nada no uso de verdade.
 Não altera nada.
 """
 import os
+import time
 import sys
 from pathlib import Path
 
@@ -62,48 +63,63 @@ if not (r["interno"] or 0):
 
 # ── 2. Buscar a peça pelos códigos dela mesma ───────────────────────────────
 print("\n2) A BUSCA ACHA A PEÇA POR CADA UM DOS CÓDIGOS DELA?")
+# SEM JOIN COM FUNÇÃO NOS DOIS LADOS.
+#
+# A primeira versão unia o catálogo com UPPER(TRIM(...)) de cada lado. Isso
+# impede o uso do índice e transforma a consulta numa varredura cruzada entre
+# o faturamento e os 57 mil itens do catálogo — o diagnóstico ficou minutos
+# parado. A amostra agora sai só do faturamento, e o GTIN de cada peça é
+# buscado depois, uma consulta por item, pela chave exata que tem índice.
 amostra = conn.execute(
-    """SELECT f.manufacturer_sku, f.item_code, f.sku_key, f.brand_name,
-              MAX(c.gtin) AS gtin, COUNT(DISTINCT f.client_name) AS clientes
-       FROM fact_sales_detail f
-       LEFT JOIN item_catalog c
-              ON c.company_id = f.company_id
-             AND UPPER(TRIM(c.item_code)) = UPPER(TRIM(COALESCE(f.item_code,'')))
-       WHERE f.company_id = ? AND f.competence = ? AND f.net_value > 0
-         AND TRIM(COALESCE(f.item_code,'')) <> ''
-       GROUP BY f.item_code HAVING clientes >= 3
-       ORDER BY clientes DESC LIMIT 6""",
+    """SELECT manufacturer_sku, item_code, sku_key, brand_name,
+              COUNT(DISTINCT client_name) AS clientes
+       FROM fact_sales_detail
+       WHERE company_id = ? AND competence = ? AND net_value > 0
+         AND TRIM(COALESCE(item_code,'')) <> ''
+       GROUP BY item_code HAVING clientes >= 3
+       ORDER BY clientes DESC LIMIT 3""",
     (company_id, comp)).fetchall()
+
+def gtin_do_item(codigo: str) -> str:
+    r = conn.execute(
+        "SELECT gtin FROM item_catalog WHERE company_id = ? AND item_code = ? LIMIT 1",
+        (company_id, backend.normalize_whitespace(codigo))).fetchone()
+    return backend.normalize_whitespace(r["gtin"]) if r else ""
 
 if not amostra:
     print("   Nenhum item com código interno e 3+ clientes. Reimporte a competência.")
 else:
-    print(f"   {'PEÇA':<22}{'CÓDIGO':<14}{'TIPO DE CÓDIGO':<20}{'CLIENTES ACHADOS':>17}")
+    print("   Cada busca varre 12 meses de faturamento — alguns segundos por linha.\n")
+    print(f"   {'PEÇA':<20}{'CÓDIGO':<14}{'TIPO':<18}{'CLIENTES':>9}{'TEMPO':>8}")
     falhas = 0
     for a in amostra:
         testes = [
             ("fabricante", a["manufacturer_sku"]),
             ("interno", a["item_code"]),
             ("sku_key", a["sku_key"]),
-            ("GTIN (catálogo)", a["gtin"]),
+            ("GTIN (catálogo)", gtin_do_item(a["item_code"])),
         ]
-        rotulo = backend.normalize_whitespace(a["manufacturer_sku"] or a["item_code"])[:21]
+        rotulo = backend.normalize_whitespace(a["manufacturer_sku"] or a["item_code"])[:19]
         primeiro = True
         for nome_tipo, codigo in testes:
             codigo = backend.normalize_whitespace(codigo)
             if not codigo:
                 continue
+            t0 = time.time()
             achado = backend.item_purchase_details(conn, company_id, codigo)
+            seg = time.time() - t0
             qtd = len(achado or {})
             marca = ""
             if qtd == 0:
                 marca = "  ← NÃO ACHOU"
                 falhas += 1
-            print(f"   {(rotulo if primeiro else ''):<22}{codigo[:13]:<14}"
-                  f"{nome_tipo:<20}{qtd:>17}{marca}")
+            print(f"   {(rotulo if primeiro else ''):<20}{codigo[:13]:<14}"
+                  f"{nome_tipo:<18}{qtd:>9}{seg:>7.2f}s{marca}")
             primeiro = False
         print()
     print(f"   {falhas} busca(s) sem resultado")
+    print("   >> Acima de 3s por busca a tela fica desconfortável: o gerente")
+    print("      digita o código e acha que travou.")
     if falhas:
         print("   >> Código que a própria peça tem e a busca não acha é defeito")
         print("      da busca, não do dado.")
