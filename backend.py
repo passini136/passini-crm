@@ -6003,6 +6003,11 @@ def build_filters_from_query(query: dict[str, list[str]]) -> dict[str, str | Non
         "personType": normalize_upper(query.get("personType", [None])[0]),
         # Busca por item: aceita código do fabricante ou interno
         "itemCode": normalize_whitespace(query.get("itemCode", [None])[0]),
+        # Marca, tipo e linha da peça comprada: respondem "quem compra disso",
+        # que o código sozinho não responde.
+        "itemBrand": normalize_upper(query.get("itemBrand", [None])[0]),
+        "itemType": normalize_upper(query.get("itemType", [None])[0]),
+        "itemLine": normalize_upper(query.get("itemLine", [None])[0]),
         "search": normalize_whitespace(query.get("search", [None])[0]),
         # Recorte por limite de crédito: com, sem, ou já acima do limite no mês
         "creditLimit": normalize_upper(query.get("creditLimit", [None])[0]),
@@ -17947,6 +17952,86 @@ def clients_who_bought_item(
     return None if detalhes is None else set(detalhes.keys())
 
 
+def clientes_que_compraram(
+    conn: sqlite3.Connection, company_id: int, marca: str = "", tipo: str = "",
+    linha: str = "", months_window: int = 12,
+) -> set[str] | None:
+    """Chaves de cliente que compraram da marca / tipo / linha, na janela.
+
+    Devolve None quando não há filtro — e None significa "não filtre", que é
+    diferente de conjunto vazio ("ninguém comprou"). Confundir os dois faria a
+    carteira inteira sumir quando o gestor escolhesse uma marca sem venda.
+
+    Marca vem do próprio faturamento; tipo e linha vêm do catálogo, pela chave
+    de [[crm-chave-do-item]] — referência do fabricante mais marca, com o
+    catálogo agrupado antes do JOIN para não duplicar a linha de venda.
+    """
+    marca = normalize_upper(marca)
+    tipo = normalize_upper(tipo)
+    linha = normalize_upper(linha)
+    if not (marca or tipo or linha):
+        return None
+
+    ensure_catalogo_temp(conn, company_id)
+    latest = crm_latest_competence(conn, company_id) or today_in_brazil().strftime("%Y-%m")
+    inicio = shift_competence(latest, -(months_window - 1))
+
+    onde = ["f.company_id = ?", "f.competence >= ?", "f.net_value > 0"]
+    params: list[Any] = [company_id, inicio]
+    if marca:
+        onde.append("UPPER(TRIM(COALESCE(f.brand_name,''))) = ?")
+        params.append(marca)
+    if tipo:
+        onde.append("UPPER(TRIM(COALESCE(c.item_type,''))) = ?")
+        params.append(tipo)
+    if linha:
+        onde.append("UPPER(TRIM(COALESCE(c.item_subgroup,''))) = ?")
+        params.append(linha)
+
+    return {
+        normalize_client_key(r["client_name"])
+        for r in conn.execute(
+            f"""SELECT DISTINCT f.client_name
+                FROM fact_sales_detail f
+                {CATALOGO_JOIN_SQL}
+                WHERE {" AND ".join(onde)}""", params).fetchall()
+        if r["client_name"]
+    }
+
+
+def opcoes_compra_carteira(
+    conn: sqlite3.Connection, company_id: int, months_window: int = 12,
+) -> dict[str, list[str]]:
+    """Marcas, tipos e linhas com venda na janela, para alimentar os filtros.
+
+    Só o que teve venda: oferecer as 209 marcas do catálogo, a maioria sem
+    movimento, transformaria o filtro numa lista onde quase toda escolha
+    devolve tela vazia. Fica no cache da conexão porque a carteira é paginada
+    e a tela repete a chamada.
+    """
+    cache = getattr(conn, "_cache_opcoes_compra", None)
+    if cache is not None:
+        return cache
+    ensure_catalogo_temp(conn, company_id)
+    latest = crm_latest_competence(conn, company_id) or today_in_brazil().strftime("%Y-%m")
+    inicio = shift_competence(latest, -(months_window - 1))
+    def distintos(expr: str) -> list[str]:
+        return [r["v"] for r in conn.execute(
+            f"""SELECT DISTINCT UPPER(TRIM({expr})) v
+                FROM fact_sales_detail f
+                {CATALOGO_JOIN_SQL}
+                WHERE f.company_id = ? AND f.competence >= ? AND f.net_value > 0
+                  AND TRIM(COALESCE({expr},'')) <> ''
+                ORDER BY v""", (company_id, inicio)).fetchall() if r["v"]]
+    opcoes = {
+        "brands": distintos("f.brand_name"),
+        "types": distintos("c.item_type"),
+        "lines": distintos("c.item_subgroup"),
+    }
+    conn._cache_opcoes_compra = opcoes
+    return opcoes
+
+
 def item_purchase_details(
     conn: sqlite3.Connection, company_id: int, item_code: str, months_window: int = 12
 ) -> dict[str, dict[str, Any]] | None:
@@ -17965,22 +18050,48 @@ def item_purchase_details(
     latest = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
     inicio = shift_competence(latest, -(months_window - 1))
     padrao = f"%{termo.upper()}%"
+
+    # QUALQUER CÓDIGO QUE O BALCÃO USA deve achar a peça. São quatro no mundo
+    # real: o do fabricante (o que o mecânico fala), o interno da Passini (o da
+    # etiqueta), o GTIN de barras e a referência do catálogo. Antes a busca
+    # cobria só os dois primeiros, e quem digitasse o código interno — o mais
+    # natural para quem trabalha no balcão — recebia "nenhum cliente comprou".
+    #
+    # O GTIN vem do CATÁLOGO, não do faturamento: no faturamento ele chega
+    # sempre vazio do Alfa. Resolvendo GTIN → item_code no catálogo, a busca
+    # por código de barras passa a funcionar sem depender do arquivo de venda.
+    codigos_do_catalogo = {
+        normalize_whitespace(r["item_code"]).upper()
+        for r in conn.execute(
+            "SELECT item_code FROM item_catalog WHERE company_id = ? "
+            "  AND (UPPER(COALESCE(gtin,'')) LIKE ? OR UPPER(COALESCE(item_code,'')) LIKE ?) "
+            "LIMIT 500", (company_id, padrao, padrao)).fetchall()
+        if r["item_code"]
+    }
+    extra_sql, extra_par = "", []
+    if codigos_do_catalogo:
+        lista = sorted(codigos_do_catalogo)
+        extra_sql = f" OR UPPER(COALESCE(item_code,'')) IN ({','.join('?' for _ in lista)})"
+        extra_par = lista
+
     rows = conn.execute(
-        """
+        f"""
         SELECT client_name,
                COALESCE(NULLIF(issue_date, ''), competence) AS purchase_at,
-               COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''), NULLIF(gtin_value, '')) AS item_code,
+               COALESCE(NULLIF(manufacturer_sku, ''), NULLIF(sku_key, ''),
+                        NULLIF(item_code, ''), NULLIF(gtin_value, '')) AS item_code,
                SUM(quantity) AS quantity,
                SUM(net_value) AS net_value
         FROM fact_sales_detail
         WHERE company_id = ? AND competence >= ? AND net_value > 0
           AND (UPPER(COALESCE(manufacturer_sku, '')) LIKE ?
             OR UPPER(COALESCE(gtin_value, '')) LIKE ?
-            OR UPPER(COALESCE(sku_key, '')) LIKE ?)
+            OR UPPER(COALESCE(sku_key, '')) LIKE ?
+            OR UPPER(COALESCE(item_code, '')) LIKE ?{extra_sql})
         GROUP BY client_name, purchase_at, item_code
         ORDER BY purchase_at ASC
         """,
-        (company_id, inicio, padrao, padrao, padrao),
+        (company_id, inicio, padrao, padrao, padrao, padrao, *extra_par),
     ).fetchall()
 
     detalhes: dict[str, dict[str, Any]] = {}
@@ -18116,6 +18227,21 @@ def query_crm_clients_page(
     all_rows = list_crm_clients(conn, company_id, filters, attach_context=False)
     item_details = item_purchase_details(conn, company_id, filters.get("itemCode"))
     item_buyers = None if item_details is None else set(item_details.keys())
+
+    # Marca, tipo e linha restringem pelo MESMO conjunto de compradores, só que
+    # sem detalhe por item: quem comprou NAKATA são centenas de clientes e
+    # milhares de linhas — guardar a última compra de cada um só para filtrar
+    # custaria memória sem ninguém olhar. A interseção com o filtro de código,
+    # quando os dois estão ativos, é o comportamento esperado: "quem comprou
+    # ESSA peça, da NAKATA".
+    compradores = clientes_que_compraram(
+        conn, company_id,
+        marca=filters.get("itemBrand") or "",
+        tipo=filters.get("itemType") or "",
+        linha=filters.get("itemLine") or "")
+    if compradores is not None:
+        item_buyers = compradores if item_buyers is None else (item_buyers & compradores)
+
     filtered_rows = filter_crm_client_rows(all_rows, filters, item_buyers)
     filtered_rows = sort_by_search_relevance(filtered_rows, filters.get("search") or "")
     total = len(filtered_rows)
@@ -18156,6 +18282,7 @@ def query_crm_clients_page(
         "page": safe_page,
         "pageSize": safe_page_size,
         "totalPages": total_pages,
+        "purchaseOptions": opcoes_compra_carteira(conn, company_id),
     }
 
 

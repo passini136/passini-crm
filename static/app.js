@@ -226,7 +226,10 @@ const state = {
       personType: "",
       creditLimit: "",   // COM_LIMITE | SEM_LIMITE | LIMITE_ESTOURADO
       search: "",
-      itemCode: "",     // busca por peça comprada (código fabricante ou interno)
+      itemCode: "",     // busca por peça comprada (fabricante, interno, GTIN ou referência)
+      itemBrand: "",    // comprou da marca
+      itemLine: "",     // comprou da linha
+      itemType: "",     // comprou o tipo de peça
       unit: "",
       seller: "",
     },
@@ -952,6 +955,9 @@ async function loadCrmClients({ renderAfterLoad = true, reason = "reload", pageA
   if (filters.personType) query.set("personType", filters.personType);
   if (filters.search) query.set("search", filters.search);
   if (filters.itemCode) query.set("itemCode", filters.itemCode);
+  if (filters.itemBrand) query.set("itemBrand", filters.itemBrand);
+  if (filters.itemLine) query.set("itemLine", filters.itemLine);
+  if (filters.itemType) query.set("itemType", filters.itemType);
   if (filters.creditLimit) query.set("creditLimit", filters.creditLimit);
   // Vendedor vê toda a carteira de uma vez (sem paginação) para agrupar por status
   const isSeller = roleIsSeller();
@@ -968,6 +974,11 @@ async function loadCrmClients({ renderAfterLoad = true, reason = "reload", pageA
       return loadCrmClients({ renderAfterLoad, reason, pageAdjusted: true });
     }
     state.crm.clients = clients.rows || [];
+    // Opções dos filtros de compra. Guardadas separadas das linhas porque não
+    // mudam a cada página e a tela precisa delas mesmo quando o filtro atual
+    // devolveu lista vazia — senão o usuário não consegue trocar de marca sem
+    // antes limpar tudo.
+    if (clients.purchaseOptions) state.crm.clientsMeta = { purchaseOptions: clients.purchaseOptions };
     state.crm.pagination = {
       page: Number(clients.page || 1),
       pageSize: Number(clients.pageSize || state.crm.pagination.pageSize || 50),
@@ -1019,6 +1030,9 @@ async function clearCrmClientFilters() {
     creditLimit: "",
     search: "",
     itemCode: "",
+    itemBrand: "",
+    itemLine: "",
+    itemType: "",
     unit: "",
     seller: "",
   };
@@ -1179,6 +1193,9 @@ async function exportCrmClientsXLSX() {
     if (filters.personType) query.set("personType", filters.personType);
     if (filters.search) query.set("search", filters.search);
     if (filters.itemCode) query.set("itemCode", filters.itemCode);
+    if (filters.itemBrand) query.set("itemBrand", filters.itemBrand);
+    if (filters.itemLine) query.set("itemLine", filters.itemLine);
+    if (filters.itemType) query.set("itemType", filters.itemType);
     if (filters.creditLimit) query.set("creditLimit", filters.creditLimit);
     query.set("page", "1");
     query.set("pageSize", "20000");
@@ -15144,8 +15161,8 @@ function crmFilterToolbar() {
           <label>🔧 Comprou o item (código)</label>
           <input
             value="${escapeHtml(filters.itemCode || "")}"
-            placeholder="Código do fabricante ou interno"
-            title="Mostra só os clientes que compraram essa peça nos últimos 12 meses, com data, quantidade e preço pago"
+            placeholder="Código do fabricante, interno ou de barras"
+            title="Aceita o código do fabricante, o código interno da Passini, o GTIN de barras ou a referência do catálogo. Mostra quem comprou nos últimos 12 meses, com data, quantidade e preço pago."
             oninput="state.crm.crmClientFilters.itemCode=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();runCrmClientSearch();}"
           />
@@ -15229,6 +15246,28 @@ function crmFilterToolbar() {
             <option value="LIMITE_ESTOURADO" ${filters.creditLimit === "LIMITE_ESTOURADO" ? "selected" : ""}>Passou do limite no mês</option>
           </select>
         </div>
+        ${(() => {
+          // O QUE O CLIENTE COMPRA, não só qual peça. Marca, linha e tipo
+          // respondem "quem compra amortecedor", "quem é cliente de NAKATA" —
+          // perguntas de campanha e de reposição que o código sozinho não
+          // responde. Só aparecem para quem vê mais de uma carteira: para o
+          // vendedor seriam três caixas a mais numa tela que ele usa o dia
+          // inteiro.
+          const op = state.crm.clientsMeta?.purchaseOptions || {};
+          if (roleIsSeller()) return "";
+          const campo = (chave, rotulo, lista, vazio) => !(lista || []).length ? "" : `
+            <div class="field">
+              <label>${rotulo}</label>
+              <select onchange="updateCrmClientFilter('${chave}', this.value)">
+                <option value="">${vazio}</option>
+                ${lista.map((v) => `<option value="${escapeHtml(v)}"
+                  ${filters[chave] === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+              </select>
+            </div>`;
+          return campo("itemBrand", "Comprou da marca", op.brands, "Qualquer marca")
+               + campo("itemLine", "Comprou da linha", op.lines, "Qualquer linha")
+               + campo("itemType", "Comprou o tipo", op.types, "Qualquer tipo");
+        })()}
         <div class="field">
           <label>Por página</label>
           <select onchange="setCrmClientPageSize(this.value)">
