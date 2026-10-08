@@ -748,6 +748,27 @@ def normalize_whitespace(value: str | None) -> str:
     return re.sub(r"\s+", " ", (value or "").strip())
 
 
+def normalize_texto_longo(value: str | None) -> str:
+    """Limpa texto escrito à mão SEM destruir a quebra de linha.
+
+    `normalize_whitespace` colapsa qualquer espaço em branco — inclusive \\n —
+    num espaço só. Isso está certo para nome, cidade e código, e estava sendo
+    usado também no feedback, na ata e na observação de contato: o gerente
+    escrevia em parágrafos, salvava, e voltava tudo numa linha só. Pior, o
+    estrago era no BANCO, não na exibição — o texto original não existe mais
+    para ser recuperado.
+
+    Aqui a regra é outra: espaço horizontal em excesso some, espaço no fim da
+    linha some, três linhas em branco viram uma, mas a quebra de linha que a
+    pessoa digitou fica.
+    """
+    texto = (value or "").replace("\r\n", "\n").replace("\r", "\n")
+    linhas = [re.sub(r"[ \t]+", " ", l).strip() for l in texto.split("\n")]
+    texto = "\n".join(linhas)
+    texto = re.sub(r"\n{3,}", "\n\n", texto)
+    return texto.strip()
+
+
 def normalize_upper(value: str | None) -> str:
     return normalize_whitespace(value).upper()
 
@@ -1859,7 +1880,7 @@ def upsert_access_profile(
     if data_scope not in DATA_SCOPE_IDS:
         raise ValueError("Escopo de dados inválido.")
     can_manage = 1 if payload.get("canManageUsers") else 0
-    description = normalize_whitespace(payload.get("description"))
+    description = normalize_texto_longo(payload.get("description"))
     profile_id = payload.get("id")
 
     if profile_id:
@@ -3611,7 +3632,7 @@ def save_territory_mapping(
             "valid_from = ?, valid_to = ?, notes = ? WHERE company_id = ? AND id = ?",
             (cidade, bairro, unidade, vigencia,
              normalize_whitespace(payload.get("validTo")) or None,
-             normalize_whitespace(payload.get("notes")) or None, company_id, int(registro_id)),
+             normalize_texto_longo(payload.get("notes")) or None, company_id, int(registro_id)),
         )
         acao = "atualizado"
     else:
@@ -3626,7 +3647,7 @@ def save_territory_mapping(
             """,
             (company_id, cidade, bairro, unidade, vigencia,
              normalize_whitespace(payload.get("validTo")) or None,
-             normalize_whitespace(payload.get("notes")) or None, now_iso()),
+             normalize_texto_longo(payload.get("notes")) or None, now_iso()),
         )
         acao = "salvo"
 
@@ -6914,8 +6935,8 @@ def save_meeting(
         int(payload.get("durationMin") or 0),
         normalize_whitespace(payload.get("location")),
         normalize_whitespace(payload.get("agenda")),
-        normalize_whitespace(payload.get("summary")),
-        normalize_whitespace(payload.get("decisions")),
+        normalize_texto_longo(payload.get("summary")),
+        normalize_texto_longo(payload.get("decisions")),
         normalize_whitespace(payload.get("organizerName")) or meeting_person_identity(user),
         "EMPRESA" if normalize_upper(payload.get("visibility")) == "EMPRESA" else "UNIDADE",
     )
@@ -7848,13 +7869,13 @@ def save_feedback(
     ).fetchone()
 
     campos = (
-        normalize_whitespace(payload.get("highlights")),
-        normalize_whitespace(payload.get("improvements")),
-        normalize_whitespace(payload.get("agreements")),
-        normalize_whitespace(payload.get("tacticalGoal")),
-        normalize_whitespace(payload.get("tacticalReality")),
-        normalize_whitespace(payload.get("tacticalOptions")),
-        normalize_whitespace(payload.get("tacticalWill")),
+        normalize_texto_longo(payload.get("highlights")),
+        normalize_texto_longo(payload.get("improvements")),
+        normalize_texto_longo(payload.get("agreements")),
+        normalize_texto_longo(payload.get("tacticalGoal")),
+        normalize_texto_longo(payload.get("tacticalReality")),
+        normalize_texto_longo(payload.get("tacticalOptions")),
+        normalize_texto_longo(payload.get("tacticalWill")),
         json.dumps(indicadores, ensure_ascii=False),
     )
 
@@ -8109,7 +8130,7 @@ def save_feedback_note(
     person_name = normalize_whitespace(payload.get("personName"))
     if not person_name:
         raise ValueError("Selecione a pessoa.")
-    resumo = normalize_whitespace(payload.get("summary"))
+    resumo = normalize_texto_longo(payload.get("summary"))
     if not resumo:
         raise ValueError("Descreva o que aconteceu.")
     kind = normalize_upper(payload.get("kind")) or "ORIENTACAO"
@@ -8137,7 +8158,7 @@ def save_feedback_note(
             WHERE company_id = ? AND id = ?
             """,
             (person_name, person_key(person_name), unidade, ocorrido, competence, kind, resumo,
-             normalize_whitespace(payload.get("agreement")), exige, company_id, int(note_id)),
+             normalize_texto_longo(payload.get("agreement")), exige, company_id, int(note_id)),
         )
         novo_id = int(note_id)
     else:
@@ -8150,7 +8171,7 @@ def save_feedback_note(
             """,
             (company_id, person_name, person_key(person_name),
              resolve_user_for_person(conn, company_id, person_name), unidade, ocorrido, competence,
-             kind, resumo, normalize_whitespace(payload.get("agreement")), exige,
+             kind, resumo, normalize_texto_longo(payload.get("agreement")), exige,
              meeting_person_identity(user), user["id"], now_iso()),
         )
         novo_id = int(cursor.lastrowid)
@@ -9346,7 +9367,7 @@ def save_visit(
     if status == "REALIZADA":
         if not ocorrida:
             ocorrida = today_in_brazil().isoformat()
-        if not normalize_whitespace(payload.get("outcome")):
+        if not normalize_texto_longo(payload.get("outcome")):
             raise ValueError("Descreva o que aconteceu na visita antes de marcar como realizada.")
 
     perfil = conn.execute(
@@ -9378,8 +9399,8 @@ def save_visit(
         normalize_whitespace(payload.get("managerName")) or meeting_person_identity(user),
         normalize_whitespace(payload.get("sellerName")) or None,
         normalize_whitespace(payload.get("objective")),
-        normalize_whitespace(payload.get("outcome")),
-        normalize_whitespace(payload.get("agreement")),
+        normalize_texto_longo(payload.get("outcome")),
+        normalize_texto_longo(payload.get("agreement")),
         normalize_whitespace(payload.get("nextAction")),
         normalize_whitespace(payload.get("nextActionDue")) or None,
     )
@@ -9961,7 +9982,7 @@ def create_crm_tasks(
             VALUES (?,?,?,?,?,?,?, 'ABERTA', 'LIVRE', ?,?,?,?)
             """,
             (company_id, client_key or "", client_name or "", nome, titulo,
-             normalize_whitespace(payload.get("description")), vencimento,
+             normalize_texto_longo(payload.get("description")), vencimento,
              prioridade, meeting_person_identity(user), user["id"], now_iso()),
         )
         criados.append({"taskId": int(cursor.lastrowid), "sellerName": nome})
@@ -10271,7 +10292,7 @@ def save_assistant_tip(
     if not user_can_manage_users(conn, user):
         raise PermissionError("Apenas a diretoria edita as dicas.")
     titulo = normalize_whitespace(payload.get("title"))
-    corpo = normalize_whitespace(payload.get("body"))
+    corpo = normalize_texto_longo(payload.get("body"))
     if not titulo or not corpo:
         raise ValueError("Título e texto são obrigatórios.")
     kind = normalize_upper(payload.get("kind")) or "MENSAGEM"
@@ -10606,7 +10627,7 @@ def save_unit_phase(
         """,
         (company_id, unidade, fase, normalize_whitespace(payload.get("openingDate")) or None,
          normalize_whitespace(payload.get("goalExemptUntil")) or None,
-         normalize_whitespace(payload.get("notes")), user["id"], now_iso(), now_iso()),
+         normalize_texto_longo(payload.get("notes")), user["id"], now_iso(), now_iso()),
     )
     audit_log(conn, company_id, user["id"], "salvar", "unit_phases", unidade, {"fase": fase})
     conn.commit()
@@ -10812,6 +10833,90 @@ def prospect_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def prospect_scope_sql(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, seller: str = "",
+) -> tuple[str, list[Any]]:
+    """Recorte de permissão da prospecção, em um lugar só.
+
+    Estava escrito dentro de `list_prospects`. Com a contagem dos selos saindo
+    de outra consulta, seriam duas cópias da mesma regra de permissão — e
+    regra de permissão duplicada não diverge com alarde: ela vaza em silêncio,
+    meses depois, quando alguém altera uma das cópias.
+    """
+    sql = ""
+    params: list[Any] = []
+    if data_scope_for_user(conn, user) == "proprio":
+        sql += " AND UPPER(p.seller_name) = ?"
+        params.append(normalize_upper(seller_identity_for_user(user)))
+    else:
+        permitidas = crm_allowed_units_for_user(conn, user)
+        if permitidas is not None:
+            if permitidas:
+                sql += f" AND p.unit_name IN ({','.join('?' for _ in permitidas)})"
+                params.extend(permitidas)
+            else:
+                sql += " AND 1 = 0"
+        if seller:
+            sql += " AND UPPER(p.seller_name) = ?"
+            params.append(normalize_upper(seller))
+    return sql, params
+
+
+def prospect_counts(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+) -> dict[str, Any]:
+    """Contagem dos selos, feita no BANCO — não sobre uma lista truncada.
+
+    O número do selo vinha de carregar até 5.000 prospects e contar em Python.
+    Só que a ordenação da lista põe CADASTRADO e PERDIDO no fim: passando de
+    5.000, eram exatamente esses dois que o corte comia. O selo dizia
+    "Cadastrado (3)" e o clique trazia dezenas — e quem vê isso para de
+    confiar na tela inteira, inclusive nas partes certas.
+
+    Contar com COUNT(*) não tem teto e ainda é mais rápido: três consultas
+    agregadas no lugar de milhares de linhas trafegadas.
+    """
+    escopo, par_escopo = prospect_scope_sql(conn, company_id, user)
+    base = f"FROM prospects p WHERE p.company_id = ?{escopo}"
+    params = [company_id, *par_escopo]
+
+    por_status = {s["id"]: 0 for s in PROSPECT_STATUSES}
+    for r in conn.execute(f"SELECT p.status, COUNT(*) n {base} GROUP BY p.status",
+                          params).fetchall():
+        if r["status"] in por_status:
+            por_status[r["status"]] = int(r["n"] or 0)
+    total = sum(por_status.values())
+
+    # Sem contato nenhum, entre os que ainda são trabalho de prospecção.
+    sem_contato = int(conn.execute(
+        f"""SELECT COUNT(*) n {base}
+            AND p.status NOT IN ('CADASTRADO','PERDIDO')
+            AND NOT EXISTS (SELECT 1 FROM crm_interactions i
+                            WHERE i.company_id = p.company_id
+                              AND i.client_key = p.client_key)""",
+        params).fetchone()["n"] or 0)
+
+    # Parados: na fila de trabalho e sem contato há 7 dias ou mais.
+    limite = (today_in_brazil() - timedelta(days=7)).isoformat()
+    parados = int(conn.execute(
+        f"""SELECT COUNT(*) n {base}
+            AND p.status IN ('NOVO','EM_CONTATO','QUALIFICADO')
+            AND COALESCE((SELECT MAX(date(substr(replace(i.occurred_at,'T',' '),1,10)))
+                          FROM crm_interactions i
+                          WHERE i.company_id = p.company_id
+                            AND i.client_key = p.client_key), '0000-00-00') <= ?""",
+        [*params, limite]).fetchone()["n"] or 0)
+
+    convertidos = por_status.get("CADASTRADO", 0)
+    return {
+        "total": total,
+        "byStatus": por_status,
+        "conversionPct": round(safe_div(convertidos, total) * 100, 1) if total else 0.0,
+        "withoutContact": sem_contato,
+        "stale": parados,
+    }
+
+
 def list_prospects(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     status: str = "", search: str = "", seller: str = "", limit: int = 500,
@@ -10832,21 +10937,9 @@ def list_prospects(
            "WHERE p.company_id = ?")
     params: list[Any] = [company_id]
 
-    if data_scope_for_user(conn, user) == "proprio":
-        sql += " AND UPPER(p.seller_name) = ?"
-        params.append(normalize_upper(seller_identity_for_user(user)))
-    else:
-        permitidas = crm_allowed_units_for_user(conn, user)
-        if permitidas is not None:
-            if permitidas:
-                marcadores = ",".join("?" for _ in permitidas)
-                sql += f" AND p.unit_name IN ({marcadores})"
-                params.extend(permitidas)
-            else:
-                sql += " AND 1 = 0"
-        if seller:
-            sql += " AND UPPER(p.seller_name) = ?"
-            params.append(normalize_upper(seller))
+    _escopo, _par = prospect_scope_sql(conn, company_id, user, seller)
+    sql += _escopo
+    params.extend(_par)
 
     if status in PROSPECT_STATUS_IDS:
         sql += " AND p.status = ?"
@@ -12085,7 +12178,7 @@ def save_prospect(
         normalize_whitespace(payload.get("mainLine")),
         normalize_whitespace(payload.get("payment")),
         normalize_upper(payload.get("closingTrigger")) or None,
-        normalize_whitespace(payload.get("notes")),
+        normalize_texto_longo(payload.get("notes")),
     )
 
     # Campos da ficha cadastral. Vão à parte porque são muitos e opcionais:
@@ -12165,7 +12258,7 @@ def save_prospect(
     # de novo, em outra tela, é retrabalho e faz o esforço não aparecer no
     # placar. Só vale para quem cadastrou a própria prospecção: gestor
     # cadastrando pelo vendedor não gera ligação no nome dele.
-    observacao = normalize_whitespace(payload.get("notes"))
+    observacao = normalize_texto_longo(payload.get("notes"))
     if (escopo == "proprio" and observacao
             and payload.get("registerContact") is not False):
         try:
@@ -14586,23 +14679,16 @@ def brand_insights(
 def prospect_funnel(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
 ) -> dict[str, Any]:
-    # incluir_encerrados: o funil mede o histórico inteiro. Fosse a mesma lista
-    # da tela, "Cadastrado" e "Perdido" apareceriam como zero.
-    linhas = list_prospects(conn, company_id, user, limit=5000, incluir_encerrados=True)
-    por_status = {s["id"]: 0 for s in PROSPECT_STATUSES}
-    for p in linhas:
-        por_status[p["status"]] = por_status.get(p["status"], 0) + 1
-    total = len(linhas)
-    convertidos = por_status.get("CADASTRADO", 0)
+    # A contagem sai do BANCO, não de uma lista truncada — ver prospect_counts.
+    contagens = prospect_counts(conn, company_id, user)
+    por_status = contagens["byStatus"]
+    total = contagens["total"]
     return {
         "total": total,
         "byStatus": por_status,
-        "conversionPct": round(safe_div(convertidos, total) * 100, 1) if total else 0.0,
-        "withoutContact": sum(1 for p in linhas if not p["contactCount"]
-                              and p["status"] not in ("CADASTRADO", "PERDIDO")),
-        "stale": sum(1 for p in linhas
-                     if p["status"] in ("NOVO", "EM_CONTATO", "QUALIFICADO")
-                     and (p["daysSinceContact"] is None or p["daysSinceContact"] >= 7)),
+        "conversionPct": contagens["conversionPct"],
+        "withoutContact": contagens["withoutContact"],
+        "stale": contagens["stale"],
     }
 
 
@@ -18287,7 +18373,7 @@ def save_crm_client_contact(
     client_name = normalize_whitespace(payload.get("clientName"))
     updated_phone = normalize_whitespace(payload.get("updatedPhone"))
     primary_contact_name = normalize_whitespace(payload.get("primaryContactName"))
-    contact_notes = normalize_whitespace(payload.get("notes") or payload.get("contactNotes"))
+    contact_notes = normalize_texto_longo(payload.get("notes") or payload.get("contactNotes"))
     if not client_key or not client_name:
         raise ValueError("Cliente invalido para atualizacao de contato")
 
@@ -18478,17 +18564,21 @@ def client_is_outside_own_portfolio(
 def support_client_view(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, codigo: str
 ) -> dict[str, Any] | None:
-    """Ficha REDUZIDA de um cliente de outra carteira, por código exato.
+    """Ficha de um cliente de outra carteira, por código exato.
 
-    Duas escolhas de desenho, ambas deliberadas:
+    A BUSCA continua sendo só por código EXATO. Aceitar nome ou trecho deixaria
+    qualquer vendedor varrer a carteira do colega em minutos; pelo código, ele
+    só chega em quem já está falando com ele — é o cliente que informa o código.
+    Isso não é restrição de dado, é restrição de VARREDURA, e permanece.
 
-    1. Só código EXATO. Aceitar nome ou trecho deixaria qualquer vendedor varrer
-       a carteira do colega em minutos. Pelo código, ele só chega em quem já
-       está falando com ele — é o cliente que informa o código.
-    2. Sem valores. Vai o necessário para ATENDER (telefone, contato, endereço,
-       última compra, retornos em aberto, histórico de contatos). Não vai
-       faturamento, média, classe nem margem: isso é resultado do colega e
-       alimenta comparação e comissão.
+    Os DADOS, porém, vão completos. [stated] Decisão do Felipe (08/10/2026):
+    dado de cliente não tem restrição para nenhum usuário. A versão anterior
+    omitia faturamento, média e classe para não expor o resultado do colega —
+    mas quem está com o cliente na linha precisa do mesmo contexto de quem é
+    dono, senão negocia no escuro e a Passini perde a venda.
+
+    O controle que sobra é o registro: toda abertura de ficha entra em
+    `client_views` e aparece no log que a gestão enxerga.
     """
     code = normalize_whitespace(codigo)
     if not code:
@@ -18506,6 +18596,22 @@ def support_client_view(
 
     dados = dict(perfil)
     dados["isOwnClient"] = not client_is_outside_own_portfolio(conn, company_id, user, code)
+    # Faturamento, média, classe e situação — os campos que a versão reduzida
+    # omitia. Vêm da mesma função que alimenta a ficha normal, para os dois
+    # caminhos mostrarem exatamente o mesmo número.
+    try:
+        completo = get_crm_client_summary(
+            conn, company_id, crm_scoped_filters_for_user(
+                conn, company_id, user, build_filters_from_query({})),
+            code, seller_name=seller_identity_for_user(user), allow_outside=True)
+    except Exception:
+        completo = None
+    if completo:
+        for chave, valor in completo.items():
+            # O que já veio do cadastro manda: ali o dado é o mais recente.
+            if chave not in dados or dados.get(chave) in (None, ""):
+                dados[chave] = valor
+        dados["isOwnClient"] = not client_is_outside_own_portfolio(conn, company_id, user, code)
     dados["interactions"] = [dict(r) for r in conn.execute(
         "SELECT i.occurred_at, i.seller_name, i.notes, i.initiative, "
         "       t.label AS type_label, r.label AS result_label "
@@ -18535,7 +18641,7 @@ def create_crm_interaction(
     contact_type_code = normalize_upper(payload.get("contactTypeCode"))
     result_code = normalize_upper(payload.get("resultCode"))
     occurred_at = normalize_whitespace(payload.get("occurredAt")) or now_iso()
-    notes = normalize_whitespace(payload.get("notes"))
+    notes = normalize_texto_longo(payload.get("notes"))
     next_action = normalize_whitespace(payload.get("nextAction"))
     followup_due_at = normalize_whitespace(payload.get("followupDueAt"))
     if not client_key or not client_name:
@@ -18583,7 +18689,7 @@ def create_crm_interaction(
                 "clientName": client_name,
                 "updatedPhone": contact_phone,
                 "primaryContactName": contact_name,
-                "notes": normalize_whitespace(payload.get("contactNotes")),
+                "notes": normalize_texto_longo(payload.get("contactNotes")),
             },
         )
     cursor = conn.execute(
@@ -27853,7 +27959,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         client_name = normalize_whitespace(payload.get("clientName"))
                         seller_name = normalize_whitespace(payload.get("sellerName"))
                         title = normalize_whitespace(payload.get("title")) or "Contatar cliente"
-                        description = normalize_whitespace(payload.get("description"))
+                        description = normalize_texto_longo(payload.get("description"))
                         due_at = normalize_whitespace(payload.get("dueAt")) or date.today().isoformat()
                         # O vendedor escolhido precisa estar nas unidades do gestor —
                         # sem isso, um gerente poderia criar tarefa para outra equipe.
@@ -28178,7 +28284,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 person_name = normalize_whitespace(payload.get("person_name") or "")
                 start_date = normalize_whitespace(payload.get("start_date") or "")
                 end_date = normalize_whitespace(payload.get("end_date") or "")
-                notes = normalize_whitespace(payload.get("notes") or "") or None
+                notes = normalize_texto_longo(payload.get("notes") or "") or None
                 if not person_name or not start_date or not end_date:
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "Nome, data inicial e data final são obrigatórios"}))
@@ -28216,7 +28322,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 person_name = normalize_whitespace(payload.get("person_name") or "")
                 start_date = normalize_whitespace(payload.get("start_date") or "")
                 end_date = normalize_whitespace(payload.get("end_date") or "")
-                notes = normalize_whitespace(payload.get("notes") or "") or None
+                notes = normalize_texto_longo(payload.get("notes") or "") or None
                 if not vac_id or not person_name or not start_date or not end_date:
                     self._set_headers(400)
                     self.wfile.write(json_dumps({"error": "ID, nome, data inicial e data final são obrigatórios"}))
