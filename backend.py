@@ -10864,6 +10864,7 @@ def prospect_scope_sql(
 
 def prospect_counts(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    search: str = "", seller: str = "",
 ) -> dict[str, Any]:
     """Contagem dos selos, feita no BANCO — não sobre uma lista truncada.
 
@@ -10876,9 +10877,27 @@ def prospect_counts(
     Contar com COUNT(*) não tem teto e ainda é mais rápido: três consultas
     agregadas no lugar de milhares de linhas trafegadas.
     """
-    escopo, par_escopo = prospect_scope_sql(conn, company_id, user)
+    escopo, par_escopo = prospect_scope_sql(conn, company_id, user, seller)
     base = f"FROM prospects p WHERE p.company_id = ?{escopo}"
     params = [company_id, *par_escopo]
+
+    # O SELO SEGUE A BUSCA. Antes ele contava a base inteira enquanto a lista
+    # respeitava o termo digitado: com uma busca ativa, o número do selo e o
+    # que aparecia ao clicar eram coisas diferentes — e quem vê isso conclui,
+    # com razão, que um dos dois está errado. Mesmas condições da listagem.
+    termo = normalize_whitespace(search)
+    if termo:
+        alvo = f"%{normalize_upper(strip_accents(termo))}%"
+        partes = ["sem_acento(p.company_name) LIKE ?",
+                  "sem_acento(COALESCE(p.trade_name,'')) LIKE ?",
+                  "sem_acento(COALESCE(p.contact_name,'')) LIKE ?",
+                  "sem_acento(COALESCE(p.city_name,'')) LIKE ?"]
+        params.extend([alvo, alvo, alvo, alvo])
+        digitos = only_digits(termo)
+        if digitos:
+            partes.append("COALESCE(p.document_digits,'') LIKE ?")
+            params.append(f"%{digitos}%")
+        base += " AND (" + " OR ".join(partes) + ")"
 
     por_status = {s["id"]: 0 for s in PROSPECT_STATUSES}
     for r in conn.execute(f"SELECT p.status, COUNT(*) n {base} GROUP BY p.status",
@@ -10912,6 +10931,21 @@ def prospect_counts(
                             AND i.client_key = {chave}), '0000-00-00') <= ?""",
         [*params, limite]).fetchone()["n"] or 0)
 
+    # A FILA DE TRABALHO É MENOR QUE A SOMA DOS SELOS, e isso é de propósito:
+    # sem filtro de status, a lista esconde quem já virou carteira (o vendedor
+    # encontra a oficina lá) e quem foi dado como perdido. O problema é que o
+    # selo continua contando tudo — então "NOVO (22)" com quinze linhas na tela
+    # parece erro. Devolver o tamanho da fila deixa a tela explicar a diferença
+    # em vez de o usuário descobrir sozinho que não bate.
+    fila = int(conn.execute(
+        f"""SELECT COUNT(*) n FROM prospects p
+            LEFT JOIN crm_client_profiles c
+              ON c.company_id = p.company_id AND TRIM(c.client_code) = TRIM(p.client_code)
+            WHERE p.company_id = ?{escopo}
+              AND p.status <> 'PERDIDO'
+              AND TRIM(COALESCE(c.internal_seller_name, '')) = ''""",
+        [company_id, *par_escopo]).fetchone()["n"] or 0)
+
     convertidos = por_status.get("CADASTRADO", 0)
     return {
         "total": total,
@@ -10919,6 +10953,8 @@ def prospect_counts(
         "conversionPct": round(safe_div(convertidos, total) * 100, 1) if total else 0.0,
         "withoutContact": sem_contato,
         "stale": parados,
+        "queueSize": fila,
+        "hiddenFromQueue": max(total - fila, 0),
     }
 
 
@@ -14682,10 +14718,11 @@ def brand_insights(
 
 
 def prospect_funnel(
-    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    search: str = "", seller: str = "",
 ) -> dict[str, Any]:
     # A contagem sai do BANCO, não de uma lista truncada — ver prospect_counts.
-    contagens = prospect_counts(conn, company_id, user)
+    contagens = prospect_counts(conn, company_id, user, search, seller)
     por_status = contagens["byStatus"]
     total = contagens["total"]
     return {
@@ -14694,6 +14731,8 @@ def prospect_funnel(
         "conversionPct": contagens["conversionPct"],
         "withoutContact": contagens["withoutContact"],
         "stale": contagens["stale"],
+        "queueSize": contagens["queueSize"],
+        "hiddenFromQueue": contagens["hiddenFromQueue"],
     }
 
 
@@ -26536,7 +26575,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             status=normalize_upper(query.get("status", [""])[0]),
                             search=normalize_whitespace(query.get("q", [""])[0]),
                             seller=normalize_whitespace(query.get("seller", [""])[0])),
-                        "funnel": prospect_funnel(conn, user["company_id"], user),
+                        "funnel": prospect_funnel(
+                            conn, user["company_id"], user,
+                            search=normalize_whitespace(query.get("q", [""])[0]),
+                            seller=normalize_whitespace(query.get("seller", [""])[0])),
                         "statuses": PROSPECT_STATUSES,
                         "triggers": PROSPECT_TRIGGERS,
                         "metrics": ACTIVITY_METRICS,

@@ -3423,6 +3423,13 @@ function prospeccaoView() {
                 : `${s.icon} ${escapeHtml(s.label)} (${number(fun.byStatus?.[s.id] || 0)})`}
             </button>`).join("")}
         </div>
+        ${f.status || !fun.hiddenFromQueue ? "" : `
+          <div class="text-small" style="color:var(--muted);margin-top:7px">
+            A fila mostra <strong>${number(fun.queueSize || 0)}</strong> oficina(s) para trabalhar.
+            Outras <strong>${number(fun.hiddenFromQueue)}</strong> ficam fora: já viraram carteira
+            ou foram dadas como perdidas. Clique no selo correspondente para vê-las —
+            o número do selo é sempre o que aparece ao clicar.
+          </div>`}
         <div class="text-small" style="color:var(--muted);margin-top:2px">
           A lista mostra o que ainda é trabalho de prospecção. Quem ganhou vendedor no
           cadastro virou carteira e quem foi dado como perdido saem daqui — clique no
