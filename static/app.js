@@ -7,11 +7,11 @@ const state = {
   contacts: null,      // histórico de registros de contato
   inactives: null,     // clientes inativos da unidade, para reativação
   leads: null,         // base fria de empresas que ainda não são clientes
-  leadFilters: { city: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
+  leadFilters: { city: "", neighborhood: "", segment: "", search: "", withPhone: false, status: "", assignTo: "" },
   leadAssign: null,    // modal "Direcionar": { id, name, seller }
   leadFiltersApplied: null,  // recorte que gerou a lista que está na tela
-  contactFilters: { start: "", end: "", seller: "", type: "", result: "", initiative: "",
-                    search: "", portfolio: "", origin: "", limit: "300" },
+  contactFilters: { start: "", end: "", seller: "", unit: "", type: "", result: "",
+                    initiative: "", search: "", portfolio: "", origin: "", limit: "300" },
   kpiThresholds: null,   // limites do farol
   content: null,          // biblioteca de vendas
   contentEditor: null,    // item em edição na biblioteca
@@ -38,7 +38,7 @@ const state = {
   visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
   tasks: null,            // tarefas + filtros + contadores
   taskEditor: null,       // nova tarefa de direcionamento
-  taskFilters: { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" },
+  taskFilters: { status: "ABERTAS", seller: "", unit: "", from: "", to: "", origin: "", search: "" },
   prospects: null,        // prospecção e fase da unidade
   prospectEditor: null,
   prospectFilters: { status: "", search: "", seller: "" },
@@ -126,6 +126,7 @@ const state = {
     bulkCities: new Set(), // cidades pendentes marcadas para resolver em lote
     bulkCityUnit: "",      // unidade escolhida para o lote
     analysisOpen: false,   // subgrupo Análises do menu aberto
+    supportOpen: false,    // subgrupo Material de apoio do menu aberto
     leadsOpen: false,      // painel da base fria de leads
     refreshing: {},        // botões de atualizar que estão rodando agora
     fichaAberta: null,     // null = decide sozinho; true/false = escolha da pessoa
@@ -2772,6 +2773,7 @@ async function loadLeads() {
     const f = state.leadFilters;
     const q = new URLSearchParams();
     if (f.city) q.set("city", f.city);
+    if (f.neighborhood) q.set("neighborhood", f.neighborhood);
     if (f.segment) q.set("segment", f.segment);
     if (f.search) q.set("q", f.search);
     if (f.withPhone) q.set("withPhone", "1");
@@ -2804,6 +2806,9 @@ function toggleLeads() {
  * ficam pendentes e vão todos juntos. */
 function setLeadFilter(campo, valor) {
   state.leadFilters[campo] = valor;
+  // Trocar de cidade zera o bairro: bairro de outra cidade devolveria lista
+  // vazia sem explicar por quê.
+  if (campo === "city") state.leadFilters.neighborhood = "";
   requestRender();   // atualiza o aviso de "filtros alterados"
 }
 
@@ -2811,7 +2816,7 @@ function setLeadFilter(campo, valor) {
 function leadFiltrosPendentes() {
   const a = state.leadFiltersApplied;
   if (!a) return false;
-  return ["city", "segment", "search", "withPhone", "status"]
+  return ["city", "neighborhood", "segment", "search", "withPhone", "status"]
     .some((k) => String(state.leadFilters[k] ?? "") !== String(a[k] ?? ""));
 }
 
@@ -3018,6 +3023,20 @@ function blocoBaseDeLeads() {
                   escapeHtml(c)}${n != null ? ` (${number(n)})` : ""}</option>`;
               }).join("")}
             </select></div>
+          <div class="field"><label>Bairro</label>
+            ${!f.city ? `
+              <select disabled><option>Escolha a cidade primeiro</option></select>
+              <div class="text-small" style="color:var(--muted);margin-top:3px">
+                Bairro só faz sentido dentro de uma cidade.</div>`
+            : !(d?.neighborhoods || []).length ? `
+              <select disabled><option>Sem bairro cadastrado nesta cidade</option></select>`
+            : `
+              <select onchange="setLeadFilter('neighborhood', this.value)">
+                <option value="">Todos os bairros (${number((d.neighborhoods || []).length)})</option>
+                ${(d.neighborhoods || []).map((b) => `
+                  <option value="${escapeHtml(b)}" ${f.neighborhood === b ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
+              </select>`}
+          </div>
           <div class="field"><label>Segmento</label>
             <select onchange="setLeadFilter('segment', this.value)">
               <option value="">Todos</option>
@@ -3353,6 +3372,8 @@ function prospeccaoView() {
       ${metasAtividadeModal()}
 
       ${blocoConfiguracaoUnidade()}
+
+      ${podeGerir ? prospeccaoResumoUnidade(d) : ""}
 
       ${blocoBaseDeLeads()}
       ${blocoInativosDaUnidade()}
@@ -3754,6 +3775,58 @@ function toggleBrand(marca) {
   if (state.brandOpen[marca]) delete state.brandOpen[marca];
   else state.brandOpen[marca] = true;
   requestRender();
+}
+
+/* Resumo da prospecção por unidade.
+ *
+ * A lista oficina a oficina serve ao vendedor. Quem cuida de várias equipes
+ * precisa primeiro ver QUAL unidade está prospectando e qual parou — o nome
+ * vem depois. "Fila" é o que ainda dá trabalho: nem convertido, nem perdido.
+ */
+function prospeccaoResumoUnidade(d) {
+  const linhas = d.byUnit || [];
+  if (linhas.length < 2) return "";
+  return `
+    <div class="table-card">
+      <div class="section-title"><div><h3>Por unidade</h3>
+        <div class="text-small">Onde a prospecção anda e onde parou.</div></div></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Unidade</th>
+            <th style="text-align:right">Na fila</th>
+            <th style="text-align:right">Nunca contatadas</th>
+            <th style="text-align:right">Paradas 7d+</th>
+            <th style="text-align:right">Viraram cliente</th>
+            <th style="text-align:right">Conversão</th>
+            <th style="text-align:right">Perdidas</th>
+          </tr></thead>
+          <tbody>
+            ${linhas.map((u) => `
+              <tr>
+                <td><strong>${escapeHtml(u.unidade)}</strong>
+                  <div class="text-small" style="color:var(--muted)">
+                    ${number(u.novos)} novas · ${number(u.em_contato)} em contato
+                    ${u.qualificados ? ` · ${number(u.qualificados)} qualificadas` : ""}</div></td>
+                <td style="text-align:right;font-weight:700">${number(u.fila)}</td>
+                <td style="text-align:right;color:${u.sem_contato ? "var(--bad)" : "var(--muted)"};
+                    font-weight:${u.sem_contato ? "700" : "400"}">${number(u.sem_contato)}</td>
+                <td style="text-align:right;color:${u.parados ? "#b06000" : "var(--muted)"};
+                    font-weight:${u.parados ? "700" : "400"}">${number(u.parados)}</td>
+                <td style="text-align:right">${number(u.cadastrados)}</td>
+                <td style="text-align:right;font-weight:700;color:${
+                  u.conversionPct >= 30 ? "var(--good)" : u.conversionPct >= 15 ? "#b06000" : "var(--bad)"}">
+                  ${u.conversionPct.toFixed(0)}%</td>
+                <td style="text-align:right;color:var(--muted)">${number(u.perdidos)}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        "Nunca contatadas" é oficina que entrou na base e ninguém ligou — é a primeira
+        cobrança. "Paradas 7d+" já teve contato e esfriou.
+      </div>
+    </div>`;
 }
 
 /** Marca, linha ou grupo — o mesmo faturamento, três formas de enxergar. */
@@ -7673,7 +7746,61 @@ async function loadContacts() {
 
 function setContactFilter(campo, valor) {
   state.contactFilters[campo] = valor;
+  // Trocar de unidade invalida o vendedor escolhido: ele é de outra equipe e o
+  // cruzamento devolveria tela vazia sem dizer por quê.
+  if (campo === "unit") state.contactFilters.seller = "";
   void loadContacts();
+}
+
+/* Resumo por unidade em Contatos.
+ *
+ * A lista por vendedor tem 44 linhas. Para o gestor de mais de uma unidade,
+ * ela responde "quem trabalhou" mas não "qual equipe parou" — e é essa a
+ * pergunta da reunião. Os números são a soma exata das linhas de baixo, não
+ * uma consulta nova: duas consultas para a mesma coisa acabam divergindo e
+ * aí ninguém sabe qual acreditar.
+ */
+function contatosResumoUnidade(d) {
+  const linhas = d.byUnit || [];
+  if (linhas.length < 2) return "";
+  return `
+    <div class="table-card">
+      <div class="section-title"><div><h3>Por unidade</h3>
+        <div class="text-small">Soma das equipes no período. Clique na unidade para filtrar.</div></div></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Unidade</th>
+            <th style="text-align:right">Vendedores</th>
+            <th style="text-align:right">Ligações ativas</th>
+            <th style="text-align:right">Por vendedor</th>
+            <th style="text-align:right">Falou</th>
+            <th style="text-align:right">Converteu</th>
+            <th style="text-align:right">Clientes</th>
+            <th style="text-align:right">Receptivo</th>
+          </tr></thead>
+          <tbody>
+            ${linhas.map((u) => `
+              <tr style="cursor:pointer" onclick="setContactFilter('unit','${jsAttr(u.unit)}')">
+                <td><strong>${escapeHtml(u.unit)}</strong></td>
+                <td style="text-align:right;color:var(--muted)">${number(u.sellers)}</td>
+                <td style="text-align:right;font-weight:700">${number(u.ligacoes)}</td>
+                <td style="text-align:right">${u.callsPerSeller}</td>
+                <td style="text-align:right">${number(u.falou)}
+                  <div class="text-small" style="color:var(--muted)">${u.talkRatePct}%</div></td>
+                <td style="text-align:right">${number(u.converteu)}
+                  <div class="text-small" style="color:var(--muted)">${u.conversionPct}%</div></td>
+                <td style="text-align:right">${number(u.clientes)}</td>
+                <td style="text-align:right;color:var(--muted)">${number(u.receptivos)}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        "Falou" e "Converteu" são percentuais sobre as ligações ativas da unidade.
+        Unidade com muita ligação e pouca conversa é lista fria ou telefone desatualizado.
+      </div>
+    </div>`;
 }
 
 function contactPeriodPreset(preset) {
@@ -7737,6 +7864,12 @@ function contatosView() {
             <input type="date" value="${escapeHtml(f.start)}" onchange="setContactFilter('start', this.value)" /></div>
           <div class="field"><label>Até</label>
             <input type="date" value="${escapeHtml(f.end)}" onchange="setContactFilter('end', this.value)" /></div>
+          ${gerente && (d.unitOptions || []).length > 1 ? `
+          <div class="field"><label>Unidade</label>
+            <select onchange="setContactFilter('unit', this.value)">
+              <option value="">Todas</option>
+              ${(d.unitOptions || []).map((u) => `<option value="${escapeHtml(u)}" ${f.unit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select></div>` : ""}
           ${gerente ? `
           <div class="field"><label>Vendedor</label>
             <select onchange="setContactFilter('seller', this.value)">
@@ -7795,6 +7928,8 @@ function contatosView() {
         ${kpiCard("Vieram de tarefa", number(t.deTarefa || 0),
                   `${number(t.espontaneos || 0)} da carteira/missão`, "")}
       </div>
+
+      ${gerente ? contatosResumoUnidade(d) : ""}
 
       ${gerente && (d.sellers || []).length ? `
       <div class="form-card">
@@ -12766,6 +12901,130 @@ function visitasViewVendedor() {
     </div>`;
 }
 
+function setVisitaResumoDias(dias) {
+  state.visitResumoDias = Number(dias) || 30;
+  requestRender();
+}
+
+/* Resumo de visitas por vendedor, para o gestor.
+ *
+ * A tela mostrava duas listas longas — pedidos e visitas — e nenhuma resposta
+ * para a pergunta que o gestor faz toda semana: quem está pedindo visita, quem
+ * nunca pede, e há quanto tempo alguém espera. Com dez vendedores e trinta
+ * visitas, isso não se lê rolando a tela.
+ *
+ * Calculado sobre as MESMAS listas que já estão carregadas, não numa consulta
+ * nova: assim o resumo é, por construção, a soma do que aparece abaixo dele.
+ */
+function visitasResumoGestor(visitas, pedidos) {
+  const dias = state.visitResumoDias || 30;
+  const corte = new Date();
+  corte.setDate(corte.getDate() - dias);
+  const dentro = (iso) => {
+    if (!iso) return false;
+    const d = new Date(String(iso).slice(0, 10));
+    return !isNaN(d) && d >= corte;
+  };
+  const idade = (iso) => {
+    if (!iso) return null;
+    const d = new Date(String(iso).slice(0, 10));
+    return isNaN(d) ? null : Math.floor((Date.now() - d.getTime()) / 86400000);
+  };
+
+  const porVendedor = new Map();
+  const pega = (nome) => {
+    const chave = nomeVendedorCurto(nome) || "Sem vendedor";
+    if (!porVendedor.has(chave)) {
+      porVendedor.set(chave, { nome: chave, pendentes: 0, aceitas: 0, recusadas: 0,
+                               visitas: 0, esperaMax: null, ultima: null });
+    }
+    return porVendedor.get(chave);
+  };
+
+  for (const p of pedidos || []) {
+    const v = pega(p.sellerName);
+    if (p.status === "PENDENTE") {
+      v.pendentes += 1;
+      const dd = idade(p.createdAt);
+      if (dd !== null && (v.esperaMax === null || dd > v.esperaMax)) v.esperaMax = dd;
+    } else if (p.status === "ACEITA") v.aceitas += 1;
+    else v.recusadas += 1;
+  }
+  for (const vi of visitas || []) {
+    const quando = vi.occurredAt || vi.scheduledFor;
+    if (!dentro(quando)) continue;
+    const v = pega(vi.sellerName || vi.clientSeller || "");
+    v.visitas += 1;
+    if (!v.ultima || String(quando) > String(v.ultima)) v.ultima = quando;
+  }
+
+  const linhas = [...porVendedor.values()]
+    .sort((a, b) => (b.pendentes - a.pendentes) || (b.visitas - a.visitas));
+  if (linhas.length < 2) return "";
+
+  const totPend = linhas.reduce((s, l) => s + l.pendentes, 0);
+  const totVis = linhas.reduce((s, l) => s + l.visitas, 0);
+  const semVisita = linhas.filter((l) => !l.visitas).length;
+  const esperando = Math.max(...linhas.map((l) => l.esperaMax ?? -1), -1);
+
+  return `
+    <div class="table-card">
+      <div class="section-title">
+        <div><h3>Resumo da equipe</h3>
+          <div class="text-small">Quem pede visita, quem recebe e quem ficou sem.</div></div>
+        <div style="display:flex;gap:4px">
+          ${[30, 60, 90].map((n) => `
+            <button class="btn btn-sm ${dias === n ? "btn-primary" : "btn-ghost"}"
+              onclick="setVisitaResumoDias(${n})">${n}d</button>`).join("")}
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin:4px 0 10px">
+        ${[["Pedidos pendentes", number(totPend), totPend ? "var(--bad)" : "var(--good)"],
+           [`Visitas em ${dias}d`, number(totVis), "var(--ink)"],
+           ["Sem visita no período", number(semVisita), semVisita ? "#b06000" : "var(--good)"],
+           ["Maior espera", esperando >= 0 ? `${esperando} dia(s)` : "—",
+            esperando >= 7 ? "var(--bad)" : "var(--ink)"]].map(([r, v, c]) => `
+          <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 12px">
+            <div class="text-small" style="color:var(--muted);text-transform:uppercase;
+                 font-size:10px;font-weight:700;letter-spacing:.4px">${r}</div>
+            <div style="font-size:18px;font-weight:800;color:${c}">${v}</div>
+          </div>`).join("")}
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>Vendedor</th>
+            <th style="text-align:right">Pedidos pendentes</th>
+            <th style="text-align:right">Esperando há</th>
+            <th style="text-align:right">Aceitos</th>
+            <th style="text-align:right">Visitas em ${dias}d</th>
+            <th style="text-align:right">Última visita</th>
+          </tr></thead>
+          <tbody>
+            ${linhas.map((l) => `
+              <tr>
+                <td><strong>${escapeHtml(l.nome)}</strong></td>
+                <td style="text-align:right;font-weight:${l.pendentes ? "800" : "400"};
+                    color:${l.pendentes ? "var(--bad)" : "var(--muted)"}">${number(l.pendentes)}</td>
+                <td style="text-align:right;color:${(l.esperaMax ?? 0) >= 7 ? "var(--bad)" : "var(--muted)"}">
+                  ${l.esperaMax === null ? "—" : `${l.esperaMax}d`}</td>
+                <td style="text-align:right;color:var(--muted)">${number(l.aceitas)}</td>
+                <td style="text-align:right;font-weight:700">${number(l.visitas)}</td>
+                <td style="text-align:right;color:var(--muted)">
+                  ${l.ultima ? shortDate(l.ultima) : "nenhuma"}</td>
+              </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        Vendedor que nunca pede visita não é necessariamente autossuficiente — pode ser
+        que tenha desistido de pedir. Espera acima de 7 dias costuma ser o motivo.
+      </div>
+    </div>`;
+}
+
 function visitasView() {
   if (!state.visits) { loadVisits(); return `<div class="loader panel">Carregando visitas…</div>`; }
   if (state.visits.error) return `<div class="message error">${escapeHtml(state.visits.error)}</div>`;
@@ -12802,6 +13061,8 @@ function visitasView() {
           ＋ NOVA VISITA
         </button>
       </div>
+
+      ${podeGerir ? visitasResumoGestor(visitas, pedidos) : ""}
 
       ${pedidos.length ? `
         <div class="table-card" style="border-left:4px solid #e74c3c">
@@ -16330,6 +16591,7 @@ async function loadCrmTasks(silencioso) {
   const q = new URLSearchParams();
   q.set("status", f.status || "ABERTAS");
   if (f.seller) q.set("seller", f.seller);
+  if (f.unit) q.set("unit", f.unit);
   if (f.from) q.set("from", f.from);
   if (f.to) q.set("to", f.to);
   if (f.origin) q.set("origin", f.origin);
@@ -16368,7 +16630,7 @@ function applyTaskSearch() {
 }
 
 function limparFiltrosTarefa() {
-  state.taskFilters = { status: "ABERTAS", seller: "", from: "", to: "", origin: "", search: "" };
+  state.taskFilters = { status: "ABERTAS", seller: "", unit: "", from: "", to: "", origin: "", search: "" };
   loadCrmTasks();
 }
 
@@ -16498,6 +16760,13 @@ function crmTasksView() {
             oninput="state.taskFilters.search=this.value"
             onkeydown="if(event.key==='Enter'){event.preventDefault();applyTaskSearch();}" />
           <button class="btn btn-secondary btn-sm" onclick="applyTaskSearch()">Buscar</button>
+          ${(state.tasks.units || []).length > 1 ? `
+            <select style="min-width:160px"
+              onchange="state.taskFilters.unit=this.value;state.taskFilters.seller='';loadCrmTasks()">
+              <option value="">Todas as unidades</option>
+              ${(state.tasks.units || []).map((u) => `
+                <option value="${escapeHtml(u)}" ${f.unit === u ? "selected" : ""}>${escapeHtml(u)}</option>`).join("")}
+            </select>` : ""}
           ${(state.tasks.sellers || []).length > 1 ? `
             <select style="min-width:190px" onchange="state.taskFilters.seller=this.value;loadCrmTasks()">
               <option value="">Todos os vendedores</option>
@@ -20095,13 +20364,16 @@ function topbarTitle() {
 
 /** Subgrupo recolhível: consultas ocasionais que não merecem o primeiro nível.
  *  Abre sozinho quando a tela ativa está dentro dele — ninguém fica preso. */
-function sidebarSubGroup(title, tabs) {
+function sidebarSubGroup(title, tabs, chave = "analysisOpen") {
   if (!tabs.length) return "";
   if (state.ui.sidebarCollapsed) return sidebarTabGroup("", tabs);
   const contémAtiva = tabs.some((t) => t.id === state.activeTab);
-  const aberto = state.ui.analysisOpen || contémAtiva;
+  // Um sinalizador POR subgrupo. Com um só, abrir "Análises" abria também
+  // "Material de apoio", e fechar um fechava o outro — o menu parecia ter
+  // vontade própria.
+  const aberto = state.ui[chave] || contémAtiva;
   return `
-    <button class="sidebar-subtoggle" onclick="state.ui.analysisOpen=!state.ui.analysisOpen;requestRender()">
+    <button class="sidebar-subtoggle" onclick="state.ui.${chave}=!state.ui.${chave};requestRender()">
       <span>${aberto ? "▾" : "▸"} ${escapeHtml(title)}</span>
       <span class="text-small" style="color:var(--muted)">${tabs.length}</span>
     </button>
@@ -20443,7 +20715,6 @@ function dashboardView() {
   const equipeTabs = [
     { id: "meu-placar",    title: "Meu Placar",       desc: "Seus pontos e premiação",  icon: "⭐" },
     { id: "placar-equipe", title: "Placar Equipe",    desc: "Apuração da premiação",    icon: "🏆" },
-    { id: "biblioteca",    title: "Biblioteca",       desc: "Scripts e abordagens",     icon: "📚" },
     { id: "novidades",     title: "Novidades",        desc: "O que estreou em vendas",  icon: "✨" },
     { id: "reunioes", title: "Reuniões",  desc: "Atas e treinamentos",  icon: "🗓️",
       badge: state.meetings?.pendingCount || 0 },
@@ -20452,6 +20723,14 @@ function dashboardView() {
     // O `allowed` abaixo já respeita o perfil; o escopo de QUEM aparece dentro
     // da tela (empresa, unidade ou só a própria pessoa) é decidido no backend.
     { id: "atividade", title: "Atividade", desc: "Acessos e fichas abertas", icon: "🔎" },
+  ].filter((t) => allowed.includes(t.id));
+
+  // Material de consulta, não de rotina: fica junto das telas de venda, onde
+  // o vendedor procura, mas recolhido — ocupava um lugar nobre em "Equipe"
+  // (entre placar e feedback, que são de gestão de pessoas) e é aberto umas
+  // poucas vezes por mês.
+  const apoioTabs = [
+    { id: "biblioteca", title: "Biblioteca", desc: "Scripts e abordagens", icon: "📚" },
   ].filter((t) => allowed.includes(t.id));
 
   const resultTabs = [
@@ -20564,9 +20843,10 @@ function dashboardView() {
             </button>
             ${sidebarTabGroup("Meu Dia", meuDiaTabs)}
             ${sidebarTabGroup("Crescer", crescerTabs)}
+            ${sidebarSubGroup("Material de apoio", apoioTabs, "supportOpen")}
             ${sidebarTabGroup("Equipe", equipeTabs)}
             ${sidebarTabGroup("Resultados", resultTabs)}
-            ${sidebarSubGroup("Análises", analiseTabs)}
+            ${sidebarSubGroup("Análises", analiseTabs, "analysisOpen")}
             ${sidebarTabGroup("Operações", opsTabs)}
           </div>
           <div class="sidebar-footer">

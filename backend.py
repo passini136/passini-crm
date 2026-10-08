@@ -9600,6 +9600,57 @@ def task_assignable_people(
 CALL_GOAL_MONTH = 60  # piso do MEC: 60 ligações ativas no mês
 
 
+def contact_unit_options(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, competencia: str,
+) -> list[str]:
+    """Unidades que o usuário pode filtrar em Contatos."""
+    permitidas = crm_allowed_units_for_user(conn, user)
+    mapa = build_seller_unit_map(conn, company_id, competencia)
+    unidades = sorted({u for u in mapa.values() if u})
+    if permitidas is not None:
+        _p = {normalize_unit(u) for u in permitidas}
+        unidades = [u for u in unidades if u in _p]
+    return unidades
+
+
+def contact_history_por_unidade(
+    conn: sqlite3.Connection, company_id: int, por_vendedor: list[dict[str, Any]],
+    competencia: str,
+) -> list[dict[str, Any]]:
+    """Soma os números de contato por unidade, a partir das linhas do vendedor.
+
+    Reaproveita o que já foi apurado em vez de consultar de novo: os totais por
+    vendedor já vieram do banco, e somá-los em Python garante que a linha da
+    unidade seja exatamente a soma das linhas que o gestor vê abaixo dela — se
+    eu refizesse a consulta, uma diferença de arredondamento ou de recorte
+    faria os dois números divergirem na mesma tela.
+    """
+    mapa = build_seller_unit_map(conn, company_id, competencia)
+    acumulado: dict[str, dict[str, Any]] = {}
+    somaveis = ("registros", "ativos", "receptivos", "apoios", "ligacoes",
+                "falou", "converteu", "clientes")
+    for linha in por_vendedor:
+        nome = linha.get("seller_name") or ""
+        unidade = (mapa.get(person_key(nome)) or mapa.get(short_person_key(nome)) or "")
+        if not unidade:
+            unidade = "SEM UNIDADE"
+        alvo = acumulado.setdefault(unidade, {"unit": unidade, "sellers": 0,
+                                              **{c: 0 for c in somaveis}})
+        alvo["sellers"] += 1
+        for c in somaveis:
+            valor = linha.get(c)
+            if isinstance(valor, (int, float)):
+                alvo[c] += valor
+    saida = list(acumulado.values())
+    for u in saida:
+        ativos = u.get("ativos") or 0
+        u["talkRatePct"] = round(100 * (u.get("falou") or 0) / ativos, 1) if ativos else 0.0
+        u["conversionPct"] = round(100 * (u.get("converteu") or 0) / ativos, 1) if ativos else 0.0
+        u["callsPerSeller"] = round((u.get("ligacoes") or 0) / u["sellers"], 1) if u["sellers"] else 0.0
+    saida.sort(key=lambda u: -(u.get("ligacoes") or 0))
+    return saida
+
+
 def contact_history(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     filtros: dict[str, Any],
@@ -9629,6 +9680,31 @@ def contact_history(
         marcadores = ",".join("?" for _ in visiveis)
         condicoes.append(f"UPPER(i.seller_name) IN ({marcadores})")
         params.extend(normalize_upper(v) for v in visiveis)
+
+    # UNIDADE pela PESSOA, não pela coluna gravada na interação.
+    #
+    # `crm_interactions.unit_name` é preenchida no momento do registro e
+    # congela: vendedor que mudou de filial deixa um rastro dividido entre as
+    # duas. O mapa pessoa → unidade é resolvido na competência e é o mesmo que
+    # o resto do sistema usa — filtrar por ele mantém a tela de Contatos
+    # contando a mesma equipe que o painel de resultados.
+    unidade = normalize_unit(filtros.get("unit"))
+    if unidade:
+        _comp = fim[:7]
+        _mapa = build_seller_unit_map(conn, company_id, _comp)
+        _da_unidade = sorted({
+            normalize_upper(r["seller_name"]) for r in conn.execute(
+                "SELECT DISTINCT seller_name FROM crm_interactions WHERE company_id = ?",
+                (company_id,)).fetchall()
+            if r["seller_name"] and (
+                _mapa.get(person_key(r["seller_name"]))
+                or _mapa.get(short_person_key(r["seller_name"]))) == unidade})
+        if not _da_unidade:
+            condicoes.append("1 = 0")
+        else:
+            condicoes.append(
+                f"UPPER(i.seller_name) IN ({','.join('?' for _ in _da_unidade)})")
+            params.extend(_da_unidade)
 
     vendedor = normalize_whitespace(filtros.get("seller"))
     if vendedor:
@@ -9796,6 +9872,14 @@ def contact_history(
         "totals": enriquece(dict(agregado) if agregado else {}),
         "sellers": [enriquece(l) for l in por_vendedor],
         "sellerOptions": sorted({l["seller_name"] for l in por_vendedor if l["seller_name"]}),
+        # RESUMO POR UNIDADE: os mesmos vendedores, agrupados pela equipe.
+        # O gestor de mais de uma unidade precisa comparar as equipes antes de
+        # descer ao nome — a lista por vendedor, com 44 linhas, não deixa ver
+        # qual unidade está trabalhando e qual parou.
+        "byUnit": contact_history_por_unidade(
+            conn, company_id, [enriquece(l) for l in por_vendedor], fim[:7]),
+        "unitOptions": contact_unit_options(conn, company_id, user, fim[:7]),
+        "unit": unidade,
         "portfolioOptions": sorted({i["portfolioSeller"] for i in itens
                                     if i["portfolioSeller"] != "Sem vendedor"}),
         "crossCount": sum(1 for i in itens if i["crossPortfolio"]),
@@ -9829,7 +9913,8 @@ def task_visible_sellers(
 
 def list_crm_tasks(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
-    status: str = "ABERTAS", seller: str = "", date_from: str = "", date_to: str = "",
+    status: str = "ABERTAS", seller: str = "", unit: str = "",
+    date_from: str = "", date_to: str = "",
     origin: str = "", search: str = "", limit: int = 400,
 ) -> list[dict[str, Any]]:
     sql = """
@@ -9854,6 +9939,24 @@ def list_crm_tasks(
     if seller:
         sql += " AND UPPER(seller_name) = ?"
         params.append(normalize_upper(seller))
+    # Unidade: resolvida pela PESSOA, como em Contatos. A tarefa não guarda
+    # unidade, e nem deveria — quem muda de filial leva as tarefas junto.
+    unidade = normalize_unit(unit)
+    if unidade:
+        _mapa = build_seller_unit_map(conn, company_id,
+                                      today_in_brazil().strftime("%Y-%m"))
+        _nomes = sorted({
+            normalize_upper(r["seller_name"]) for r in conn.execute(
+                "SELECT DISTINCT seller_name FROM crm_tasks WHERE company_id = ?",
+                (company_id,)).fetchall()
+            if r["seller_name"] and (
+                _mapa.get(person_key(r["seller_name"]))
+                or _mapa.get(short_person_key(r["seller_name"]))) == unidade})
+        if not _nomes:
+            sql += " AND 1 = 0"
+        else:
+            sql += f" AND UPPER(seller_name) IN ({','.join('?' for _ in _nomes)})"
+            params.extend(_nomes)
 
     filtro = normalize_upper(status) or "ABERTAS"
     if filtro == "ABERTAS":
@@ -11299,6 +11402,15 @@ def search_prospect_leads(
         "NOT EXISTS (SELECT 1 FROM prospects pp WHERE pp.company_id = l.company_id "
         "            AND pp.status = 'PERDIDO' AND pp.document_digits = l.cnpj)")
 
+    # BAIRRO: a coluna sempre existiu na base fria e nunca foi usada. Numa
+    # cidade grande, "Capão da Canoa" devolve centenas de oficinas e o vendedor
+    # não consegue montar um roteiro de rua — é o bairro que transforma a lista
+    # numa manhã de visitas.
+    bairro = normalize_upper(strip_accents(filtros.get("neighborhood")))
+    if bairro:
+        condicoes.append("sem_acento(COALESCE(l.bairro,'')) = ?")
+        params.append(bairro)
+
     segmento = normalize_upper(filtros.get("segment"))
     if segmento:
         condicoes.append("l.segmento = ?")
@@ -11364,9 +11476,24 @@ def search_prospect_leads(
     else:
         opcoes = sorted(cidades)
 
+    # Bairros DA CIDADE ESCOLHIDA, não de todas. A lista completa tem milhares
+    # de nomes e é inútil: bairro só faz sentido depois de escolher a cidade.
+    bairros: list[str] = []
+    if cidade:
+        vistos: dict[str, str] = {}
+        for r in conn.execute(
+            "SELECT DISTINCT bairro FROM prospect_leads "
+            "WHERE company_id = ? AND sem_acento(cidade) = ? "
+            "  AND TRIM(COALESCE(bairro,'')) <> ''",
+                (company_id, cidade)).fetchall():
+            vistos.setdefault(normalize_upper(strip_accents(r["bairro"])), r["bairro"])
+        bairros = [vistos[k] for k in sorted(vistos)]
+
     return {"items": linhas[:limite], "total": total, "cities": opcoes,
             "cityCounts": contagem, "claimedHere": assumidas,
             "unrestricted": sem_restricao, "status": status_filtro,
+            "neighborhoods": bairros,
+            "neighborhood": normalize_whitespace(filtros.get("neighborhood")),
             "segments": LEAD_SEGMENTS, "limited": total > limite}
 
 
@@ -14715,6 +14842,55 @@ def brand_insights(
             })
 
     return saida
+
+
+def prospect_por_unidade(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+) -> list[dict[str, Any]]:
+    """Prospecção somada por unidade, para o gerente e a diretoria.
+
+    A tela lista oficina por oficina, o que serve ao vendedor. Quem cuida de
+    várias equipes precisa primeiro saber QUAL unidade está prospectando e
+    qual parou — descer ao nome vem depois.
+
+    A unidade sai da coluna da própria prospecção (`p.unit_name`), não do mapa
+    pessoa→unidade: o prospect é cadastrado com a unidade que vai atendê-lo, e
+    pode não ter vendedor nenhum ainda.
+    """
+    escopo, par = prospect_scope_sql(conn, company_id, user)
+    limite = (today_in_brazil() - timedelta(days=7)).isoformat()
+    chave = f"'{PROSPECT_KEY_PREFIX}' || p.id"
+    linhas = [dict(r) for r in conn.execute(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(p.unit_name),''), 'SEM UNIDADE') AS unidade,
+               COUNT(*) AS total,
+               SUM(CASE WHEN p.status = 'NOVO' THEN 1 ELSE 0 END)        AS novos,
+               SUM(CASE WHEN p.status = 'EM_CONTATO' THEN 1 ELSE 0 END)  AS em_contato,
+               SUM(CASE WHEN p.status = 'QUALIFICADO' THEN 1 ELSE 0 END) AS qualificados,
+               SUM(CASE WHEN p.status = 'CADASTRADO' THEN 1 ELSE 0 END)  AS cadastrados,
+               SUM(CASE WHEN p.status = 'PERDIDO' THEN 1 ELSE 0 END)     AS perdidos,
+               SUM(CASE WHEN p.status NOT IN ('CADASTRADO','PERDIDO')
+                         AND NOT EXISTS (SELECT 1 FROM crm_interactions i
+                                         WHERE i.company_id = p.company_id
+                                           AND i.client_key = {chave})
+                        THEN 1 ELSE 0 END) AS sem_contato,
+               SUM(CASE WHEN p.status IN ('NOVO','EM_CONTATO','QUALIFICADO')
+                         AND COALESCE((SELECT MAX(date(substr(replace(i.occurred_at,'T',' '),1,10)))
+                                       FROM crm_interactions i
+                                       WHERE i.company_id = p.company_id
+                                         AND i.client_key = {chave}), '0000-00-00') <= ?
+                        THEN 1 ELSE 0 END) AS parados
+        FROM prospects p
+        WHERE p.company_id = ?{escopo}
+        GROUP BY unidade
+        """, [limite, company_id, *par]).fetchall()]
+    for u in linhas:
+        total = u["total"] or 0
+        u["conversionPct"] = round(100 * (u["cadastrados"] or 0) / total, 1) if total else 0.0
+        # Fila é o que ainda dá trabalho: nem convertido, nem perdido.
+        u["fila"] = (u["novos"] or 0) + (u["em_contato"] or 0) + (u["qualificados"] or 0)
+    linhas.sort(key=lambda u: -(u["fila"] or 0))
+    return linhas
 
 
 def prospect_funnel(
@@ -26579,6 +26755,10 @@ class AppHandler(BaseHTTPRequestHandler):
                             conn, user["company_id"], user,
                             search=normalize_whitespace(query.get("q", [""])[0]),
                             seller=normalize_whitespace(query.get("seller", [""])[0])),
+                        # Resumo por unidade só para quem cuida de mais de uma
+                        # equipe; para o vendedor seria uma linha só, dele.
+                        "byUnit": (prospect_por_unidade(conn, user["company_id"], user)
+                                   if data_scope_for_user(conn, user) != "proprio" else []),
                         "statuses": PROSPECT_STATUSES,
                         "triggers": PROSPECT_TRIGGERS,
                         "metrics": ACTIVITY_METRICS,
@@ -27370,6 +27550,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn, user["company_id"], user,
                         status=normalize_upper(query.get("status", ["ABERTAS"])[0]),
                         seller=normalize_whitespace(query.get("seller", [""])[0]),
+                        unit=normalize_unit(query.get("unit", [""])[0]),
                         date_from=normalize_whitespace(query.get("from", [""])[0]),
                         date_to=normalize_whitespace(query.get("to", [""])[0]),
                         origin=normalize_upper(query.get("origin", [""])[0]),
@@ -27385,6 +27566,9 @@ class AppHandler(BaseHTTPRequestHandler):
                         "canCreate": pode_criar,
                         "people": task_assignable_people(conn, user["company_id"], user) if pode_criar else [],
                         "sellers": task_visible_sellers(conn, user["company_id"], user) or [],
+                        "units": contact_unit_options(
+                            conn, user["company_id"], user,
+                            today_in_brazil().strftime("%Y-%m")),
                         "myName": meeting_person_identity(user),
                     }
                 self._set_headers(200)
@@ -27438,6 +27622,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 with closing(get_connection()) as conn:
                     dados = search_prospect_leads(conn, user["company_id"], user, {
                         "city": query.get("city", [""])[0],
+                        "neighborhood": query.get("neighborhood", [""])[0],
                         "segment": query.get("segment", [""])[0],
                         "search": query.get("q", [""])[0],
                         "status": query.get("status", [""])[0],
