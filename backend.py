@@ -18015,14 +18015,28 @@ def opcoes_compra_carteira(
     ensure_catalogo_temp(conn, company_id)
     latest = crm_latest_competence(conn, company_id) or today_in_brazil().strftime("%Y-%m")
     inicio = shift_competence(latest, -(months_window - 1))
-    def distintos(expr: str) -> list[str]:
-        return [r["v"] for r in conn.execute(
-            f"""SELECT DISTINCT UPPER(TRIM({expr})) v
-                FROM fact_sales_detail f
-                {CATALOGO_JOIN_SQL}
-                WHERE f.company_id = ? AND f.competence >= ? AND f.net_value > 0
-                  AND TRIM(COALESCE({expr},'')) <> ''
-                ORDER BY v""", (company_id, inicio)).fetchall() if r["v"]]
+
+    def distintos(expr: str) -> list[dict[str, Any]]:
+        # COM A CONTAGEM DE CLIENTES, não só o nome.
+        #
+        # São 436 marcas, 231 linhas e 290 tipos — uma lista nua desse tamanho
+        # não ajuda a escolher, e esconde que boa parte é cadastro sujo:
+        # "(SACHS)" com dois clientes é erro de digitação convivendo ao lado
+        # de "SACHS". Com o número ao lado, o gestor vê na hora o que vale
+        # filtrar e o que é ruído — e a mesma consulta já revela o que o
+        # cadastro precisa corrigir.
+        return [
+            {"value": r["v"], "clients": int(r["n"] or 0)}
+            for r in conn.execute(
+                f"""SELECT UPPER(TRIM({expr})) v, COUNT(DISTINCT f.client_name) n
+                    FROM fact_sales_detail f
+                    {CATALOGO_JOIN_SQL}
+                    WHERE f.company_id = ? AND f.competence >= ? AND f.net_value > 0
+                      AND TRIM(COALESCE({expr},'')) <> ''
+                    GROUP BY v ORDER BY v""", (company_id, inicio)).fetchall()
+            if r["v"]
+        ]
+
     opcoes = {
         "brands": distintos("f.brand_name"),
         "types": distintos("c.item_type"),
@@ -18049,7 +18063,17 @@ def item_purchase_details(
         return None
     latest = crm_latest_competence(conn, company_id) or date.today().strftime("%Y-%m")
     inicio = shift_competence(latest, -(months_window - 1))
-    padrao = f"%{termo.upper()}%"
+
+    # TERMO CURTO VIRA BUSCA EXATA.
+    #
+    # Com LIKE '%X%', um termo de um ou dois caracteres casa com quase tudo:
+    # procurar "." devolveu 1.713 clientes, e "1" devolveria mais ainda. O
+    # gerente lê aquilo como "todo mundo compra essa peça" e toma decisão em
+    # cima de ruído — pior que não achar nada, porque parece um resultado.
+    # A partir de 3 caracteres o trecho já identifica peça de verdade.
+    exata = len(termo) < 3
+    padrao = termo.upper() if exata else f"%{termo.upper()}%"
+    op = "=" if exata else "LIKE"
 
     # QUALQUER CÓDIGO QUE O BALCÃO USA deve achar a peça. São quatro no mundo
     # real: o do fabricante (o que o mecânico fala), o interno da Passini (o da
@@ -18063,9 +18087,9 @@ def item_purchase_details(
     codigos_do_catalogo = {
         normalize_whitespace(r["item_code"]).upper()
         for r in conn.execute(
-            "SELECT item_code FROM item_catalog WHERE company_id = ? "
-            "  AND (UPPER(COALESCE(gtin,'')) LIKE ? OR UPPER(COALESCE(item_code,'')) LIKE ?) "
-            "LIMIT 500", (company_id, padrao, padrao)).fetchall()
+            f"SELECT item_code FROM item_catalog WHERE company_id = ? "
+            f"  AND (UPPER(COALESCE(gtin,'')) {op} ? OR UPPER(COALESCE(item_code,'')) {op} ?) "
+            f"LIMIT 500", (company_id, padrao, padrao)).fetchall()
         if r["item_code"]
     }
     extra_sql, extra_par = "", []
@@ -18084,10 +18108,10 @@ def item_purchase_details(
                SUM(net_value) AS net_value
         FROM fact_sales_detail
         WHERE company_id = ? AND competence >= ? AND net_value > 0
-          AND (UPPER(COALESCE(manufacturer_sku, '')) LIKE ?
-            OR UPPER(COALESCE(gtin_value, '')) LIKE ?
-            OR UPPER(COALESCE(sku_key, '')) LIKE ?
-            OR UPPER(COALESCE(item_code, '')) LIKE ?{extra_sql})
+          AND (UPPER(COALESCE(manufacturer_sku, '')) {op} ?
+            OR UPPER(COALESCE(gtin_value, '')) {op} ?
+            OR UPPER(COALESCE(sku_key, '')) {op} ?
+            OR UPPER(COALESCE(item_code, '')) {op} ?{extra_sql})
         GROUP BY client_name, purchase_at, item_code
         ORDER BY purchase_at ASC
         """,

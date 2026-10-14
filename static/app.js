@@ -5981,28 +5981,85 @@ function celulaProjecao(row) {
       </div>` : "");
 }
 
+/* "Precisa R$ X/dia para fechar a meta", em uma linha.
+ *
+ * Este número existia na tabela como uma coluna SEM CABEÇALHO — o corpo tinha
+ * quatorze células e o cabeçalho treze, então aparecia um valor solto que
+ * ninguém sabia o que era. É o indicador mais acionável no meio do mês:
+ * compara o que falta por dia útil restante com o ritmo atual.
+ */
+function ritmoNecessario(row) {
+  const pace = row.pace;
+  if (!pace || !pace.hasGoal) return "";
+  const alvo = (pace.targets || []).find((x) => x.pct === 100);
+  if (!alvo) return "";
+  if (alvo.reached) {
+    return '<div class="text-small" style="color:var(--good);font-weight:700">✓ meta batida</div>';
+  }
+  if (!pace.remainingDays) {
+    return '<div class="text-small" style="color:var(--muted)">mês encerrado</div>';
+  }
+  // Precisar mais de 20% acima do ritmo atual é o sinal de que a meta não sai
+  // sozinha: dá para ver na cor sem ler o número.
+  const apertado = alvo.dailyNeeded > pace.dailyActual * 1.2;
+  return `<div class="text-small" style="color:${apertado ? "var(--bad)" : "var(--muted)"}">
+    precisa ${currency(alvo.dailyNeeded)}/dia · faz ${currency(pace.dailyActual)}</div>`;
+}
+
+/* Performance por unidade: SETE colunas, não treze.
+ *
+ * Esta tabela é feita para ser PRINTADA e mandada por e-mail e WhatsApp. Com
+ * treze colunas ela não cabia em tela nenhuma, e o print saía cortado na
+ * metade — o diretor mandava um retrato sem devolução, sem margem e sem
+ * peças, que são justamente as colunas do fim.
+ *
+ * Nada foi removido: valor e percentual que se leem juntos passaram a dividir
+ * a mesma célula. De quebra isso conserta um desalinhamento antigo — o
+ * cabeçalho tinha treze títulos e o corpo quatorze células, então a última
+ * coluna aparecia sem nome.
+ */
 function unitRows(rows) {
   return rows
-    .map(
-      (row) => `
+    // LINHA SEM UNIDADE NÃO É UNIDADE. Vinha um registro com nome vazio e
+    // tudo zerado no rodapé: não some nada, não significa nada, e num print
+    // enviado para a diretoria parece erro de sistema.
+    .filter((row) => normalizeTexto(row.unitName) || Number(row.revenueNet || 0))
+    .map((row) => {
+      const meta = Number(row.revenueGoal || 0);
+      const liquido = Number(row.revenueNet || 0);
+      const falta = meta - liquido;
+      return `
       <tr>
-        <td>${escapeHtml(row.unitName)}</td>
-        <td>${currency(row.revenueNet)}</td>
-        <td>${currency(row.revenueGoal)}</td>
-        <td>${farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)}</td>
-        <td>${celulaProjecao(row)}</td>
-        <td>${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</td>
-        <td>${currency(row.returnsValue)}</td>
-        <td>${farolValue(pct(row.returnRatioPct || 0), row.farol?.returnRatio)}</td>
-        <td>${currency(row.warrantyReturnsValue || 0)}</td>
-        <td>${farolValue(marginText(row.marginValue), row.farol?.marginValue)}</td>
-        <td>${number(row.qtySold || 0)}</td>
-        <td>${currency(row.ticketPerPiece || 0)}</td>
-        <td>${currency(row.metaDiaria)}</td>
-        <td>${celulaRitmo(row.pace, 100)}</td>
-      </tr>
-    `
-    )
+        <td><strong>${escapeHtml(row.unitName || "—")}</strong></td>
+        <td style="text-align:right">
+          <strong>${currency(liquido)}</strong>
+          <div class="text-small" style="color:var(--muted)">
+            meta ${meta ? currency(meta) : "não lançada"}</div>
+        </td>
+        <td style="text-align:right">
+          ${meta ? farolValue(pct(row.goalAttainmentPct), row.farol?.goalAttainment)
+                 : '<span style="color:var(--muted)">—</span>'}
+          ${meta ? `<div class="text-small" style="color:var(--muted)">
+            ${falta > 0 ? `faltam ${currency(falta)}` : `+${currency(-falta)}`}</div>` : ""}
+          ${ritmoNecessario(row)}
+        </td>
+        <td style="text-align:right">
+          ${celulaProjecao(row)}
+          <div class="text-small">${farolValue(pct(row.projectedGoalAttainmentPct || 0), row.farol?.projectedAttainment)}</div>
+        </td>
+        <td style="text-align:right">
+          ${currency(row.returnsValue)}
+          <div class="text-small">${farolValue(pct(row.returnRatioPct || 0), row.farol?.returnRatio)}</div>
+          ${Number(row.warrantyReturnsValue || 0) ? `<div class="text-small" style="color:var(--muted)">
+            garantia ${currency(row.warrantyReturnsValue)}</div>` : ""}
+        </td>
+        <td style="text-align:right">${farolValue(marginText(row.marginValue), row.farol?.marginValue)}</td>
+        <td style="text-align:right">
+          ${number(row.qtySold || 0)}
+          <div class="text-small" style="color:var(--muted)">${currency(row.ticketPerPiece || 0)}/peça</div>
+        </td>
+      </tr>`;
+    })
     .join("");
 }
 
@@ -15255,13 +15312,16 @@ function crmFilterToolbar() {
           // inteiro.
           const op = state.crm.clientsMeta?.purchaseOptions || {};
           if (roleIsSeller()) return "";
+          // A contagem de clientes ao lado de cada opção. Sem ela, 436 marcas
+          // são uma parede de nomes onde "(SACHS)" com 2 clientes parece tão
+          // relevante quanto "NAKATA" com 400 — e o gestor escolhe no escuro.
           const campo = (chave, rotulo, lista, vazio) => !(lista || []).length ? "" : `
             <div class="field">
-              <label>${rotulo}</label>
+              <label>${rotulo} <span style="font-weight:400;color:var(--muted)">(${number(lista.length)})</span></label>
               <select onchange="updateCrmClientFilter('${chave}', this.value)">
                 <option value="">${vazio}</option>
-                ${lista.map((v) => `<option value="${escapeHtml(v)}"
-                  ${filters[chave] === v ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+                ${lista.map((o) => `<option value="${escapeHtml(o.value)}"
+                  ${filters[chave] === o.value ? "selected" : ""}>${escapeHtml(o.value)} · ${number(o.clients)}</option>`).join("")}
               </select>
             </div>`;
           return campo("itemBrand", "Comprou da marca", op.brands, "Qualquer marca")
@@ -20653,18 +20713,12 @@ function executivoView() {
           <table>
             <thead><tr>
               ${sortableTh("unidades","Unidade","unitName","text")}
-              ${sortableTh("unidades","Líquido","revenueNet")}
-              ${sortableTh("unidades","Meta","revenueGoal")}
-              ${sortableTh("unidades","% Meta","goalAttainmentPct")}
+              ${sortableTh("unidades","Líquido e meta","revenueNet")}
+              ${sortableTh("unidades","Atingimento","goalAttainmentPct")}
               ${sortableTh("unidades","Projeção","projectedRevenue")}
-              ${sortableTh("unidades","% Proj.","projectedGoalAttainmentPct")}
-              ${sortableTh("unidades","Dev. comercial","returnsValue")}
-              ${sortableTh("unidades","% Dev.","returnRatioPct")}
-              ${sortableTh("unidades","Dev. garantia","warrantyReturnsValue")}
+              ${sortableTh("unidades","Devolução","returnsValue")}
               ${sortableTh("unidades","Margem","marginValue")}
-              ${sortableTh("unidades","Qtd. Peças","qtySold")}
-              ${sortableTh("unidades","Ticket/Peça","ticketPerPiece")}
-              ${sortableTh("unidades","Meta diária","metaDiaria")}
+              ${sortableTh("unidades","Peças","qtySold")}
             </tr></thead>
             <tbody>${unitRows(applyTableSort(units, "unidades"))}</tbody>
           </table>

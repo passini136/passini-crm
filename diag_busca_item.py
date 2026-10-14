@@ -128,20 +128,38 @@ else:
 
 # ── 3. Os filtros de marca, linha e tipo devolvem gente? ────────────────────
 print("3) FILTRAR POR MARCA, LINHA E TIPO")
+t0 = time.time()
 op = backend.opcoes_compra_carteira(conn, company_id)
+print(f"   Apurado em {time.time() - t0:.2f}s")
 print(f"   Opções oferecidas: {len(op['brands'])} marca(s), "
       f"{len(op['lines'])} linha(s), {len(op['types'])} tipo(s)")
-print(f"\n   {'FILTRO':<16}{'VALOR':<24}{'CLIENTES':>10}")
-for chave, rotulo in (("brands", "marca"), ("lines", "linha"), ("types", "tipo")):
-    for valor in (op[chave] or [])[:3]:
-        kwargs = {"marca": valor} if chave == "brands" else (
-            {"linha": valor} if chave == "lines" else {"tipo": valor})
-        achados = backend.clientes_que_compraram(conn, company_id, **kwargs)
+
+# CADASTRO SUJO FICA VISÍVEL. Opção com um ou dois clientes num universo de
+# centenas quase sempre é grafia errada convivendo com a certa — "(SACHS)" ao
+# lado de "SACHS". Quem decide compra precisa ver isso, não tropeçar nisso.
+for chave, rotulo in (("brands", "MARCA"), ("lines", "LINHA"), ("types", "TIPO")):
+    lista = op[chave] or []
+    raros = [o for o in lista if o["clients"] <= 2]
+    grandes = sorted(lista, key=lambda o: -o["clients"])[:5]
+    print(f"\n   {rotulo} — {len(lista)} opções, {len(raros)} com 2 clientes ou menos")
+    print("      maiores: " + " · ".join(f"{o['value'][:18]} ({o['clients']})" for o in grandes))
+    if raros:
+        print("      suspeitas de cadastro: "
+              + " · ".join(f"{o['value'][:18]} ({o['clients']})" for o in raros[:6]))
+
+print("\n   Conferindo que a opção oferecida devolve gente:")
+print(f"   {'FILTRO':<10}{'VALOR':<24}{'NA LISTA':>10}{'NO FILTRO':>11}{'TEMPO':>8}")
+for chave, rotulo, arg in (("brands", "marca", "marca"), ("lines", "linha", "linha"),
+                           ("types", "tipo", "tipo")):
+    for o in sorted(op[chave] or [], key=lambda x: -x["clients"])[:2]:
+        t0 = time.time()
+        achados = backend.clientes_que_compraram(conn, company_id, **{arg: o["value"]})
+        seg = time.time() - t0
         n_ach = len(achados or [])
-        print(f"   {rotulo:<16}{valor[:23]:<24}{n_ach:>10}"
+        print(f"   {rotulo:<10}{o['value'][:23]:<24}{o['clients']:>10}{n_ach:>11}{seg:>7.2f}s"
               f"{'  ← VAZIO' if not n_ach else ''}")
-print("\n   >> Opção oferecida no filtro que devolve zero cliente é armadilha:")
-print("      o gestor escolhe, a tela esvazia e ele acha que quebrou.")
+print("\n   >> As duas colunas de contagem têm de bater. Se a opção diz 400 e o")
+print("      filtro devolve 12, a lista e o filtro estão medindo coisas diferentes.")
 
 # ── 4. Sem filtro continua sendo sem filtro ─────────────────────────────────
 # A distinção entre None ("não filtre") e conjunto vazio ("ninguém comprou") é
