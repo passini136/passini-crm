@@ -147,12 +147,22 @@ AUTO_IMPORT_FOLDERS = [
     {"folder": "faturamento",  "scope": "sales", "label": "Faturamento Detalhado"},
     {"folder": "custo-venda",  "scope": "cost",  "label": "Custo de Venda"},
     # CRM separado em duas pastas — cada base importa de forma independente
-    {"folder": "crm/clientes", "scope": "crm_clients",
+    # PASTAS NA RAIZ, não aninhadas em crm/.
+    #
+    # Quem copia os arquivos faz isso toda manhã, e descer um nível para duas
+    # das sete pastas custava cliques à toa. Os nomes mantêm o prefixo `crm-`
+    # por dois motivos concretos: o histórico em processados/ e erros/ já usa
+    # essa grafia (o destino é `folder.replace("/", "-")`, ou seja, hoje já é
+    # `crm-clientes`), então nada se parte ao meio; e `faturamento-consolidado`
+    # solto na raiz ficaria colado em `faturamento` na ordem alfabética — e
+    # trocar os arquivos entre essas duas pastas já aconteceu uma vez e
+    # derrubou a importação do dia sem erro visível.
+    {"folder": "crm-clientes", "scope": "crm_clients",
      "label": "CRM · Cadastro de Clientes",
      "hint": "Base do Alfa, sem competência. A base vem dividida em DOIS arquivos e a "
              "importação SUBSTITUI a base inteira: mandar um arquivo só apaga o outro. "
              "Coloque os dois juntos na pasta antes de importar. Atualizar 1x ao dia."},
-    {"folder": "crm/faturamento-consolidado", "scope": "crm_summary",
+    {"folder": "crm-faturamento-consolidado", "scope": "crm_summary",
      "label": "CRM · Faturamento Consolidado",
      "hint": "Competência obrigatória no nome do arquivo, ex: 2026-07_faturamento_cliente.csv"},
     {"folder": "catalogo", "scope": "catalog",
@@ -30049,7 +30059,7 @@ def _auto_import_tick_inner() -> None:
             _now_ts = time.time()
             _unstable = [f for f in csv_files if (_now_ts - f.stat().st_mtime) < CRM_CLIENTS_SETTLE_SECONDS]
             if _unstable:
-                print(f"[auto-import] crm/clientes: {len(_unstable)} arquivo(s) ainda sendo gravado(s), "
+                print(f"[auto-import] crm-clientes: {len(_unstable)} arquivo(s) ainda sendo gravado(s), "
                       f"aguardando {CRM_CLIENTS_SETTLE_SECONDS}s de estabilidade")
                 continue
             by_competence: dict[str, list[Path]] = {"_clients__all": list(csv_files)}
@@ -30257,24 +30267,76 @@ def _auto_import_loop() -> None:
 
 
 def _migrate_legacy_crm_folder() -> None:
-    """Move CSVs soltos na antiga pasta crm/ para as novas subpastas dedicadas.
+    """Esvazia a antiga pasta crm/ e a remove, movendo tudo para a raiz.
 
-    A pasta crm/ passou a ter subpastas (clientes / faturamento-consolidado). Arquivos
-    que ficaram na raiz são classificados por conteúdo e movidos uma única vez.
+    Histórico desta pasta, em duas etapas:
+
+    1. `crm/` era uma pasta só. Depois virou `crm/clientes` e
+       `crm/faturamento-consolidado`, e os CSVs soltos na raiz dela passaram a
+       ser classificados por conteúdo.
+    2. Agora as duas subpastas subiram para a raiz do auto-import, como
+       `crm-clientes` e `crm-faturamento-consolidado` — quem copia os arquivos
+       todo dia não precisa mais descer um nível só para duas das sete pastas.
+
+    A migração roda no restart e é idempotente: se a pasta antiga não existe,
+    não faz nada. Arquivo que já exista no destino NÃO é sobrescrito — ganha
+    sufixo. Perder um arquivo de importação aqui significa perder um dia de
+    faturamento, e renomear é barato perto disso.
     """
     legacy = AUTO_IMPORT_BASE / "crm"
     if not legacy.exists():
         return
+
+    def mover(origem: Path, destino_dir: Path) -> None:
+        destino_dir.mkdir(parents=True, exist_ok=True)
+        alvo = destino_dir / origem.name
+        n = 1
+        while alvo.exists():
+            alvo = destino_dir / f"{origem.stem}__{n}{origem.suffix}"
+            n += 1
+        shutil.move(str(origem), str(alvo))
+        print(f"[auto-import] migrado {origem.name} -> {destino_dir.name}/{alvo.name}")
+
+    # Subpastas antigas → pastas novas na raiz.
+    for antiga, nova in (("clientes", "crm-clientes"),
+                         ("faturamento-consolidado", "crm-faturamento-consolidado")):
+        origem_dir = legacy / antiga
+        if not origem_dir.is_dir():
+            continue
+        for f in sorted(origem_dir.iterdir()):
+            if f.is_file():
+                try:
+                    mover(f, AUTO_IMPORT_BASE / nova)
+                except Exception:
+                    traceback.print_exc()
+
+    # Arquivos que ficaram soltos na raiz de crm/: classifica por conteúdo,
+    # como a migração anterior já fazia.
     for f in sorted(legacy.glob("*.csv")):
         try:
-            field = _auto_import_detect_crm_field(f.read_bytes(), f.name)
-            sub = "clientes" if field == "import-crm-clients-file" else "faturamento-consolidado"
-            dest_dir = legacy / sub
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(f), str(dest_dir / f.name))
-            print(f"[auto-import] migrado {f.name} -> crm/{sub}/")
+            campo = _auto_import_detect_crm_field(f.read_bytes(), f.name)
+            nova = ("crm-clientes" if campo == "import-crm-clients-file"
+                    else "crm-faturamento-consolidado")
+            mover(f, AUTO_IMPORT_BASE / nova)
         except Exception:
             traceback.print_exc()
+
+    # Só remove a pasta se ela ficou REALMENTE vazia. Sobrou qualquer coisa que
+    # eu não soube classificar, ela fica — apagar em silêncio o que não entendi
+    # é como se perde arquivo sem ninguém notar.
+    try:
+        for sub in ("clientes", "faturamento-consolidado"):
+            d = legacy / sub
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+        if not any(legacy.iterdir()):
+            legacy.rmdir()
+            print("[auto-import] pasta crm/ removida: tudo migrado para a raiz")
+        else:
+            restante = [p.name for p in legacy.iterdir()]
+            print(f"[auto-import] pasta crm/ mantida, ainda tem: {', '.join(restante)}")
+    except Exception:
+        traceback.print_exc()
 
 
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
