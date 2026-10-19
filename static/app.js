@@ -35,6 +35,12 @@ const state = {
   rotaAdd: null,           // modal "Adicionar ao roteiro": { city, search, items }
   visitEditor: null,       // visita em registro
   visitFilters: { city: "", neighborhood: "", relationship: true },
+  // O resumo e a lista de visitas compartilham o recorte. Começa em 30 dias
+  // nos dois: sem isto o resumo dizia "30d" e a lista abaixo mostrava tudo
+  // desde sempre, o que fazia os números da tela discordarem entre si.
+  visitResumoDias: 30,
+  visitFiltroVendedor: "",
+  prospectFaixaFechada: {},   // faixas recolhidas da fila de prospecção
   visitRequestEditor: null,  // pedido de visita a partir da ficha do cliente
   tasks: null,            // tarefas + filtros + contadores
   taskEditor: null,       // nova tarefa de direcionamento
@@ -3477,13 +3483,21 @@ function prospeccaoView() {
 
       <div class="table-card">
         <div class="section-title">
-          <div><h3>Oficinas em prospecção</h3>
-            <div class="text-small">${lista.length} no filtro atual</div></div>
+          <div><h3>${podeGerir || f.status ? "Oficinas em prospecção" : "Sua fila de prospecção"}</h3>
+            <div class="text-small">${lista.length} no filtro atual${
+              podeGerir || f.status ? ""
+              : " · agrupadas pelo que fazer primeiro"}</div></div>
         </div>
         <div class="stack" style="padding-top:8px">
           ${state.ui.loading.prospects ? '<div class="loader">Buscando…</div>' : ""}
-          ${lista.map((p) => prospectCard(p, podeGerir)).join("")
-            || emptyStateCard("Nenhuma oficina aqui ainda. Comece pelo botão Nova oficina.")}
+          ${!lista.length
+            ? emptyStateCard("Nenhuma oficina aqui ainda. Comece pelo botão Nova oficina.")
+            // Com filtro de status ativo o agrupamento atrapalha: o vendedor
+            // pediu UMA lista específica (as cadastradas, as perdidas) e não
+            // quer vê-la picada em cinco faixas.
+            : (podeGerir || f.status)
+              ? lista.map((p) => prospectCard(p, podeGerir)).join("")
+              : prospectListaVendedor(lista, podeGerir)}
         </div>
       </div>
     </div>`;
@@ -4298,6 +4312,82 @@ async function exportBrandsXLSX() {
                  "Marcas", cabecalho, linhas);
 }
 
+
+/* A fila do vendedor: o que fazer HOJE, não a lista inteira.
+ *
+ * A tela entregava uma lista única ordenada por status e nome. Para o gestor
+ * serve; para quem vai pegar o telefone, não: ele precisava ler as 30 linhas e
+ * decidir sozinho por onde começar, toda manhã. E a decisão é sempre a mesma —
+ * primeiro quem tem retorno marcado, depois quem nunca foi contatado, depois
+ * quem esfriou.
+ *
+ * As faixas são excludentes e seguem essa ordem. Oficina com retorno marcado
+ * para hoje NÃO aparece também em "parada", senão o vendedor trabalha duas
+ * vezes a mesma e perde a confiança na fila.
+ */
+function prospectFilaVendedor(lista) {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const faixas = [
+    { id: "retorno", titulo: "Retorno marcado", icone: "⏰", cor: "#e74c3c",
+      nota: "Você combinou de voltar. Atrasado ou vence hoje.",
+      teste: (p) => p.nextTaskAt && String(p.nextTaskAt).slice(0, 10) <= hoje },
+    { id: "novas", titulo: "Nunca contatadas", icone: "🆕", cor: "#b06000",
+      nota: "Entraram na base e ninguém ligou ainda. É aqui que a prospecção trava.",
+      teste: (p) => !p.contactCount },
+    { id: "paradas", titulo: "Esfriaram", icone: "🧊", cor: "#8a6100",
+      nota: "Já houve contato e passaram sete dias sem nada.",
+      teste: (p) => (p.daysSinceContact ?? 0) >= 7 },
+    { id: "agendadas", titulo: "Retorno agendado para depois", icone: "📅", cor: "#5b9bd5",
+      nota: "Em dia — não precisa tocar agora.",
+      teste: (p) => Boolean(p.nextTaskAt) },
+    { id: "andamento", titulo: "Em andamento", icone: "💬", cor: "#2e7d32",
+      nota: "Contato recente, sem retorno marcado. Vale definir o próximo passo.",
+      teste: () => true },
+  ];
+
+  const porFaixa = new Map(faixas.map((f) => [f.id, []]));
+  for (const p of lista) {
+    const faixa = faixas.find((f) => f.teste(p));
+    porFaixa.get(faixa.id).push(p);
+  }
+  // Dentro da faixa, o mais atrasado primeiro.
+  for (const arr of porFaixa.values()) {
+    arr.sort((a, b) => (b.daysSinceContact ?? 999) - (a.daysSinceContact ?? 999));
+  }
+  return { faixas, porFaixa };
+}
+
+function toggleProspectFaixa(id) {
+  state.prospectFaixaFechada = state.prospectFaixaFechada || {};
+  state.prospectFaixaFechada[id] = !state.prospectFaixaFechada[id];
+  requestRender();
+}
+
+function prospectListaVendedor(lista, podeGerir) {
+  const { faixas, porFaixa } = prospectFilaVendedor(lista);
+  const fechada = state.prospectFaixaFechada || {};
+  return faixas.map((f) => {
+    const itens = porFaixa.get(f.id);
+    if (!itens.length) return "";
+    const oculta = fechada[f.id];
+    return `
+      <div style="margin-bottom:14px">
+        <div onclick="toggleProspectFaixa('${f.id}')"
+          style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:6px 2px;
+                 border-bottom:2px solid ${f.cor}22;margin-bottom:8px">
+          <span style="font-size:15px">${f.icone}</span>
+          <strong style="font-size:13.5px;color:${f.cor}">${f.titulo}</strong>
+          <span style="background:${f.cor};color:#fff;border-radius:10px;padding:1px 9px;
+                       font-size:11px;font-weight:800">${number(itens.length)}</span>
+          <span class="text-small" style="color:var(--muted);flex:1">${f.nota}</span>
+          <span style="color:var(--muted);font-size:12px">${oculta ? "▸" : "▾"}</span>
+        </div>
+        ${oculta ? "" : `<div class="stack">
+          ${itens.map((p) => prospectCard(p, podeGerir)).join("")}
+        </div>`}
+      </div>`;
+  }).join("");
+}
 
 function prospectCard(p, podeGerir) {
   const parado = p.status !== "CADASTRADO" && p.status !== "PERDIDO"
@@ -12980,6 +13070,35 @@ function setVisitaResumoDias(dias) {
   requestRender();
 }
 
+function setVisitaFiltroVendedor(nome) {
+  // Clicar de novo no mesmo vendedor desliga — é como o resto do sistema se
+  // comporta e evita o usuário procurar um botão de limpar.
+  state.visitFiltroVendedor = state.visitFiltroVendedor === nome ? "" : nome;
+  requestRender();
+}
+
+function limparFiltroVisitas() {
+  state.visitFiltroVendedor = "";
+  state.visitResumoDias = 0;   // 0 = sem recorte de período
+  requestRender();
+}
+
+/** As visitas que o recorte atual (período + vendedor) deixa passar. */
+function visitasNoRecorte(visitas) {
+  const dias = state.visitResumoDias || 0;
+  const vend = state.visitFiltroVendedor || "";
+  if (!dias && !vend) return visitas;
+  const corte = new Date();
+  corte.setDate(corte.getDate() - (dias || 36500));
+  return (visitas || []).filter((v) => {
+    if (vend && nomeVendedorCurto(v.sellerName) !== nomeVendedorCurto(vend)) return false;
+    const quando = v.occurredAt || v.scheduledFor;
+    if (!quando) return !dias;
+    const d = new Date(String(quando).slice(0, 10));
+    return isNaN(d) ? true : d >= corte;
+  });
+}
+
 /* Resumo de visitas por vendedor, para o gestor.
  *
  * A tela mostrava duas listas longas — pedidos e visitas — e nenhuma resposta
@@ -13078,8 +13197,12 @@ function visitasResumoGestor(visitas, pedidos) {
           </tr></thead>
           <tbody>
             ${linhas.map((l) => `
-              <tr>
-                <td><strong>${escapeHtml(l.nome)}</strong></td>
+              <tr style="cursor:pointer;${state.visitFiltroVendedor === l.nome ? "background:#eef4fa" : ""}"
+                onclick="setVisitaFiltroVendedor('${jsAttr(l.nome)}')"
+                title="Filtrar a lista de visitas por ${escapeHtml(l.nome)}">
+                <td><strong>${escapeHtml(l.nome)}</strong>
+                  ${state.visitFiltroVendedor === l.nome
+                    ? '<span class="status-tag" style="margin-left:4px">filtrando</span>' : ""}</td>
                 <td style="text-align:right;font-weight:${l.pendentes ? "800" : "400"};
                     color:${l.pendentes ? "var(--bad)" : "var(--muted)"}">${number(l.pendentes)}</td>
                 <td style="text-align:right;color:${(l.esperaMax ?? 0) >= 7 ? "var(--bad)" : "var(--muted)"}">
@@ -13250,20 +13373,39 @@ function visitasView() {
           </div>
         </div>` : ""}
 
+      ${(() => {
+        // A LISTA SEGUE O RESUMO. Antes, o resumo falava de 30 dias e a lista
+        // abaixo mostrava tudo desde sempre: o gestor lia "4 visitas em 30d" e
+        // encontrava trinta cartões logo abaixo, sem saber quais eram quais.
+        // Agora o mesmo período e o mesmo vendedor valem para os dois.
+        const visiveis = podeGerir ? visitasNoRecorte(visitas) : visitas;
+        const filtrando = podeGerir && (state.visitFiltroVendedor
+          || (state.visitResumoDias && visiveis.length !== visitas.length));
+        return `
       <div class="table-card">
         <div class="section-title">
           <div><h3>Visitas registradas</h3>
-            <div class="text-small">O efeito compara o faturamento 60 dias antes e 60 dias depois.</div></div>
+            <div class="text-small">
+              ${podeGerir ? `Últimos ${state.visitResumoDias || 30} dias${
+                state.visitFiltroVendedor
+                  ? ` · ${escapeHtml(nomeVendedorCurto(state.visitFiltroVendedor))}` : ""}. ` : ""}
+              O efeito compara o faturamento 60 dias antes e 60 dias depois.</div></div>
           <div style="display:flex;gap:8px;align-items:center">
+            ${filtrando ? `<button class="btn btn-ghost btn-sm" onclick="limparFiltroVisitas()">
+              Ver todas (${number(visitas.length)})</button>` : ""}
             ${podeGerir ? `<button class="btn btn-secondary btn-sm" onclick="novaVisita(null)">＋ Nova visita</button>` : ""}
-            <div class="soft-badge">${visitas.length}</div>
+            <div class="soft-badge">${number(visiveis.length)}</div>
+            ${botaoRecolherVisita("registradas")}
           </div>
         </div>
-        <div class="stack" style="padding-top:8px">
-          ${visitas.map((v) => visitaCard(v, podeGerir)).join("")
-            || emptyStateCard("Nenhuma visita registrada ainda.")}
+        <div class="stack" style="padding-top:8px;${blocoVisitaFechado("registradas") ? "display:none" : ""}">
+          ${visiveis.map((v) => visitaCard(v, podeGerir)).join("")
+            || emptyStateCard(filtrando
+                ? "Nenhuma visita neste recorte. Amplie o período ou limpe o filtro."
+                : "Nenhuma visita registrada ainda.")}
         </div>
-      </div>
+      </div>`;
+      })()}
     </div>`;
 }
 
