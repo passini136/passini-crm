@@ -23058,6 +23058,20 @@ def _pdf_cor_farol(farol: Any) -> colors.Color:
     }.get(normalize_whitespace(nivel).lower(), colors.black)
 
 
+def _pdf_num(value: Any, casas: int = 1, sufixo: str = "%") -> str:
+    """Número com vírgula decimal, como o resto do PDF.
+
+    O PDF saía com "R$ 2.988.406,84" ao lado de "48.9%" e "1.51x": dinheiro
+    em português e percentual em inglês, no mesmo documento que vai para a
+    diretoria. Ninguém entende errado, mas parece rascunho.
+    """
+    try:
+        numero = float(value or 0)
+    except (TypeError, ValueError):
+        numero = 0.0
+    return f"{numero:.{casas}f}".replace(".", ",") + sufixo
+
+
 def _pdf_fatia_carteira(s: dict[str, Any]) -> str:
     """Quanto do faturamento saiu da carteira e quanto saiu do balcão.
 
@@ -23071,7 +23085,7 @@ def _pdf_fatia_carteira(s: dict[str, Any]) -> str:
     base = carteira + balcao
     if base <= 0:
         return "—"
-    return f"{carteira / base * 100:.0f}% × {balcao / base * 100:.0f}%"
+    return (_pdf_num(carteira / base * 100, 0) + " × " + _pdf_num(balcao / base * 100, 0))
 
 
 def export_executivo_pdf(data: dict[str, Any]) -> bytes:
@@ -23135,18 +23149,18 @@ def export_executivo_pdf(data: dict[str, Any]) -> bytes:
 
     grupo = [
         ["Faturamento líquido", brl(liquido), "Meta", brl(meta) if meta else "não lançada"],
-        ["% da meta", f"{s.get('goalAttainmentPct') or 0:.1f}%",
+        ["% da meta", _pdf_num(s.get('goalAttainmentPct'), 1),
          "Falta para a meta", brl(falta) if falta > 0 else f"+{brl(-falta)}"],
         ["Projeção do mês", brl(projecao),
-         "% projetado", f"{s.get('projectedGoalAttainmentPct') or 0:.1f}%"],
+         "% projetado", _pdf_num(s.get('projectedGoalAttainmentPct'), 1)],
         ["Clientes faturados", f"{int(s.get('distinctClients') or 0):,}".replace(",", "."),
          "Ticket médio", brl(s.get("ticketAverage"))],
         ["Peças vendidas", f"{int(float(s.get('qtySold') or 0)):,}".replace(",", "."),
          "Ticket por peça", brl(s.get("ticketPerPiece"))],
         ["Devolução comercial", brl(s.get("returnsValue")),
-         "% devolução", f"{s.get('returnRatioPct') or 0:.2f}%"],
+         "% devolução", _pdf_num(s.get('returnRatioPct'), 2)],
         ["Devolução em garantia", brl(s.get("warrantyReturnsValue")),
-         "Desconto médio", f"{s.get('discountPct') or 0:.2f}%"],
+         "Desconto médio", _pdf_num(s.get('discountPct'), 2)],
         # CARTEIRA × BALCÃO, não mix.
         #
         # Aqui havia "Mix de itens", lendo s["mixSku"] — que NÃO EXISTE no
@@ -23157,7 +23171,7 @@ def export_executivo_pdf(data: dict[str, Any]) -> bytes:
         # No lugar entra a divisão carteira × balcão, que o summary tem de
         # verdade e que não aparece em nenhuma outra linha deste PDF.
         ["Carteira × balcão", _pdf_fatia_carteira(s),
-         "Margem", f"{s.get('marginAverage') or 0:.2f}x"],
+         "Margem", _pdf_num(s.get('marginAverage'), 2, 'x')],
     ]
     t_grupo = Table(grupo, colWidths=[120, 110, 120, 110], repeatRows=0)
     t_grupo.setStyle(TableStyle([
@@ -23190,10 +23204,10 @@ def export_executivo_pdf(data: dict[str, Any]) -> bytes:
             normalize_whitespace(u.get("unitName")) or "—",
             brl(u.get("revenueNet")),
             brl(meta_u) if meta_u else "—",
-            f"{u.get('goalAttainmentPct') or 0:.1f}%" if meta_u else "—",
+            _pdf_num(u.get('goalAttainmentPct'), 1) if meta_u else "—",
             brl(u.get("projectedRevenue")),
-            f"{brl(u.get('returnsValue'))}  ({u.get('returnRatioPct') or 0:.1f}%)",
-            f"{u.get('marginValue') or 0:.2f}x",
+            f"{brl(u.get('returnsValue'))}  ({_pdf_num(u.get('returnRatioPct'), 1)})",
+            _pdf_num(u.get('marginValue'), 2, 'x'),
             f"{int(float(u.get('qtySold') or 0)):,}".replace(",", "."),
             brl(u.get("ticketPerPiece")),
         ])
@@ -23201,10 +23215,10 @@ def export_executivo_pdf(data: dict[str, Any]) -> bytes:
     # erra conclui que falta unidade na lista.
     linhas.append([
         "TOTAL", brl(liquido), brl(meta) if meta else "—",
-        f"{s.get('goalAttainmentPct') or 0:.1f}%" if meta else "—",
+        _pdf_num(s.get('goalAttainmentPct'), 1) if meta else "—",
         brl(projecao),
-        f"{brl(s.get('returnsValue'))}  ({s.get('returnRatioPct') or 0:.1f}%)",
-        f"{s.get('marginAverage') or 0:.2f}x",
+        f"{brl(s.get('returnsValue'))}  ({_pdf_num(s.get('returnRatioPct'), 1)})",
+        _pdf_num(s.get('marginAverage'), 2, 'x'),
         f"{int(float(s.get('qtySold') or 0)):,}".replace(",", "."),
         brl(s.get("ticketPerPiece")),
     ])

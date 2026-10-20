@@ -230,8 +230,8 @@ else:
         ("Faturamento líquido", moeda(s.get("revenueNet"))),
         ("Meta", moeda(s.get("revenueGoal"))),
         ("Projeção", moeda(s.get("projectedRevenue"))),
-        ("% da meta", f"{s.get('goalAttainmentPct') or 0:.1f}%"),
-        ("Margem", f"{s.get('marginAverage') or 0:.2f}x"),
+        ("% da meta", backend._pdf_num(s.get("goalAttainmentPct"), 1)),
+        ("Margem", backend._pdf_num(s.get("marginAverage"), 2, "x")),
         ("Carteira × balcão", backend._pdf_fatia_carteira(s)),
     ]
     errados = 0
