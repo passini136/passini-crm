@@ -725,6 +725,17 @@ def main() -> int:
     # por um palpite do script — e que ela também sobreponha um acerto
     # automático que esteja errado.
     manual = carregar_depara_manual(Path(args.depara))
+
+    # NOME DE DESTINO QUE NÃO EXISTE É PIOR QUE NENHUM DE-PARA.
+    #
+    # Se a linha apontar para um vendedor que o CRM não conhece — um erro de
+    # digitação no nome completo, por exemplo —, a falta recebe um "dono"
+    # com quem nenhum login casa. A tela do vendedor abre vazia e ninguém
+    # descobre, porque vazia é indistinguível de "não faltou nada".
+    conhecidos = {chave_nome(v) for v in vendedores}
+    invalidos = {alvo for alvo in manual.values()
+                 if chave_nome(alvo) not in conhecidos}
+
     aplicados = 0
     for (login, unidade) in list(pares):
         alvo = (manual.get((login.upper(), unidade.upper()))
@@ -747,6 +758,12 @@ def main() -> int:
     print(f"   Apelidos de grafia vindos do CRM: {len(apelidos)}")
     print(f"   De-para à mão ({args.depara}): "
           f"{len(manual)} regra(s), {aplicados} aplicada(s)")
+    if invalidos:
+        print(f"   >> {len(invalidos)} destino(s) NÃO EXISTEM no CRM — a falta")
+        print("      ficaria com dono que nenhum login encontra, e a tela do")
+        print("      vendedor abriria vazia. Corrija no arquivo:")
+        for alvo in sorted(invalidos)[:6]:
+            print(f"      · {alvo}")
     print(f"   Pares usuário × unidade: {len(pares)}")
     print(f"   resolvidos:   {len(de_para_vend):>4}")
     print(f"   AMBÍGUO:      {len(ambiguos):>4} "
