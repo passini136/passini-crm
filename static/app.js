@@ -6360,7 +6360,7 @@ function topbarActions() {
   const dropdownItems = [
     !roleIsSeller() ? '<button class="dropdown-item" onclick="toggleActionsMenu(); bootstrapSample()">Carregar exemplo</button>' : "",
     `<button class="dropdown-item" onclick="toggleActionsMenu(); downloadFile('/api/export.xlsx?${buildQuery()}')">Exportar Excel</button>`,
-    `<button class="dropdown-item" onclick="toggleActionsMenu(); downloadFile('/api/export.pdf?${buildQuery()}')">Exportar PDF</button>`,
+    `<button class="dropdown-item" onclick="toggleActionsMenu(); downloadFile('/api/export.pdf?${buildQuery()}')">Exportar PDF (completo)</button>`,
   ].filter(Boolean).join("");
   return `
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
@@ -20850,6 +20850,21 @@ function executivoView() {
           </table>
         </div>
       `)}
+      ${roleIsSeller() ? "" : `
+        <div class="panel" style="display:flex;justify-content:space-between;align-items:center;
+                                  gap:12px;flex-wrap:wrap;padding:12px 18px">
+          <div>
+            <strong style="font-size:13.5px">Resultado em uma página</strong>
+            <div class="text-small" style="color:var(--muted)">
+              O grupo e cada unidade, em PDF de uma folha — para mandar por e-mail
+              ou WhatsApp antes da reunião. Usa o mesmo recorte de competência da tela.
+            </div>
+          </div>
+          <button class="btn btn-primary btn-sm"
+            onclick="downloadFile('/api/export/executivo.pdf?${buildQuery()}')">
+            📄 Baixar PDF executivo</button>
+        </div>`}
+
       ${executiveExpandSection("units", "Ver performance por unidade", `
         <div class="table-wrap">
           <table>

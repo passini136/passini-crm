@@ -23029,6 +23029,180 @@ def export_dashboard_xlsx(data: dict[str, Any]) -> bytes:
     return output.getvalue()
 
 
+_PDF_AZUL = colors.HexColor("#0f3044")
+_PDF_LINHA = colors.HexColor("#d7e2ea")
+_PDF_CINZA = colors.HexColor("#6b7b87")
+_PDF_BOM = colors.HexColor("#1e6b34")
+_PDF_ALERTA = colors.HexColor("#b06000")
+_PDF_RUIM = colors.HexColor("#a4262c")
+
+
+def _pdf_cor_farol(farol: str | None):
+    return {"bom": _PDF_BOM, "alerta": _PDF_ALERTA, "ruim": _PDF_RUIM}.get(farol or "", colors.black)
+
+
+def export_executivo_pdf(data: dict[str, Any]) -> bytes:
+    """Uma página com o resultado do grupo e o de cada unidade.
+
+    Feito para ser enviado, não navegado: o diretor manda por e-mail ou
+    WhatsApp antes da reunião e o gerente lê no celular. Por isso cabe em uma
+    folha, em retrato, sem nada que dependa de clique.
+
+    Os números são os MESMOS da tela — vêm do mesmo `get_dashboard_data`. Um
+    PDF que diverge do painel faz a reunião discutir qual dos dois está certo,
+    que é exatamente o contrário do que ele serve.
+
+    O mês em curso é declarado no cabeçalho, com os dias úteis já decorridos.
+    Sem isso, quem recebe no dia 8 lê "29% da meta" como catástrofe em vez de
+    como ritmo.
+    """
+    s = data.get("summary") or {}
+    unidades = data.get("unitPerformance") or []
+    comp = data.get("primaryCompetence") or "—"
+    farol = s.get("farol") or {}
+
+    saida = io.BytesIO()
+    doc = SimpleDocTemplate(saida, pagesize=A4, leftMargin=28, rightMargin=28,
+                            topMargin=26, bottomMargin=24,
+                            title=f"Resultado Passini {comp}")
+    estilos = getSampleStyleSheet()
+    titulo = estilos["Title"]
+    titulo.fontSize = 17
+    titulo.spaceAfter = 2
+    pequeno = estilos["Normal"].clone("pequeno")
+    pequeno.fontSize = 8
+    pequeno.textColor = _PDF_CINZA
+    secao = estilos["Heading2"].clone("secao")
+    secao.fontSize = 11.5
+    secao.textColor = _PDF_AZUL
+    secao.spaceBefore = 12
+    secao.spaceAfter = 5
+
+    dias_tot = int(s.get("workingDaysTotal") or 0)
+    dias_dec = int(s.get("workingDaysElapsed") or 0)
+    em_curso = dias_tot and dias_dec < dias_tot
+    cabecalho_extra = (
+        f"Mês em andamento — {dias_dec} de {dias_tot} dias úteis decorridos. "
+        f"Os percentuais comparam o realizado com a meta CHEIA do mês."
+        if em_curso else f"Mês fechado — {dias_tot} dias úteis.")
+
+    elementos: list[Any] = [
+        Paragraph("Resultado Comercial · Passini", titulo),
+        Paragraph(f"Competência {comp} · gerado em "
+                  f"{today_in_brazil().strftime('%d/%m/%Y')}", pequeno),
+        Paragraph(cabecalho_extra, pequeno),
+        Spacer(1, 10),
+    ]
+
+    # ── Grupo ────────────────────────────────────────────────────────────────
+    liquido = float(s.get("revenueNet") or 0)
+    meta = float(s.get("revenueGoal") or 0)
+    projecao = float(s.get("projectedRevenue") or 0)
+    falta = meta - liquido
+
+    grupo = [
+        ["Faturamento líquido", brl(liquido), "Meta", brl(meta) if meta else "não lançada"],
+        ["% da meta", f"{s.get('goalAttainmentPct') or 0:.1f}%",
+         "Falta para a meta", brl(falta) if falta > 0 else f"+{brl(-falta)}"],
+        ["Projeção do mês", brl(projecao),
+         "% projetado", f"{s.get('projectedGoalAttainmentPct') or 0:.1f}%"],
+        ["Clientes faturados", f"{int(s.get('distinctClients') or 0):,}".replace(",", "."),
+         "Ticket médio", brl(s.get("ticketAverage"))],
+        ["Peças vendidas", f"{int(float(s.get('qtySold') or 0)):,}".replace(",", "."),
+         "Ticket por peça", brl(s.get("ticketPerPiece"))],
+        ["Devolução comercial", brl(s.get("returnsValue")),
+         "% devolução", f"{s.get('returnRatioPct') or 0:.2f}%"],
+        ["Devolução em garantia", brl(s.get("warrantyReturnsValue")),
+         "Desconto médio", f"{s.get('discountPct') or 0:.2f}%"],
+        ["Mix de itens", f"{int(s.get('mixSku') or 0):,}".replace(",", "."),
+         "Margem", f"{s.get('marginAverage') or 0:.2f}x"],
+    ]
+    t_grupo = Table(grupo, colWidths=[120, 110, 120, 110], repeatRows=0)
+    t_grupo.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTNAME", (1, 0), (1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("FONTSIZE", (1, 0), (1, 0), 12),
+        ("TEXTCOLOR", (0, 0), (0, -1), _PDF_CINZA),
+        ("TEXTCOLOR", (2, 0), (2, -1), _PDF_CINZA),
+        ("TEXTCOLOR", (1, 1), (1, 1), _pdf_cor_farol(farol.get("goalAttainment"))),
+        ("FONTNAME", (1, 1), (1, 1), "Helvetica-Bold"),
+        ("TEXTCOLOR", (3, 5), (3, 5), _pdf_cor_farol(farol.get("returnRatio"))),
+        ("LINEBELOW", (0, 0), (-1, -2), 0.4, _PDF_LINHA),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    elementos += [Paragraph("Grupo", secao), t_grupo]
+
+    # ── Unidades ─────────────────────────────────────────────────────────────
+    # Mesmas colunas da tela de performance por unidade, na mesma ordem: quem
+    # recebe o PDF e abre o sistema depois tem de reconhecer a mesma tabela.
+    linhas = [["Unidade", "Líquido", "Meta", "% meta", "Projeção",
+               "Devolução", "Margem", "Peças", "R$/peça"]]
+    visiveis = [u for u in unidades
+                if normalize_whitespace(u.get("unitName")) or float(u.get("revenueNet") or 0)]
+    for u in sorted(visiveis, key=lambda x: -float(x.get("revenueNet") or 0)):
+        meta_u = float(u.get("revenueGoal") or 0)
+        linhas.append([
+            normalize_whitespace(u.get("unitName")) or "—",
+            brl(u.get("revenueNet")),
+            brl(meta_u) if meta_u else "—",
+            f"{u.get('goalAttainmentPct') or 0:.1f}%" if meta_u else "—",
+            brl(u.get("projectedRevenue")),
+            f"{brl(u.get('returnsValue'))}  ({u.get('returnRatioPct') or 0:.1f}%)",
+            f"{u.get('marginValue') or 0:.2f}x",
+            f"{int(float(u.get('qtySold') or 0)):,}".replace(",", "."),
+            brl(u.get("ticketPerPiece")),
+        ])
+    # Total do grupo fecha a tabela: sem ele, quem soma as unidades à mão e
+    # erra conclui que falta unidade na lista.
+    linhas.append([
+        "TOTAL", brl(liquido), brl(meta) if meta else "—",
+        f"{s.get('goalAttainmentPct') or 0:.1f}%" if meta else "—",
+        brl(projecao),
+        f"{brl(s.get('returnsValue'))}  ({s.get('returnRatioPct') or 0:.1f}%)",
+        f"{s.get('marginAverage') or 0:.2f}x",
+        f"{int(float(s.get('qtySold') or 0)):,}".replace(",", "."),
+        brl(s.get("ticketPerPiece")),
+    ])
+
+    t_un = Table(linhas, repeatRows=1,
+                 colWidths=[70, 68, 68, 40, 68, 85, 40, 44, 52])
+    estilo_un = [
+        ("BACKGROUND", (0, 0), (-1, 0), _PDF_AZUL),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eef4fa")),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("ALIGN", (1, 0), (-1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.3, _PDF_LINHA),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+    ]
+    # Cor no % de cada unidade, pela mesma régua da tela.
+    for i, u in enumerate(sorted(visiveis, key=lambda x: -float(x.get("revenueNet") or 0)), start=1):
+        estilo_un.append(("TEXTCOLOR", (3, i), (3, i),
+                          _pdf_cor_farol((u.get("farol") or {}).get("goalAttainment"))))
+    t_un.setStyle(TableStyle(estilo_un))
+    elementos += [Paragraph("Por unidade", secao), t_un]
+
+    elementos += [
+        Spacer(1, 10),
+        Paragraph(
+            "Faturamento, meta e devolução saem do custo × venda, a fonte oficial de "
+            "resultado. Devolução em garantia é defeito de peça e já está separada da "
+            "devolução comercial. Margem é o multiplicador do Alfa — 1,55x equivale a "
+            "cerca de 35%.", pequeno),
+    ]
+
+    doc.build(elementos)
+    saida.seek(0)
+    return saida.read()
+
+
 def export_dashboard_pdf(data: dict[str, Any]) -> bytes:
     output = io.BytesIO()
     doc = SimpleDocTemplate(output, pagesize=landscape(A4), leftMargin=24, rightMargin=24, topMargin=24, bottomMargin=24)
@@ -28185,6 +28359,23 @@ class AppHandler(BaseHTTPRequestHandler):
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     {"Content-Disposition": 'attachment; filename="dashboard_passini.xlsx"'},
                 )
+                self.wfile.write(content)
+                return
+            if path == "/api/export/executivo.pdf":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    filters = scoped_filters_for_user(
+                        conn, user["company_id"], user, build_filters_from_query(query))
+                    data = get_dashboard_data(conn, user["company_id"], filters)
+                content = export_executivo_pdf(data)
+                comp = (data.get("primaryCompetence") or "atual").replace("/", "-")
+                self._set_headers(
+                    200, "application/pdf",
+                    {"Content-Disposition":
+                     f'attachment; filename="resultado-passini-{comp}.pdf"'})
                 self.wfile.write(content)
                 return
             if path == "/api/export.pdf":
