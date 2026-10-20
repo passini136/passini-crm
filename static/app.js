@@ -69,6 +69,7 @@ const state = {
   phaseEditor: null,           // fase da unidade (diretoria)
   activityGoalEditor: null,    // metas de atividade
   metas: null,                 // painel de metas por unidade e equipe
+  faltas: null,                // solicitações de compra do Radar, por mês
   metasAberta: "",             // unidade expandida no painel
   metasAno: "",                // ano exibido no painel de metas
   sugestaoMetas: null,         // modal de sugestão de metas da equipe
@@ -105,6 +106,7 @@ const state = {
       clientDrawer: false,
       admin: false,
       metas: false,
+      faltas: false,
       integrityAudit: false,
       filters: false,
       meetings: false,
@@ -13753,9 +13755,169 @@ function setResultadoNivel(level, target) {
 async function setResultadoAba(aba) {
   if (state.resultadosFiltros.tab === aba) return;
   state.resultadosFiltros.tab = aba;
+  // A aba de faltas lê OUTRO arquivo, não o dashboard. Recarregar o painel
+  // inteiro aqui custaria segundos e não traria nada do que ela mostra.
+  if (aba === "faltas") {
+    render();
+    await loadFaltas();
+    return;
+  }
   state.resultados = null;          // força o "Montando o painel…"
   render();
   await loadResultados();
+}
+
+
+async function loadFaltas(competencia) {
+  setLoading("faltas", true);
+  render();
+  try {
+    const q = new URLSearchParams();
+    if (competencia) q.set("competence", competencia);
+    state.faltas = await api(`/api/faltas/painel?${q}`);
+  } catch (e) {
+    state.faltas = { erro: String(e && e.message ? e.message : e) };
+  } finally {
+    setLoading("faltas", false);
+    render();
+  }
+}
+
+
+function abaFaltas() {
+  const d = state.faltas;
+  if (state.ui.loading.faltas || !d) {
+    return `<div class="message">⏳ Lendo as solicitações de compra…</div>`;
+  }
+  if (d.erro) {
+    return `<div class="message" style="background:#fce8e6;color:#a4262c">
+      Não consegui ler as faltas: ${escapeHtml(d.erro)}</div>`;
+  }
+  // O ARQUIVO PODE NÃO EXISTIR, e isso não é erro.
+  // Ele é gerado fora do CRM, a partir da base do Radar. Enquanto ninguém
+  // rodar o exportador, a resposta honesta é dizer isso — não uma tela vazia
+  // que parece "nenhuma falta".
+  if (!d.disponivel) {
+    return `<div class="message" style="background:#fef7e0;color:#8a5a00">
+      A base de faltas ainda não foi gerada. Ela vem das solicitações de compra
+      do Radar de Rupturas e é atualizada por fora do CRM.</div>`;
+  }
+  if (d.semVinculo) {
+    return `<div class="message" style="background:#fef7e0;color:#8a5a00">
+      Não encontrei solicitações vinculadas ao seu nome. Isso costuma ser
+      cadastro: o Radar grava só o primeiro nome, e o vínculo é feito pelo
+      cadastro de pessoas.</div>`;
+  }
+  const r = d.resumo || {};
+  const st = d.status || {};
+  const porStatus = r.porStatus || {};
+  const total = r.pecas || 0;
+
+  const cartao = (rot, valor, sub, cor) => `
+    <div class="panel" style="padding:12px 14px;border-left:4px solid ${cor}">
+      <div class="text-small" style="color:var(--muted)">${rot}</div>
+      <div style="font-size:21px;font-weight:800;color:${cor}">${valor}</div>
+      <div class="text-small" style="color:var(--muted)">${sub}</div>
+    </div>`;
+
+  // Barra de status: proporção visual antes dos números, porque o gerente
+  // olha isto de relance e a pergunta dele é "melhorou ou piorou".
+  const barra = ["TEM", "VOLTOU", "ABERTO", "SEM_INFO"]
+    .filter((k) => porStatus[k])
+    .map((k) => `<div title="${escapeHtml(st[k].label)}: ${porStatus[k]}"
+         style="width:${(100 * porStatus[k] / Math.max(1, total)).toFixed(1)}%;
+                background:${st[k].cor};height:100%"></div>`).join("");
+
+  const linhas = (d.linhas || []).map((l) => {
+    const s = st[l.status] || {};
+    const dt = l.lastRequest ? l.lastRequest.split("-").reverse().join("/") : "—";
+    return `<tr>
+      <td style="font-family:ui-monospace,monospace">${escapeHtml(l.itemCode)}</td>
+      <td>${escapeHtml(l.item || "—")}<div class="text-small" style="color:var(--muted)">
+          ${escapeHtml(l.brand || "")}${l.type ? " · " + escapeHtml(l.type) : ""}</div></td>
+      ${d.unitName ? "" : `<td>${escapeHtml(l.unitName)}</td>`}
+      <td style="text-align:right;font-weight:700">${l.pedidos}</td>
+      <td style="text-align:right">${dt}</td>
+      <td style="text-align:right">${l.cost ? currency(l.cost) : "—"}</td>
+      <td style="color:${s.cor};font-weight:700;white-space:nowrap">
+        ${s.icon || ""} ${escapeHtml(s.label || l.status)}</td>
+      <td style="text-align:right">${l.stock === null ? "—" : number(l.stock)}</td>
+    </tr>`;
+  }).join("");
+
+  return `
+    <div class="stack" style="margin-top:12px">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <select onchange="loadFaltas(this.value)"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px">
+          ${(d.competencias || []).map((c) => `<option value="${c}"
+            ${c === d.competencia ? "selected" : ""}>${c}</option>`).join("")}
+        </select>
+        <span class="text-small" style="color:var(--muted)">
+          ${d.unitName ? escapeHtml(d.unitName) : "Todas as unidades"}
+          ${d.sellerName ? " · " + escapeHtml(d.sellerName) : ""}
+        </span>
+        <span style="flex:1"></span>
+        <span class="text-small" style="color:var(--muted)">
+          Base de ${escapeHtml((d.arquivo || {}).geradoEm || "—")}
+        </span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
+        ${cartao("Peças que faltaram", number(total),
+          `${number(r.pedidos || 0)} pedido(s)`, "#0f3044")}
+        ${cartao("Tem na loja hoje", number(porStatus.TEM || 0),
+          r.resolvidoPct === null ? "sem base para %" : `${r.resolvidoPct}% das com resposta`,
+          st.TEM ? st.TEM.cor : "#1e8e3e")}
+        ${cartao("Chegou e acabou", number(porStatus.VOLTOU || 0),
+          "entrou depois do pedido", st.VOLTOU ? st.VOLTOU.cor : "#b06000")}
+        ${cartao("Em aberto", number(porStatus.ABERTO || 0),
+          "família ainda zerada", st.ABERTO ? st.ABERTO.cor : "#c5221f")}
+        ${cartao("Valor pedido", currency(r.valorEstimado || 0),
+          "custo × pedidos", "#5f6368")}
+      </div>
+
+      <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;background:#eef2f5">
+        ${barra}
+      </div>
+      <div class="text-small" style="color:var(--muted)">
+        ${["TEM", "VOLTOU", "ABERTO", "SEM_INFO"].map((k) =>
+          `<span style="margin-right:12px">
+             <span style="display:inline-block;width:9px;height:9px;border-radius:2px;
+                   background:${st[k].cor};margin-right:4px"></span>
+             ${escapeHtml(st[k].label)} ${number(porStatus[k] || 0)}</span>`).join("")}
+      </div>
+
+      ${(porStatus.SEM_INFO || 0) > total * 0.2 ? `
+        <div class="message" style="background:#f1f3f4;color:#5f6368;font-size:12px">
+          ${number(porStatus.SEM_INFO)} peça(s) sem posição de estoque — a unidade
+          nunca teve essa família cadastrada. Não dá para dizer se resolveu, então
+          elas ficam fora do percentual.
+        </div>` : ""}
+
+      <div class="panel" style="padding:0;overflow:auto;max-height:560px">
+        <table class="table" style="margin:0">
+          <thead><tr>
+            <th>Código</th><th>Peça</th>${d.unitName ? "" : "<th>Unidade</th>"}
+            <th style="text-align:right">Pedidos</th>
+            <th style="text-align:right">Último</th>
+            <th style="text-align:right">Custo</th>
+            <th>Situação</th>
+            <th style="text-align:right">Estoque</th>
+          </tr></thead>
+          <tbody>${linhas || `<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--muted)">
+            Nenhuma falta registrada neste mês.</td></tr>`}</tbody>
+        </table>
+      </div>
+      ${d.truncado ? `<div class="text-small" style="color:var(--muted)">
+        Mostrando as ${(d.linhas || []).length} peças mais pedidas de ${number(total)}.</div>` : ""}
+
+      <div class="text-small" style="color:var(--muted)">
+        Situação pela regra do Radar: a peça só conta como em falta quando a
+        <strong>família de substitutos</strong> está zerada na unidade — peça
+        pedida com substituto na prateleira não é ruptura.
+      </div>
+    </div>`;
 }
 
 /* ─── Gráficos do painel de evolução ─────────────────────────────────────────
@@ -14567,7 +14729,8 @@ function resultadosView() {
       </div>
 
       <div style="display:flex;gap:4px;border-bottom:2px solid var(--line)">
-        ${[["fca", "📌 Fato, causa e produtividade"], ["evolucao", "📈 Evolução 12 meses"]]
+        ${[["fca", "📌 Fato, causa e produtividade"], ["evolucao", "📈 Evolução 12 meses"],
+           ["faltas", "⛔ Faltas e rupturas"]]
           .map(([id, rot]) => `
             <button onclick="setResultadoAba('${id}')"
               style="background:${f.tab === id ? "#fff" : "transparent"};border:none;
@@ -14584,7 +14747,9 @@ function resultadosView() {
           As comparações de volume estão ajustadas a essa fatia.
         </div>` : ""}
 
-      ${f.tab === "evolucao" ? abaEvolucao : `<div class="stack">${montarFca()}</div>`}
+      ${f.tab === "faltas" ? abaFaltas()
+        : f.tab === "evolucao" ? abaEvolucao
+        : `<div class="stack">${montarFca()}</div>`}
     </div>`;
 
   // Declaração de função (não const): é içada, então pode ser chamada acima
