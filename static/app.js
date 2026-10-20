@@ -70,6 +70,8 @@ const state = {
   activityGoalEditor: null,    // metas de atividade
   metas: null,                 // painel de metas por unidade e equipe
   faltas: null,                // solicitações de compra do Radar, por mês
+  faltasFiltros: { competence: "", status: "", brand: "", type: "",
+                   search: "", sort: "pedidos", dir: "desc" },
   metasAberta: "",             // unidade expandida no painel
   metasAno: "",                // ano exibido no painel de metas
   sugestaoMetas: null,         // modal de sugestão de metas da equipe
@@ -13780,8 +13782,11 @@ async function loadFaltas(competencia) {
   requestRender();
   let resposta;
   try {
+    const f = state.faltasFiltros;
+    if (competencia) f.competence = competencia;
     const q = new URLSearchParams();
-    if (competencia) q.set("competence", competencia);
+    ["competence", "status", "brand", "type", "search", "sort", "dir"]
+      .forEach((k) => { if (f[k]) q.set(k, f[k]); });
     resposta = await api(`/api/faltas/painel?${q}`);
   } catch (e) {
     resposta = { erro: String(e && e.message ? e.message : e) };
@@ -13795,6 +13800,46 @@ async function loadFaltas(competencia) {
   state.ui.loading.faltas = false;
   requestRender();
   return state.faltas;
+}
+
+
+function setFaltaFiltro(campo, valor) {
+  state.faltasFiltros[campo] = valor;
+  loadFaltas();
+}
+
+
+function limparFaltaFiltros() {
+  state.faltasFiltros = { ...state.faltasFiltros, status: "", brand: "",
+                          type: "", search: "" };
+  loadFaltas();
+}
+
+
+function setFaltaOrdem(campo) {
+  const f = state.faltasFiltros;
+  // Clicar de novo na mesma coluna inverte; coluna nova começa decrescente,
+  // que é o que se quer em quase tudo aqui (mais pedidos, maior valor).
+  // Exceções: texto e data começam crescentes, porque "de A a Z" e "do mais
+  // antigo" é a leitura natural dessas duas.
+  if (f.sort === campo) {
+    f.dir = f.dir === "desc" ? "asc" : "desc";
+  } else {
+    f.sort = campo;
+    f.dir = ["item", "codigo", "unidade", "ultimo"].includes(campo) ? "asc" : "desc";
+  }
+  loadFaltas();
+}
+
+
+function thFalta(rotulo, campo, alinhar) {
+  const f = state.faltasFiltros;
+  const ativo = f.sort === campo;
+  const seta = ativo ? (f.dir === "desc" ? " ▼" : " ▲") : "";
+  return `<th onclick="setFaltaOrdem('${campo}')" title="Ordenar por ${escapeHtml(rotulo)}"
+    style="cursor:pointer;user-select:none;white-space:nowrap;
+           text-align:${alinhar || "left"};${ativo ? "color:#0f3044;font-weight:800" : ""}">
+    ${escapeHtml(rotulo)}<span style="opacity:.75">${seta}</span></th>`;
 }
 
 
@@ -13826,6 +13871,10 @@ function abaFaltas() {
   const st = d.status || {};
   const porStatus = r.porStatus || {};
   const total = r.pecas || 0;
+  const ft = state.faltasFiltros;
+  const op = d.opcoes || { brands: [], types: [], units: [] };
+  const filtrosAtivos = ["status", "brand", "type", "search"]
+    .filter((k) => ft[k]).length;
 
   const cartao = (rot, valor, sub, cor) => `
     <div class="panel" style="padding:12px 14px;border-left:4px solid ${cor}">
@@ -13852,7 +13901,6 @@ function abaFaltas() {
       ${d.unitName ? "" : `<td>${escapeHtml(l.unitName)}</td>`}
       <td style="text-align:right;font-weight:700">${l.pedidos}</td>
       <td style="text-align:right">${dt}</td>
-      <td style="text-align:right">${l.cost ? currency(l.cost) : "—"}</td>
       <td style="color:${s.cor};font-weight:700;white-space:nowrap">
         ${s.icon || ""} ${escapeHtml(s.label || l.status)}</td>
       <td style="text-align:right">${l.stock === null ? "—" : number(l.stock)}</td>
@@ -13861,12 +13909,38 @@ function abaFaltas() {
 
   return `
     <div class="stack" style="margin-top:12px">
-      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <select onchange="loadFaltas(this.value)"
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select onchange="loadFaltas(this.value)" title="Competência"
           style="padding:6px 10px;border:1px solid var(--line);border-radius:6px">
           ${(d.competencias || []).map((c) => `<option value="${c}"
             ${c === d.competencia ? "selected" : ""}>${c}</option>`).join("")}
         </select>
+        <select onchange="setFaltaFiltro('status', this.value)" title="Situação"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px">
+          <option value="">Todas as situações</option>
+          ${["ABERTO", "VOLTOU", "TEM", "SEM_INFO"].map((k) => `<option value="${k}"
+            ${ft.status === k ? "selected" : ""}>${st[k].icon} ${escapeHtml(st[k].label)}
+            (${number(porStatus[k] || 0)})</option>`).join("")}
+        </select>
+        <select onchange="setFaltaFiltro('brand', this.value)" title="Marca"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;max-width:190px">
+          <option value="">Todas as marcas</option>
+          ${op.brands.map((b) => `<option value="${escapeHtml(b)}"
+            ${ft.brand === b ? "selected" : ""}>${escapeHtml(b)}</option>`).join("")}
+        </select>
+        <select onchange="setFaltaFiltro('type', this.value)" title="Tipo de peça"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;max-width:190px">
+          <option value="">Todos os tipos</option>
+          ${op.types.map((t) => `<option value="${escapeHtml(t)}"
+            ${ft.type === t ? "selected" : ""}>${escapeHtml(t)}</option>`).join("")}
+        </select>
+        <input value="${escapeHtml(ft.search || "")}" placeholder="🔍 código, peça ou marca"
+          onkeydown="if(event.key==='Enter'){setFaltaFiltro('search', this.value);}"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;min-width:190px" />
+        ${filtrosAtivos ? `<button class="btn btn-ghost btn-sm"
+          onclick="limparFaltaFiltros()">Limpar (${filtrosAtivos})</button>` : ""}
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <span class="text-small" style="color:var(--muted)">
           ${d.unitName ? escapeHtml(d.unitName) : "Todas as unidades"}
           ${d.sellerName ? " · " + escapeHtml(d.sellerName) : ""}
@@ -13887,8 +13961,6 @@ function abaFaltas() {
           "entrou depois do pedido", st.VOLTOU ? st.VOLTOU.cor : "#b06000")}
         ${cartao("Em aberto", number(porStatus.ABERTO || 0),
           "família ainda zerada", st.ABERTO ? st.ABERTO.cor : "#c5221f")}
-        ${cartao("Valor pedido", currency(r.valorEstimado || 0),
-          "custo × pedidos", "#5f6368")}
       </div>
 
       <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;background:#eef2f5">
@@ -13912,15 +13984,16 @@ function abaFaltas() {
       <div class="panel" style="padding:0;overflow:auto;max-height:560px">
         <table class="table" style="margin:0">
           <thead><tr>
-            <th>Código</th><th>Peça</th>${d.unitName ? "" : "<th>Unidade</th>"}
-            <th style="text-align:right">Pedidos</th>
-            <th style="text-align:right">Último</th>
-            <th style="text-align:right">Custo</th>
-            <th>Situação</th>
-            <th style="text-align:right">Estoque</th>
+            ${thFalta("Código", "codigo")}
+            ${thFalta("Peça", "item")}
+            ${d.unitName ? "" : thFalta("Unidade", "unidade")}
+            ${thFalta("Pedidos", "pedidos", "right")}
+            ${thFalta("Último", "ultimo", "right")}
+            ${thFalta("Situação", "situacao")}
+            ${thFalta("Estoque", "estoque", "right")}
           </tr></thead>
-          <tbody>${linhas || `<tr><td colspan="8" style="text-align:center;padding:18px;color:var(--muted)">
-            Nenhuma falta registrada neste mês.</td></tr>`}</tbody>
+          <tbody>${linhas || `<tr><td colspan="7" style="text-align:center;padding:18px;color:var(--muted)">
+            ${filtrosAtivos ? "Nenhuma peça com esses filtros." : "Nenhuma falta registrada neste mês."}</td></tr>`}</tbody>
         </table>
       </div>
       ${d.truncado ? `<div class="text-small" style="color:var(--muted)">

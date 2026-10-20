@@ -18224,7 +18224,9 @@ def _falta_status(estoque, ultima_entrada, ultima_data) -> str:
 def faltas_painel(
     conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
     competencia: str = "", unidade: str = "", vendedor: str = "",
-    limite: int = 120,
+    filtro_status: str = "", filtro_marca: str = "", filtro_tipo: str = "",
+    busca: str = "", ordenar: str = "pedidos", sentido: str = "desc",
+    limite: int = 150,
 ) -> dict[str, Any]:
     """Acompanhamento de rupturas: o que faltou e o que aconteceu depois.
 
@@ -18291,9 +18293,14 @@ def faltas_painel(
             onde.append(f"f.vendedor IN ({','.join('?' * len(equivalentes))})")
             par.extend(equivalentes)
 
-        linhas = []
-        contagem = {k: 0 for k in FALTA_STATUS}
-        pedidos_total = valor_total = 0.0
+        # TUDO DO MÊS NA MEMÓRIA, DEPOIS FILTRA E ORDENA.
+        #
+        # São alguns milhares de linhas por mês — nada para o Python. Em troca
+        # dá para ordenar e filtrar por SITUAÇÃO, que não existe no banco: ela
+        # nasce do cruzamento com o estoque da família. Ordenar no SQL e cortar
+        # em 120 antes de classificar traria "as 120 mais pedidas, ordenadas
+        # por outra coisa" — o topo da tela mostraria a peça errada.
+        todas = []
         for r in fconn.execute(
             f"""SELECT f.unidade, f.item_code, f.familia,
                        SUM(f.pedidos) AS pedidos,
@@ -18305,28 +18312,82 @@ def faltas_painel(
                   LEFT JOIN estoque_familia e
                          ON e.unidade = f.unidade AND e.familia = f.familia
                  WHERE {' AND '.join(onde)}
-                 GROUP BY f.unidade, f.item_code
-                 ORDER BY pedidos DESC""", par
+                 GROUP BY f.unidade, f.item_code""", par
         ):
-            st = _falta_status(r["estoque"], r["ultima_entrada"], r["ultima_data"])
-            contagem[st] += 1
-            pedidos_total += r["pedidos"] or 0
             custo = float(r["custo"] or 0)
-            valor_total += custo * (r["pedidos"] or 0)
-            if len(linhas) < limite:
-                linhas.append({
-                    "unitName": r["unidade"],
-                    "itemCode": r["item_code"],
-                    "item": normalize_whitespace(r["item"]),
-                    "brand": normalize_whitespace(r["fabricante"]),
-                    "type": normalize_whitespace(r["tipo"]),
-                    "pedidos": r["pedidos"],
-                    "lastRequest": r["ultima_data"] or "",
-                    "cost": round(custo, 2),
-                    "stock": None if r["estoque"] is None else float(r["estoque"]),
-                    "lastEntry": r["ultima_entrada"] or "",
-                    "status": st,
-                })
+            todas.append({
+                "unitName": r["unidade"],
+                "itemCode": r["item_code"],
+                "item": normalize_whitespace(r["item"]),
+                "brand": normalize_whitespace(r["fabricante"]),
+                "type": normalize_whitespace(r["tipo"]),
+                "pedidos": r["pedidos"] or 0,
+                "lastRequest": r["ultima_data"] or "",
+                "cost": round(custo, 2),
+                "value": round(custo * (r["pedidos"] or 0), 2),
+                "stock": None if r["estoque"] is None else float(r["estoque"]),
+                "lastEntry": r["ultima_entrada"] or "",
+                "status": _falta_status(r["estoque"], r["ultima_entrada"],
+                                        r["ultima_data"]),
+            })
+
+        # As opções dos filtros saem do recorte do usuário, antes de filtrar:
+        # oferecer marca que não existe na unidade dele é convite a lista vazia.
+        opcoes = {
+            "brands": sorted({x["brand"] for x in todas if x["brand"]})[:300],
+            "types": sorted({x["type"] for x in todas if x["type"]})[:300],
+            "units": sorted({x["unitName"] for x in todas if x["unitName"]}),
+        }
+
+        alvo_status = normalize_whitespace(filtro_status).upper()
+        alvo_marca = normalize_whitespace(filtro_marca).upper()
+        alvo_tipo = normalize_whitespace(filtro_tipo).upper()
+        termo = normalize_whitespace(busca).upper()
+        if alvo_status in FALTA_STATUS:
+            todas = [x for x in todas if x["status"] == alvo_status]
+        if alvo_marca:
+            todas = [x for x in todas if x["brand"].upper() == alvo_marca]
+        if alvo_tipo:
+            todas = [x for x in todas if x["type"].upper() == alvo_tipo]
+        if termo:
+            todas = [x for x in todas
+                     if termo in x["itemCode"].upper() or termo in x["item"].upper()
+                     or termo in x["brand"].upper()]
+
+        contagem = {k: 0 for k in FALTA_STATUS}
+        pedidos_total = valor_total = 0.0
+        for x in todas:
+            contagem[x["status"]] += 1
+            pedidos_total += x["pedidos"]
+            valor_total += x["value"]
+
+        # Ordenação. Nulo vai SEMPRE para o fim, nos dois sentidos: peça sem
+        # custo no topo do "mais caro" seria ruído ocupando a primeira tela.
+        CAMPOS = {"pedidos": "pedidos", "item": "item", "codigo": "itemCode",
+                  "ultimo": "lastRequest", "custo": "cost", "valor": "value",
+                  "estoque": "stock", "situacao": "status", "unidade": "unitName"}
+        campo = CAMPOS.get(normalize_whitespace(ordenar).lower(), "pedidos")
+        desc = normalize_whitespace(sentido).lower() != "asc"
+
+        def chave_ordem(x):
+            v = x.get(campo)
+            vazio = v is None or v == ""
+            if campo == "situacao":
+                # Ordem útil, não alfabética: o que está em aberto primeiro.
+                ordem = {"ABERTO": 0, "VOLTOU": 1, "SEM_INFO": 2, "TEM": 3}
+                return (False, ordem.get(v, 9))
+            if isinstance(v, (int, float)):
+                return (vazio, v)
+            return (vazio, str(v or "").upper())
+
+        todas.sort(key=chave_ordem, reverse=desc)
+        # reverse=True joga o nulo para o começo; recoloca no fim.
+        if desc:
+            cheios = [x for x in todas if not (x.get(campo) is None or x.get(campo) == "")]
+            vazios = [x for x in todas if (x.get(campo) is None or x.get(campo) == "")]
+            todas = cheios + vazios
+
+        linhas = todas[:limite]
         pecas = sum(contagem.values())
         resolvidas = contagem["TEM"]
         # O percentual ignora SEM_INFO no denominador: incluir o que não se
@@ -18352,6 +18413,10 @@ def faltas_painel(
             },
             "linhas": linhas,
             "truncado": pecas > limite,
+            "opcoes": opcoes,
+            "filtros": {"status": alvo_status, "brand": filtro_marca,
+                        "type": filtro_tipo, "search": busca,
+                        "sort": campo, "dir": "desc" if desc else "asc"},
             "arquivo": faltas_status(),
         }
     except Exception as exc:  # noqa: BLE001
@@ -27879,7 +27944,13 @@ class AppHandler(BaseHTTPRequestHandler):
                         conn, user["company_id"], user,
                         competencia=query.get("competence", [""])[0],
                         unidade=query.get("unit", [""])[0],
-                        vendedor=query.get("seller", [""])[0])
+                        vendedor=query.get("seller", [""])[0],
+                        filtro_status=query.get("status", [""])[0],
+                        filtro_marca=query.get("brand", [""])[0],
+                        filtro_tipo=query.get("type", [""])[0],
+                        busca=query.get("search", [""])[0],
+                        ordenar=query.get("sort", ["pedidos"])[0],
+                        sentido=query.get("dir", ["desc"])[0])
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return
