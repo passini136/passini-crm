@@ -134,8 +134,38 @@ print("\n3) ESTOQUE CONSOLIDADO POR UNIDADE × FAMÍLIA")
 # canonical_gtin, lê a última entrada e resolve a família. É a mesma leitura
 # que o Radar usa para calcular ruptura, então os dois não podem divergir.
 preparado = _prepare_stock(stock, familias)
+
+# DUAS NORMALIZAÇÕES DE UNIDADE, E ELAS NÃO FALAM A MESMA LÍNGUA.
+#
+# _prepare_stock normaliza com o vocabulário do Radar: ZONASUL, ZONANORTE,
+# sem espaço. O arquivo de faltas já saiu traduzido para o do CRM: ZONA SUL,
+# ZONA NORTE. Sem converter aqui, essas duas unidades jamais casam — e a
+# conta não dá erro, dá "sem posição de estoque" para um quarto das faltas,
+# que é um número plausível o bastante para ninguém desconfiar.
+#
+# Foi o que aconteceu na execução anterior: 27% de "sem posição", e a Zona
+# Sul mais a Zona Norte são ~24% do arquivo.
+DE_PARA_UNIDADE: dict[str, str] = {}
+_fonte_backend = Path(__file__).resolve().parent / "backend.py"
+try:
+    import ast
+    for _no in ast.parse(_fonte_backend.read_text(encoding="utf-8")).body:
+        if isinstance(_no, ast.Assign) and any(
+                getattr(a, "id", "") == "UNIT_NORMALIZATION" for a in _no.targets):
+            DE_PARA_UNIDADE = ast.literal_eval(_no.value)
+            break
+except Exception as _exc:  # noqa: BLE001
+    print(f"   (não consegui ler UNIT_NORMALIZATION: {_exc})")
+
+
+def para_unidade_do_crm(valor) -> str:
+    bruto = re.sub(r"\s+", " ", str(valor or "").upper()).strip()
+    return DE_PARA_UNIDADE.get(bruto, bruto)
+
+
+_antes = sorted(set(preparado["Unidade_Normalizada"]))
 est = pd.DataFrame({
-    "unidade": preparado["Unidade_Normalizada"],
+    "unidade": preparado["Unidade_Normalizada"].map(para_unidade_do_crm),
     "codigo": preparado["GTIN"],
     "qtd": preparado["quantity"],
     "entrada": preparado["Ultima_Entrada"],
@@ -145,6 +175,9 @@ est = est[est["codigo"].astype(str).ne("")]
 fam = est.groupby(["unidade", "familia"], as_index=False).agg(
     estoque=("qtd", "sum"), ultima_entrada=("entrada", "max"))
 print(f"   {len(est):,} posições → {len(fam):,} combinações unidade × família")
+_depois = sorted(set(est["unidade"]))
+print(f"   Unidade no vocabulário do Radar: {', '.join(_antes)}")
+print(f"   Traduzida para o do CRM:         {', '.join(_depois)}")
 entradas = int(est["entrada"].notna().sum())
 print(f"   Posições com data de última entrada: {entradas:,} "
       f"({100 * entradas / max(1, len(est)):.0f}%)")
@@ -192,12 +225,22 @@ else:
     idx = {(r["unidade"], r["familia"]): (r["estoque"], r["ultima_entrada"])
            for r in fam.to_dict("records")}
 
+    # "Sem posição" precisa dizer POR QUE. Unidade que não existe no estoque
+    # é erro de de-para; família que não existe é cadastro. Os dois somavam
+    # num número só e pareciam o mesmo problema.
+    unidades_estoque = {u for u, _ in idx}
+    sem_unidade = sem_familia = 0
+
     tem = zerado = sem_posicao = chegou_depois = 0
     for r in linhas:
         familia = familias.get(r["item_code"], {}).get("FamiliaID", r["item_code"])
         par = idx.get((r["unidade"], familia))
         if par is None:
             sem_posicao += 1
+            if r["unidade"] not in unidades_estoque:
+                sem_unidade += 1
+            else:
+                sem_familia += 1
             continue
         estoque, entrada = par
         if estoque > 0:
@@ -212,9 +255,15 @@ else:
     print(f"      com estoque da família HOJE:   {tem:>7,} ({100 * tem / tot:.0f}%)  → resolvido")
     print(f"      família ainda zerada:          {zerado:>7,} ({100 * zerado / tot:.0f}%)  → em aberto")
     print(f"      sem posição de estoque:        {sem_posicao:>7,} ({100 * sem_posicao / tot:.0f}%)  → não dá para dizer")
+    print(f"         · unidade fora do estoque:  {sem_unidade:>7,}  (erro de de-para)")
+    print(f"         · família sem posição:      {sem_familia:>7,}  (cadastro)")
     print(f"      entrada APÓS o pedido:         {chegou_depois:>7,} ({100 * chegou_depois / tot:.0f}%)  → chegou")
-    print("   >> 'Sem posição' alto significa que o estoque e a solicitação")
-    print("      falam de peças diferentes — e aí o painel não pode afirmar nada.")
+    if sem_unidade:
+        print("   >> UNIDADE FORA DO ESTOQUE é defeito de tradução, não de dado:")
+        print("      o estoque e as faltas estão escrevendo o mesmo lugar com")
+        print("      nomes diferentes. Tem de ser zero.")
+    print("   >> 'Família sem posição' é peça que a unidade nunca teve em")
+    print("      estoque — aí 'em aberto' é a leitura certa, não 'resolvido'.")
     fconn.close()
 
 # ── 5. O primeiro nome é ambíguo? ───────────────────────────────────────────
