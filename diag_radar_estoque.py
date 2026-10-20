@@ -44,8 +44,16 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from analytics import (canonical_gtin, gerar_familias_substitutos,
-                           normalizar_unidade)
+    # _prepare_stock é privada, mas é A função do Radar que lê o estoque.
+    #
+    # A primeira versão deste diagnóstico redigitou a lista de nomes de
+    # coluna candidatos e esqueceu "item" — que é justamente como a coluna se
+    # chama no arquivo real. Resultado: "código do item — AUSENTE" e 100% de
+    # "sem posição de estoque", um falso negativo perfeito. Terceira vez na
+    # mesma sessão que recriar uma lista do sistema me faz errar. Então usa-se
+    # a função, com privada e tudo: se ela mudar, este diagnóstico muda junto,
+    # que é exatamente o que se quer.
+    from analytics import _prepare_stock, gerar_familias_substitutos
 except ImportError as exc:
     print(f">> Não consegui importar o analytics do Radar: {exc}")
     print("   Esperava encontrá-lo em /srv/passini/apps/radar-rupturas")
@@ -92,18 +100,7 @@ def col(df, *nomes):
     return None
 
 
-c_un = col(stock, "branchName", "unidade")
-c_item = col(stock, "itemExternalCode", "item external code", "codigo externo")
-c_qtd = col(stock, "quantity", "quantidade")
 c_ent = col(stock, "lastIncrementDate", "last increment date", "ultima entrada")
-print(f"\n   {'PAPEL':<20}{'COLUNA':<28}PREENCHIDA")
-for papel, c in (("unidade", c_un), ("código do item", c_item),
-                 ("quantidade", c_qtd), ("última entrada", c_ent)):
-    if c is None:
-        print(f"   {papel:<20}{'— AUSENTE —':<28}")
-        continue
-    cheia = stock[c].map(limpa).ne("").sum()
-    print(f"   {papel:<20}{str(c)[:27]:<28}{100 * cheia / len(stock):.1f}%")
 if c_ent is None:
     print("   >> Sem data de última entrada não dá para dizer 'chegou depois")
     print("      do pedido'. Sobra só 'tem agora', que é bem menos.")
@@ -133,19 +130,29 @@ else:
 
 # ── 3. Estoque por unidade × família ────────────────────────────────────────
 print("\n3) ESTOQUE CONSOLIDADO POR UNIDADE × FAMÍLIA")
+# _prepare_stock faz tudo: normaliza unidade, acha a coluna do código, aplica
+# canonical_gtin, lê a última entrada e resolve a família. É a mesma leitura
+# que o Radar usa para calcular ruptura, então os dois não podem divergir.
+preparado = _prepare_stock(stock, familias)
 est = pd.DataFrame({
-    "unidade": stock[c_un].map(normalizar_unidade) if c_un else "SEM_UNIDADE",
-    "codigo": stock[c_item].map(canonical_gtin) if c_item else "",
-    "qtd": pd.to_numeric(stock[c_qtd], errors="coerce").fillna(0) if c_qtd else 0,
+    "unidade": preparado["Unidade_Normalizada"],
+    "codigo": preparado["GTIN"],
+    "qtd": preparado["quantity"],
+    "entrada": preparado["Ultima_Entrada"],
+    "familia": preparado["FamiliaID"],
 })
-est["entrada"] = (pd.to_datetime(stock[c_ent], errors="coerce", dayfirst=True)
-                  if c_ent else pd.NaT)
-est = est[est["codigo"].ne("")]
-est["familia"] = est["codigo"].map(
-    lambda x: familias.get(x, {}).get("FamiliaID", x))
+est = est[est["codigo"].astype(str).ne("")]
 fam = est.groupby(["unidade", "familia"], as_index=False).agg(
     estoque=("qtd", "sum"), ultima_entrada=("entrada", "max"))
 print(f"   {len(est):,} posições → {len(fam):,} combinações unidade × família")
+entradas = int(est["entrada"].notna().sum())
+print(f"   Posições com data de última entrada: {entradas:,} "
+      f"({100 * entradas / max(1, len(est)):.0f}%)")
+
+# O estoque e a solicitação falam do mesmo código? Se não, o passo 4 dá 100%
+# de "sem posição" e parece problema de dado quando é problema de chave.
+cods_estoque = set(est["codigo"].astype(str))
+print(f"   Códigos distintos no estoque: {len(cods_estoque):,}")
 print(f"\n   {'UNIDADE':<14}{'FAMÍLIAS':>10}{'COM ESTOQUE':>13}{'ZERADAS':>10}")
 for u, g in fam.groupby("unidade"):
     com = int((g["estoque"] > 0).sum())
@@ -165,6 +172,23 @@ else:
     linhas = fconn.execute(
         "SELECT unidade, item_code, pedidos, ultima_data FROM faltas_resumo"
         " WHERE competencia = ?", (alvo_comp,)).fetchall()
+
+    # A CHAVE CRUZA, ANTES DE QUALQUER CONTA.
+    #
+    # Na primeira execução este passo deu 100% de "sem posição de estoque" e
+    # pareceu divergência de cadastro. Não era: a leitura do estoque tinha
+    # falhado antes, e o conjunto estava vazio. Conferir a interseção das
+    # chaves separa "o dado não cruza" de "eu li errado" — e os dois produzem
+    # exatamente o mesmo 100%.
+    cods_falta = {r["item_code"] for r in linhas}
+    comum = cods_falta & cods_estoque
+    print(f"   Códigos das faltas: {len(cods_falta):,} · "
+          f"também no estoque: {len(comum):,} "
+          f"({100 * len(comum) / max(1, len(cods_falta)):.0f}%)")
+    if not comum:
+        print("   >> NENHUM código em comum. Ou o estoque não foi lido, ou as")
+        print("      duas bases usam códigos diferentes. Sem isso, o resto do")
+        print("      passo 4 não significa nada.")
     idx = {(r["unidade"], r["familia"]): (r["estoque"], r["ultima_entrada"])
            for r in fam.to_dict("records")}
 
