@@ -317,13 +317,15 @@ def familia_e_estoque(
     import importlib
 
     vazio = pd.DataFrame(columns=["unidade", "familia", "estoque", "ultima_entrada"])
+    vazio_item = pd.DataFrame(
+        columns=["unidade", "codigo", "familia", "estoque", "ultima_entrada"])
     sys.path.insert(0, "/srv/passini/apps/radar-rupturas")
     try:
         analytics = importlib.import_module("analytics")
     except ImportError as exc:
         print(f"   >> analytics do Radar indisponível ({exc}); "
               f"sem família e sem estoque.")
-        return {}, vazio
+        return {}, vazio, vazio_item
 
     familias = {}
     p_subs = sources / "substitutos.pkl"
@@ -338,7 +340,7 @@ def familia_e_estoque(
     p_stock = sources / "stock.pkl"
     if not p_stock.exists():
         print(f"   >> {p_stock} não existe; sem estoque não há 'resolvido'.")
-        return familias, vazio
+        return familias, vazio, vazio_item
 
     preparado = analytics._prepare_stock(pd.read_pickle(p_stock), familias)
     est = pd.DataFrame({
@@ -351,6 +353,7 @@ def familia_e_estoque(
         "entrada": preparado["Ultima_Entrada"],
     })
     est = est[est["familia"].ne("")]
+    est["codigo"] = preparado["GTIN"].astype(str)
     fam = est.groupby(["unidade", "familia"], as_index=False).agg(
         estoque=("qtd", "sum"), ultima_entrada=("entrada", "max"))
     fam["ultima_entrada"] = fam["ultima_entrada"].dt.strftime("%Y-%m-%d")
@@ -359,7 +362,15 @@ def familia_e_estoque(
     print(f"   Com saldo: {com:,} ({100 * com / max(1, len(fam)):.0f}%) · "
           f"zeradas: {len(fam) - com:,}")
     print(f"   Unidades: {', '.join(sorted(set(est['unidade'])))}")
-    return familias, fam
+
+    # Item a item, só o que tem saldo — para dizer QUAL da família chegou.
+    itens = est[est["qtd"] > 0].groupby(
+        ["unidade", "codigo"], as_index=False).agg(
+        familia=("familia", "first"), estoque=("qtd", "sum"),
+        ultima_entrada=("entrada", "max"))
+    itens["ultima_entrada"] = itens["ultima_entrada"].dt.strftime("%Y-%m-%d")
+    print(f"   Itens com saldo: {len(itens):,} (de {len(est):,} posições)")
+    return familias, fam, itens
 
 
 def limpa(v) -> str:
@@ -415,6 +426,22 @@ CREATE TABLE estoque_familia (
     ultima_entrada TEXT,
     PRIMARY KEY (unidade, familia)
 );
+-- Quem, DENTRO da família, está na prateleira. Só os códigos com saldo.
+--
+-- O vendedor pede a pastilha da marca A, da B e da C — uma necessidade, três
+-- pedidos. Chega a da B. Sem esta tabela o painel diria "resolvido" sem saber
+-- dizer o que chegou, e o vendedor continuaria oferecendo a A.
+-- Guardar só o que tem saldo reduz de 343 mil posições para algumas dezenas
+-- de milhares: é tudo que a resposta precisa.
+CREATE TABLE estoque_item (
+    unidade        TEXT NOT NULL,
+    item_code      TEXT NOT NULL,
+    familia        TEXT NOT NULL,
+    estoque        REAL NOT NULL,
+    ultima_entrada TEXT,
+    PRIMARY KEY (unidade, item_code)
+);
+CREATE INDEX idx_estoque_item_fam ON estoque_item(unidade, familia);
 CREATE TABLE faltas_meta (chave TEXT PRIMARY KEY, valor TEXT);
 """
 
@@ -582,7 +609,7 @@ def main() -> int:
     resumo["custo"] = resumo["custo"].round(2)
 
     # ── Família e estoque ───────────────────────────────────────────────────
-    familias, estoque = familia_e_estoque(origem.parent, mapa)
+    familias, estoque, estoque_itens = familia_e_estoque(origem.parent, mapa)
     resumo["familia"] = resumo["item_code"].map(
         lambda c: familias.get(c, {}).get("FamiliaID", c))
     meses = sorted(resumo["competencia"].unique())
@@ -630,6 +657,18 @@ def main() -> int:
                 estoque[["unidade", "familia", "estoque", "ultima_entrada"]]
                 .astype(object).where(pd.notna(estoque[[
                     "unidade", "familia", "estoque", "ultima_entrada"]]), None)
+                .itertuples(index=False, name=None),
+            )
+        if len(estoque_itens):
+            conn.executemany(
+                "INSERT OR REPLACE INTO estoque_item"
+                " (unidade, item_code, familia, estoque, ultima_entrada)"
+                " VALUES (?,?,?,?,?)",
+                estoque_itens[["unidade", "codigo", "familia", "estoque",
+                               "ultima_entrada"]]
+                .astype(object).where(pd.notna(estoque_itens[[
+                    "unidade", "codigo", "familia", "estoque",
+                    "ultima_entrada"]]), None)
                 .itertuples(index=False, name=None),
             )
         conn.executemany(

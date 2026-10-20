@@ -13894,12 +13894,34 @@ function abaFaltas() {
   const linhas = (d.linhas || []).map((l) => {
     const s = st[l.status] || {};
     const dt = l.lastRequest ? l.lastRequest.split("-").reverse().join("/") : "—";
+    // A linha é a família. Quando o vendedor tentou mais de uma marca, mostra
+    // quantas — sem isso ele acha que a lista "sumiu" com os outros pedidos.
+    const similares = l.codigos > 1
+      ? `<div class="text-small" style="color:#8a5a00">
+           ${l.codigos} marcas pedidas: ${escapeHtml((l.marcas || []).join(", "))}
+           · ${l.pedidosBrutos} pedido(s) no total</div>` : "";
+    // "Pediu A, chegou B" — o que o vendedor precisa saber para voltar ao
+    // cliente. Substituto que ele não pediu vem destacado: é a informação
+    // que ele não tem como adivinhar.
+    const chegou = [];
+    if ((l.atendidoPedido || []).length) {
+      chegou.push(`✅ na loja: ${l.atendidoPedido
+        .map((a) => `${escapeHtml(a.code)} (${number(a.stock)})`).join(", ")}`);
+    }
+    if ((l.atendidoOutro || []).length) {
+      chegou.push(`🔄 substituto: ${l.atendidoOutro
+        .map((a) => `${escapeHtml(a.code)} (${number(a.stock)})`).join(", ")}`);
+    }
+    const bloco = chegou.length
+      ? `<div class="text-small" style="color:#1e6b34">${chegou.join(" · ")}</div>` : "";
     return `<tr>
       <td style="font-family:ui-monospace,monospace">${escapeHtml(l.itemCode)}</td>
       <td>${escapeHtml(l.item || "—")}<div class="text-small" style="color:var(--muted)">
-          ${escapeHtml(l.brand || "")}${l.type ? " · " + escapeHtml(l.type) : ""}</div></td>
+          ${escapeHtml(l.brand || "")}${l.type ? " · " + escapeHtml(l.type) : ""}</div>
+          ${similares}${bloco}</td>
       ${d.unitName ? "" : `<td>${escapeHtml(l.unitName)}</td>`}
       <td style="text-align:right;font-weight:700">${l.pedidos}</td>
+      <td style="text-align:right">${l.codigos}</td>
       <td style="text-align:right">${dt}</td>
       <td style="color:${s.cor};font-weight:700;white-space:nowrap">
         ${s.icon || ""} ${escapeHtml(s.label || l.status)}</td>
@@ -13952,8 +13974,12 @@ function abaFaltas() {
       </div>
 
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px">
-        ${cartao("Peças que faltaram", number(total),
-          `${number(r.pedidos || 0)} pedido(s)`, "#0f3044")}
+        ${/* O número que vale é FAMÍLIA, não código. Pedir a mesma pastilha
+              de cinco marcas é uma necessidade, não cinco — e era assim que
+              a primeira versão contava, inflando a falta. */""}
+        ${cartao("Peças faltando", number(total),
+          `${number(r.codigos || total)} código(s) · ${number(r.pedidos || 0)} pedido(s)`,
+          "#0f3044")}
         ${cartao("Tem na loja hoje", number(porStatus.TEM || 0),
           r.resolvidoPct === null ? "sem base para %" : `${r.resolvidoPct}% das com resposta`,
           st.TEM ? st.TEM.cor : "#1e8e3e")}
@@ -13988,21 +14014,30 @@ function abaFaltas() {
             ${thFalta("Peça", "item")}
             ${d.unitName ? "" : thFalta("Unidade", "unidade")}
             ${thFalta("Pedidos", "pedidos", "right")}
+            ${thFalta("Marcas", "marcas", "right")}
             ${thFalta("Último", "ultimo", "right")}
             ${thFalta("Situação", "situacao")}
             ${thFalta("Estoque", "estoque", "right")}
           </tr></thead>
-          <tbody>${linhas || `<tr><td colspan="7" style="text-align:center;padding:18px;color:var(--muted)">
+          <tbody>${linhas || `<tr><td colspan="${d.unitName ? 7 : 8}" style="text-align:center;padding:18px;color:var(--muted)">
             ${filtrosAtivos ? "Nenhuma peça com esses filtros." : "Nenhuma falta registrada neste mês."}</td></tr>`}</tbody>
         </table>
       </div>
       ${d.truncado ? `<div class="text-small" style="color:var(--muted)">
         Mostrando as ${(d.linhas || []).length} peças mais pedidas de ${number(total)}.</div>` : ""}
 
+      ${r.multiMarca ? `
+        <div class="text-small" style="color:var(--muted)">
+          ${number(r.multiMarca)} peça(s) foram pedidas em mais de uma marca —
+          são ${number(r.codigos)} códigos para ${number(total)} necessidades.
+          Repor uma das marcas resolve a família inteira.
+        </div>` : ""}
+
       <div class="text-small" style="color:var(--muted)">
-        Situação pela regra do Radar: a peça só conta como em falta quando a
-        <strong>família de substitutos</strong> está zerada na unidade — peça
-        pedida com substituto na prateleira não é ruptura.
+        Cada linha é uma <strong>família de substitutos</strong>, não um código:
+        a mesma peça pedida em cinco marcas é uma necessidade só, e basta uma
+        chegar. A contagem de pedidos usa a regra da casa — o maior número
+        entre as marcas da família, não a soma.
       </div>
     </div>`;
 }

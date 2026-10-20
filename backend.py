@@ -18300,13 +18300,24 @@ def faltas_painel(
         # nasce do cruzamento com o estoque da família. Ordenar no SQL e cortar
         # em 120 antes de classificar traria "as 120 mais pedidas, ordenadas
         # por outra coisa" — o topo da tela mostraria a peça errada.
-        todas = []
+        # A LINHA É A FAMÍLIA, NÃO O CÓDIGO.
+        #
+        # O vendedor pede a mesma peça de cinco marcas: são cinco códigos e
+        # UMA necessidade. Contar por código inflava a falta em cinco, e
+        # "resolvido" ficava estranho — chega uma marca e as outras quatro
+        # continuariam na lista como se faltassem.
+        #
+        # A quantidade segue a regra da casa, que o Radar chama de
+        # consolidação: o MAIOR número de pedidos entre os códigos da família,
+        # não a soma. Pedir a marca A três vezes e a B três vezes é três
+        # necessidades, não seis.
+        por_familia: dict[tuple[str, str], dict[str, Any]] = {}
         for r in fconn.execute(
             f"""SELECT f.unidade, f.item_code, f.familia,
                        SUM(f.pedidos) AS pedidos,
                        MAX(f.ultima_data) AS ultima_data,
                        MAX(f.item) AS item, MAX(f.fabricante) AS fabricante,
-                       MAX(f.tipo) AS tipo, AVG(f.custo) AS custo,
+                       MAX(f.tipo) AS tipo,
                        e.estoque AS estoque, e.ultima_entrada AS ultima_entrada
                   FROM faltas_resumo f
                   LEFT JOIN estoque_familia e
@@ -18314,21 +18325,68 @@ def faltas_painel(
                  WHERE {' AND '.join(onde)}
                  GROUP BY f.unidade, f.item_code""", par
         ):
-            custo = float(r["custo"] or 0)
-            todas.append({
-                "unitName": r["unidade"],
-                "itemCode": r["item_code"],
+            chave = (r["unidade"], r["familia"] or r["item_code"])
+            alvo = por_familia.get(chave)
+            if alvo is None:
+                alvo = por_familia[chave] = {
+                    "unitName": r["unidade"],
+                    "familia": r["familia"] or r["item_code"],
+                    "itens": [],
+                    "lastRequest": "",
+                    "stock": None if r["estoque"] is None else float(r["estoque"]),
+                    "lastEntry": r["ultima_entrada"] or "",
+                }
+            alvo["itens"].append({
+                "code": r["item_code"],
                 "item": normalize_whitespace(r["item"]),
                 "brand": normalize_whitespace(r["fabricante"]),
                 "type": normalize_whitespace(r["tipo"]),
                 "pedidos": r["pedidos"] or 0,
-                "lastRequest": r["ultima_data"] or "",
-                "cost": round(custo, 2),
-                "value": round(custo * (r["pedidos"] or 0), 2),
-                "stock": None if r["estoque"] is None else float(r["estoque"]),
-                "lastEntry": r["ultima_entrada"] or "",
-                "status": _falta_status(r["estoque"], r["ultima_entrada"],
-                                        r["ultima_data"]),
+            })
+            if (r["ultima_data"] or "") > alvo["lastRequest"]:
+                alvo["lastRequest"] = r["ultima_data"] or ""
+
+        # Quem da família está na prateleira — para dizer "pediu A, chegou B".
+        atendidos: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        try:
+            for r in fconn.execute(
+                    "SELECT unidade, familia, item_code, estoque, ultima_entrada"
+                    "  FROM estoque_item WHERE estoque > 0"):
+                atendidos.setdefault((r["unidade"], r["familia"]), []).append({
+                    "code": r["item_code"], "stock": float(r["estoque"] or 0),
+                    "lastEntry": r["ultima_entrada"] or "",
+                })
+        except sqlite3.Error:
+            # Arquivo antigo, sem a tabela. A tela perde o "chegou o Y" e
+            # mantém todo o resto — melhor que derrubar o painel inteiro.
+            atendidos = {}
+
+        todas = []
+        for (unidade_l, familia), g in por_familia.items():
+            g["itens"].sort(key=lambda x: -x["pedidos"])
+            principal = g["itens"][0]
+            na_prateleira = atendidos.get((unidade_l, familia), [])
+            pedidos_codigos = {i["code"] for i in g["itens"]}
+            todas.append({
+                **g,
+                "itemCode": principal["code"],
+                "item": principal["item"],
+                "brand": principal["brand"],
+                "type": principal["type"],
+                # Regra da casa: o maior entre os códigos, não a soma.
+                "pedidos": max(i["pedidos"] for i in g["itens"]),
+                "pedidosBrutos": sum(i["pedidos"] for i in g["itens"]),
+                "codigos": len(g["itens"]),
+                "marcas": sorted({i["brand"] for i in g["itens"] if i["brand"]}),
+                # Separa o que chegou e ERA pedido do que chegou e não era:
+                # substituto que o vendedor não tinha cogitado é justamente o
+                # que vale avisar.
+                "atendidoPedido": [a for a in na_prateleira
+                                   if a["code"] in pedidos_codigos][:4],
+                "atendidoOutro": [a for a in na_prateleira
+                                  if a["code"] not in pedidos_codigos][:4],
+                "status": _falta_status(g["stock"], g["lastEntry"],
+                                        g["lastRequest"]),
             })
 
         # As opções dos filtros saem do recorte do usuário, antes de filtrar:
@@ -18355,16 +18413,20 @@ def faltas_painel(
                      or termo in x["brand"].upper()]
 
         contagem = {k: 0 for k in FALTA_STATUS}
-        pedidos_total = valor_total = 0.0
+        pedidos_total = 0
+        codigos_total = 0
+        multi = 0        # famílias pedidas em mais de uma marca
         for x in todas:
             contagem[x["status"]] += 1
             pedidos_total += x["pedidos"]
-            valor_total += x["value"]
+            codigos_total += x["codigos"]
+            if x["codigos"] > 1:
+                multi += 1
 
-        # Ordenação. Nulo vai SEMPRE para o fim, nos dois sentidos: peça sem
-        # custo no topo do "mais caro" seria ruído ocupando a primeira tela.
+        # Ordenação. Nulo vai SEMPRE para o fim, nos dois sentidos: linha sem
+        # valor no topo seria ruído ocupando a primeira tela.
         CAMPOS = {"pedidos": "pedidos", "item": "item", "codigo": "itemCode",
-                  "ultimo": "lastRequest", "custo": "cost", "valor": "value",
+                  "ultimo": "lastRequest", "marcas": "codigos",
                   "estoque": "stock", "situacao": "status", "unidade": "unitName"}
         campo = CAMPOS.get(normalize_whitespace(ordenar).lower(), "pedidos")
         desc = normalize_whitespace(sentido).lower() != "asc"
@@ -18402,9 +18464,13 @@ def faltas_painel(
             "sellerName": vendedor_efetivo,
             "status": FALTA_STATUS,
             "resumo": {
+                # "pecas" agora conta FAMÍLIAS: é a necessidade real.
+                # "codigos" é quantos códigos distintos foram pedidos, que é
+                # sempre maior quando o vendedor tenta várias marcas.
                 "pecas": pecas,
+                "codigos": int(codigos_total),
+                "multiMarca": int(multi),
                 "pedidos": int(pedidos_total),
-                "valorEstimado": round(valor_total, 2),
                 "porStatus": contagem,
                 "resolvidoPct": (round(100 * resolvidas / com_resposta, 1)
                                  if com_resposta else None),
