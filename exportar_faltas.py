@@ -126,6 +126,48 @@ SUFIXOS_LOGIN = ["ZONANORTE", "ZONASUL", "XANGRILA", "LAJEADO", "PELOTAS",
                  "MATRIZ", "BALCAO", "TELEVENDAS", "VENDAS", "POA"]
 
 
+def carregar_apelidos_do_crm() -> dict[str, str]:
+    """Grafia errada → grafia correta, do mapa de apelidos do CRM.
+
+    O Radar grava "ANA CAROLINA"; o cadastro tem "ANNA", com dois N. Nenhuma
+    comparação por prefixo resolve isso, e inventar semelhança aproximada
+    aqui casaria nomes que não devem casar.
+
+    O CRM já tem a tabela person_aliases justamente para grafia divergente, e
+    ela é mantida por quem conhece a equipe. Usá-la significa que corrigir um
+    nome UMA VEZ, no CRM, conserta as faltas, o placar e a carteira juntos —
+    em vez de um de-para só das faltas, que ninguém lembraria de atualizar.
+
+    Segue a cadeia (A→B→C) com limite, para apelido circular não travar.
+    """
+    caminho = Path(os.environ.get("PASSINI_CRM_DATA")
+                   or "/srv/passini/data/crm") / "passini_dashboard.db"
+    if not caminho.exists():
+        return {}
+    bruto: dict[str, str] = {}
+    try:
+        conn = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
+        cid = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()[0]
+        for r in conn.execute(
+                "SELECT alias_key, canonical_key FROM person_aliases"
+                " WHERE company_id = ?", (cid,)):
+            if r[0] and r[1]:
+                bruto[limpa(r[0]).upper()] = limpa(r[1]).upper()
+        conn.close()
+    except sqlite3.Error:
+        return {}
+    resolvido: dict[str, str] = {}
+    for alias in bruto:
+        destino, visto = alias, {alias}
+        for _ in range(10):
+            proximo = bruto.get(destino)
+            if not proximo or proximo in visto:
+                break
+            destino, _ = proximo, visto.add(proximo)
+        resolvido[alias] = destino
+    return resolvido
+
+
 def carregar_vendedores_do_crm() -> dict[str, str]:
     """Nome do vendedor → unidade-base, do cadastro de pessoas do CRM.
 
@@ -265,8 +307,8 @@ def _sem_sufixo(chave: str) -> str:
 
 def resolver_vendedores(
     pares: set[tuple[str, str]], vendedores: dict[str, str],
-    mapa_unidade: dict[str, str],
-) -> tuple[dict[tuple[str, str], str], set[str], set[str]]:
+    mapa_unidade: dict[str, str], apelidos: dict[str, str] | None = None,
+) -> tuple[dict[tuple[str, str], str], set[str], set[str], dict[str, str]]:
     """(usuário do Radar, unidade do pedido) → vendedor do CRM.
 
     A chave é o PAR, não o nome sozinho. Foi assim que o Felipe descreveu a
@@ -333,10 +375,15 @@ def resolver_vendedores(
     # cadastro de pessoa sem unidade, pessoa em loja diferente da que pediu,
     # ou dois homônimos de verdade na mesma loja.
     motivos: dict[str, str] = {}
+    apelidos = apelidos or {}
     for usuario, unidade in pares:
         k = chave_nome(usuario)
         if not k:
             continue
+        # Apelido do CRM primeiro: "ANA CAROLINA" vira "ANNA ..." antes de
+        # qualquer comparação, então as três passadas seguintes trabalham já
+        # com a grafia certa.
+        k = apelidos.get(k, k)
         candidatos = [v for kk, v in por_chave.items()
                       if kk == k or kk.startswith(k + " ")]
         if len(candidatos) == 1:
@@ -600,8 +647,9 @@ def main() -> int:
     usuario_bruto = (req[col_user].map(limpa) if col_user
                      else pd.Series([""] * len(req), index=req.index))
     pares = {(u, un) for u, un in zip(usuario_bruto, unidades) if u and un}
+    apelidos = carregar_apelidos_do_crm()
     de_para_vend, ambiguos, orfaos, motivos = resolver_vendedores(
-        pares, vendedores, mapa)
+        pares, vendedores, mapa, apelidos)
     # Quanto do ARQUIVO cada grupo representa. Contar nomes engana: um nome
     # sem dono com 12 mil linhas pesa mais que dez com cem.
     peso = {}
@@ -611,6 +659,7 @@ def main() -> int:
     linhas_ok = sum(n for p, n in peso.items() if p in de_para_vend)
 
     print(f"\n5) VENDEDOR — {len(vendedores)} nome(s) conhecido(s) no CRM")
+    print(f"   Apelidos de grafia vindos do CRM: {len(apelidos)}")
     print(f"   Pares usuário × unidade: {len(pares)}")
     print(f"   resolvidos:   {len(de_para_vend):>4}")
     print(f"   AMBÍGUO:      {len(ambiguos):>4} "
