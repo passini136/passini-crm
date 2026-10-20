@@ -18056,6 +18056,137 @@ def opcoes_compra_carteira(
     return opcoes
 
 
+# ── Faltas: o que o Radar registrou como solicitação de compra ──────────────
+#
+# A base de solicitações mora no Radar de Rupturas, no mesmo servidor. O CRM
+# NÃO a importa de novo: lê um arquivo enxuto que o exportar_faltas.py gera a
+# partir do pickle do Radar — unidade × mês × peça, com quantos pedidos.
+#
+# Três decisões deste módulo, e o motivo de cada uma:
+#
+# 1. Conexão NOVA a cada chamada, fechada no fim. O servidor é multi-thread e
+#    conexão sqlite não atravessa thread. O arquivo é pequeno e indexado; o
+#    custo de abrir é irrelevante perto do risco de compartilhar handle.
+#
+# 2. Somente leitura, de verdade (mode=ro na URI). Um bug aqui não pode
+#    corromper o arquivo que outra tela está lendo.
+#
+# 3. Ausência NUNCA vira erro. Se o arquivo não existe — ninguém rodou o
+#    exportador ainda — as funções devolvem vazio e a tela some com o bloco
+#    de faltas. Dado que falta não pode derrubar dado que existe.
+FALTAS_DB_PATH = Path(
+    os.environ.get("PASSINI_FALTAS_DB")
+    or (DATA_DIR.parent / "compartilhado" / "faltas.db")
+)
+
+
+def faltas_conexao() -> sqlite3.Connection | None:
+    """Abre o arquivo de faltas só para leitura. None quando não há arquivo."""
+    try:
+        if not FALTAS_DB_PATH.exists():
+            return None
+        conn = sqlite3.connect(f"file:{FALTAS_DB_PATH}?mode=ro", uri=True,
+                               timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as exc:  # noqa: BLE001
+        print(f"[faltas] arquivo indisponível ({FALTAS_DB_PATH}): {exc}", flush=True)
+        return None
+
+
+def faltas_status() -> dict[str, Any]:
+    """Quando o arquivo foi gerado e o que tem dentro.
+
+    A tela precisa disso para não mentir por omissão: "nenhuma falta" com um
+    arquivo de três meses atrás é bem diferente de "nenhuma falta" com um
+    arquivo de ontem.
+    """
+    conn = faltas_conexao()
+    if conn is None:
+        return {"disponivel": False}
+    try:
+        meta = {r["chave"]: r["valor"] for r in conn.execute(
+            "SELECT chave, valor FROM faltas_meta")}
+        return {
+            "disponivel": True,
+            "geradoEm": meta.get("gerado_em", ""),
+            "competenciaMin": meta.get("competencia_min", ""),
+            "competenciaMax": meta.get("competencia_max", ""),
+            "linhas": int(meta.get("linhas_resumo") or 0),
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[faltas] não consegui ler o status: {exc}", flush=True)
+        return {"disponivel": False}
+    finally:
+        conn.close()
+
+
+def faltas_por_item(
+    codigos: set[str] | list[str], unidade: str = "", meses: int = 12
+) -> dict[str, Any]:
+    """Histórico de falta das peças informadas, por unidade e por mês.
+
+    `codigos` são item_code do CRM — os mesmos que a busca da carteira já
+    resolve a partir de código de fabricante, interno ou GTIN. O cruzamento
+    com o Radar é por esse código: foi a única chave que sobreviveu ao
+    controle cego (diag_radar_prova.py), com 94,7% de concordância de
+    fabricante contra o catálogo.
+    """
+    vazio: dict[str, Any] = {"disponivel": False, "pedidos": 0, "porUnidade": [],
+                             "porMes": [], "ultimaData": ""}
+    chaves = {normalize_whitespace(c).upper() for c in (codigos or set())}
+    chaves = {c for c in chaves if c}
+    if not chaves:
+        return vazio
+    conn = faltas_conexao()
+    if conn is None:
+        return vazio
+    try:
+        inicio = shift_competence(
+            date.today().strftime("%Y-%m"), -(max(int(meses), 1) - 1))
+        # Lote de 400 para não estourar o limite de variáveis do SQLite com
+        # uma busca que casou muitos códigos no catálogo.
+        lista = sorted(chaves)
+        por_unidade: dict[str, int] = {}
+        por_mes: dict[str, int] = {}
+        ultima = ""
+        filtro_un, par_un = "", []
+        if normalize_whitespace(unidade):
+            filtro_un = " AND unidade = ?"
+            par_un = [normalize_unit(unidade)]
+        for i in range(0, len(lista), 400):
+            lote = lista[i:i + 400]
+            marcas = ",".join("?" * len(lote))
+            for r in conn.execute(
+                f"SELECT unidade, competencia, SUM(pedidos) AS pedidos,"
+                f"       MAX(ultima_data) AS ultima"
+                f"  FROM faltas_resumo"
+                f" WHERE UPPER(item_code) IN ({marcas})"
+                f"   AND competencia >= ?{filtro_un}"
+                f" GROUP BY unidade, competencia",
+                [*lote, inicio, *par_un],
+            ):
+                por_unidade[r["unidade"]] = por_unidade.get(r["unidade"], 0) + r["pedidos"]
+                por_mes[r["competencia"]] = por_mes.get(r["competencia"], 0) + r["pedidos"]
+                if (r["ultima"] or "") > ultima:
+                    ultima = r["ultima"] or ""
+        total = sum(por_unidade.values())
+        return {
+            "disponivel": True,
+            "pedidos": total,
+            "ultimaData": ultima,
+            "porUnidade": [{"unitName": u, "pedidos": n}
+                           for u, n in sorted(por_unidade.items(), key=lambda x: -x[1])],
+            "porMes": [{"competence": m, "pedidos": n}
+                       for m, n in sorted(por_mes.items())],
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[faltas] consulta por item falhou: {exc}", flush=True)
+        return vazio
+    finally:
+        conn.close()
+
+
 def item_purchase_details(
     conn: sqlite3.Connection, company_id: int, item_code: str, months_window: int = 12
 ) -> dict[str, dict[str, Any]] | None:
