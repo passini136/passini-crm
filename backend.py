@@ -18187,6 +18187,52 @@ def faltas_por_item(
         conn.close()
 
 
+def codigos_do_termo(
+    conn: sqlite3.Connection, company_id: int, termo: str, limite: int = 500
+) -> set[str]:
+    """O que o balcão digitou → os item_code do CRM que aquilo significa.
+
+    O arquivo de faltas do Radar é indexado por item_code. A busca da
+    carteira aceita qualquer um dos quatro códigos que circulam no balcão
+    (fabricante, interno, GTIN, referência), então é preciso traduzir antes
+    de perguntar ao Radar — senão quem digita o código de fabricante nunca vê
+    a falta, e conclui que a peça nunca faltou.
+
+    Mesma regra de termo curto da busca: abaixo de 3 caracteres, só exato.
+    Com LIKE '%1%' isto devolveria meio catálogo e a falta de tudo.
+    """
+    t = normalize_whitespace(termo)
+    if not t:
+        return set()
+    exata = len(t) < 3
+    padrao = t.upper() if exata else f"%{t.upper()}%"
+    op = "=" if exata else "LIKE"
+    achados = {
+        normalize_whitespace(r["item_code"]).upper()
+        for r in conn.execute(
+            f"SELECT item_code FROM item_catalog WHERE company_id = ?"
+            f"   AND (UPPER(COALESCE(gtin,'')) {op} ?"
+            f"     OR UPPER(COALESCE(item_code,'')) {op} ?"
+            f"     OR UPPER(COALESCE(manufacturer_ref,'')) {op} ?)"
+            f" LIMIT ?", (company_id, padrao, padrao, padrao, limite))
+        if r["item_code"]
+    }
+    # O faturamento pode ter código que o catálogo não tem (item antigo,
+    # cadastro removido). Sem isto, peça que vendeu e sumiu do catálogo
+    # perderia o histórico de falta.
+    achados |= {
+        normalize_whitespace(r["item_code"]).upper()
+        for r in conn.execute(
+            f"SELECT DISTINCT item_code FROM fact_sales_detail"
+            f" WHERE company_id = ? AND TRIM(COALESCE(item_code,'')) <> ''"
+            f"   AND (UPPER(COALESCE(item_code,'')) {op} ?"
+            f"     OR UPPER(COALESCE(manufacturer_sku,'')) {op} ?)"
+            f" LIMIT ?", (company_id, padrao, padrao, limite))
+        if r["item_code"]
+    }
+    return achados - {""}
+
+
 def item_purchase_details(
     conn: sqlite3.Connection, company_id: int, item_code: str, months_window: int = 12
 ) -> dict[str, dict[str, Any]] | None:
@@ -18448,6 +18494,12 @@ def query_crm_clients_page(
         "pageSize": safe_page_size,
         "totalPages": total_pages,
         "purchaseOptions": opcoes_compra_carteira(conn, company_id),
+        # Quando a busca é por código de peça, diz também se essa peça FALTOU.
+        # Saber quem compra sem saber que a loja ficou sem conta metade da
+        # história: o cliente pode ter deixado de comprar porque não tinha.
+        "itemShortage": faltas_por_item(
+            codigos_do_termo(conn, company_id, filters.get("itemCode") or ""),
+            unidade=filters.get("unit_name") or ""),
     }
 
 

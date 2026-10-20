@@ -985,6 +985,9 @@ async function loadCrmClients({ renderAfterLoad = true, reason = "reload", pageA
     // devolveu lista vazia — senão o usuário não consegue trocar de marca sem
     // antes limpar tudo.
     if (clients.purchaseOptions) state.crm.clientsMeta = { purchaseOptions: clients.purchaseOptions };
+    // Falta da peça pesquisada, vinda do Radar de Rupturas. Guardada à parte
+    // das linhas: é sobre a PEÇA, não sobre nenhum cliente da lista.
+    state.crm.itemShortage = clients.itemShortage || null;
     state.crm.pagination = {
       page: Number(clients.page || 1),
       pageSize: Number(clients.pageSize || state.crm.pagination.pageSize || 50),
@@ -15375,7 +15378,8 @@ function crmFilterToolbar() {
         <div class="message" style="background:#eef4fa;color:var(--accent);font-weight:600;margin:0 0 8px">
           🔧 Mostrando apenas quem comprou "${escapeHtml(filters.itemCode)}" nos últimos 12 meses.
           A data, a quantidade e o preço pago aparecem embaixo do nome de cada cliente.
-        </div>`}
+        </div>
+        ${blocoFaltaDoItem(state.crm.itemShortage)}`}
       <div class="filter-grid crm-filter-grid">
         <div class="field">
           <label>Unidade</label>
@@ -15669,6 +15673,36 @@ function qtyLabel(valor) {
  * só o que o gestor precisa para decidir: quando comprou, quanto levou e por
  * quanto — o resto continua na ficha.
  */
+function blocoFaltaDoItem(falta) {
+  // Silêncio quando não há arquivo de faltas (ninguém rodou o exportador) ou
+  // quando a peça nunca foi pedida. Bloco vazio dizendo "0 faltas" ocuparia
+  // espaço na tela para informar nada.
+  if (!falta || !falta.disponivel || !falta.pedidos) return "";
+  const unidades = (falta.porUnidade || [])
+    .map((u) => `${escapeHtml(u.unitName)} ${u.pedidos}`)
+    .join(" · ");
+  // O mês mais recente separado do resto: faltar 40 vezes em 12 meses e
+  // faltar 40 vezes só no mês passado são situações muito diferentes, e o
+  // total sozinho não distingue uma da outra.
+  const meses = falta.porMes || [];
+  const ultimo = meses.length ? meses[meses.length - 1] : null;
+  const data = falta.ultimaData
+    ? falta.ultimaData.split("-").reverse().join("/") : "";
+  // "faltou 5 vezes em 0 meses" só sairia com dado inconsistente, mas frase
+  // absurda na tela derruba a confiança no resto do número.
+  const janela = meses.length ? ` em ${meses.length} mês(es)` : "";
+  return `
+    <div class="message" style="background:#fef7e0;color:#8a5a00;font-weight:600;margin:0 0 8px">
+      ⚠️ Esta peça faltou <strong>${falta.pedidos}</strong> vez(es)${janela}${ultimo ? `, sendo <strong>${ultimo.pedidos}</strong> em ${escapeHtml(ultimo.competence)}` : ""}${data ? ` · último pedido em ${escapeHtml(data)}` : ""}.
+      <div style="font-weight:500;margin-top:4px">Por unidade: ${unidades}</div>
+      <div style="font-weight:400;font-size:12px;margin-top:4px;opacity:.85">
+        Solicitações de compra registradas no Radar de Rupturas. Quem comprou
+        pode ter comprado menos do que queria — ou deixado de comprar.
+      </div>
+    </div>`;
+}
+
+
 function itemPurchaseLinhaTabela(item) {
   const c = item.itemPurchase;
   if (!c) return "";
