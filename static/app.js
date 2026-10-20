@@ -13768,19 +13768,33 @@ async function setResultadoAba(aba) {
 }
 
 
+let faltasRequestSeq = 0;
+
 async function loadFaltas(competencia) {
-  setLoading("faltas", true);
-  render();
+  // requestRender(), não render(): esta função é chamada de DENTRO do render
+  // (o Meu Placar dispara a carga na primeira vez que a tela monta), e
+  // render() síncrono ali seria reentrante. requestRender agenda, que é o que
+  // o resto do sistema já faz.
+  const meuPedido = ++faltasRequestSeq;
+  state.ui.loading.faltas = true;
+  requestRender();
+  let resposta;
   try {
     const q = new URLSearchParams();
     if (competencia) q.set("competence", competencia);
-    state.faltas = await api(`/api/faltas/painel?${q}`);
+    resposta = await api(`/api/faltas/painel?${q}`);
   } catch (e) {
-    state.faltas = { erro: String(e && e.message ? e.message : e) };
-  } finally {
-    setLoading("faltas", false);
-    render();
+    resposta = { erro: String(e && e.message ? e.message : e) };
   }
+  // Resposta atrasada de uma competência que o usuário já trocou: aplicar
+  // faria a tela voltar sozinha para o mês anterior.
+  if (meuPedido !== faltasRequestSeq) return state.faltas;
+  // Nunca deixar nulo: o Meu Placar dispara a carga quando state.faltas é
+  // falso, então um nulo aqui viraria laço infinito de requisições.
+  state.faltas = resposta || { erro: "resposta vazia do servidor" };
+  state.ui.loading.faltas = false;
+  requestRender();
+  return state.faltas;
 }
 
 
@@ -20626,7 +20640,36 @@ function missoesDoVendedor(eu, s) {
             ${conquistados.map((i) => cartao(i, true)).join("")}
           </div>
         </div>` : ""}
+
+      ${/* AS SOLICITAÇÕES DELE, AQUI — não no Painel de Resultados.
+            A aba de faltas nasceu dentro do Painel de Resultados, que o perfil
+            Vendedor NÃO acessa. Para o gerente estava no lugar; para o
+            vendedor, em lugar nenhum — ele abriria o menu e não acharia.
+            O Meu Placar é a casa dele, então a mesma tela é montada aqui.
+            É a MESMA função: duas cópias divergiriam no primeiro ajuste. */""}
+      <div class="form-card" style="padding:14px 18px">
+        <div class="section-title">
+          <div>
+            <h3>⛔ Minhas solicitações de peça</h3>
+            <div class="text-small">O que você pediu e não tinha — e o que
+              aconteceu depois.</div>
+          </div>
+        </div>
+        ${blocoMinhasFaltas()}
+      </div>
     </div>`;
+}
+
+
+function blocoMinhasFaltas() {
+  // Carrega só quando a tela abre, e uma vez. O placar já faz várias
+  // chamadas; somar mais uma no carregamento inicial atrasaria o que o
+  // vendedor olha primeiro, que é o ponto dele.
+  if (!state.faltas && !state.ui.loading.faltas) {
+    loadFaltas();
+    return `<div class="message">⏳ Lendo suas solicitações…</div>`;
+  }
+  return abaFaltas();
 }
 
 function meuPlacarViewAntigo() {
