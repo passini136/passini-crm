@@ -120,61 +120,131 @@ def chave_nome(valor: str) -> str:
     return re.sub(r"[^A-Z0-9 ]", " ", t).strip()
 
 
-def carregar_vendedores_do_crm() -> set[str]:
-    """Nomes de vendedor que o CRM conhece, lidos só para leitura."""
+# Sufixo de unidade grudado no login: GABRIELLAJEADO, TIAGOBALCAO.
+# Tirar isso é o que transforma o login na pessoa.
+SUFIXOS_LOGIN = ["ZONANORTE", "ZONASUL", "XANGRILA", "LAJEADO", "PELOTAS",
+                 "MATRIZ", "BALCAO", "TELEVENDAS", "VENDAS", "POA"]
+
+
+def carregar_vendedores_do_crm() -> dict[str, str]:
+    """Nome do vendedor → unidade-base, do cadastro de pessoas do CRM.
+
+    A unidade é o que desfaz a ambiguidade: há dois Carlos e dois Leonardos,
+    e o que distingue é a loja. people_records é o cadastro de pessoas, com
+    base_unit; os nomes que só aparecem no faturamento entram sem unidade e
+    só podem ser resolvidos quando o primeiro nome já é único.
+    """
     caminho = Path(os.environ.get("PASSINI_CRM_DATA")
                    or "/srv/passini/data/crm") / "passini_dashboard.db"
     if not caminho.exists():
         print(f"   (banco do CRM não encontrado em {caminho}; "
               f"nenhuma falta terá dono)")
-        return set()
-    nomes: set[str] = set()
+        return {}
+    nomes: dict[str, str] = {}
     try:
         conn = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
         cid = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()[0]
         for tabela in ("fact_sales_detail", "fact_vendor_summary",
                        "crm_client_summary"):
             try:
-                nomes |= {limpa(r[0]) for r in conn.execute(
-                    f"SELECT DISTINCT seller_name FROM {tabela}"
-                    f" WHERE company_id = ?", (cid,))}
+                for r in conn.execute(
+                        f"SELECT DISTINCT seller_name FROM {tabela}"
+                        f" WHERE company_id = ?", (cid,)):
+                    if limpa(r[0]):
+                        nomes.setdefault(limpa(r[0]), "")
             except sqlite3.Error:
                 continue
+        try:
+            # ORDER BY valid_from DESC + setdefault = fica a unidade mais
+            # recente de quem já mudou de loja.
+            for r in conn.execute(
+                    "SELECT person_name, base_unit FROM people_records"
+                    " WHERE company_id = ? AND TRIM(COALESCE(base_unit,'')) <> ''"
+                    " ORDER BY date(valid_from) DESC", (cid,)):
+                nome = limpa(r[0])
+                if nome and not nomes.get(nome):
+                    nomes[nome] = limpa(r[1]).upper()
+        except sqlite3.Error as exc:
+            print(f"   (people_records indisponível: {exc})")
         conn.close()
     except sqlite3.Error as exc:
         print(f"   (não consegui ler os vendedores: {exc})")
-    return nomes - {""}
+    return nomes
+
+
+def _sem_sufixo(chave: str) -> str:
+    """GABRIELLAJEADO → GABRIEL · TIAGOBALCAO → TIAGO."""
+    compacto = chave.replace(" ", "")
+    for suf in SUFIXOS_LOGIN:
+        if compacto.endswith(suf) and len(compacto) > len(suf) + 2:
+            return compacto[: -len(suf)]
+    return chave
 
 
 def resolver_vendedores(
-    usuarios: set[str], vendedores: set[str]
-) -> tuple[dict[str, str], set[str], set[str]]:
-    """Primeiro nome do Radar → nome completo do CRM, SÓ quando é inequívoco.
+    pares: set[tuple[str, str]], vendedores: dict[str, str],
+    mapa_unidade: dict[str, str],
+) -> tuple[dict[tuple[str, str], str], set[str], set[str]]:
+    """(usuário do Radar, unidade do pedido) → vendedor do CRM.
 
-    Devolve (de_para, ambíguos, órfãos). Ambíguo é o primeiro nome que casa
-    com mais de um vendedor; órfão é o que não casa com nenhum — logins de
-    balcão como TIAGOBALCAO caem aqui, e é onde devem cair.
+    A chave é o PAR, não o nome sozinho. Foi assim que o Felipe descreveu a
+    equipe — "o Carlos de Pelotas", "o Leonardo da Zona Norte" — e é a única
+    informação que separa dois homônimos sem adivinhação.
+
+    Três passadas, da mais segura para a menos:
+      1. nome completo casa com UM vendedor → resolve;
+      2. casa com vários, mas só um está NAQUELA unidade → resolve;
+      3. só o primeiro nome casa, e só uma pessoa daquele nome está naquela
+         unidade → resolve.
+
+    A terceira é a mais frouxa e é onde entram os logins grudados
+    (GABRIELLAJEADO) e os nomes que o Radar abrevia. Por isso o exportador
+    imprime o mapa inteiro: resolução por primeiro nome precisa de olho
+    humano antes de virar "as minhas solicitações" de alguém.
     """
     por_chave: dict[str, list[str]] = {}
+    por_primeiro: dict[str, list[str]] = {}
     for v in vendedores:
         k = chave_nome(v)
-        if k:
-            por_chave.setdefault(k, []).append(v)
-    de_para: dict[str, str] = {}
-    ambiguos: set[str] = set()
-    orfaos: set[str] = set()
-    for u in usuarios:
-        k = chave_nome(u)
         if not k:
             continue
-        casam = [v for kk, lista in por_chave.items() for v in lista
-                 if kk == k or kk.startswith(k + " ")]
-        if len(casam) == 1:
-            de_para[u] = casam[0]
-        elif len(casam) > 1:
-            ambiguos.add(u)
+        por_chave.setdefault(k, []).append(v)
+        por_primeiro.setdefault(k.split(" ")[0], []).append(v)
+
+    def unidade_do(nome: str) -> str:
+        bruto = (vendedores.get(nome) or "").upper()
+        return mapa_unidade.get(bruto, bruto)
+
+    de_para: dict[tuple[str, str], str] = {}
+    ambiguos: set[str] = set()
+    orfaos: set[str] = set()
+    for usuario, unidade in pares:
+        k = chave_nome(usuario)
+        if not k:
+            continue
+        candidatos = [v for kk, lista in por_chave.items() for v in lista
+                      if kk == k or kk.startswith(k + " ")]
+        if len(candidatos) == 1:
+            de_para[(usuario, unidade)] = candidatos[0]
+            continue
+        if len(candidatos) > 1:
+            na_unidade = [v for v in candidatos if unidade_do(v) == unidade]
+            if len(na_unidade) == 1:
+                de_para[(usuario, unidade)] = na_unidade[0]
+            else:
+                ambiguos.add(usuario)
+            continue
+        # Terceira passada: primeiro nome, obrigatoriamente com a unidade.
+        primeiro = _sem_sufixo(k).split(" ")[0]
+        candidatos = [v for kk, lista in por_primeiro.items() for v in lista
+                      if kk == primeiro]
+        na_unidade = [v for v in candidatos if unidade_do(v) == unidade]
+        if len(na_unidade) == 1:
+            de_para[(usuario, unidade)] = na_unidade[0]
+        elif candidatos:
+            ambiguos.add(usuario)
         else:
-            orfaos.add(u)
+            orfaos.add(usuario)
     return de_para, ambiguos, orfaos
 
 
@@ -367,13 +437,29 @@ def main() -> int:
     # para a unidade.
     col_user = coluna(req, "Usuario", "usuário")
     vendedores = carregar_vendedores_do_crm()
-    de_para_vend, ambiguos, orfaos = resolver_vendedores(
-        set(req[col_user].map(limpa)) if col_user else set(), vendedores)
-    print(f"\n5) VENDEDOR — {len(vendedores)} no CRM")
-    print(f"   nome único:   {len(de_para_vend):>4} usuário(s) atribuído(s)")
-    print(f"   AMBÍGUO:      {len(ambiguos):>4} ({', '.join(sorted(ambiguos)[:6])})")
-    print(f"   sem vendedor: {len(orfaos):>4} ({', '.join(sorted(orfaos)[:4])}…)")
-    print("   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
+    usuario_bruto = (req[col_user].map(limpa) if col_user
+                     else pd.Series([""] * len(req), index=req.index))
+    pares = {(u, un) for u, un in zip(usuario_bruto, unidades) if u and un}
+    de_para_vend, ambiguos, orfaos = resolver_vendedores(pares, vendedores, mapa)
+
+    print(f"\n5) VENDEDOR — {len(vendedores)} nome(s) conhecido(s) no CRM")
+    print(f"   Pares usuário × unidade: {len(pares)}")
+    print(f"   resolvidos:   {len(de_para_vend):>4}")
+    print(f"   AMBÍGUO:      {len(ambiguos):>4} "
+          f"({', '.join(sorted(ambiguos)[:6]) or '—'})")
+    print(f"   sem vendedor: {len(orfaos):>4} "
+          f"({', '.join(sorted(orfaos)[:4]) or '—'}…)")
+    # O MAPA INTEIRO, PARA CONFERÊNCIA.
+    #
+    # A terceira passada resolve por primeiro nome + unidade, que é um palpite
+    # informado, não um fato. Atribuir errado faz o vendedor abrir a tela e
+    # ver pedido do colega — então o mapa é impresso para alguém que conhece
+    # a equipe bater o olho antes de virar "as minhas solicitações".
+    if de_para_vend:
+        print(f"\n   {'USUÁRIO (RADAR)':<20}{'UNIDADE':<13}VENDEDOR (CRM)")
+        for (u, un), v in sorted(de_para_vend.items()):
+            print(f"   {u[:19]:<20}{un[:12]:<13}{v}")
+    print("\n   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
 
     # ── Montagem ────────────────────────────────────────────────────────────
     col_item = coluna(req, "Item")
@@ -382,8 +468,6 @@ def main() -> int:
     col_user = coluna(req, "Usuario", "usuário")
 
     col_custo = coluna(req, "P. Entrada", "P Entrada")
-    usuario_bruto = req[col_user].map(limpa) if col_user else pd.Series(
-        [""] * len(req), index=req.index)
     base = pd.DataFrame({
         "unidade": unidades,
         "competencia": datas.dt.strftime("%Y-%m"),
@@ -394,7 +478,10 @@ def main() -> int:
         "fabricante": req[col_fab].map(limpa) if col_fab else "",
         "tipo": req[col_tipo].map(limpa) if col_tipo else "",
         "usuario": usuario_bruto,
-        "vendedor": usuario_bruto.map(lambda u: de_para_vend.get(u, "")),
+        # O dono depende do par usuário+unidade: o mesmo primeiro nome em
+        # duas lojas é, de fato, duas pessoas diferentes.
+        "vendedor": [de_para_vend.get((u, un), "")
+                     for u, un in zip(usuario_bruto, unidades)],
         # "P. Entrada" parece data pelo nome e é PREÇO: 108,71 · 73,15.
         # É o que permite dizer quanto vale a peça que faltou — a coluna Qtd
         # é inaproveitável (10% preenchida, com linha de 500 milhões).
