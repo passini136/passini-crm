@@ -218,6 +218,12 @@ def resolver_vendedores(
     de_para: dict[tuple[str, str], str] = {}
     ambiguos: set[str] = set()
     orfaos: set[str] = set()
+    # POR QUE não resolveu. Sem isso a lista de ambíguos é um beco: quem
+    # conhece a equipe sabe de quem é o pedido, mas não sabe o que consertar.
+    # Com os candidatos e as unidades deles à vista, fica evidente se o caso é
+    # cadastro de pessoa sem unidade, pessoa em loja diferente da que pediu,
+    # ou dois homônimos de verdade na mesma loja.
+    motivos: dict[str, str] = {}
     for usuario, unidade in pares:
         k = chave_nome(usuario)
         if not k:
@@ -227,12 +233,19 @@ def resolver_vendedores(
         if len(candidatos) == 1:
             de_para[(usuario, unidade)] = candidatos[0]
             continue
+        def detalhar(lista: list[str]) -> str:
+            return " | ".join(
+                f"{v} [{unidade_do(v) or 'sem unidade'}]" for v in sorted(lista)[:4])
+
         if len(candidatos) > 1:
             na_unidade = [v for v in candidatos if unidade_do(v) == unidade]
             if len(na_unidade) == 1:
                 de_para[(usuario, unidade)] = na_unidade[0]
             else:
                 ambiguos.add(usuario)
+                motivos[f"{usuario} / {unidade}"] = (
+                    f"{len(candidatos)} nomes casam, {len(na_unidade)} em "
+                    f"{unidade} → {detalhar(candidatos)}")
             continue
         # Terceira passada: primeiro nome, obrigatoriamente com a unidade.
         primeiro = _sem_sufixo(k).split(" ")[0]
@@ -243,9 +256,14 @@ def resolver_vendedores(
             de_para[(usuario, unidade)] = na_unidade[0]
         elif candidatos:
             ambiguos.add(usuario)
+            motivos[f"{usuario} / {unidade}"] = (
+                f"por primeiro nome '{primeiro}': {len(candidatos)} candidato(s), "
+                f"{len(na_unidade)} em {unidade} → {detalhar(candidatos)}")
         else:
             orfaos.add(usuario)
-    return de_para, ambiguos, orfaos
+            motivos[f"{usuario} / {unidade}"] = (
+                f"nenhum vendedor começa com '{primeiro}'")
+    return de_para, ambiguos, orfaos, motivos
 
 
 def familia_e_estoque(
@@ -440,7 +458,15 @@ def main() -> int:
     usuario_bruto = (req[col_user].map(limpa) if col_user
                      else pd.Series([""] * len(req), index=req.index))
     pares = {(u, un) for u, un in zip(usuario_bruto, unidades) if u and un}
-    de_para_vend, ambiguos, orfaos = resolver_vendedores(pares, vendedores, mapa)
+    de_para_vend, ambiguos, orfaos, motivos = resolver_vendedores(
+        pares, vendedores, mapa)
+    # Quanto do ARQUIVO cada grupo representa. Contar nomes engana: um nome
+    # sem dono com 12 mil linhas pesa mais que dez com cem.
+    peso = {}
+    for u, un in zip(usuario_bruto, unidades):
+        if u and un:
+            peso[(u, un)] = peso.get((u, un), 0) + 1
+    linhas_ok = sum(n for p, n in peso.items() if p in de_para_vend)
 
     print(f"\n5) VENDEDOR — {len(vendedores)} nome(s) conhecido(s) no CRM")
     print(f"   Pares usuário × unidade: {len(pares)}")
@@ -459,7 +485,17 @@ def main() -> int:
         print(f"\n   {'USUÁRIO (RADAR)':<20}{'UNIDADE':<13}VENDEDOR (CRM)")
         for (u, un), v in sorted(de_para_vend.items()):
             print(f"   {u[:19]:<20}{un[:12]:<13}{v}")
-    print("\n   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
+    if motivos:
+        print(f"\n   POR QUE OS OUTROS {len(motivos)} NÃO RESOLVERAM")
+        for rotulo in sorted(motivos, key=lambda r: -peso.get(
+                (r.split(" / ")[0], r.split(" / ")[1]), 0)):
+            u, un = rotulo.split(" / ")
+            print(f"   {rotulo[:30]:<32}{peso.get((u, un), 0):>8,} linhas")
+            print(f"      {motivos[rotulo][:150]}")
+    total_linhas = sum(peso.values()) or 1
+    print(f"\n   Linhas COM dono: {linhas_ok:,} de {total_linhas:,} "
+          f"({100 * linhas_ok / total_linhas:.0f}%)")
+    print("   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
 
     # ── Montagem ────────────────────────────────────────────────────────────
     col_item = coluna(req, "Item")
