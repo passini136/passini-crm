@@ -202,14 +202,41 @@ def resolver_vendedores(
     imprime o mapa inteiro: resolução por primeiro nome precisa de olho
     humano antes de virar "as minhas solicitações" de alguém.
     """
-    por_chave: dict[str, list[str]] = {}
-    por_primeiro: dict[str, list[str]] = {}
+    # UMA PESSOA, VÁRIAS GRAFIAS — isso não é ambiguidade.
+    #
+    # O cadastro guarda "NICOLAS DA SILVA" e "NICOLAS DA SILVA (VENDAS)" como
+    # entradas distintas; o mesmo vale para Heider, Leonardo Santos, Marcelo
+    # Rossner e Adriana Barros. chave_nome() derruba o sufixo do papel, então
+    # as duas viram a mesma chave — mas a primeira versão guardava as duas
+    # como candidatas e declarava ambiguidade. Resultado: cinco pessoas
+    # ficaram sem dono por um defeito meu, não por falta de dado.
+    #
+    # Agora cada chave guarda UM nome canônico: prefiro o que tem unidade no
+    # cadastro e, empatando, o mais longo — que costuma ser a grafia completa
+    # usada no faturamento.
+    def melhor(a: str, b: str) -> str:
+        tem_a, tem_b = bool(vendedores.get(a)), bool(vendedores.get(b))
+        if tem_a != tem_b:
+            return a if tem_a else b
+        return a if len(a) >= len(b) else b
+
+    por_chave: dict[str, str] = {}
     for v in vendedores:
         k = chave_nome(v)
         if not k:
             continue
-        por_chave.setdefault(k, []).append(v)
-        por_primeiro.setdefault(k.split(" ")[0], []).append(v)
+        por_chave[k] = melhor(por_chave[k], v) if k in por_chave else v
+
+    por_primeiro: dict[str, list[str]] = {}
+    # Nome grudado com o sobrenome: NATHANPEGLOW é NATHAN MARTINS PEGLOW.
+    # Guardamos também primeiro+último compactados para alcançar esses.
+    por_compacto: dict[str, str] = {}
+    for k, v in por_chave.items():
+        partes = k.split(" ")
+        por_primeiro.setdefault(partes[0], []).append(v)
+        por_compacto.setdefault(k.replace(" ", ""), v)
+        if len(partes) > 1:
+            por_compacto.setdefault(partes[0] + partes[-1], v)
 
     def unidade_do(nome: str) -> str:
         bruto = (vendedores.get(nome) or "").upper()
@@ -228,11 +255,17 @@ def resolver_vendedores(
         k = chave_nome(usuario)
         if not k:
             continue
-        candidatos = [v for kk, lista in por_chave.items() for v in lista
+        candidatos = [v for kk, v in por_chave.items()
                       if kk == k or kk.startswith(k + " ")]
         if len(candidatos) == 1:
             de_para[(usuario, unidade)] = candidatos[0]
             continue
+        if not candidatos:
+            # Login grudado: NATHANPEGLOW → NATHAN MARTINS PEGLOW.
+            achado = por_compacto.get(_sem_sufixo(k).replace(" ", ""))
+            if achado:
+                de_para[(usuario, unidade)] = achado
+                continue
         def detalhar(lista: list[str]) -> str:
             return " | ".join(
                 f"{v} [{unidade_do(v) or 'sem unidade'}]" for v in sorted(lista)[:4])

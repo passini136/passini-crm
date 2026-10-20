@@ -18265,8 +18265,31 @@ def faltas_painel(
             onde.append("f.unidade = ?")
             par.append(unidade_efetiva)
         if vendedor_efetivo:
-            onde.append("f.vendedor = ?")
-            par.append(vendedor_efetivo)
+            # NÃO comparar o nome como string.
+            #
+            # O arquivo de faltas guarda o nome como o cadastro escreve
+            # ("NICOLAS DA SILVA (VENDAS)"); o login guarda como a pessoa foi
+            # vinculada ("Nicolas da Silva"). Igualdade literal faria a tela
+            # do vendedor abrir vazia — e vazia é indistinguível de "não
+            # faltou nada", que é a conclusão errada mais cara aqui.
+            #
+            # chave_canonica é a mesma normalização que o resto do CRM usa, e
+            # ainda segue o mapa de apelidos: grafia errada no cadastro
+            # (MATHEUS RODINEI × RODRINEI) se resolve lá, uma vez, para o
+            # sistema inteiro.
+            alvo = chave_canonica(conn, company_id, vendedor_efetivo)
+            nomes = [r[0] for r in fconn.execute(
+                "SELECT DISTINCT vendedor FROM faltas_resumo"
+                " WHERE vendedor <> ''")]
+            equivalentes = [n for n in nomes
+                            if chave_canonica(conn, company_id, n) == alvo]
+            if not equivalentes:
+                return {**base, "disponivel": True, "escopo": escopo,
+                        "competencia": comp, "competencias": comps,
+                        "sellerName": vendedor_efetivo,
+                        "semVinculo": True}
+            onde.append(f"f.vendedor IN ({','.join('?' * len(equivalentes))})")
+            par.extend(equivalentes)
 
         linhas = []
         contagem = {k: 0 for k in FALTA_STATUS}
