@@ -18187,6 +18187,158 @@ def faltas_por_item(
         conn.close()
 
 
+# Como cada falta é classificada. A ordem importa: "chegou e acabou" só faz
+# sentido depois de saber que o saldo está zerado hoje.
+FALTA_STATUS = {
+    "TEM": {"id": "TEM", "label": "Tem na loja", "icon": "✅", "cor": "#1e8e3e"},
+    "VOLTOU": {"id": "VOLTOU", "label": "Chegou e acabou", "icon": "🔁", "cor": "#b06000"},
+    "ABERTO": {"id": "ABERTO", "label": "Em aberto", "icon": "⛔", "cor": "#c5221f"},
+    "SEM_INFO": {"id": "SEM_INFO", "label": "Sem informação", "icon": "–", "cor": "#5f6368"},
+}
+
+
+def _falta_status(estoque, ultima_entrada, ultima_data) -> str:
+    """Classifica uma falta pelo estoque da FAMÍLIA, não da peça.
+
+    A regra é do Radar: ruptura só existe quando a família inteira de
+    substitutos está zerada na unidade. Peça pedida com substituto na
+    prateleira não é falta — é escolha de quem atendeu.
+
+    "Sem informação" é um estado de primeira classe, não um erro disfarçado
+    de zero. Família que a unidade nunca teve em estoque não pode ser
+    declarada resolvida nem em aberto; dizer qualquer um dos dois seria
+    inventar, e painel de acompanhamento que inventa perde o gerente na
+    primeira conferência.
+    """
+    if estoque is None:
+        return "SEM_INFO"
+    if float(estoque or 0) > 0:
+        return "TEM"
+    # Entrou depois do pedido e mesmo assim está zerado: chegou e vendeu tudo.
+    # É o caso mais informativo dos quatro — demanda maior que a reposição.
+    if ultima_entrada and ultima_data and str(ultima_entrada) >= str(ultima_data):
+        return "VOLTOU"
+    return "ABERTO"
+
+
+def faltas_painel(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    competencia: str = "", unidade: str = "", vendedor: str = "",
+    limite: int = 120,
+) -> dict[str, Any]:
+    """Acompanhamento de rupturas: o que faltou e o que aconteceu depois.
+
+    Não é lista de compras. O gerente vê a unidade dele; o vendedor vê as
+    solicitações dele. O escopo sai de crm_scoped_filters_for_user, que é o
+    mesmo do resto do CRM — filtro de permissão só pode ESTREITAR o que a
+    pessoa já podia ver, nunca ampliar.
+    """
+    base: dict[str, Any] = {
+        "disponivel": False, "competencias": [], "linhas": [],
+        "resumo": {}, "status": FALTA_STATUS, "escopo": "",
+    }
+    fconn = faltas_conexao()
+    if fconn is None:
+        return base
+    try:
+        escopo = data_scope_for_user(conn, user)
+        filtros = crm_scoped_filters_for_user(
+            conn, company_id, user,
+            {"unit_name": unidade, "seller_name": vendedor})
+        unidade_efetiva = normalize_whitespace(filtros.get("unit_name"))
+        if unidade_efetiva == "__NO_ACCESS__":
+            return {**base, "disponivel": True, "escopo": escopo}
+        # Vendedor só vê o que é dele. Não é só esconder na tela: a consulta
+        # nem chega a trazer a linha dos outros.
+        vendedor_efetivo = (seller_identity_for_user(user) if escopo == "proprio"
+                            else normalize_whitespace(vendedor))
+
+        comps = [r[0] for r in fconn.execute(
+            "SELECT DISTINCT competencia FROM faltas_resumo ORDER BY competencia DESC")]
+        comp = normalize_whitespace(competencia) or (comps[0] if comps else "")
+        if not comp:
+            return {**base, "disponivel": True, "escopo": escopo}
+
+        onde = ["f.competencia = ?"]
+        par: list[Any] = [comp]
+        if unidade_efetiva:
+            onde.append("f.unidade = ?")
+            par.append(unidade_efetiva)
+        if vendedor_efetivo:
+            onde.append("f.vendedor = ?")
+            par.append(vendedor_efetivo)
+
+        linhas = []
+        contagem = {k: 0 for k in FALTA_STATUS}
+        pedidos_total = valor_total = 0.0
+        for r in fconn.execute(
+            f"""SELECT f.unidade, f.item_code, f.familia,
+                       SUM(f.pedidos) AS pedidos,
+                       MAX(f.ultima_data) AS ultima_data,
+                       MAX(f.item) AS item, MAX(f.fabricante) AS fabricante,
+                       MAX(f.tipo) AS tipo, AVG(f.custo) AS custo,
+                       e.estoque AS estoque, e.ultima_entrada AS ultima_entrada
+                  FROM faltas_resumo f
+                  LEFT JOIN estoque_familia e
+                         ON e.unidade = f.unidade AND e.familia = f.familia
+                 WHERE {' AND '.join(onde)}
+                 GROUP BY f.unidade, f.item_code
+                 ORDER BY pedidos DESC""", par
+        ):
+            st = _falta_status(r["estoque"], r["ultima_entrada"], r["ultima_data"])
+            contagem[st] += 1
+            pedidos_total += r["pedidos"] or 0
+            custo = float(r["custo"] or 0)
+            valor_total += custo * (r["pedidos"] or 0)
+            if len(linhas) < limite:
+                linhas.append({
+                    "unitName": r["unidade"],
+                    "itemCode": r["item_code"],
+                    "item": normalize_whitespace(r["item"]),
+                    "brand": normalize_whitespace(r["fabricante"]),
+                    "type": normalize_whitespace(r["tipo"]),
+                    "pedidos": r["pedidos"],
+                    "lastRequest": r["ultima_data"] or "",
+                    "cost": round(custo, 2),
+                    "stock": None if r["estoque"] is None else float(r["estoque"]),
+                    "lastEntry": r["ultima_entrada"] or "",
+                    "status": st,
+                })
+        pecas = sum(contagem.values())
+        resolvidas = contagem["TEM"]
+        # O percentual ignora SEM_INFO no denominador: incluir o que não se
+        # sabe como se fosse não resolvido puniria a unidade por cadastro.
+        com_resposta = pecas - contagem["SEM_INFO"]
+        return {
+            "disponivel": True,
+            "escopo": escopo,
+            "competencia": comp,
+            "competencias": comps,
+            "unitName": unidade_efetiva,
+            "sellerName": vendedor_efetivo,
+            "status": FALTA_STATUS,
+            "resumo": {
+                "pecas": pecas,
+                "pedidos": int(pedidos_total),
+                "valorEstimado": round(valor_total, 2),
+                "porStatus": contagem,
+                "resolvidoPct": (round(100 * resolvidas / com_resposta, 1)
+                                 if com_resposta else None),
+                "semInfoPct": (round(100 * contagem["SEM_INFO"] / pecas, 1)
+                               if pecas else 0.0),
+            },
+            "linhas": linhas,
+            "truncado": pecas > limite,
+            "arquivo": faltas_status(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        print(f"[faltas] painel falhou: {exc}", flush=True)
+        traceback.print_exc()
+        return base
+    finally:
+        fconn.close()
+
+
 def codigos_do_termo(
     conn: sqlite3.Connection, company_id: int, termo: str, limite: int = 500
 ) -> set[str]:
@@ -27693,6 +27845,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         }
                     )
                 )
+                return
+            if path == "/api/faltas/painel":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = faltas_painel(
+                        conn, user["company_id"], user,
+                        competencia=query.get("competence", [""])[0],
+                        unidade=query.get("unit", [""])[0],
+                        vendedor=query.get("seller", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
                 return
             if path == "/api/crm/clients":
                 user = self._require_auth()
