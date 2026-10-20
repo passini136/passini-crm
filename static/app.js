@@ -16314,6 +16314,15 @@ function crmClientsView() {
             Filtro ativo — mostrando ${number(rows.length)} cliente(s) da sua carteira.
             A ordem dos blocos continua a mesma: urgentes primeiro.
           </div>` : ""}
+        ${/* A MESMA BUSCA EXISTE EM DUAS TELAS.
+              O gestor pesquisa a peça na tabela da carteira; o vendedor
+              pesquisa nos cards. São telas diferentes montando a mesma
+              consulta, e a primeira versão do aviso de falta entrou só na do
+              gestor — quem testou pelo lado do vendedor não viu nada e
+              concluiu que a peça nunca faltou. Aviso que existe em uma tela
+              e não na outra é pior que aviso nenhum. */""}
+        ${state.crm.crmClientFilters?.itemCode
+          ? blocoFaltaDoItem(state.crm.itemShortage) : ""}
         ${buscaSemResultadoVendedor(rows)}
         ${groupSection("🔴 Urgente — Contatar agora", "#e74c3c", urgent, "✅ Nenhum pré-inativo ou inativo.")}
         ${groupSection("🟡 Ativos sem compra este mês", "#f39c12", noSale, "✅ Todos os ativos já compraram este mês.")}
