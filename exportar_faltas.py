@@ -155,14 +155,29 @@ def carregar_vendedores_do_crm() -> dict[str, str]:
             except sqlite3.Error:
                 continue
         try:
-            # ORDER BY valid_from DESC + setdefault = fica a unidade mais
-            # recente de quem já mudou de loja.
+            # TODA PESSOA CADASTRADA, COM OU SEM UNIDADE.
+            #
+            # A primeira versão exigia base_unit preenchida, porque é a
+            # unidade que desfaz a ambiguidade entre dois homônimos. Só que
+            # isso apagava do mapa quem está cadastrado SEM unidade — Alessana
+            # e Alex, por exemplo — e o diagnóstico passava a afirmar "nenhum
+            # vendedor começa com ALEX", que é falso. Exigir o dado que ajuda
+            # a desempatar para sequer considerar a pessoa é trocar um
+            # problema de ambiguidade por um de invisibilidade.
+            #
+            # Sem unidade a pessoa ainda resolve pela primeira passada (nome
+            # único); só não participa do desempate por loja.
+            #
+            # ORDER BY valid_from DESC + só preencher o vazio = fica a unidade
+            # mais recente de quem já mudou de loja.
             for r in conn.execute(
                     "SELECT person_name, base_unit FROM people_records"
-                    " WHERE company_id = ? AND TRIM(COALESCE(base_unit,'')) <> ''"
+                    " WHERE company_id = ?"
                     " ORDER BY date(valid_from) DESC", (cid,)):
                 nome = limpa(r[0])
-                if nome and not nomes.get(nome):
+                if not nome:
+                    continue
+                if not nomes.get(nome):
                     nomes[nome] = limpa(r[1]).upper()
         except sqlite3.Error as exc:
             print(f"   (people_records indisponível: {exc})")
