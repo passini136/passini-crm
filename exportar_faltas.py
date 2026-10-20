@@ -111,6 +111,136 @@ def de_para_unidades() -> dict[str, str]:
     return {}
 
 
+def chave_nome(valor: str) -> str:
+    """Nome comparável: sem acento, sem (VENDAS), sem pontuação."""
+    t = limpa(valor).upper()
+    for a, b in zip("ÁÀÃÂÄÉÊËÍÏÓÕÔÖÚÜÇ", "AAAAAEEEIIOOOOUUC"):
+        t = t.replace(a, b)
+    t = re.sub(r"\((VENDAS|TELEVENDAS|BALCAO)\)", " ", t)
+    return re.sub(r"[^A-Z0-9 ]", " ", t).strip()
+
+
+def carregar_vendedores_do_crm() -> set[str]:
+    """Nomes de vendedor que o CRM conhece, lidos só para leitura."""
+    caminho = Path(os.environ.get("PASSINI_CRM_DATA")
+                   or "/srv/passini/data/crm") / "passini_dashboard.db"
+    if not caminho.exists():
+        print(f"   (banco do CRM não encontrado em {caminho}; "
+              f"nenhuma falta terá dono)")
+        return set()
+    nomes: set[str] = set()
+    try:
+        conn = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
+        cid = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()[0]
+        for tabela in ("fact_sales_detail", "fact_vendor_summary",
+                       "crm_client_summary"):
+            try:
+                nomes |= {limpa(r[0]) for r in conn.execute(
+                    f"SELECT DISTINCT seller_name FROM {tabela}"
+                    f" WHERE company_id = ?", (cid,))}
+            except sqlite3.Error:
+                continue
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"   (não consegui ler os vendedores: {exc})")
+    return nomes - {""}
+
+
+def resolver_vendedores(
+    usuarios: set[str], vendedores: set[str]
+) -> tuple[dict[str, str], set[str], set[str]]:
+    """Primeiro nome do Radar → nome completo do CRM, SÓ quando é inequívoco.
+
+    Devolve (de_para, ambíguos, órfãos). Ambíguo é o primeiro nome que casa
+    com mais de um vendedor; órfão é o que não casa com nenhum — logins de
+    balcão como TIAGOBALCAO caem aqui, e é onde devem cair.
+    """
+    por_chave: dict[str, list[str]] = {}
+    for v in vendedores:
+        k = chave_nome(v)
+        if k:
+            por_chave.setdefault(k, []).append(v)
+    de_para: dict[str, str] = {}
+    ambiguos: set[str] = set()
+    orfaos: set[str] = set()
+    for u in usuarios:
+        k = chave_nome(u)
+        if not k:
+            continue
+        casam = [v for kk, lista in por_chave.items() for v in lista
+                 if kk == k or kk.startswith(k + " ")]
+        if len(casam) == 1:
+            de_para[u] = casam[0]
+        elif len(casam) > 1:
+            ambiguos.add(u)
+        else:
+            orfaos.add(u)
+    return de_para, ambiguos, orfaos
+
+
+def familia_e_estoque(
+    sources: Path, mapa_unidade: dict[str, str]
+) -> tuple[dict, "pd.DataFrame"]:
+    """Famílias de substitutos e estoque consolidado, pela regra do Radar.
+
+    Usa gerar_familias_substitutos e _prepare_stock IMPORTADAS do Radar, não
+    reescritas. Reimplementar a regra criaria um segundo Radar que diverge do
+    primeiro no primeiro ajuste — e já errei uma vez redigitando a lista de
+    nomes de coluna do estoque, o que produziu "sem posição" para tudo.
+
+    A unidade sai do _prepare_stock no vocabulário do Radar (ZONASUL) e é
+    traduzida para o do CRM (ZONA SUL). Sem isso, duas unidades inteiras
+    nunca casariam com as faltas — e o resultado seria um percentual
+    plausível de "sem informação", não um erro visível.
+    """
+    import importlib
+
+    vazio = pd.DataFrame(columns=["unidade", "familia", "estoque", "ultima_entrada"])
+    sys.path.insert(0, "/srv/passini/apps/radar-rupturas")
+    try:
+        analytics = importlib.import_module("analytics")
+    except ImportError as exc:
+        print(f"   >> analytics do Radar indisponível ({exc}); "
+              f"sem família e sem estoque.")
+        return {}, vazio
+
+    familias = {}
+    p_subs = sources / "substitutos.pkl"
+    if p_subs.exists():
+        familias = analytics.gerar_familias_substitutos(pd.read_pickle(p_subs))
+        print(f"\n7) FAMÍLIAS — {len(familias):,} códigos em "
+              f"{len({e['FamiliaID'] for e in familias.values()}):,} famílias")
+    else:
+        print(f"\n7) FAMÍLIAS — {p_subs} não existe; cada peça vira a própria "
+              f"família e a ruptura sai inflada.")
+
+    p_stock = sources / "stock.pkl"
+    if not p_stock.exists():
+        print(f"   >> {p_stock} não existe; sem estoque não há 'resolvido'.")
+        return familias, vazio
+
+    preparado = analytics._prepare_stock(pd.read_pickle(p_stock), familias)
+    est = pd.DataFrame({
+        "unidade": preparado["Unidade_Normalizada"].map(
+            lambda v: mapa_unidade.get(
+                re.sub(r"\s+", " ", str(v or "").upper()).strip(),
+                re.sub(r"\s+", " ", str(v or "").upper()).strip())),
+        "familia": preparado["FamiliaID"].astype(str),
+        "qtd": preparado["quantity"],
+        "entrada": preparado["Ultima_Entrada"],
+    })
+    est = est[est["familia"].ne("")]
+    fam = est.groupby(["unidade", "familia"], as_index=False).agg(
+        estoque=("qtd", "sum"), ultima_entrada=("entrada", "max"))
+    fam["ultima_entrada"] = fam["ultima_entrada"].dt.strftime("%Y-%m-%d")
+    com = int((fam["estoque"] > 0).sum())
+    print(f"   ESTOQUE — {len(est):,} posições → {len(fam):,} unidade × família")
+    print(f"   Com saldo: {com:,} ({100 * com / max(1, len(fam)):.0f}%) · "
+          f"zeradas: {len(fam) - com:,}")
+    print(f"   Unidades: {', '.join(sorted(set(est['unidade'])))}")
+    return familias, fam
+
+
 def limpa(v) -> str:
     """Tira o '.0' que o Excel cola em número, colapsa espaço, sobe a caixa."""
     if v is None:
@@ -137,17 +267,33 @@ CREATE TABLE faltas_resumo (
     unidade      TEXT NOT NULL,
     competencia  TEXT NOT NULL,      -- AAAA-MM
     item_code    TEXT NOT NULL,      -- código interno da Passini
+    vendedor     TEXT NOT NULL,      -- nome do CRM, ou '' quando não dá para dizer
+    familia      TEXT,               -- família de substitutos (regra do Radar)
     pedidos      INTEGER NOT NULL,   -- quantas vezes foi pedida no mês
     ultima_data  TEXT,
     item         TEXT,
     fabricante   TEXT,
     tipo         TEXT,
-    usuarios     TEXT,               -- quem pediu, separado por vírgula
-    fonte_codigo TEXT,               -- de qual coluna do Radar veio o código
-    PRIMARY KEY (unidade, competencia, item_code)
+    usuario      TEXT,               -- como o Radar gravou, antes do de-para
+    custo        REAL,               -- P. Entrada: o preço de entrada da peça
+    fonte_codigo TEXT,
+    PRIMARY KEY (unidade, competencia, item_code, vendedor)
 );
 CREATE INDEX idx_faltas_item ON faltas_resumo(item_code);
 CREATE INDEX idx_faltas_comp ON faltas_resumo(competencia, unidade);
+CREATE INDEX idx_faltas_vend ON faltas_resumo(vendedor, competencia);
+
+-- Estoque consolidado por família, que é a regra central do Radar: ruptura
+-- só existe quando a família INTEIRA de substitutos está zerada na unidade.
+-- Perguntar item a item inflaria a ruptura, porque peça pedida com
+-- substituto na prateleira não é falta — é escolha.
+CREATE TABLE estoque_familia (
+    unidade        TEXT NOT NULL,
+    familia        TEXT NOT NULL,
+    estoque        REAL NOT NULL,
+    ultima_entrada TEXT,
+    PRIMARY KEY (unidade, familia)
+);
 CREATE TABLE faltas_meta (chave TEXT PRIMARY KEY, valor TEXT);
 """
 
@@ -211,12 +357,33 @@ def main() -> int:
     if not nao_mapeados:
         print("   Todo rótulo encontrou unidade no CRM.")
 
+    # ── Vendedor: o Radar grava só o primeiro nome ──────────────────────────
+    #
+    # "EDUARDO", "CARLOS". Casar por prefixo resolve 74% das linhas, mas
+    # prefixo é AMBÍGUO: há dois Carlos e dois Leonardos no cadastro. Atribuir
+    # no chute faria o vendedor abrir a tela e ver pedido do colega como se
+    # fosse dele — pior que não mostrar lista nenhuma. Então só entra o nome
+    # que casa com UM único vendedor; o resto fica sem dono, e a falta conta
+    # para a unidade.
+    col_user = coluna(req, "Usuario", "usuário")
+    vendedores = carregar_vendedores_do_crm()
+    de_para_vend, ambiguos, orfaos = resolver_vendedores(
+        set(req[col_user].map(limpa)) if col_user else set(), vendedores)
+    print(f"\n5) VENDEDOR — {len(vendedores)} no CRM")
+    print(f"   nome único:   {len(de_para_vend):>4} usuário(s) atribuído(s)")
+    print(f"   AMBÍGUO:      {len(ambiguos):>4} ({', '.join(sorted(ambiguos)[:6])})")
+    print(f"   sem vendedor: {len(orfaos):>4} ({', '.join(sorted(orfaos)[:4])}…)")
+    print("   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
+
     # ── Montagem ────────────────────────────────────────────────────────────
     col_item = coluna(req, "Item")
     col_fab = coluna(req, "Fabricante")
     col_tipo = coluna(req, "Tipo")
     col_user = coluna(req, "Usuario", "usuário")
 
+    col_custo = coluna(req, "P. Entrada", "P Entrada")
+    usuario_bruto = req[col_user].map(limpa) if col_user else pd.Series(
+        [""] * len(req), index=req.index)
     base = pd.DataFrame({
         "unidade": unidades,
         "competencia": datas.dt.strftime("%Y-%m"),
@@ -226,30 +393,42 @@ def main() -> int:
         "item": req[col_item].map(limpa) if col_item else "",
         "fabricante": req[col_fab].map(limpa) if col_fab else "",
         "tipo": req[col_tipo].map(limpa) if col_tipo else "",
-        "usuario": req[col_user].map(limpa) if col_user else "",
+        "usuario": usuario_bruto,
+        "vendedor": usuario_bruto.map(lambda u: de_para_vend.get(u, "")),
+        # "P. Entrada" parece data pelo nome e é PREÇO: 108,71 · 73,15.
+        # É o que permite dizer quanto vale a peça que faltou — a coluna Qtd
+        # é inaproveitável (10% preenchida, com linha de 500 milhões).
+        "custo": (pd.to_numeric(req[col_custo], errors="coerce")
+                  if col_custo else pd.Series([None] * len(req), index=req.index)),
     })
     antes = len(base)
     base = base[base["item_code"].ne("") & base["unidade"].ne("") & ~ruins]
-    print(f"\n5) APROVEITÁVEL: {len(base):,} de {antes:,} "
+    print(f"\n6) APROVEITÁVEL: {len(base):,} de {antes:,} "
           f"({100 * len(base) / max(1, antes):.1f}%)")
     if base.empty:
         print(">> Nada sobrou. Não grava arquivo vazio por cima do bom.")
         return 1
 
-    def juntar_usuarios(s) -> str:
-        nomes = sorted({u for u in s if u})
-        return ", ".join(nomes)[:200]
-
-    resumo = base.groupby(["unidade", "competencia", "item_code"], as_index=False).agg(
+    resumo = base.groupby(
+        ["unidade", "competencia", "item_code", "vendedor"], as_index=False).agg(
         pedidos=("item_code", "size"),
         ultima_data=("data", "max"),
         item=("item", "last"),
         fabricante=("fabricante", "last"),
         tipo=("tipo", "last"),
-        usuarios=("usuario", juntar_usuarios),
+        usuario=("usuario", "last"),
+        custo=("custo", "median"),
         fonte_codigo=("fonte_codigo", "first"),
     )
     resumo["ultima_data"] = resumo["ultima_data"].dt.strftime("%Y-%m-%d")
+    # A mediana de um grupo sai com ruído de ponto flutuante (220,77499...).
+    # Arredondar na gravação evita que cada tela resolva isso do seu jeito.
+    resumo["custo"] = resumo["custo"].round(2)
+
+    # ── Família e estoque ───────────────────────────────────────────────────
+    familias, estoque = familia_e_estoque(origem.parent, mapa)
+    resumo["familia"] = resumo["item_code"].map(
+        lambda c: familias.get(c, {}).get("FamiliaID", c))
     meses = sorted(resumo["competencia"].unique())
     print(f"   Agrupado em {len(resumo):,} linha(s) "
           f"(redução de {100 * (1 - len(resumo) / len(base)):.0f}%)")
@@ -276,13 +455,27 @@ def main() -> int:
         conn = sqlite3.connect(temporario)
         conn.executescript(ESQUEMA)
         conn.executemany(
-            "INSERT INTO faltas_resumo (unidade, competencia, item_code, pedidos,"
-            " ultima_data, item, fabricante, tipo, usuarios, fonte_codigo)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
-            resumo[["unidade", "competencia", "item_code", "pedidos", "ultima_data",
-                    "item", "fabricante", "tipo", "usuarios", "fonte_codigo"]]
+            "INSERT INTO faltas_resumo (unidade, competencia, item_code, vendedor,"
+            " familia, pedidos, ultima_data, item, fabricante, tipo, usuario,"
+            " custo, fonte_codigo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            resumo[["unidade", "competencia", "item_code", "vendedor", "familia",
+                    "pedidos", "ultima_data", "item", "fabricante", "tipo",
+                    "usuario", "custo", "fonte_codigo"]]
+            .astype(object).where(pd.notna(resumo[[
+                "unidade", "competencia", "item_code", "vendedor", "familia",
+                "pedidos", "ultima_data", "item", "fabricante", "tipo",
+                "usuario", "custo", "fonte_codigo"]]), None)
             .itertuples(index=False, name=None),
         )
+        if len(estoque):
+            conn.executemany(
+                "INSERT OR REPLACE INTO estoque_familia"
+                " (unidade, familia, estoque, ultima_entrada) VALUES (?,?,?,?)",
+                estoque[["unidade", "familia", "estoque", "ultima_entrada"]]
+                .astype(object).where(pd.notna(estoque[[
+                    "unidade", "familia", "estoque", "ultima_entrada"]]), None)
+                .itertuples(index=False, name=None),
+            )
         conn.executemany(
             "INSERT INTO faltas_meta (chave, valor) VALUES (?,?)",
             [
@@ -293,6 +486,13 @@ def main() -> int:
                 ("competencia_min", meses[0]),
                 ("competencia_max", meses[-1]),
                 ("ordem_codigo", " > ".join(disponiveis)),
+                ("linhas_estoque", str(len(estoque))),
+                # Quanto da base tem dono. A tela do vendedor precisa dizer
+                # isso: lista curta pode ser carteira tranquila ou nome que o
+                # de-para não resolveu, e as duas se parecem.
+                ("vendedores_atribuidos", str(len(de_para_vend))),
+                ("usuarios_ambiguos", ", ".join(sorted(ambiguos))),
+                ("usuarios_sem_vendedor", ", ".join(sorted(orfaos))[:500]),
             ],
         )
         conn.commit()
@@ -304,7 +504,7 @@ def main() -> int:
         raise
 
     tamanho = destino.stat().st_size / 1024
-    print(f"\n6) GRAVADO: {destino} · {tamanho:,.0f} KB")
+    print(f"\n8) GRAVADO: {destino} · {tamanho:,.0f} KB")
     print("   O arquivo anterior só foi substituído depois do novo ficar pronto.")
     return 0
 
