@@ -23037,8 +23037,25 @@ _PDF_ALERTA = colors.HexColor("#b06000")
 _PDF_RUIM = colors.HexColor("#a4262c")
 
 
-def _pdf_cor_farol(farol: str | None):
-    return {"bom": _PDF_BOM, "alerta": _PDF_ALERTA, "ruim": _PDF_RUIM}.get(farol or "", colors.black)
+def _pdf_cor_farol(farol: Any) -> colors.Color:
+    """Cor do número no PDF a partir do farol que o dashboard já calculou.
+
+    O farol NÃO é uma string: evaluate_farol() devolve um dicionário com
+    {"level": "good" | "warn" | "bad" | "neutral", ...}. A primeira versão
+    desta função esperava as palavras "bom"/"alerta"/"ruim", que não existem
+    em lugar nenhum do sistema — eu inventei um vocabulário em vez de ler o
+    que o dashboard produz. Resultado: TypeError a cada download, e o
+    navegador recebendo JSON de erro com cara de arquivo corrompido.
+
+    Aceita o dicionário ou a string do nível, para não voltar a quebrar se
+    algum chamador passar só o nível.
+    """
+    nivel = farol.get("level") if isinstance(farol, dict) else farol
+    return {
+        "good": _PDF_BOM,
+        "warn": _PDF_ALERTA,
+        "bad": _PDF_RUIM,
+    }.get(normalize_whitespace(nivel).lower(), colors.black)
 
 
 def export_executivo_pdf(data: dict[str, Any]) -> bytes:
