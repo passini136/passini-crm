@@ -172,6 +172,46 @@ def carregar_vendedores_do_crm() -> dict[str, str]:
     return nomes
 
 
+def carregar_catalogo_do_crm() -> dict[str, dict[str, str]]:
+    """item_code → marca, tipo e descrição, do catálogo do CRM.
+
+    A MARCA NÃO VEM DO RADAR.
+    A coluna que ele chama de "Fabricante" guarda a REFERÊNCIA do fabricante
+    — números como 100031 —, não o nome. O filtro de marca da tela saiu
+    cheio de código, sem sentido para quem olha. O nome existe na coluna
+    "Referencial" ("00072 FRAS-LE"), grudado a um código de fornecedor, mas
+    usar aquilo criaria um terceiro vocabulário de marca na empresa.
+
+    O catálogo do CRM já tem marca, tipo e linha, e é o mesmo que alimenta a
+    tela de Marcas. Puxar de lá faz o filtro de faltas falar a mesma língua
+    do resto do sistema — "NAKATA" aqui é "NAKATA" lá.
+    """
+    caminho = Path(os.environ.get("PASSINI_CRM_DATA")
+                   or "/srv/passini/data/crm") / "passini_dashboard.db"
+    if not caminho.exists():
+        return {}
+    catalogo: dict[str, dict[str, str]] = {}
+    try:
+        conn = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
+        cid = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()[0]
+        for r in conn.execute(
+                "SELECT item_code, brand_name, item_type, item_subgroup,"
+                "       sub_description"
+                "  FROM item_catalog WHERE company_id = ?", (cid,)):
+            codigo = limpa(r[0])
+            if codigo and codigo not in catalogo:
+                catalogo[codigo] = {
+                    "marca": limpa(r[1]),
+                    "tipo": limpa(r[2]),
+                    "linha": limpa(r[3]),
+                    "descricao": limpa(r[4]),
+                }
+        conn.close()
+    except sqlite3.Error as exc:
+        print(f"   (catálogo do CRM indisponível: {exc})")
+    return catalogo
+
+
 def _sem_sufixo(chave: str) -> str:
     """GABRIELLAJEADO → GABRIEL · TIAGOBALCAO → TIAGO."""
     compacto = chave.replace(" ", "")
@@ -331,10 +371,10 @@ def familia_e_estoque(
     p_subs = sources / "substitutos.pkl"
     if p_subs.exists():
         familias = analytics.gerar_familias_substitutos(pd.read_pickle(p_subs))
-        print(f"\n7) FAMÍLIAS — {len(familias):,} códigos em "
+        print(f"\n8) FAMÍLIAS — {len(familias):,} códigos em "
               f"{len({e['FamiliaID'] for e in familias.values()}):,} famílias")
     else:
-        print(f"\n7) FAMÍLIAS — {p_subs} não existe; cada peça vira a própria "
+        print(f"\n8) FAMÍLIAS — {p_subs} não existe; cada peça vira a própria "
               f"família e a ruptura sai inflada.")
 
     p_stock = sources / "stock.pkl"
@@ -608,6 +648,32 @@ def main() -> int:
     # Arredondar na gravação evita que cada tela resolva isso do seu jeito.
     resumo["custo"] = resumo["custo"].round(2)
 
+    # ── Marca, tipo e descrição: do catálogo do CRM ─────────────────────────
+    catalogo = carregar_catalogo_do_crm()
+    achou = resumo["item_code"].isin(catalogo.keys()).sum()
+    print(f"\n7) CATÁLOGO — {len(catalogo):,} item(ns) no CRM")
+    print(f"   Linhas com marca do catálogo: {achou:,} de {len(resumo):,} "
+          f"({100 * achou / max(1, len(resumo)):.0f}%)")
+    # O que o catálogo não conhece mantém o texto do Radar: perder a
+    # descrição seria pior que mostrá-la com o vocabulário antigo.
+    resumo["fabricante"] = [
+        catalogo.get(c, {}).get("marca") or f
+        for c, f in zip(resumo["item_code"], resumo["fabricante"])]
+    resumo["tipo"] = [
+        catalogo.get(c, {}).get("tipo") or t
+        for c, t in zip(resumo["item_code"], resumo["tipo"])]
+    resumo["item"] = [
+        catalogo.get(c, {}).get("descricao") or i
+        for c, i in zip(resumo["item_code"], resumo["item"])]
+    marcas = sorted({m for m in resumo["fabricante"] if m})
+    print(f"   Marcas distintas: {len(marcas):,} · "
+          f"amostra: {', '.join(marcas[:6])}")
+    # Marca que ainda parece código é sinal de que o catálogo não cobriu.
+    numericas = [m for m in marcas if m.isdigit()]
+    if numericas:
+        print(f"   >> {len(numericas)} marca(s) ainda numéricas "
+              f"({', '.join(numericas[:5])}) — são peças fora do catálogo.")
+
     # ── Família e estoque ───────────────────────────────────────────────────
     familias, estoque, estoque_itens = familia_e_estoque(origem.parent, mapa)
     resumo["familia"] = resumo["item_code"].map(
@@ -699,7 +765,7 @@ def main() -> int:
         raise
 
     tamanho = destino.stat().st_size / 1024
-    print(f"\n8) GRAVADO: {destino} · {tamanho:,.0f} KB")
+    print(f"\n9) GRAVADO: {destino} · {tamanho:,.0f} KB")
     print("   O arquivo anterior só foi substituído depois do novo ficar pronto.")
     return 0
 
