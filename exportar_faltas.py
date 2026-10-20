@@ -194,18 +194,45 @@ def carregar_catalogo_do_crm() -> dict[str, dict[str, str]]:
     try:
         conn = sqlite3.connect(f"file:{caminho}?mode=ro", uri=True)
         cid = conn.execute("SELECT id FROM companies LIMIT 1").fetchone()[0]
+        # TIPO E DESCRIÇÃO do catálogo; MARCA, não.
+        #
+        # item_catalog.brand_name está sujo: a primeira versão puxou de lá e
+        # o filtro encheu de "001/1LT", "0W20SP/7000 HYBRID" — código de
+        # embalagem e especificação de lubrificante, não marca. A marca que a
+        # empresa usa, e que alimenta a tela de Marcas, é
+        # fact_sales_detail.brand_name (BRAND_FILTER_EXPR["brand"] no
+        # backend). Trocar a fonte aqui é o que faz o filtro de faltas e o de
+        # marcas listarem as mesmas marcas.
         for r in conn.execute(
-                "SELECT item_code, brand_name, item_type, item_subgroup,"
-                "       sub_description"
+                "SELECT item_code, item_type, item_subgroup, sub_description"
                 "  FROM item_catalog WHERE company_id = ?", (cid,)):
             codigo = limpa(r[0])
             if codigo and codigo not in catalogo:
                 catalogo[codigo] = {
-                    "marca": limpa(r[1]),
-                    "tipo": limpa(r[2]),
-                    "linha": limpa(r[3]),
-                    "descricao": limpa(r[4]),
+                    "marca": "",
+                    "tipo": limpa(r[1]),
+                    "linha": limpa(r[2]),
+                    "descricao": limpa(r[3]),
                 }
+        # A marca mais frequente no faturamento daquele código. Mais
+        # frequente, não a última: uma linha digitada errada não deve
+        # renomear a marca da peça inteira.
+        melhor: dict[str, tuple[int, str]] = {}
+        for r in conn.execute(
+                "SELECT item_code, brand_name, COUNT(*) n"
+                "  FROM fact_sales_detail"
+                " WHERE company_id = ? AND TRIM(COALESCE(item_code,'')) <> ''"
+                "   AND TRIM(COALESCE(brand_name,'')) <> ''"
+                " GROUP BY item_code, brand_name", (cid,)):
+            codigo, marca, n = limpa(r[0]), limpa(r[1]), int(r[2] or 0)
+            if not codigo or not marca:
+                continue
+            if n > melhor.get(codigo, (0, ""))[0]:
+                melhor[codigo] = (n, marca)
+        for codigo, (_, marca) in melhor.items():
+            catalogo.setdefault(codigo, {"marca": "", "tipo": "", "linha": "",
+                                         "descricao": ""})["marca"] = marca
+        print(f"   Marca do faturamento para {len(melhor):,} código(s)")
         conn.close()
     except sqlite3.Error as exc:
         print(f"   (catálogo do CRM indisponível: {exc})")
@@ -652,13 +679,16 @@ def main() -> int:
     catalogo = carregar_catalogo_do_crm()
     achou = resumo["item_code"].isin(catalogo.keys()).sum()
     print(f"\n7) CATÁLOGO — {len(catalogo):,} item(ns) no CRM")
-    print(f"   Linhas com marca do catálogo: {achou:,} de {len(resumo):,} "
-          f"({100 * achou / max(1, len(resumo)):.0f}%)")
-    # O que o catálogo não conhece mantém o texto do Radar: perder a
-    # descrição seria pior que mostrá-la com o vocabulário antigo.
-    resumo["fabricante"] = [
-        catalogo.get(c, {}).get("marca") or f
-        for c, f in zip(resumo["item_code"], resumo["fabricante"])]
+    print(f"   Linhas reconhecidas (tipo e descrição): {achou:,} de "
+          f"{len(resumo):,} ({100 * achou / max(1, len(resumo)):.0f}%)")
+    # MARCA DESCONHECIDA FICA VAZIA, não vira o código do Radar.
+    #
+    # O "Fabricante" do Radar é referência numérica (100031). Usá-lo de
+    # reserva encheria o filtro de marca com código — foi exatamente o que
+    # apareceu na tela. Vazio é honesto: a peça não tem marca conhecida, e o
+    # filtro simplesmente não a oferece.
+    resumo["fabricante"] = [catalogo.get(c, {}).get("marca", "")
+                            for c in resumo["item_code"]]
     resumo["tipo"] = [
         catalogo.get(c, {}).get("tipo") or t
         for c, t in zip(resumo["item_code"], resumo["tipo"])]
@@ -666,13 +696,16 @@ def main() -> int:
         catalogo.get(c, {}).get("descricao") or i
         for c, i in zip(resumo["item_code"], resumo["item"])]
     marcas = sorted({m for m in resumo["fabricante"] if m})
+    com_marca = int(sum(1 for m in resumo["fabricante"] if m))
+    print(f"   Linhas com marca: {com_marca:,} de {len(resumo):,} "
+          f"({100 * com_marca / max(1, len(resumo)):.0f}%)")
     print(f"   Marcas distintas: {len(marcas):,} · "
-          f"amostra: {', '.join(marcas[:6])}")
-    # Marca que ainda parece código é sinal de que o catálogo não cobriu.
-    numericas = [m for m in marcas if m.isdigit()]
+          f"amostra: {', '.join(marcas[:8])}")
+    # Marca que parece código é cadastro sujo chegando na tela.
+    numericas = [m for m in marcas if m.replace("/", "").replace(".", "").isdigit()]
     if numericas:
-        print(f"   >> {len(numericas)} marca(s) ainda numéricas "
-              f"({', '.join(numericas[:5])}) — são peças fora do catálogo.")
+        print(f"   >> {len(numericas)} marca(s) com cara de código "
+              f"({', '.join(numericas[:5])}) — vale olhar o cadastro.")
 
     # ── Família e estoque ───────────────────────────────────────────────────
     familias, estoque, estoque_itens = familia_e_estoque(origem.parent, mapa)
