@@ -71,6 +71,18 @@ COLUNAS_CODIGO = ["Codigo", "GTIN_NORMALIZADO", "gtin", "GTIN"]
 
 DESTINO_PADRAO = "/srv/passini/data/compartilhado/faltas.db"
 
+# De-para de LOGIN DO RADAR para pessoa do CRM, mantido à mão.
+#
+# Por que não usar a tela de Equipe do CRM: ela associa grafias de pessoas
+# que EXISTEM no cadastro — é para "Thielly Henrique" × "THIELLY HENRIQUES".
+# "ANA CAROLINA" não é pessoa do CRM, é login de outro sistema; a tela não
+# tem como oferecê-la, e eu cheguei a mandar o Felipe procurar lá.
+#
+# Um arquivo de texto resolve sem tocar no banco: dá para ver, versionar,
+# corrigir e desfazer. O script cria um modelo com os nomes pendentes e os
+# candidatos que ele mesmo encontrou, para a pessoa só preencher.
+DEPARA_PADRAO = "/srv/passini/data/compartilhado/vendedores_faltas.csv"
+
 
 def achar_pickle() -> Path:
     candidatos = [
@@ -124,6 +136,59 @@ def chave_nome(valor: str) -> str:
 # Tirar isso é o que transforma o login na pessoa.
 SUFIXOS_LOGIN = ["ZONANORTE", "ZONASUL", "XANGRILA", "LAJEADO", "PELOTAS",
                  "MATRIZ", "BALCAO", "TELEVENDAS", "VENDAS", "POA"]
+
+
+def carregar_depara_manual(caminho: Path) -> dict[tuple[str, str], str]:
+    """Lê o de-para à mão: login do Radar; unidade; vendedor do CRM.
+
+    Unidade em branco vale para todas — é o caso comum. Unidade preenchida
+    serve para o login compartilhado entre lojas, em que o mesmo primeiro
+    nome é gente diferente em cada uma.
+
+    Linha começando com # é comentário, e é onde o modelo guarda os
+    candidatos que o script encontrou sozinho.
+    """
+    if not caminho.exists():
+        return {}
+    mapa: dict[tuple[str, str], str] = {}
+    for linha in caminho.read_text(encoding="utf-8", errors="replace").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#"):
+            continue
+        partes = [p.strip() for p in linha.split(";")]
+        if len(partes) < 3:
+            continue
+        login, unidade, vendedor = partes[0], partes[1], partes[2]
+        if login and vendedor:
+            mapa[(login.upper(), unidade.upper())] = vendedor
+    return mapa
+
+
+def escrever_modelo_depara(
+    caminho: Path, pendentes: list[tuple[str, str, int, str]],
+) -> None:
+    """Gera o arquivo para preencher, já com o que o script descobriu."""
+    linhas = [
+        "# DE-PARA: login do Radar  ->  vendedor do CRM",
+        "#",
+        "# Formato:  login_do_radar ; unidade ; nome exato do vendedor no CRM",
+        "# A unidade pode ficar VAZIA: aí vale para todas as lojas.",
+        "# Linha com # é ignorada. Apague o # para ativar a linha.",
+        "#",
+        "# As linhas abaixo são os logins que o script NÃO conseguiu resolver,",
+        "# do que mais pesa para o que menos pesa. Ao lado, os candidatos que",
+        "# ele encontrou — confira antes de usar: semelhança de nome não é",
+        "# prova, e atribuir errado faz o vendedor ver pedido do colega.",
+        "",
+    ]
+    for login, unidade, peso, dica in pendentes:
+        linhas.append(f"# {peso:>7,} linha(s) · {login} em {unidade}")
+        if dica:
+            linhas.append(f"#   candidatos: {dica}")
+        linhas.append(f"# {login};{unidade};")
+        linhas.append("")
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_text("\n".join(linhas), encoding="utf-8")
 
 
 def carregar_apelidos_do_crm() -> dict[str, str]:
@@ -580,6 +645,8 @@ def main() -> int:
     ap.add_argument("--destino", default=DESTINO_PADRAO)
     ap.add_argument("--simular", action="store_true",
                     help="apura e relata sem gravar")
+    ap.add_argument("--depara", default=DEPARA_PADRAO,
+                    help="arquivo de de-para login do Radar → vendedor do CRM")
     args = ap.parse_args()
 
     origem = achar_pickle()
@@ -650,6 +717,24 @@ def main() -> int:
     apelidos = carregar_apelidos_do_crm()
     de_para_vend, ambiguos, orfaos, motivos = resolver_vendedores(
         pares, vendedores, mapa, apelidos)
+
+    # O DE-PARA À MÃO MANDA.
+    #
+    # Ele é a decisão de quem conhece a equipe; o resto é inferência. Aplicar
+    # depois, por cima, garante que uma correção humana nunca seja desfeita
+    # por um palpite do script — e que ela também sobreponha um acerto
+    # automático que esteja errado.
+    manual = carregar_depara_manual(Path(args.depara))
+    aplicados = 0
+    for (login, unidade) in list(pares):
+        alvo = (manual.get((login.upper(), unidade.upper()))
+                or manual.get((login.upper(), "")))
+        if alvo:
+            de_para_vend[(login, unidade)] = alvo
+            ambiguos.discard(login)
+            orfaos.discard(login)
+            motivos.pop(f"{login} / {unidade}", None)
+            aplicados += 1
     # Quanto do ARQUIVO cada grupo representa. Contar nomes engana: um nome
     # sem dono com 12 mil linhas pesa mais que dez com cem.
     peso = {}
@@ -660,6 +745,8 @@ def main() -> int:
 
     print(f"\n5) VENDEDOR — {len(vendedores)} nome(s) conhecido(s) no CRM")
     print(f"   Apelidos de grafia vindos do CRM: {len(apelidos)}")
+    print(f"   De-para à mão ({args.depara}): "
+          f"{len(manual)} regra(s), {aplicados} aplicada(s)")
     print(f"   Pares usuário × unidade: {len(pares)}")
     print(f"   resolvidos:   {len(de_para_vend):>4}")
     print(f"   AMBÍGUO:      {len(ambiguos):>4} "
@@ -686,6 +773,18 @@ def main() -> int:
     total_linhas = sum(peso.values()) or 1
     print(f"\n   Linhas COM dono: {linhas_ok:,} de {total_linhas:,} "
           f"({100 * linhas_ok / total_linhas:.0f}%)")
+    # Modelo para preencher, com os pendentes e os candidatos já apurados.
+    alvo_modelo = Path(args.depara)
+    if motivos and not alvo_modelo.exists():
+        escrever_modelo_depara(
+            alvo_modelo,
+            sorted(((r.split(" / ")[0], r.split(" / ")[1],
+                     peso.get((r.split(" / ")[0], r.split(" / ")[1]), 0),
+                     motivos[r].split("→")[-1].strip() if "→" in motivos[r] else "")
+                    for r in motivos), key=lambda x: -x[2]))
+        print(f"\n   >> Criei {alvo_modelo} com os {len(motivos)} pendentes.")
+        print("      Preencha as linhas que souber e rode de novo.")
+
     print("   >> Ambíguo e sem vendedor entram como falta da unidade, sem dono.")
 
     # ── Montagem ────────────────────────────────────────────────────────────
