@@ -63,31 +63,77 @@ for chave, valor in farol.items():
 print("   >> Tem de ser dict com level em good/warn/bad/neutral. String aqui")
 print("      significa que alguém mudou evaluate_farol e o PDF vai sair preto.")
 
-# ── 2. As unidades, uma a uma ───────────────────────────────────────────────
-# A tabela por unidade formata nove colunas numéricas. Basta uma unidade com
-# campo faltando para a formatação estourar — e a Zona Norte, que não tem meta
-# lançada, é a candidata natural.
-print("\n2) CADA UNIDADE TEM OS CAMPOS QUE A TABELA FORMATA")
+# ── 2. Todo campo que o PDF lê existe no dado? ──────────────────────────────
+# A PRIMEIRA VERSÃO DESTE TRECHO TINHA A LISTA DE CAMPOS DIGITADA POR MIM.
+#
+# Ela acusou "FALTA: marginAverage" em todas as unidades. Era mentira: o PDF
+# lê marginValue na unidade, e marginAverage só no grupo. Quem estava errado
+# era o diagnóstico, e eu quase "consertei" código que funcionava — o pior
+# desfecho possível para uma ferramenta de conferência.
+#
+# Agora a lista é EXTRAÍDA DO PRÓPRIO CÓDIGO do export_executivo_pdf: todo
+# s.get("x") e u.get("x") que ele faz. Assim o diagnóstico não pode discordar
+# do PDF sobre o que o PDF lê — e se alguém acrescentar um campo novo lá,
+# aparece aqui sozinho, sem ninguém lembrar de atualizar nada.
+print("\n2) TODO CAMPO QUE O PDF LÊ EXISTE NO DADO REAL?")
+import ast  # noqa: E402
+
+fonte = Path(backend.__file__).with_suffix(".py").read_text(encoding="utf-8")
+arvore = ast.parse(fonte)
+# Varre o PDF E as auxiliares _pdf_*: a função que calcula a fatia da
+# carteira lê ownRevenue e otherRevenue fora do corpo principal, e olhar só
+# o corpo principal deixaria esses dois campos sem conferência nenhuma.
+alvos = [n for n in ast.walk(arvore)
+         if isinstance(n, ast.FunctionDef)
+         and (n.name == "export_executivo_pdf" or n.name.startswith("_pdf_"))]
+le_s, le_u = set(), set()
+for alvo in alvos:
+    for n in ast.walk(alvo):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "get" and n.args
+                and isinstance(n.args[0], ast.Constant)
+                and isinstance(n.args[0].value, str)):
+            nome_var = getattr(n.func.value, "id", "")
+            if nome_var == "s":
+                le_s.add(n.args[0].value)
+            elif nome_var == "u":
+                le_u.add(n.args[0].value)
+print("   Funções varridas: " + ", ".join(a.name for a in alvos))
+
 unidades = data.get("unitPerformance") or []
-campos = ["unitName", "revenueNet", "revenueGoal", "goalAttainmentPct",
-          "projectedRevenue", "returnRatioPct", "marginAverage",
-          "qtySold", "ticketPerPiece"]
-print(f"   {len(unidades)} linha(s) em unitPerformance")
-print(f"   {'UNIDADE':<16}" + "".join(f"{c[:9]:>11}" for c in campos[1:]))
+print(f"   O PDF lê {len(le_s)} campo(s) do grupo e {len(le_u)} de cada unidade.")
+
+faltam_s = sorted(c for c in le_s if c not in s)
+print(f"\n   GRUPO — ausentes: {', '.join(faltam_s) if faltam_s else 'nenhum'}")
+for c in sorted(le_s):
+    if c == "farol":
+        continue
+    v = s.get(c)
+    estado = "AUSENTE" if c not in s else ("None" if v is None else str(v)[:22])
+    print(f"      {c:<28}{estado}")
+
+print(f"\n   UNIDADES — {len(unidades)} linha(s)")
+colunas = sorted(c for c in le_u if c not in ("farol", "unitName"))
+print(f"   {'UNIDADE':<14}" + "".join(f"{c[:10]:>12}" for c in colunas))
 problemas = 0
 for u in unidades:
     nome = backend.normalize_whitespace(u.get("unitName")) or "(sem nome)"
     marcas = []
-    for c in campos[1:]:
-        v = u.get(c)
-        marcas.append("—" if v is None else ("0" if not v else "ok"))
-    faltando = [c for c in campos if c not in u]
+    for c in colunas:
+        if c not in u:
+            marcas.append("AUSENTE")
+        else:
+            v = u.get(c)
+            marcas.append("None" if v is None else ("0" if not v else "ok"))
+    faltando = [c for c in le_u if c not in u]
     if faltando:
         problemas += 1
-    print(f"   {nome[:15]:<16}" + "".join(f"{m:>11}" for m in marcas)
-          + ("   FALTA: " + ", ".join(faltando) if faltando else ""))
-print("   >> '—' é None: formata como zero e não quebra. Campo AUSENTE, sim,")
-print("      quebra — e é o que a coluna FALTA denuncia.")
+    print(f"   {nome[:13]:<14}" + "".join(f"{m:>12}" for m in marcas))
+print("\n   >> 'None' e '0' formatam como zero e não quebram. 'AUSENTE' quebra.")
+print("      E 'ok' num campo que deveria ter número é o caso silencioso:")
+print("      confira se o valor impresso bate com o da tela.")
+if problemas:
+    print(f"   >> {problemas} unidade(s) com campo ausente.")
 
 # ── 3. Gerar o PDF de verdade ───────────────────────────────────────────────
 print("\n3) GERANDO O PDF COM ESTE DADO")

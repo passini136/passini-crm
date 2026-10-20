@@ -23058,6 +23058,22 @@ def _pdf_cor_farol(farol: Any) -> colors.Color:
     }.get(normalize_whitespace(nivel).lower(), colors.black)
 
 
+def _pdf_fatia_carteira(s: dict[str, Any]) -> str:
+    """Quanto do faturamento saiu da carteira e quanto saiu do balcão.
+
+    Divide pela soma das duas partes, não pelo líquido: as duas vêm do
+    faturamento detalhado e o líquido vem do custo × venda, que são arquivos
+    diferentes do Alfa e não fecham entre si. Dividir pelo líquido foi o que
+    já fez as fatias somarem 97% numa tela.
+    """
+    carteira = float(s.get("ownRevenue") or 0)
+    balcao = float(s.get("otherRevenue") or 0)
+    base = carteira + balcao
+    if base <= 0:
+        return "—"
+    return f"{carteira / base * 100:.0f}% × {balcao / base * 100:.0f}%"
+
+
 def export_executivo_pdf(data: dict[str, Any]) -> bytes:
     """Uma página com o resultado do grupo e o de cada unidade.
 
@@ -23131,7 +23147,16 @@ def export_executivo_pdf(data: dict[str, Any]) -> bytes:
          "% devolução", f"{s.get('returnRatioPct') or 0:.2f}%"],
         ["Devolução em garantia", brl(s.get("warrantyReturnsValue")),
          "Desconto médio", f"{s.get('discountPct') or 0:.2f}%"],
-        ["Mix de itens", f"{int(s.get('mixSku') or 0):,}".replace(",", "."),
+        # CARTEIRA × BALCÃO, não mix.
+        #
+        # Aqui havia "Mix de itens", lendo s["mixSku"] — que NÃO EXISTE no
+        # summary: mix é indicador de vendedor e de produtividade, nunca foi
+        # calculado para o grupo. O PDF imprimia zero, com cara de número
+        # apurado. Zero errado é pior que erro: ninguém desconfia.
+        #
+        # No lugar entra a divisão carteira × balcão, que o summary tem de
+        # verdade e que não aparece em nenhuma outra linha deste PDF.
+        ["Carteira × balcão", _pdf_fatia_carteira(s),
          "Margem", f"{s.get('marginAverage') or 0:.2f}x"],
     ]
     t_grupo = Table(grupo, colWidths=[120, 110, 120, 110], repeatRows=0)
