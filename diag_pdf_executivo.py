@@ -23,9 +23,12 @@ na mão de quem clicou em baixar.
 
 Grava o PDF em /tmp para conferência visual. NÃO altera o banco.
 """
+import base64
 import os
+import re
 import sys
 import traceback
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, "/srv/passini/apps/crm-comercial")
@@ -151,20 +154,54 @@ except Exception:
 
 # ── 4. Conferir o que saiu ──────────────────────────────────────────────────
 print("\n4) O QUE SAIU DENTRO DO ARQUIVO")
-try:
-    from pypdf import PdfReader
-except ImportError:
-    try:
-        from PyPDF2 import PdfReader  # type: ignore
-    except ImportError:
-        PdfReader = None  # type: ignore
-if PdfReader is None:
-    print("   (pypdf não instalado — pulando a leitura; o arquivo foi gerado)")
+
+
+def texto_do_pdf(raw: bytes) -> tuple[str, int]:
+    """Lê o texto do PDF sem depender de pypdf.
+
+    A primeira versão deste passo exigia pypdf e, não achando, simplesmente
+    pulava — o diagnóstico terminava "OK" sem ter conferido nada do que
+    importa: se as unidades estão lá, se cabe numa página. Verificação que se
+    desliga sozinha quando falta uma biblioteca é verificação que não existe.
+
+    Instalar pypdf no venv de produção por causa de um diagnóstico seria pior.
+    O reportlab grava o conteúdo em ASCII85 por cima de Flate, e desmontar
+    isso são vinte linhas de biblioteca padrão.
+    """
+    paginas = len(re.findall(rb"/Type\s*/Page[^s]", raw))
+    pedacos: list[str] = []
+    for m in re.finditer(rb"stream\r?\n(.*?)endstream", raw, re.S):
+        bruto = m.group(1).strip()
+        conteudo = b""
+        for tentativa in (
+            lambda b: zlib.decompress(base64.a85decode(b, adobe=True)),
+            lambda b: zlib.decompress(b),
+            lambda b: b,
+        ):
+            try:
+                conteudo = tentativa(bruto)
+                break
+            except Exception:  # noqa: BLE001 — stream ilegível é só stream sem texto
+                continue
+        for t in re.finditer(rb"\((?:\\.|[^\\()])*\)", conteudo):
+            s = t.group(0)[1:-1]
+            s = re.sub(rb"\\([()\\])", rb"\1", s)
+            # Acento vem como escape octal (\352 = ê). Sem desfazer isso,
+            # "Competência" nunca casa e o diagnóstico acusa falta que não há.
+            s = re.sub(rb"\\([0-7]{1,3})",
+                       lambda g: bytes([int(g.group(1), 8)]), s)
+            pedacos.append(s.decode("latin-1", "replace"))
+    return " ".join(pedacos), paginas
+
+
+raw = destino.read_bytes()
+texto, n_paginas = texto_do_pdf(raw)
+if not texto.strip():
+    print("   >> Não consegui extrair texto. O arquivo existe, mas não dá para")
+    print("      afirmar o que tem dentro — confira à mão em /tmp.")
 else:
-    leitor = PdfReader(str(destino))
-    texto = "\n".join((p.extract_text() or "") for p in leitor.pages)
-    print(f"   Páginas: {len(leitor.pages)}")
-    if len(leitor.pages) > 1:
+    print(f"   Páginas: {n_paginas}")
+    if n_paginas > 1:
         print("   >> MAIS DE UMA PÁGINA. O PDF foi desenhado para caber numa só;")
         print("      com mais unidades as larguras das colunas precisam mudar.")
     esperados = [backend.normalize_whitespace(u.get("unitName"))
@@ -176,6 +213,38 @@ else:
     print(f"   Linha TOTAL presente: {'sim' if 'TOTAL' in texto.upper() else 'NÃO'}")
     comp = str(data.get("primaryCompetence") or "")
     print(f"   Competência impressa: {'sim' if comp and comp in texto else 'NÃO'}")
+
+    # ── O NÚMERO IMPRESSO É O NÚMERO DO DADO? ───────────────────────────────
+    # Estar presente não basta. O Mix imprimia zero e estava "presente".
+    # Aqui conferimos valor por valor: pega o número do dashboard, formata
+    # como o PDF formata, e procura essa string exata no arquivo.
+    print("\n   OS VALORES BATEM COM O DADO?")
+
+    # Usa o brl() DO SISTEMA, não uma cópia. Reescrever o formatador aqui
+    # seria repetir o erro da lista de campos digitada à mão: o dia em que o
+    # brl mudar, a cópia diverge e o diagnóstico passa a acusar diferença
+    # onde não há — ou, pior, a deixar passar diferença onde há.
+    moeda = backend.brl
+
+    confs = [
+        ("Faturamento líquido", moeda(s.get("revenueNet"))),
+        ("Meta", moeda(s.get("revenueGoal"))),
+        ("Projeção", moeda(s.get("projectedRevenue"))),
+        ("% da meta", f"{s.get('goalAttainmentPct') or 0:.1f}%"),
+        ("Margem", f"{s.get('marginAverage') or 0:.2f}x"),
+        ("Carteira × balcão", backend._pdf_fatia_carteira(s)),
+    ]
+    errados = 0
+    for rotulo, valor in confs:
+        ok = valor in texto
+        if not ok:
+            errados += 1
+        print(f"      {rotulo:<22}{valor:<22}{'ok' if ok else '← NÃO ESTÁ NO PDF'}")
+    if errados:
+        print("      >> Valor que o dado tem e o PDF não mostra é o erro")
+        print("         silencioso: o arquivo sai bonito e com número errado.")
+    else:
+        print("      >> Todos os números do grupo saíram como estão no dado.")
 
 print("\n   Abra /tmp/diag_executivo.pdf para conferir o visual.")
 conn.close()
