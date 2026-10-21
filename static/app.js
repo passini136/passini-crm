@@ -22319,11 +22319,11 @@ async function cotAcao(chave, url, body, aviso) {
   s.salvando[chave] = true;
   cotPaint();
   try {
-    await api(url, { method: "POST", body: JSON.stringify(body) });
+    const resposta = await api(url, { method: "POST", body: JSON.stringify(body) });
     state.tasks = null;   // desfecho pode criar/fechar tarefa: a tela Tarefas recarrega
     s.data = await api(`/api/crm/quotes?${cotQs()}`);
     await cotLoadCarteira(false);
-    if (aviso) cotAviso(aviso);
+    if (aviso) cotAviso(typeof aviso === "function" ? aviso(resposta) : aviso);
   } catch (e) {
     cotAviso(e.message, true);
   } finally {
@@ -22345,7 +22345,9 @@ function cotCriar(clientKey, channel) {
   const nome = COT_CANAIS.find((c) => c[0] === channel)?.[1] || channel;
   cotAcao(`c-${clientKey}`, "/api/crm/quotes/create",
           { clientKey, channel, seller: s.data?.isSeller ? undefined : (s.seller || undefined) },
-          `Cotação pelo ${nome} registrada. Agora é dar o retorno em até 10 minutos.`);
+          (r) => `Cotação pelo ${nome} registrada.`
+            + (r?.ownerNotified ? ` ${r.ownerNotified} recebeu uma tarefa de Apoio (cliente da carteira dele).` : "")
+            + " Agora é dar o retorno em até 10 minutos.");
 }
 
 function cotDesfecho(id, status) {

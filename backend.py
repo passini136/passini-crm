@@ -27395,8 +27395,10 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
         return 400, {"error": "Escolha o cliente."}
     if canal not in COTACAO_CANAIS:
         return 400, {"error": "Escolha o canal: WhatsApp, telefone ou balcão."}
-    cli = conn.execute("SELECT client_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
-                       (cid, chave)).fetchone()
+    cli = conn.execute(
+        "SELECT client_name, NULLIF(TRIM(internal_seller_name), '') AS dono "
+        "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+        (cid, chave)).fetchone()
     nome = normalize_whitespace(cli["client_name"]) if cli else ""
     if not nome:
         return 400, {"error": "Cliente não encontrado no cadastro."}
@@ -27418,9 +27420,38 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
          _cotacao_agora(), now_iso(), user["id"]))
     novo = int(cur.lastrowid)
     audit_log(conn, cid, user["id"], "criar", "crm_quotes", str(novo), {"cliente": chave, "canal": canal})
+
+    # Apoio (regra do MEC): cotação de cliente de OUTRA carteira avisa o dono,
+    # pela tarefa que ele já usa todo dia — mesmo padrão do registro de interação.
+    # Uma tarefa por cliente e dia: o mesmo cliente cotando 3 vezes não gera 3 avisos.
+    dono = normalize_whitespace(cli["dono"]) if cli else ""
+    avisado = ""
+    if dono and normalize_upper(strip_accents(dono)) != normalize_upper(strip_accents(vendedor)):
+        hoje = today_in_brazil().isoformat()
+        ja_avisado = conn.execute(
+            "SELECT 1 FROM crm_tasks WHERE company_id = ? AND client_key = ? AND UPPER(seller_name) = ? "
+            "AND origin = 'APOIO' AND date(created_at) = date(?) "
+            "AND status IN ('ABERTA', 'ATRASADA', 'REAGENDADA')",
+            (cid, chave, normalize_upper(dono), hoje)).fetchone()
+        if not ja_avisado:
+            nome_canal = {"WHATSAPP": "WhatsApp", "TELEFONE": "telefone", "BALCAO": "balcão"}[canal]
+            conn.execute(
+                """
+                INSERT INTO crm_tasks
+                    (company_id, client_key, client_name, seller_name, title, description,
+                     due_at, status, origin, priority, created_by_name, created_at)
+                VALUES (?,?,?,?,?,?,?, 'ABERTA', 'APOIO', 'ALTA', ?, ?)
+                """,
+                (cid, chave, nome, dono,
+                 f"Cliente cotou com {vendedor}",
+                 f"{vendedor} registrou uma cotação deste cliente da sua carteira em {hoje}, "
+                 f"pelo {nome_canal}. Retome o contato com o cliente.",
+                 hoje, vendedor, now_iso()))
+            invalidate_crm_cache(cid)
+        avisado = dono
     conn.commit()
     r = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (novo,)).fetchone()
-    return 200, {"quote": _cotacao_dict(r, today_in_brazil().isoformat())}
+    return 200, {"quote": _cotacao_dict(r, today_in_brazil().isoformat()), "ownerNotified": avisado}
 
 
 def desfecho_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
