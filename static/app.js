@@ -6319,6 +6319,9 @@ async function refreshCurrentTab() {
   if (tab === "crm-tarefas" || tab === "crm-interacao") {
     promises.push(loadCrmData());
   }
+  if (tab === "crm-cotacoes") {
+    promises.push(cotLoad());
+  }
   if (tab === "importacoes") {
     promises.push(loadAutoImportStatus(), loadAdmin());
   }
@@ -20949,6 +20952,7 @@ function topbarTitle() {
     "crm-agenda":     { title: "Missão do Dia",            description: "Sua fila de 5 contatos. 1 oferta + 1 pergunta por cliente." },
     "crm-clientes":   { title: "Carteira CRM",            description: "Clientes ativos, riscos e oportunidades." },
     "crm-tarefas":    { title: "Tarefas CRM",             description: "Tarefas pendentes de follow-up e interação." },
+    "crm-cotacoes":   { title: "Cotações do Dia",         description: "Cotou, fechou ou motivo — toda cotação com desfecho até amanhã." },
     "reunioes":       { title: "Reuniões e Treinamentos", description: "Atas, presença, ciência da equipe e acervo de treinamentos." },
     "feedback":       { title: "Feedback e PDI",         description: "Feedback mensal com base no MEC, plano de desenvolvimento e ciência." },
     "visitas":        { title: "Visitas",                description: "Roteiro sugerido, registro da visita e efeito no faturamento." },
@@ -21307,6 +21311,8 @@ function dashboardView() {
   const meuDiaTabs = [
     { id: "crm-agenda",    title: "Missão do Dia",    desc: "5 contatos prioritários", icon: "📅" },
     { id: "crm-tarefas",   title: "Tarefas",          desc: "Pendências de follow-up",  icon: "✅" },
+    { id: "crm-cotacoes",  title: "Cotações",         desc: "Cotou, fechou ou motivo",  icon: "🧾",
+      badge: state.cotacoes?.data?.pendingCount || 0 },
     { id: "crm-clientes",  title: "Carteira",         desc: "Clientes e status",        icon: "👥" },
     { id: "contatos",      title: "Contatos",         desc: "Histórico e produtividade", icon: "📇" },
   ].filter((t) => allowed.includes(t.id));
@@ -21476,6 +21482,7 @@ function dashboardView() {
           ${state.activeTab === "crm-agenda"    ? crmAgendaView()      : ""}
           ${state.activeTab === "crm-clientes"  ? crmClientsView()     : ""}
           ${state.activeTab === "crm-tarefas"   ? crmTasksView()       : ""}
+          ${state.activeTab === "crm-cotacoes"  ? cotacoesView()       : ""}
           ${state.activeTab === "biblioteca"    ? bibliotecaView()     : ""}
           ${state.activeTab === "novidades"     ? novidadesView()      : ""}
           ${state.activeTab === "atividade"     ? atividadeView()      : ""}
@@ -22215,3 +22222,370 @@ window.addEventListener("resize", () => {
   }
 });
 bootstrap();
+
+// ─── Cotações do Dia (MEC 2.0) — etapa 1 ─────────────────────────────────────
+//
+// O vendedor marca em até 3 toques: cotou (canal), fechou? e o motivo.
+// Ao tocar um botão, só os blocos #cot-* são redesenhados — nunca render()
+// completo, que troca o DOM inteiro e faria a busca perder o cursor.
+// A tela só aparece para unidades liberadas pela diretoria (quadro no topo).
+
+const COT_CANAIS = [["WHATSAPP", "WhatsApp", "💬"], ["TELEFONE", "Telefone", "📞"], ["BALCAO", "Balcão", "🏪"]];
+
+function cotState() {
+  if (!state.cotacoes) {
+    state.cotacoes = { data: null, carteira: null, busca: "", seller: "", abrindoMotivo: null,
+                       detalhe: null, det: {}, salvando: {}, releases: null, erro: "" };
+  }
+  return state.cotacoes;
+}
+
+function cotQs(extra = {}) {
+  const s = cotState();
+  const qs = new URLSearchParams();
+  if (s.seller) qs.set("seller", s.seller);
+  Object.entries(extra).forEach(([k, v]) => { if (v) qs.set(k, v); });
+  return qs.toString();
+}
+
+async function cotLoad() {
+  const s = cotState();
+  if (s.carregando) return;   // loadTab e a própria tela pedem juntos
+  s.carregando = true;
+  try {
+    s.data = await api(`/api/crm/quotes?${cotQs()}`);
+    s.erro = "";
+    await cotLoadCarteira(false);
+    if (s.data.canRelease && !s.releases) await cotLoadReleases(false);
+  } catch (e) {
+    s.erro = e.message;
+  } finally {
+    s.carregando = false;
+  }
+  requestRender();
+}
+
+async function cotLoadCarteira(paint = true) {
+  const s = cotState();
+  const pedido = (s._pedidoCarteira = (s._pedidoCarteira || 0) + 1);
+  const q = s.busca.trim().length >= 2 ? s.busca.trim() : "";
+  try {
+    const r = await api(`/api/crm/quotes/portfolio?${cotQs({ q })}`);
+    if (pedido !== s._pedidoCarteira) return;   // resposta de uma busca anterior
+    s.carteira = r;
+  } catch (e) {
+    s.carteira = { clients: [], error: e.message };
+  }
+  if (paint) cotPaint();
+}
+
+let cotBuscaTimer = null;
+function cotBuscar(valor) {
+  cotState().busca = valor;
+  clearTimeout(cotBuscaTimer);
+  cotBuscaTimer = setTimeout(() => cotLoadCarteira(true), 300);
+}
+
+function cotTrocarVendedor(valor) {
+  const s = cotState();
+  s.seller = valor;
+  s.data = null;
+  s.carteira = null;
+  cotLoad();
+}
+
+function cotPaint() {
+  const set = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+  if (!cotState().data) return;
+  set("cot-placar", cotPlacarHtml());
+  set("cot-abertas", cotAbertasHtml());
+  set("cot-carteira", cotCarteiraHtml());
+  set("cot-encerradas", cotEncerradasHtml());
+}
+
+let cotAvisoTimer = null;
+function cotAviso(texto, erro = false) {
+  const el = document.getElementById("cot-aviso");
+  if (!el) return;
+  el.textContent = texto;
+  el.className = `cot-aviso ${erro ? "erro" : "ok"}`;
+  clearTimeout(cotAvisoTimer);
+  cotAvisoTimer = setTimeout(() => { el.textContent = ""; el.className = "cot-aviso"; }, erro ? 6000 : 3000);
+}
+
+async function cotAcao(chave, url, body, aviso) {
+  const s = cotState();
+  if (s.salvando[chave]) return;
+  s.salvando[chave] = true;
+  cotPaint();
+  try {
+    await api(url, { method: "POST", body: JSON.stringify(body) });
+    state.tasks = null;   // desfecho pode criar/fechar tarefa: a tela Tarefas recarrega
+    s.data = await api(`/api/crm/quotes?${cotQs()}`);
+    await cotLoadCarteira(false);
+    if (aviso) cotAviso(aviso);
+  } catch (e) {
+    cotAviso(e.message, true);
+  } finally {
+    delete s.salvando[chave];
+    cotPaint();
+  }
+}
+
+function cotDetalhes(id) {
+  const d = cotState().det[id] || {};
+  const out = {};
+  if (d.valor !== undefined && String(d.valor).trim() !== "") out.approxValue = String(d.valor).trim();
+  if (d.peca !== undefined && String(d.peca).trim() !== "") out.itemHint = String(d.peca).trim();
+  return out;
+}
+
+function cotCriar(clientKey, channel) {
+  const s = cotState();
+  const nome = COT_CANAIS.find((c) => c[0] === channel)?.[1] || channel;
+  cotAcao(`c-${clientKey}`, "/api/crm/quotes/create",
+          { clientKey, channel, seller: s.data?.isSeller ? undefined : (s.seller || undefined) },
+          `Cotação pelo ${nome} registrada. Agora é dar o retorno em até 10 minutos.`);
+}
+
+function cotDesfecho(id, status) {
+  const s = cotState();
+  if (status === "NAO_FECHOU") {
+    s.abrindoMotivo = id;
+    cotPaint();
+    return;
+  }
+  const aviso = status === "FECHOU" ? "Venda registrada. Boa!" : "Retorno marcado para amanhã às 8h40.";
+  cotAcao(`q-${id}`, "/api/crm/quotes/status", { id, status, ...cotDetalhes(id) }, aviso);
+}
+
+function cotMotivo(id, motivo) {
+  const s = cotState();
+  s.abrindoMotivo = null;
+  cotAcao(`q-${id}`, "/api/crm/quotes/status",
+          { id, status: "NAO_FECHOU", lossReason: motivo, ...cotDetalhes(id) },
+          "Motivo registrado. É ele que mostra onde a Passini está perdendo.");
+}
+
+function cotCancelarMotivo() {
+  cotState().abrindoMotivo = null;
+  cotPaint();
+}
+
+function cotDesfazer(id) {
+  cotAcao(`q-${id}`, "/api/crm/quotes/undo", { id }, "Desfeito. A cotação voltou para as abertas.");
+}
+
+function cotToggleDetalhe(id) {
+  const s = cotState();
+  s.detalhe = s.detalhe === id ? null : id;
+  cotPaint();
+}
+
+function cotDet(id, campo, valor) {
+  const s = cotState();
+  s.det[id] = { ...(s.det[id] || {}), [campo]: valor };
+}
+
+function cotArg(texto) {
+  return encodeURIComponent(String(texto ?? "")).replaceAll("'", "%27");
+}
+
+function cotCanal(c) {
+  const x = COT_CANAIS.find((k) => k[0] === c);
+  return x ? `${x[2]} ${x[1]}` : escapeHtml(c);
+}
+
+function cotQuando(q) {
+  const t = q.quotedAt || "";
+  const hora = t.slice(11, 16);
+  return q.pending ? `${t.slice(8, 10)}/${t.slice(5, 7)} ${hora}` : hora;
+}
+
+function cotPlacarHtml() {
+  const d = cotState().data;
+  const t = d.today || {};
+  const w = d.week || {};
+  const taxa = (x) => (x.rate === null || x.rate === undefined ? "–" : `${x.rate}%`);
+  return `
+    <div class="cot-placar">
+      <div><b>${number(t.total)}</b><span>Cotações hoje</span></div>
+      <div><b>${number(t.closed)}</b><span>Fechadas</span></div>
+      <div><b>${taxa(t)}</b><span>Taxa de fechamento</span></div>
+      <div class="cot-semana"><b>${taxa(w)}</b><span>Taxa na semana · ${number(w.total)} cotações</span></div>
+    </div>
+    ${d.pendingCount ? `<div class="cot-alerta">⚠ ${d.pendingCount} ${d.pendingCount > 1 ? "cotações" : "cotação"} de dias anteriores esperando desfecho</div>` : ""}`;
+}
+
+function cotLinhaAberta(q) {
+  const s = cotState();
+  const ocupado = s.salvando[`q-${q.id}`] ? "disabled" : "";
+  const det = s.det[q.id] || {};
+  const extra = [
+    escapeHtml(q.clientKey), cotCanal(q.channel), cotQuando(q),
+    q.status === "DECIDINDO" ? "<em>decidindo · retorno marcado</em>" : "",
+    s.data.isSeller ? "" : escapeHtml(q.sellerName),
+  ].filter(Boolean).join(" · ");
+  const botoes = s.abrindoMotivo === q.id
+    ? `<span class="cot-pergunta">Por que não fechou?</span>
+       ${s.data.reasons.map((r) => `<button class="btn cot-btn cot-motivo" ${ocupado} onclick="cotMotivo(${q.id},'${r.id}')">${escapeHtml(r.label)}</button>`).join("")}
+       <button class="btn btn-ghost cot-btn" onclick="cotCancelarMotivo()">Voltar</button>`
+    : `<button class="btn cot-btn cot-sim" ${ocupado} onclick="cotDesfecho(${q.id},'FECHOU')">✔ Fechou</button>
+       <button class="btn cot-btn cot-nao" ${ocupado} onclick="cotDesfecho(${q.id},'NAO_FECHOU')">✖ Não fechou</button>
+       ${q.status !== "DECIDINDO" ? `<button class="btn btn-ghost cot-btn" ${ocupado} onclick="cotDesfecho(${q.id},'DECIDINDO')">⏳ Decidindo</button>` : ""}
+       <button class="btn btn-ghost btn-sm" onclick="cotToggleDetalhe(${q.id})">${s.detalhe === q.id ? "− detalhes" : "+ detalhes"}</button>`;
+  return `
+    <div class="cot-linha ${q.pending ? "cot-pendente" : ""}">
+      <div class="cot-cli"><b>${escapeHtml(q.clientName)}</b><span>${extra}</span></div>
+      <div class="cot-botoes">${botoes}</div>
+      ${s.detalhe === q.id ? `
+        <div class="cot-detalhe">
+          <label>Valor aproximado (opcional)
+            <input id="cot-v-${q.id}" inputmode="decimal" placeholder="Ex.: 850,00"
+                   value="${escapeHtml(det.valor ?? (q.approxValue ?? ""))}" oninput="cotDet(${q.id},'valor',this.value)"></label>
+          <label>Peça ou código (opcional)
+            <input id="cot-p-${q.id}" placeholder="Ex.: pastilha dianteira Gol"
+                   value="${escapeHtml(det.peca ?? q.itemHint)}" oninput="cotDet(${q.id},'peca',this.value)"></label>
+        </div>` : ""}
+    </div>`;
+}
+
+function cotAbertasHtml() {
+  const s = cotState();
+  const lista = (s.data.quotes || [])
+    .filter((q) => q.status === "ABERTA" || q.status === "DECIDINDO")
+    .sort((a, b) => (Number(b.pending) - Number(a.pending)) || (a.quotedAt < b.quotedAt ? 1 : -1));
+  if (!lista.length) {
+    return `<div class="cot-vazio">Nenhuma cotação aberta. Cliente cotou? Toque no canal ao lado do nome dele, na carteira abaixo.</div>`;
+  }
+  return lista.map(cotLinhaAberta).join("");
+}
+
+function cotCarteiraHtml() {
+  const s = cotState();
+  const c = s.carteira;
+  if (!c) return `<div class="cot-vazio">Carregando…</div>`;
+  if (c.error) return `<div class="message error">${escapeHtml(c.error)}</div>`;
+  if (!c.clients.length) {
+    return `<div class="cot-vazio">${s.busca.trim().length >= 2 ? "Nenhum cliente encontrado com essa busca." : "Nenhum cliente na carteira. Use a busca acima para achar qualquer cliente."}</div>`;
+  }
+  return c.clients.map((cl) => {
+    const ocupado = s.salvando[`c-${cl.clientKey}`] ? "disabled" : "";
+    const info = [
+      escapeHtml(cl.clientKey), cl.city ? escapeHtml(cl.city) : "",
+      !cl.owner ? "sem vendedor" : (!cl.mine ? `carteira de ${escapeHtml(cl.owner)}` : ""),
+      cl.quotes30 ? `cotou ${cl.quotes30}× em 30 dias` : "",
+      cl.quotesToday ? `<b>${cl.quotesToday}× hoje</b>` : "",
+    ].filter(Boolean).join(" · ");
+    return `
+      <div class="cot-linha">
+        <div class="cot-cli"><b>${escapeHtml(cl.clientName)}</b><span>${info}</span></div>
+        <div class="cot-botoes">
+          ${COT_CANAIS.map(([id, label, icone]) => `
+            <button class="btn cot-btn cot-canal" ${ocupado} title="Cotou pelo ${label}"
+                    onclick="cotCriar(decodeURIComponent('${cotArg(cl.clientKey)}'),'${id}')">${icone} ${label}</button>`).join("")}
+        </div>
+      </div>`;
+  }).join("");
+}
+
+function cotEncerradasHtml() {
+  const s = cotState();
+  const lista = (s.data.quotes || []).filter((q) => q.status === "FECHOU" || q.status === "NAO_FECHOU");
+  if (!lista.length) return `<div class="cot-vazio">Nada encerrado hoje ainda.</div>`;
+  return lista.map((q) => `
+    <div class="cot-linha">
+      <div class="cot-cli"><b>${escapeHtml(q.clientName)}</b>
+        <span>${cotCanal(q.channel)} · ${cotQuando(q)}${s.data.isSeller ? "" : ` · ${escapeHtml(q.sellerName)}`}</span></div>
+      <div class="cot-botoes">
+        ${q.status === "FECHOU"
+          ? `<span class="cot-tag cot-tag-sim">✔ Fechou</span>`
+          : `<span class="cot-tag cot-tag-nao">✖ ${escapeHtml(q.lossLabel || "Não fechou")}</span>`}
+        ${q.canUndo ? `<button class="btn btn-ghost btn-sm" ${s.salvando[`q-${q.id}`] ? "disabled" : ""} onclick="cotDesfazer(${q.id})">Desfazer</button>` : ""}
+      </div>
+    </div>`).join("");
+}
+
+async function cotLoadReleases(paint = true) {
+  const s = cotState();
+  try {
+    s.releases = await api("/api/crm/quotes/releases");
+  } catch (e) {
+    s.releases = { units: [], error: e.message };
+  }
+  if (paint) {
+    const el = document.getElementById("cot-liberacao");
+    if (el) el.innerHTML = cotLiberacaoHtml();
+  }
+}
+
+async function cotLiberar(unidade, liberar) {
+  const s = cotState();
+  try {
+    s.releases = await api("/api/crm/quotes/releases",
+                           { method: "POST", body: JSON.stringify({ unit: unidade, released: liberar }) });
+    cotAviso(liberar ? `Tela Cotações liberada para ${unidade}.` : `Tela Cotações recolhida de ${unidade}.`);
+  } catch (e) {
+    cotAviso(e.message, true);
+  }
+  const el = document.getElementById("cot-liberacao");
+  if (el) el.innerHTML = cotLiberacaoHtml();
+}
+
+function cotLiberacaoHtml() {
+  const r = cotState().releases;
+  if (!r) return `<div class="form-card cot-lib">Carregando liberação por unidade…</div>`;
+  if (r.error) return `<div class="message error">${escapeHtml(r.error)}</div>`;
+  return `
+    <div class="form-card cot-lib">
+      <div><b>Liberação por unidade</b>
+        <span class="text-small">Só a diretoria vê este quadro. Unidade marcada = gerente e vendedores passam a ver a tela Cotações (após recarregar a página).</span></div>
+      <div class="cot-lib-unidades">
+        ${r.units.map((u) => `
+          <label class="cot-lib-u ${u.released ? "on" : ""}">
+            <input type="checkbox" ${u.released ? "checked" : ""} onchange="cotLiberar('${escapeHtml(u.unit)}', this.checked)">
+            ${escapeHtml(u.unit)}</label>`).join("")}
+      </div>
+    </div>`;
+}
+
+function cotacoesView() {
+  const s = cotState();
+  if (!s.data && !s.erro) {
+    cotLoad();
+    return `<div class="loader panel">Carregando cotações…</div>`;
+  }
+  if (!s.data) return `<div class="message error">${escapeHtml(s.erro)}</div>`;
+  const d = s.data;
+  const seletor = d.isSeller ? "" : `
+    <select class="cot-vendedor" onchange="cotTrocarVendedor(this.value)">
+      <option value="">Todos os vendedores</option>
+      ${(d.sellers || []).map((v) => `<option value="${escapeHtml(v)}" ${v === s.seller ? "selected" : ""}>${escapeHtml(v)}</option>`).join("")}
+    </select>`;
+  return `
+    <div class="stack cot">
+      ${d.canRelease ? `<div id="cot-liberacao">${cotLiberacaoHtml()}</div>` : ""}
+      <div class="form-card cot-topo">
+        <div class="cot-busca">
+          <input id="cot-busca" type="search" autocomplete="off"
+                 placeholder="Buscar cliente por nome, código ou CNPJ"
+                 value="${escapeHtml(s.busca)}" oninput="cotBuscar(this.value)">
+          ${seletor}
+        </div>
+        <div id="cot-placar">${cotPlacarHtml()}</div>
+        <div id="cot-aviso" class="cot-aviso" role="status" aria-live="polite"></div>
+      </div>
+      <section class="table-card cot-bloco">
+        <h3>Cotações abertas <span class="text-small">feche com venda ou motivo até amanhã</span></h3>
+        <div id="cot-abertas">${cotAbertasHtml()}</div>
+      </section>
+      <section class="table-card cot-bloco">
+        <h3>${d.isSeller ? "Minha carteira" : "Carteira"} <span class="text-small">cliente cotou? toque no canal</span></h3>
+        <div id="cot-carteira">${cotCarteiraHtml()}</div>
+      </section>
+      <details class="table-card cot-bloco">
+        <summary>Encerradas hoje</summary>
+        <div id="cot-encerradas">${cotEncerradasHtml()}</div>
+      </details>
+    </div>`;
+}

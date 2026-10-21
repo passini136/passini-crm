@@ -2160,3 +2160,48 @@ tbody tr:hover {
   .as-fab { right: 14px; bottom: 14px; }
   .as-bubble { display: none; }
 }
+
+/* ─── Cotações do Dia (MEC 2.0) ─────────────────────────────────────────── */
+.cot-topo { padding: 14px 18px; }
+.cot-busca { display: flex; gap: 10px; flex-wrap: wrap; }
+.cot-busca input[type="search"] { flex: 1 1 320px; min-height: 44px; font-size: 16px; padding: 8px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.cot-vendedor { min-height: 44px; border-radius: 12px; border: 1px solid var(--line); padding: 0 10px; }
+.cot-placar { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px; }
+.cot-placar > div { background: var(--panel-soft); border: 1px solid var(--line); border-radius: 12px; padding: 8px 14px; min-width: 120px; }
+.cot-placar b { display: block; font-size: 22px; color: var(--accent); }
+.cot-placar span { font-size: 12px; color: var(--muted); }
+.cot-placar .cot-semana b { color: var(--text); }
+.cot-alerta { margin-top: 10px; background: #fef3e2; color: #8a5a10; border: 1px solid #f3c98b; border-radius: 10px; padding: 8px 12px; font-weight: 600; }
+.cot-aviso { min-height: 20px; margin-top: 8px; font-weight: 600; font-size: 14px; }
+.cot-aviso.ok { color: var(--good); }
+.cot-aviso.erro { color: var(--bad); }
+.cot-bloco { padding: 12px 16px; }
+.cot-bloco h3 { margin: 4px 0 8px; font-size: 16px; }
+.cot-bloco h3 .text-small { font-weight: 400; color: var(--muted); margin-left: 8px; }
+.cot-bloco summary { cursor: pointer; font-weight: 700; padding: 4px 0; }
+.cot-linha { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 4px; border-bottom: 1px solid var(--line); }
+.cot-linha:last-child { border-bottom: none; }
+.cot-pendente { background: #fff8ec; border-left: 4px solid var(--warn); padding-left: 10px; }
+.cot-cli { flex: 1 1 260px; min-width: 0; }
+.cot-cli b { display: block; }
+.cot-cli span { font-size: 12.5px; color: var(--muted); }
+.cot-botoes { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.cot-btn { min-height: 40px; padding: 0 14px; border-radius: 10px; font-weight: 600; }
+.cot-canal { background: var(--accent-soft); color: var(--accent); border: 1px solid transparent; }
+.cot-sim { background: var(--good); color: #fff; border: none; }
+.cot-nao { background: var(--bad); color: #fff; border: none; }
+.cot-motivo { background: #fff; border: 1px solid var(--bad); color: var(--bad); }
+.cot-pergunta { font-weight: 700; margin-right: 4px; }
+.cot-btn[disabled] { opacity: 0.5; cursor: wait; }
+.cot-detalhe { flex-basis: 100%; display: flex; gap: 12px; flex-wrap: wrap; }
+.cot-detalhe label { font-size: 12px; color: var(--muted); display: flex; flex-direction: column; gap: 4px; flex: 1 1 220px; }
+.cot-detalhe input { min-height: 38px; border: 1px solid var(--line); border-radius: 10px; padding: 0 10px; }
+.cot-tag { border-radius: 999px; padding: 4px 12px; font-size: 13px; font-weight: 600; }
+.cot-tag-sim { background: #e3f4ee; color: var(--good); }
+.cot-tag-nao { background: #fbe9e9; color: var(--bad); }
+.cot-vazio { color: var(--muted); padding: 10px 4px; }
+.cot-lib { padding: 12px 18px; border: 1px dashed var(--accent); }
+.cot-lib .text-small { color: var(--muted); margin-left: 6px; }
+.cot-lib-unidades { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.cot-lib-u { border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer; display: flex; gap: 6px; align-items: center; }
+.cot-lib-u.on { background: var(--accent-soft); border-color: var(--accent); }

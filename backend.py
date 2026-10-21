@@ -247,6 +247,9 @@ ACCESS_MODULES: list[dict[str, str]] = [
     # Meu Dia — o ciclo diário do MEC, na ordem do dia
     {"id": "crm-agenda",     "label": "Missão do Dia",      "group": "Meu Dia"},
     {"id": "crm-tarefas",    "label": "Tarefas",            "group": "Meu Dia"},
+    # Cotações do Dia — liberada por unidade (FEATURE_GATES). Enquanto a unidade
+    # não for liberada, só quem gerencia usuários enxerga, para validar.
+    {"id": "crm-cotacoes",   "label": "Cotações do Dia",    "group": "Meu Dia"},
     {"id": "crm-clientes",   "label": "Carteira",           "group": "Meu Dia"},
     {"id": "contatos",       "label": "Contatos",           "group": "Meu Dia"},
     {"id": "crm-interacao",  "label": "Registrar interação","group": "Meu Dia"},
@@ -319,7 +322,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         "name": "Gerente",
         "description": "Gestão da unidade: resultados, carteira e equipe. Sem acesso a configurações.",
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao", "placar-equipe", "biblioteca", "novidades", "sem-vendedor",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-cotacoes", "crm-interacao", "placar-equipe", "biblioteca", "novidades", "sem-vendedor",
             "visitas", "prospeccao", "contatos", "reunioes", "feedback", "atividade",
             "resultados", "executivo", "vendedores", "unidades", "marcas", "devolucoes", "clientes", "cidades", "descontos", "calendario",
         ],
@@ -342,7 +345,7 @@ DEFAULT_ACCESS_PROFILES: list[dict[str, Any]] = [
         # "executivo" mostra o resultado do próprio vendedor — o escopo "proprio"
         # já restringe os dados, então ele vê apenas os números dele.
         "modules": [
-            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-interacao",
+            "crm-agenda", "crm-clientes", "crm-tarefas", "crm-cotacoes", "crm-interacao",
             "meu-placar", "biblioteca", "novidades", "visitas", "prospeccao", "contatos", "reunioes", "feedback",
             # "atividade" com escopo "proprio" mostra ao vendedor o PRÓPRIO
             # acesso e as próprias fichas abertas — nada dos colegas. Sem esta
@@ -1107,6 +1110,48 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_crm_tasks_seller_status_due
             ON crm_tasks(company_id, seller_name, status, due_at);
+
+        -- Cotações do Dia (MEC 2.0). Separada de crm_interactions: tem ciclo de
+        -- vida próprio e não pode contaminar o contador de contatos ativos.
+        CREATE TABLE IF NOT EXISTS crm_quotes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            client_key TEXT NOT NULL,
+            client_name TEXT NOT NULL,
+            seller_name TEXT NOT NULL,
+            unit_name TEXT,
+            channel TEXT NOT NULL,
+            initiative TEXT NOT NULL DEFAULT 'RECEPTIVO',
+            quoted_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ABERTA',
+            loss_reason TEXT,
+            approx_value REAL,
+            item_hint TEXT,
+            decided_at TEXT,
+            reconcile_status TEXT,
+            reconciled_at TEXT,
+            task_id INTEGER,
+            created_at TEXT NOT NULL,
+            created_by_user_id INTEGER,
+            FOREIGN KEY (company_id) REFERENCES companies(id),
+            FOREIGN KEY (task_id) REFERENCES crm_tasks(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_crm_quotes_seller_date
+            ON crm_quotes(company_id, seller_name, quoted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_crm_quotes_client_date
+            ON crm_quotes(company_id, client_key, quoted_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_crm_quotes_status
+            ON crm_quotes(company_id, status, quoted_at);
+
+        CREATE TABLE IF NOT EXISTS feature_releases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            feature TEXT NOT NULL,
+            unit_name TEXT NOT NULL,
+            released_at TEXT NOT NULL,
+            released_by_user_id INTEGER,
+            UNIQUE(company_id, feature, unit_name)
+        );
 
             CREATE TABLE IF NOT EXISTS crm_agenda_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1874,7 +1919,54 @@ def get_access_profile_for_user(conn: sqlite3.Connection, user: Any) -> dict[str
             "SELECT * FROM access_profiles WHERE company_id = ? AND name = ?",
             (user["company_id"], user["role"]),
         ).fetchone()
-    return access_profile_row_to_dict(row) if row else None
+    if not row:
+        return None
+    perfil = access_profile_row_to_dict(row)
+    aplicar_liberacao_por_unidade(conn, user, perfil)
+    return perfil
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Liberação de tela por unidade
+#
+# Tela nova entra no perfil (Gerente/Vendedor) mas só aparece para quem é de
+# uma unidade liberada. Quem gerencia usuários (Diretor/Administrador) sempre
+# vê, para validar antes de liberar. A liberação é feita na própria tela.
+# ─────────────────────────────────────────────────────────────────────────────
+FEATURE_GATES: dict[str, str] = {"crm-cotacoes": "cotacoes"}
+
+
+def unidades_liberadas(conn: sqlite3.Connection, company_id: int, feature: str) -> set[str]:
+    try:
+        linhas = conn.execute(
+            "SELECT unit_name FROM feature_releases WHERE company_id = ? AND feature = ?",
+            (company_id, feature)).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {normalize_unit(l["unit_name"]) for l in linhas if l["unit_name"]}
+
+
+def unidades_do_usuario(conn: sqlite3.Connection, user: Any) -> set[str]:
+    unidades = {normalize_unit(u) for u in linked_units_for_user(user) if u}
+    try:
+        propria = unidade_de_exibicao(conn, user["company_id"], user)
+    except Exception:  # noqa: BLE001
+        propria = ""
+    if propria:
+        unidades.add(normalize_unit(propria))
+    return {u for u in unidades if u}
+
+
+def aplicar_liberacao_por_unidade(conn: sqlite3.Connection, user: Any, perfil: dict[str, Any]) -> None:
+    if perfil.get("canManageUsers"):
+        return
+    travados = [m for m in perfil.get("modules", []) if m in FEATURE_GATES]
+    if not travados:
+        return
+    minhas = unidades_do_usuario(conn, user)
+    for modulo in travados:
+        if not (minhas & unidades_liberadas(conn, user["company_id"], FEATURE_GATES[modulo])):
+            perfil["modules"] = [m for m in perfil["modules"] if m != modulo]
 
 
 def upsert_access_profile(
@@ -9576,8 +9668,18 @@ TASK_ORIGINS = [
      "hint": "Tarefa de gestão, com ou sem cliente vinculado."},
     {"id": "APOIO", "label": "Atendido por outro", "icon": "🤝", "color": "#00695c", "bg": "#e0f2f1",
      "hint": "Outro vendedor atendeu este cliente da sua carteira — retome o contato."},
+    {"id": "COTACAO", "label": "Cotação", "icon": "🧾", "color": "#0e5a78", "bg": "#d7e9f0",
+     "hint": "Cotação sem desfecho ou cliente decidindo — dê o retorno na tela Cotações."},
 ]
 TASK_ORIGIN_IDS = {o["id"] for o in TASK_ORIGINS}
+
+
+def task_origins_for_user(conn: sqlite3.Connection, user: Any) -> list[dict[str, Any]]:
+    """Origem COTACAO só aparece para quem tem a tela Cotações liberada."""
+    perfil = get_access_profile_for_user(conn, user)
+    if perfil and "crm-cotacoes" in perfil["modules"]:
+        return TASK_ORIGINS
+    return [o for o in TASK_ORIGINS if o["id"] != "COTACAO"]
 
 TASK_PRIORITIES = [
     {"id": "ALTA", "label": "Alta", "color": "#c5221f", "bg": "#fce8e6"},
@@ -27040,6 +27142,389 @@ def compute_portfolio_summary_by_seller(
     }
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cotações do Dia (MEC 2.0) — etapa 1: registrar
+#
+# Spec: "Especificação — Lista de Cotações do Dia (CRM Passini)", 21/10/2026.
+# ~60% das cotações saem pelo WhatsApp e não viram orçamento no Alfa, então o
+# vendedor marca aqui: cotou (toque 1), fechou? (toque 2), motivo (toque 3).
+# Cliente sempre pelo client_code — o nome tem três grafias no sistema.
+# Não mexe no Meu Placar nem no contador de contatos ativos.
+# Conciliação com o faturamento e motivos da fila ficam para as etapas 2 e 3.
+# ─────────────────────────────────────────────────────────────────────────────
+COTACAO_CANAIS = {"WHATSAPP", "TELEFONE", "BALCAO"}
+COTACAO_MOTIVOS = {
+    "PRECO": "Preço", "MARCA": "Marca", "FALTA": "Falta",
+    "PRAZO": "Prazo", "CREDITO": "Crédito", "COMPROU_OUTRO": "Comprou em outro",
+}
+# Retorno no bloco ativo da manhã (MEC 2.0: 8h40 às 9h20)
+COTACAO_HORA_RETORNO = "08:40"
+
+
+def _cotacao_agora() -> str:
+    return datetime.now(APP_TIMEZONE).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _cotacao_proximo_dia_util(d: date) -> date:
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5:
+        n += timedelta(days=1)
+    return n
+
+
+def _cotacao_contexto(conn: sqlite3.Connection, user: Any) -> dict[str, Any] | None:
+    perfil = get_access_profile_for_user(conn, user)
+    if not perfil or "crm-cotacoes" not in perfil["modules"]:
+        return None
+    try:
+        unidade = normalize_unit(unidade_de_exibicao(conn, user["company_id"], user)) or None
+    except Exception:  # noqa: BLE001
+        unidade = None
+    if not unidade:
+        # Sem pessoa no cadastro de pessoas: usa o vínculo do login, se for um só
+        vinculadas = linked_units_for_user(user)
+        if len(vinculadas) == 1:
+            unidade = normalize_unit(vinculadas[0]) or None
+    return {
+        "proprio": (perfil.get("dataScope") or "todos") == "proprio",
+        "eu": seller_identity_for_user(user),
+        "minha_unidade": unidade,
+        "unidades": crm_allowed_units_for_user(conn, user),  # None = sem restrição
+        "gerencia_usuarios": bool(perfil.get("canManageUsers")),
+    }
+
+
+def _cotacao_filtro(ctx: dict[str, Any], vendedor: str) -> tuple[str, list[Any]]:
+    partes: list[str] = []
+    args: list[Any] = []
+    if ctx["proprio"]:
+        partes.append("seller_name = ?")
+        args.append(ctx["eu"])
+    else:
+        if ctx["unidades"] is not None:
+            if not ctx["unidades"]:
+                partes.append("1 = 0")
+            else:
+                partes.append(f"unit_name IN ({','.join('?' * len(ctx['unidades']))})")
+                args.extend(ctx["unidades"])
+        if vendedor:
+            partes.append("seller_name = ?")
+            args.append(vendedor)
+    return ((" AND " + " AND ".join(partes)) if partes else ""), args
+
+
+def _cotacao_dict(r: sqlite3.Row, hoje: str) -> dict[str, Any]:
+    data = (r["quoted_at"] or "")[:10]
+    return {
+        "id": r["id"], "clientKey": r["client_key"], "clientName": r["client_name"],
+        "sellerName": r["seller_name"], "unitName": r["unit_name"] or "",
+        "channel": r["channel"], "quotedAt": r["quoted_at"], "status": r["status"],
+        "lossReason": r["loss_reason"] or "",
+        "lossLabel": COTACAO_MOTIVOS.get(r["loss_reason"] or "", ""),
+        "approxValue": r["approx_value"], "itemHint": r["item_hint"] or "",
+        "decidedAt": r["decided_at"] or "",
+        "pending": data < hoje and r["status"] in ("ABERTA", "DECIDINDO"),
+        "canUndo": bool(r["decided_at"]) and (r["decided_at"] or "")[:10] == hoje,
+    }
+
+
+def _cotacao_criar_tarefa(conn: sqlite3.Connection, cid: int, r: sqlite3.Row, titulo: str, quando: str) -> int:
+    canal = {"WHATSAPP": "WhatsApp", "TELEFONE": "telefone", "BALCAO": "balcão"}.get(r["channel"], r["channel"])
+    cur = conn.execute(
+        """
+        INSERT INTO crm_tasks (company_id, client_key, client_name, seller_name, title,
+            description, due_at, status, origin, created_at)
+        VALUES (?,?,?,?,?,?,?, 'ABERTA', 'COTACAO', ?)
+        """,
+        (cid, r["client_key"], r["client_name"], r["seller_name"],
+         f"{titulo}: {r['client_name']}",
+         f"Cotação de {(r['quoted_at'] or '')[:16].replace('T', ' ')} pelo {canal}. "
+         "Dê o desfecho na tela Cotações: fechou ou não fechou com o motivo.",
+         quando, now_iso()),
+    )
+    return int(cur.lastrowid)
+
+
+def _cotacao_fechar_tarefa(conn: sqlite3.Connection, task_id: int | None) -> None:
+    if task_id:
+        conn.execute(
+            "UPDATE crm_tasks SET status = 'CONCLUIDA', completed_at = ? "
+            "WHERE id = ? AND status <> 'CONCLUIDA'", (now_iso(), task_id))
+
+
+def _cotacao_tarefas_pendentes(conn: sqlite3.Connection, cid: int, vendedor: str, hoje: str) -> int:
+    """Cotação de dia anterior ainda ABERTA vira tarefa "Dar desfecho" para hoje."""
+    criadas = 0
+    for r in conn.execute(
+            "SELECT * FROM crm_quotes WHERE company_id = ? AND seller_name = ? "
+            "AND status = 'ABERTA' AND task_id IS NULL AND substr(quoted_at, 1, 10) < ?",
+            (cid, vendedor, hoje)).fetchall():
+        tid = _cotacao_criar_tarefa(conn, cid, r, "Dar desfecho na cotação", f"{hoje}T{COTACAO_HORA_RETORNO}")
+        conn.execute("UPDATE crm_quotes SET task_id = ? WHERE id = ?", (tid, r["id"]))
+        criadas += 1
+    return criadas
+
+
+def listar_cotacoes(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    cid = user["company_id"]
+    hoje_d = today_in_brazil()
+    hoje = hoje_d.isoformat()
+    limite = (hoje_d - timedelta(days=14)).isoformat()
+    vendedor = "" if ctx["proprio"] else normalize_whitespace(params.get("seller"))
+    filtro, args = _cotacao_filtro(ctx, vendedor)
+    if ctx["proprio"] and _cotacao_tarefas_pendentes(conn, cid, ctx["eu"], hoje):
+        conn.commit()
+        invalidate_crm_cache(cid)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM crm_quotes
+        WHERE company_id = ? {filtro}
+          AND substr(quoted_at, 1, 10) >= ?
+          AND (status IN ('ABERTA', 'DECIDINDO')
+               OR substr(quoted_at, 1, 10) = ?
+               OR substr(COALESCE(decided_at, ''), 1, 10) = ?)
+        ORDER BY quoted_at DESC
+        """,
+        [cid, *args, limite, hoje, hoje]).fetchall()
+    itens = [_cotacao_dict(r, hoje) for r in rows]
+
+    def placar(desde: str) -> dict[str, Any]:
+        r = conn.execute(
+            f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status = 'FECHOU' THEN 1 ELSE 0 END) AS fechou,
+                   SUM(CASE WHEN status = 'NAO_FECHOU' THEN 1 ELSE 0 END) AS perdeu
+            FROM crm_quotes WHERE company_id = ? {filtro} AND substr(quoted_at, 1, 10) >= ?
+            """, [cid, *args, desde]).fetchone()
+        total, f, p = int(r["total"] or 0), int(r["fechou"] or 0), int(r["perdeu"] or 0)
+        return {"total": total, "closed": f, "lost": p,
+                "rate": round(100 * f / (f + p)) if (f + p) else None}
+
+    vendedores: list[str] = []
+    if not ctx["proprio"]:
+        f_all, a_all = _cotacao_filtro(ctx, "")
+        vendedores = [l["seller_name"] for l in conn.execute(
+            f"SELECT DISTINCT seller_name FROM crm_quotes WHERE company_id = ? {f_all} ORDER BY seller_name",
+            [cid, *a_all]).fetchall()]
+    inicio_semana = (hoje_d - timedelta(days=hoje_d.weekday())).isoformat()
+    return {
+        "quotes": itens, "today": placar(hoje), "week": placar(inicio_semana),
+        "pendingCount": sum(1 for i in itens if i["pending"]),
+        "reasons": [{"id": k, "label": v} for k, v in COTACAO_MOTIVOS.items()],
+        "isSeller": ctx["proprio"], "me": ctx["eu"], "sellers": vendedores,
+        "selectedSeller": vendedor, "canRelease": ctx["gerencia_usuarios"],
+    }
+
+
+def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    cid = user["company_id"]
+    busca = normalize_whitespace(params.get("q"))
+    vendedor = ctx["eu"] if ctx["proprio"] else (normalize_whitespace(params.get("seller")) or ctx["eu"])
+    hoje = today_in_brazil().isoformat()
+    desde = (today_in_brazil() - timedelta(days=30)).isoformat()
+    base = """
+        SELECT p.client_code, p.client_name, p.trade_name, p.city_name,
+               p.internal_seller_name, p.last_sale_at,
+               (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
+                   AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) >= ?) AS cot30,
+               (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
+                   AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) = ?
+                   AND q.seller_name = ?) AS cot_hoje
+        FROM crm_client_profiles p
+        WHERE p.company_id = ?
+    """
+    args: list[Any] = [desde, hoje, vendedor, cid]
+    if len(busca) >= 2:
+        termo = f"%{normalize_upper(strip_accents(busca))}%"
+        condicoes = ["sem_acento(p.client_name) LIKE ?",
+                     "sem_acento(COALESCE(p.trade_name, '')) LIKE ?",
+                     "p.client_code = ?"]
+        args += [termo, termo, busca]
+        digitos = re.sub(r"\D", "", busca)
+        if len(digitos) >= 5:
+            condicoes.append("REPLACE(REPLACE(REPLACE(COALESCE(p.document_number, ''), '.', ''), '/', ''), '-', '') LIKE ?")
+            args.append(f"%{digitos}%")
+        sql = (base + " AND (" + " OR ".join(condicoes) + ")"
+               " ORDER BY (sem_acento(COALESCE(p.internal_seller_name, '')) = sem_acento(?)) DESC,"
+               " cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 30")
+        args.append(vendedor)
+    else:
+        sql = (base + " AND sem_acento(COALESCE(p.internal_seller_name, '')) = sem_acento(?)"
+               " ORDER BY cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 300")
+        args.append(vendedor)
+    meu = normalize_upper(strip_accents(vendedor))
+    clientes = []
+    for r in conn.execute(sql, args).fetchall():
+        dono = normalize_whitespace(r["internal_seller_name"])
+        clientes.append({
+            "clientKey": r["client_code"], "clientName": r["client_name"],
+            "tradeName": r["trade_name"] or "", "city": r["city_name"] or "",
+            "owner": dono, "mine": bool(dono) and normalize_upper(strip_accents(dono)) == meu,
+            "quotes30": int(r["cot30"] or 0), "quotesToday": int(r["cot_hoje"] or 0),
+            "lastSaleAt": (r["last_sale_at"] or "")[:10],
+        })
+    return {"clients": clientes, "seller": vendedor, "search": busca}
+
+
+def _cotacao_carregar(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], qid: Any) -> sqlite3.Row | None:
+    try:
+        qid = int(qid)
+    except (TypeError, ValueError):
+        return None
+    filtro, args = _cotacao_filtro(ctx, "")
+    return conn.execute(f"SELECT * FROM crm_quotes WHERE company_id = ? AND id = ? {filtro}",
+                        [user["company_id"], qid, *args]).fetchone()
+
+
+def _cotacao_valor(valor: Any) -> float | None:
+    if valor in (None, ""):
+        return None
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    texto = str(valor).strip().replace("R$", "").strip()
+    if "," in texto:
+        texto = texto.replace(".", "").replace(",", ".")
+    return float(texto)
+
+
+def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    cid = user["company_id"]
+    chave = normalize_whitespace(payload.get("clientKey"))
+    canal = normalize_upper(payload.get("channel") or "")
+    if not chave:
+        return 400, {"error": "Escolha o cliente."}
+    if canal not in COTACAO_CANAIS:
+        return 400, {"error": "Escolha o canal: WhatsApp, telefone ou balcão."}
+    cli = conn.execute("SELECT client_name FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
+                       (cid, chave)).fetchone()
+    nome = normalize_whitespace(cli["client_name"]) if cli else ""
+    if not nome:
+        return 400, {"error": "Cliente não encontrado no cadastro."}
+    vendedor = ctx["eu"] if ctx["proprio"] else (normalize_whitespace(payload.get("seller")) or ctx["eu"])
+    unidade = ctx["minha_unidade"]
+    if vendedor != ctx["eu"]:
+        try:
+            unidade = normalize_unit(seller_unit_name(conn, cid, vendedor)) or unidade
+        except Exception:  # noqa: BLE001
+            pass
+    cur = conn.execute(
+        """
+        INSERT INTO crm_quotes (company_id, client_key, client_name, seller_name, unit_name,
+            channel, initiative, quoted_at, status, created_at, created_by_user_id)
+        VALUES (?,?,?,?,?,?,?,?, 'ABERTA', ?, ?)
+        """,
+        (cid, chave, nome, vendedor, unidade, canal,
+         "ATIVO" if payload.get("active") else "RECEPTIVO",
+         _cotacao_agora(), now_iso(), user["id"]))
+    novo = int(cur.lastrowid)
+    audit_log(conn, cid, user["id"], "criar", "crm_quotes", str(novo), {"cliente": chave, "canal": canal})
+    conn.commit()
+    r = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (novo,)).fetchone()
+    return 200, {"quote": _cotacao_dict(r, today_in_brazil().isoformat())}
+
+
+def desfecho_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    r = _cotacao_carregar(conn, user, ctx, payload.get("id"))
+    if not r:
+        return 404, {"error": "Cotação não encontrada."}
+    status = normalize_upper(payload.get("status") or "")
+    if status not in {"FECHOU", "NAO_FECHOU", "DECIDINDO"}:
+        return 400, {"error": "Desfecho inválido."}
+    motivo = normalize_upper(payload.get("lossReason") or "") or None
+    if status == "NAO_FECHOU" and motivo not in COTACAO_MOTIVOS:
+        return 400, {"error": "Escolha o motivo da perda."}
+    if status != "NAO_FECHOU":
+        motivo = None
+    try:
+        valor = _cotacao_valor(payload.get("approxValue"))
+    except ValueError:
+        return 400, {"error": "Valor inválido."}
+    if valor is None:
+        valor = r["approx_value"]
+    peca = normalize_whitespace(payload.get("itemHint")) or r["item_hint"]
+    cid = user["company_id"]
+    # Qualquer tarefa ligada à cotação fecha; DECIDINDO abre uma nova no bloco ativo
+    _cotacao_fechar_tarefa(conn, r["task_id"])
+    task_id = None
+    decidido = _cotacao_agora()
+    if status == "DECIDINDO":
+        quando = f"{_cotacao_proximo_dia_util(today_in_brazil()).isoformat()}T{COTACAO_HORA_RETORNO}"
+        task_id = _cotacao_criar_tarefa(conn, cid, r, "Retornar cotação", quando)
+        decidido = None
+    conn.execute(
+        "UPDATE crm_quotes SET status = ?, loss_reason = ?, approx_value = ?, item_hint = ?, "
+        "decided_at = ?, task_id = ? WHERE id = ?",
+        (status, motivo, valor, peca, decidido, task_id, r["id"]))
+    audit_log(conn, cid, user["id"], "desfecho", "crm_quotes", str(r["id"]),
+              {"de": r["status"], "para": status, "motivo": motivo})
+    conn.commit()
+    invalidate_crm_cache(cid)
+    novo = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
+    return 200, {"quote": _cotacao_dict(novo, today_in_brazil().isoformat())}
+
+
+def desfazer_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    r = _cotacao_carregar(conn, user, ctx, payload.get("id"))
+    if not r:
+        return 404, {"error": "Cotação não encontrada."}
+    hoje = today_in_brazil().isoformat()
+    if not r["decided_at"] or r["decided_at"][:10] != hoje:
+        return 400, {"error": "Só dá para desfazer no mesmo dia do desfecho."}
+    conn.execute("UPDATE crm_quotes SET status = 'ABERTA', loss_reason = NULL, decided_at = NULL WHERE id = ?",
+                 (r["id"],))
+    audit_log(conn, user["company_id"], user["id"], "desfazer", "crm_quotes", str(r["id"]),
+              {"de": r["status"], "motivo": r["loss_reason"]})
+    conn.commit()
+    novo = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
+    return 200, {"quote": _cotacao_dict(novo, hoje)}
+
+
+def liberacoes_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], metodo: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not ctx["gerencia_usuarios"]:
+        return 403, {"error": "Só a diretoria libera a tela por unidade."}
+    cid = user["company_id"]
+    if metodo == "POST":
+        unidade = normalize_unit(payload.get("unit"))
+        if unidade not in CANONICAL_UNITS:
+            return 400, {"error": "Unidade inválida."}
+        liberar = bool(payload.get("released"))
+        if liberar:
+            conn.execute(
+                "INSERT OR IGNORE INTO feature_releases (company_id, feature, unit_name, released_at, released_by_user_id) "
+                "VALUES (?, 'cotacoes', ?, ?, ?)", (cid, unidade, now_iso(), user["id"]))
+        else:
+            conn.execute("DELETE FROM feature_releases WHERE company_id = ? AND feature = 'cotacoes' AND unit_name = ?",
+                         (cid, unidade))
+        audit_log(conn, cid, user["id"], "liberar" if liberar else "recolher", "feature_releases", unidade,
+                  {"feature": "cotacoes"})
+        conn.commit()
+    liberadas = unidades_liberadas(conn, cid, "cotacoes")
+    return 200, {"units": [{"unit": u, "released": u in liberadas} for u in CANONICAL_UNITS]}
+
+
+def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    ctx = _cotacao_contexto(conn, user)
+    if ctx is None:
+        return 403, {"error": "A tela Cotações ainda não foi liberada para a sua unidade."}
+    try:
+        if metodo == "GET" and path == "/api/crm/quotes":
+            return 200, listar_cotacoes(conn, user, ctx, dados)
+        if metodo == "GET" and path == "/api/crm/quotes/portfolio":
+            return 200, carteira_para_cotacao(conn, user, ctx, dados)
+        if path == "/api/crm/quotes/releases":
+            return liberacoes_cotacao(conn, user, ctx, metodo, dados)
+        if metodo == "POST" and path == "/api/crm/quotes/create":
+            return criar_cotacao(conn, user, ctx, dados)
+        if metodo == "POST" and path == "/api/crm/quotes/status":
+            return desfecho_cotacao(conn, user, ctx, dados)
+        if metodo == "POST" and path == "/api/crm/quotes/undo":
+            return desfazer_cotacao(conn, user, ctx, dados)
+    except sqlite3.Error as erro:
+        print(f"[cotacoes] {erro}", flush=True)
+        return 500, {"error": "Não consegui gravar a cotação. Tente de novo."}
+    return 404, {"error": "Rota não encontrada."}
+
+
 class AppHandler(BaseHTTPRequestHandler):
     # Prazo por operação de socket. Sem ele, uma conexão que para no meio —
     # celular que perdeu sinal enquanto subia o comprovante, aba fechada durante
@@ -27977,6 +28462,17 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
                 return
+            if path.startswith("/api/crm/quotes"):
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                params = {k: v[0] for k, v in query.items() if v}
+                with closing(get_connection()) as conn:
+                    codigo, corpo = rota_cotacoes(conn, user, "GET", path, params)
+                self._set_headers(codigo)
+                self.wfile.write(json_dumps(corpo))
+                return
             if path == "/api/crm/agenda":
                 user = self._require_auth()
                 if not user:
@@ -28460,7 +28956,7 @@ class AppHandler(BaseHTTPRequestHandler):
                         "rows": rows,
                         "total": len(rows),
                         "counters": crm_task_counters(conn, user["company_id"], user),
-                        "origins": TASK_ORIGINS,
+                        "origins": task_origins_for_user(conn, user),
                         "priorities": TASK_PRIORITIES,
                         "statusFilters": TASK_STATUS_FILTERS,
                         "canCreate": pode_criar,
@@ -29040,6 +29536,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 headers = {"Set-Cookie": f"{SESSION_COOKIE}=deleted; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"}
                 self._set_headers(200, extra_headers=headers)
                 self.wfile.write(json_dumps({"ok": True}))
+                return
+            if path.startswith("/api/crm/quotes"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                with closing(get_connection()) as conn:
+                    codigo, corpo = rota_cotacoes(conn, user, "POST", path, payload)
+                self._set_headers(codigo)
+                self.wfile.write(json_dumps(corpo))
                 return
             if path == "/api/crm/interactions":
                 user = self._require_auth()
