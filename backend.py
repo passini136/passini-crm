@@ -1153,6 +1153,23 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(company_id, feature, unit_name)
         );
 
+        -- Perfil DIFERENCIADO por cliente (tabela de até 34%). Carga inicial vinda
+        -- de seeds/diferenciado_inicial.csv; depois, o fluxo de conferência do
+        -- CNAE (4530-7/01, /03, /04 e não MEI) mantém esta tabela.
+        CREATE TABLE IF NOT EXISTS client_diferenciado (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            client_code TEXT NOT NULL,
+            status TEXT NOT NULL,            -- ATIVO | SOLICITADO | NAO_ELEGIVEL
+            reason TEXT,
+            source TEXT NOT NULL,            -- CARGA_INICIAL | CONFERENCIA
+            checked_at TEXT,
+            checked_by_user_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(company_id, client_code)
+        );
+
             CREATE TABLE IF NOT EXISTS crm_agenda_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -1934,6 +1951,58 @@ def get_access_profile_for_user(conn: sqlite3.Connection, user: Any) -> dict[str
 # vê, para validar antes de liberar. A liberação é feita na própria tela.
 # ─────────────────────────────────────────────────────────────────────────────
 FEATURE_GATES: dict[str, str] = {"crm-cotacoes": "cotacoes"}
+
+
+DIFERENCIADO_SEED = ROOT_DIR / "seeds" / "diferenciado_inicial.csv"
+
+
+def carregar_diferenciado_inicial(conn: sqlite3.Connection, company_id: int) -> None:
+    """Carga única dos clientes que já estão no Diferenciado.
+
+    INSERT OR IGNORE: rodar de novo no próximo restart não duplica nem desfaz
+    mudança feita depois pelo fluxo de conferência.
+    """
+    if not DIFERENCIADO_SEED.exists():
+        return
+    codigos = []
+    for linha in DIFERENCIADO_SEED.read_text(encoding="utf-8").splitlines():
+        texto = linha.strip()
+        if not texto or texto.startswith("#") or texto.lower() == "client_code":
+            continue
+        codigo = normalize_client_key(texto.split(";")[0].split(",")[0])
+        if codigo:
+            codigos.append(codigo)
+    if not codigos:
+        return
+    agora = now_iso()
+    antes = conn.total_changes
+    conn.executemany(
+        "INSERT OR IGNORE INTO client_diferenciado (company_id, client_code, status, source, "
+        "created_at, updated_at) VALUES (?, ?, 'ATIVO', 'CARGA_INICIAL', ?, ?)",
+        [(company_id, c, agora, agora) for c in codigos])
+    novos = conn.total_changes - antes
+    conn.commit()
+    if novos:
+        conhecidos = {normalize_client_key(r["client_code"]) for r in conn.execute(
+            "SELECT client_code FROM crm_client_profiles WHERE company_id = ?", (company_id,)).fetchall()}
+        fora = [c for c in codigos if c not in conhecidos]
+        print(f"[diferenciado] carga inicial: {novos} cliente(s) marcados; "
+              f"{len(fora)} código(s) não estão no cadastro do CRM"
+              + (f" (ex.: {', '.join(fora[:10])})" if fora else ""), flush=True)
+
+
+def marcar_diferenciado(conn: sqlite3.Connection, company_id: int, rows: list[dict[str, Any]],
+                        chaves: list[str], marcadores: str) -> None:
+    try:
+        status = {normalize_client_key(r["client_code"]): r["status"] for r in conn.execute(
+            f"SELECT client_code, status FROM client_diferenciado WHERE company_id = ? "
+            f"AND client_code IN ({marcadores})", (company_id, *chaves)).fetchall()}
+    except sqlite3.OperationalError:
+        return
+    for row in rows:
+        s_ = status.get(normalize_client_key(row.get("clientKey")))
+        row["diferenciado"] = s_ == "ATIVO"
+        row["diferenciadoStatus"] = s_ or ""
 
 
 def unidades_liberadas(conn: sqlite3.Connection, company_id: int, feature: str) -> set[str]:
@@ -3337,6 +3406,7 @@ def init_db() -> None:
         seed_help_content(conn, company_id)
         seed_territory_mappings(conn, company_id)
         repair_prospect_keys(conn, company_id)
+        carregar_diferenciado_inicial(conn, company_id)
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -17975,6 +18045,7 @@ def attach_engagement_markers(
         return
     marcadores = ",".join("?" for _ in chaves)
     limite = (today_in_brazil() - timedelta(days=ENGAGEMENT_RECENT_DAYS)).isoformat()
+    marcar_diferenciado(conn, company_id, rows, chaves, marcadores)
 
     contatos: dict[str, dict[str, Any]] = {}
     for r in conn.execute(
@@ -27329,7 +27400,9 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) >= ?) AS cot30,
                (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) = ?
-                   AND q.seller_name = ?) AS cot_hoje
+                   AND q.seller_name = ?) AS cot_hoje,
+               (SELECT d.status FROM client_diferenciado d WHERE d.company_id = p.company_id
+                   AND d.client_code = p.client_code) AS dif
         FROM crm_client_profiles p
         WHERE p.company_id = ?
     """
@@ -27362,6 +27435,7 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
             "owner": dono, "mine": bool(dono) and normalize_upper(strip_accents(dono)) == meu,
             "quotes30": int(r["cot30"] or 0), "quotesToday": int(r["cot_hoje"] or 0),
             "lastSaleAt": (r["last_sale_at"] or "")[:10],
+            "diferenciado": r["dif"] == "ATIVO",
         })
     return {"clients": clientes, "seller": vendedor, "search": busca}
 

@@ -2205,3 +2205,6 @@ tbody tr:hover {
 .cot-lib-unidades { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
 .cot-lib-u { border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; cursor: pointer; display: flex; gap: 6px; align-items: center; }
 .cot-lib-u.on { background: var(--accent-soft); border-color: var(--accent); }
+
+.dif-badge { display: inline-block; vertical-align: middle; margin-left: 4px; padding: 1px 8px; border-radius: 999px;
+  background: #fff1d6; color: #8a5a00; border: 1px solid #f0c36d; font-size: 11px; font-weight: 700; letter-spacing: .2px; }

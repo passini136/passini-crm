@@ -16056,7 +16056,7 @@ function sellerClientCard(item) {
     <div class="crm-card clean" style="padding:14px">
       <div style="display:flex;justify-content:space-between;align-items:start;gap:8px;margin-bottom:8px">
         <div>
-          <div style="font-weight:700;font-size:14px">${classBadge} ${escapeHtml(item.clientName)}</div>
+          <div style="font-weight:700;font-size:14px">${classBadge} ${escapeHtml(item.clientName)} ${difBadge(item)}</div>
           <div class="text-small">${escapeHtml(item.cityName || "-")} · ${escapeHtml(item.primaryReason || "")}</div>
         </div>
         ${crmStatusBadge(item.statusCode)}
@@ -16853,7 +16853,7 @@ function crmClientsView() {
                 ${rows.map((item) => `
                   <tr class="${Number(item.currentRevenue || 0) > 0 ? "" : "crm-row-no-purchase"}">
                     <td>
-                      <strong>${escapeHtml(item.clientName)}</strong>
+                      <strong>${escapeHtml(item.clientName)}</strong> ${difBadge(item)}
                       <div class="text-small" style="color:var(--muted)">
                         ${escapeHtml(item.clientKey || "-")}${item.unitName ? ` · ${escapeHtml(item.unitName)}` : ""}
                       </div>
@@ -22481,7 +22481,7 @@ function cotCarteiraHtml() {
     ].filter(Boolean).join(" · ");
     return `
       <div class="cot-linha">
-        <div class="cot-cli"><b>${escapeHtml(cl.clientName)}</b><span>${info}</span></div>
+        <div class="cot-cli"><b>${escapeHtml(cl.clientName)} ${difBadge(cl)}</b><span>${info}</span></div>
         <div class="cot-botoes">
           ${COT_CANAIS.map(([id, label, icone]) => `
             <button class="btn cot-btn cot-canal" ${ocupado} title="Cotou pelo ${label}"
@@ -22590,4 +22590,13 @@ function cotacoesView() {
         <div id="cot-encerradas">${cotEncerradasHtml()}</div>
       </details>
     </div>`;
+}
+
+
+/** Selo "Diferenciado" (tabela de até 34%). Faz parte do pacote do piloto
+ * MEC 2.0: aparece só para quem tem a tela Cotações liberada. */
+function difBadge(item) {
+  if (!item?.diferenciado) return "";
+  if (!allowedTabsForUser(state.user).includes("crm-cotacoes")) return "";
+  return `<span class="dif-badge" title="Cliente no perfil DIFERENCIADO — tabela com até 34%">Diferenciado</span>`;
 }
