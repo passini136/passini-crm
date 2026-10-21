@@ -1170,6 +1170,21 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(company_id, client_code)
         );
 
+        -- Ações do MEC 2.0 já feitas por cliente (primeira compra, sem limite)
+        CREATE TABLE IF NOT EXISTS mec_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_id INTEGER NOT NULL,
+            client_code TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            result TEXT,
+            notes TEXT,
+            seller_name TEXT,
+            created_at TEXT NOT NULL,
+            created_by_user_id INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_mec_checks_kind
+            ON mec_checks(company_id, kind, client_code, created_at);
+
             CREATE TABLE IF NOT EXISTS crm_agenda_actions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -8831,15 +8846,31 @@ def suggest_visits(
 
         pedido = pedidos.get(chave)
         incluido = acao == "DENTRO"
+
+        # CLIENTE SEM VENDEDOR NÃO VIRA SUGESTÃO.
+        #
+        # Visita é trabalho de carteira: sem dono não há quem prepare a
+        # conversa, quem faça o retorno nem a quem cobrar o resultado. O
+        # roteiro sugeria assim mesmo, e a visita virava gentileza sem dono.
+        # A inclusão à mão do gestor continua valendo — pode querer ir
+        # justamente para resolver a falta de dono —, mas aí é decisão dele,
+        # não sugestão do sistema.
+        if not normalize_whitespace(c.get("assignedSeller")) and not incluido:
+            continue
+
         ultima_visita = visitados.get(chave)
         dias_visita = None
         if ultima_visita:
             d = parse_datetime_flexible(ultima_visita)
             dias_visita = (hoje - d.date()).days if d else None
-            # Cooldown: quem foi visitado há pouco sai, exceto se o vendedor pediu
-            # ou se o gestor colocou de volta à mão.
+            # STANDBY DE 60 DIAS, E O PEDIDO DO VENDEDOR NÃO FURA.
+            #
+            # Antes, pedido do vendedor derrubava o cooldown — bastava pedir
+            # de novo para o cliente reaparecer no roteiro na semana seguinte
+            # à visita. Quem decide repetir antes do prazo é a gestão, e para
+            # isso existe a inclusão à mão.
             if (dias_visita is not None and dias_visita < VISIT_COOLDOWN_DAYS
-                    and not pedido and not incluido):
+                    and not incluido):
                 continue
 
         status = normalize_upper(c.get("statusCode"))
@@ -8959,6 +8990,62 @@ def suggest_visits(
 
 # ── Pedido de visita (vendedor → gerente) ────────────────────────────────────
 
+def visit_request_block(
+    conn: sqlite3.Connection, company_id: int, client_key: str
+) -> tuple[str, str]:
+    """Por que este cliente NÃO pode receber pedido de visita agora.
+
+    Devolve (motivo, mensagem) ou ("", ""). São as três travas que o Felipe
+    pediu, e todas valem no SERVIDOR: não sugerir na tela não impede ninguém
+    de mandar o pedido assim mesmo, e a regra que só existe na tela é a que
+    some no primeiro atalho.
+
+    A ordem importa. Bloqueio do gestor vem primeiro porque é decisão de
+    gente; os outros dois são régua.
+    """
+    chave = normalize_client_key(client_key)
+
+    bloqueio = conn.execute(
+        "SELECT reason, created_by FROM visit_route_overrides"
+        " WHERE company_id = ? AND client_key = ? AND action = 'FORA'",
+        (company_id, chave)).fetchone()
+    if bloqueio:
+        motivo = normalize_whitespace(bloqueio["reason"])
+        quem = normalize_whitespace(bloqueio["created_by"])
+        return ("BLOQUEADO",
+                "A gestão tirou este cliente do roteiro"
+                + (f" ({motivo})" if motivo else "")
+                + (f" — {quem}." if quem else ".")
+                + " Só a gestão ou a diretoria pode liberar de novo.")
+
+    # Sem dono não há carteira para preparar a visita nem para cobrar o
+    # retorno. É a mesma regra que tira o cliente da sugestão.
+    perfil = conn.execute(
+        "SELECT internal_seller_name FROM crm_client_profiles"
+        " WHERE company_id = ? AND client_code = ?", (company_id, chave)).fetchone()
+    if perfil is not None and not normalize_whitespace(perfil["internal_seller_name"]):
+        return ("SEM_VENDEDOR",
+                "Este cliente não tem vendedor responsável. Peça ao gerente "
+                "para atribuir a carteira antes de pedir a visita.")
+
+    ultima = conn.execute(
+        "SELECT MAX(date(occurred_at)) u FROM visits"
+        " WHERE company_id = ? AND client_key = ? AND status = 'REALIZADA'",
+        (company_id, chave)).fetchone()
+    if ultima and ultima["u"]:
+        d = parse_datetime_flexible(ultima["u"])
+        if d:
+            dias = (today_in_brazil() - d.date()).days
+            if dias < VISIT_COOLDOWN_DAYS:
+                falta = VISIT_COOLDOWN_DAYS - dias
+                return ("EM_STANDBY",
+                        f"Este cliente foi visitado há {dias} dia(s). "
+                        f"Fica em standby por {VISIT_COOLDOWN_DAYS} dias — "
+                        f"pode ser pedido de novo em {falta} dia(s). "
+                        "Se precisar antes, fale com o gerente.")
+    return ("", "")
+
+
 def visit_request_eligibility(
     conn: sqlite3.Connection, company_id: int, client_key: str
 ) -> dict[str, Any]:
@@ -9000,6 +9087,15 @@ def create_visit_request(
         raise ValueError("Cliente inválido.")
     if not reason:
         raise ValueError("Diga por que a visita é necessária — é o que o gerente lê para decidir.")
+
+    # Travas que independem de ligação: bloqueio do gestor, cliente sem dono e
+    # standby pós-visita. Vêm ANTES da checagem de ligação porque nenhuma
+    # ligação a mais as resolve — mandar o vendedor ligar para depois descobrir
+    # que o cliente está bloqueado é desperdiçar o trabalho dele.
+    motivo_bloqueio, mensagem_bloqueio = visit_request_block(
+        conn, company_id, client_key)
+    if motivo_bloqueio:
+        raise ValueError(mensagem_bloqueio)
 
     # Condição do módulo: só pede visita quem já tentou por telefone. A checagem
     # é no servidor porque a tela pode ser contornada, e essa regra é o que
@@ -9700,6 +9796,9 @@ def client_contact_effect(
         (company_id, client_key),
     ).fetchone()
 
+    bloqueio_motivo, bloqueio_mensagem = visit_request_block(
+        conn, company_id, client_key)
+
     return {
         "visits": visitas,
         "callsTotal": int(ligacoes["total"] or 0),
@@ -9711,7 +9810,16 @@ def client_contact_effect(
         } if pedido else None,
         "eligibleForVisit": int(ligacoes["recentes"] or 0) > 0,
         "callWindowDays": VISIT_CALL_WINDOW_DAYS,
-        "canRequestVisit": (int(ligacoes["recentes"] or 0) > 0 and pedido is None),
+        # MESMA FONTE DA TRAVA E DA EXPLICAÇÃO.
+        #
+        # A recusa fica no servidor, em create_visit_request. Aqui devolvemos
+        # o MESMO motivo para a tela avisar ANTES: sem isso o vendedor escreve
+        # a justificativa, clica, e só então descobre que o cliente está
+        # bloqueado — trabalho jogado fora, e ele aprende a não confiar na tela.
+        "blockReason": bloqueio_motivo,
+        "blockMessage": bloqueio_mensagem,
+        "canRequestVisit": (int(ligacoes["recentes"] or 0) > 0
+                            and pedido is None and not bloqueio_motivo),
     }
 
 
@@ -27630,6 +27738,299 @@ def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, d
     return 404, {"error": "Rota não encontrada."}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# MEC 2.0 — piloto (primeiro bloco)
+#
+# Tudo aqui vale só para quem está no piloto: as mesmas unidades liberadas para
+# a tela Cotações (FEATURE_GATES). Nada muda no Meu Placar nem na premiação.
+#  - Números do dia do vendedor: contatos ativos concluídos x meta, tentativas
+#    ("Não atendeu"/"Pediu retorno" contam como tentativa, à parte) e cotações.
+#  - Ações do MEC: primeira compra, sem limite de crédito, conferir Diferenciado.
+#  - Placar de ontem da unidade para a largada das 8h30 (gerente/diretoria).
+#  - Pedidos de Diferenciado para a diretoria aprovar.
+# ─────────────────────────────────────────────────────────────────────────────
+MEC_META_CONTATOS_DIA = 3   # fase 1 do piloto; na fase 2 passa a 4 (~80/mês)
+MEC_LINK_SEFAZ = "https://www.sefaz.rs.gov.br/"
+MEC_LINK_RECEITA = "https://solucoes.receita.fazenda.gov.br/servicos/cnpjreva/cnpjreva_solicitacao.asp"
+DIFERENCIADO_CNAES = [
+    ("4530-7/01", "Comércio por atacado de peças e acessórios novos para veículos automotores"),
+    ("4530-7/03", "Comércio a varejo de peças e acessórios novos para veículos automotores"),
+    ("4530-7/04", "Comércio a varejo de peças e acessórios usados para veículos automotores"),
+]
+MEC_RESULTADOS_TENTATIVA = ("NAO_ATENDEU", "PEDIU_RETORNO")
+
+
+def _mec_dia_util_anterior(d: date) -> date:
+    n = d - timedelta(days=1)
+    while n.weekday() >= 5:
+        n -= timedelta(days=1)
+    return n
+
+
+def _mec_so_digitos(valor: Any) -> str:
+    return re.sub(r"\D", "", str(valor or ""))
+
+
+def _mec_carteira(conn: sqlite3.Connection, cid: int, vendedor: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT p.client_code, p.client_name, p.trade_name, p.document_number, p.city_name,
+               p.phone, p.updated_phone, p.first_sale_at, p.last_sale_at, p.credit_limit,
+               d.status AS dif_status, d.checked_at AS dif_checked_at
+        FROM crm_client_profiles p
+        LEFT JOIN client_diferenciado d ON d.company_id = p.company_id AND d.client_code = p.client_code
+        WHERE p.company_id = ? AND sem_acento(COALESCE(p.internal_seller_name, '')) = sem_acento(?)
+        """, (cid, vendedor)).fetchall()
+
+
+def _mec_ja_feito(conn: sqlite3.Connection, cid: int, tipo: str, desde: str | None = None) -> set[str]:
+    sql = "SELECT DISTINCT client_code FROM mec_checks WHERE company_id = ? AND kind = ?"
+    args: list[Any] = [cid, tipo]
+    if desde:
+        sql += " AND date(created_at) >= date(?)"
+        args.append(desde)
+    return {r["client_code"] for r in conn.execute(sql, args).fetchall()}
+
+
+def mec_numeros_do_dia(conn: sqlite3.Connection, cid: int, vendedor: str) -> dict[str, Any]:
+    hoje = today_in_brazil().isoformat()
+    r = conn.execute(
+        f"""
+        SELECT SUM(CASE WHEN result_code NOT IN ({','.join('?' * len(MEC_RESULTADOS_TENTATIVA))}) THEN 1 ELSE 0 END) AS ativos,
+               SUM(CASE WHEN result_code IN ({','.join('?' * len(MEC_RESULTADOS_TENTATIVA))}) THEN 1 ELSE 0 END) AS tentativas
+        FROM crm_interactions
+        WHERE company_id = ? AND seller_name = ? AND initiative = 'ATIVO' AND substr(occurred_at, 1, 10) = ?
+        """, (*MEC_RESULTADOS_TENTATIVA, *MEC_RESULTADOS_TENTATIVA, cid, vendedor, hoje)).fetchone()
+    q = conn.execute(
+        """
+        SELECT SUM(CASE WHEN substr(quoted_at, 1, 10) = ? THEN 1 ELSE 0 END) AS hoje,
+               SUM(CASE WHEN substr(quoted_at, 1, 10) = ? AND status IN ('FECHOU', 'NAO_FECHOU') THEN 1 ELSE 0 END) AS desfecho,
+               SUM(CASE WHEN substr(quoted_at, 1, 10) < ? AND status IN ('ABERTA', 'DECIDINDO') THEN 1 ELSE 0 END) AS pendentes
+        FROM crm_quotes WHERE company_id = ? AND seller_name = ?
+        """, (hoje, hoje, hoje, cid, vendedor)).fetchone()
+    return {
+        "activeDone": int(r["ativos"] or 0), "attempts": int(r["tentativas"] or 0),
+        "goal": MEC_META_CONTATOS_DIA,
+        "quotesToday": int(q["hoje"] or 0), "quotesDecided": int(q["desfecho"] or 0),
+        "quotesPendingOld": int(q["pendentes"] or 0),
+    }
+
+
+def mec_acoes_do_dia(conn: sqlite3.Connection, cid: int, vendedor: str) -> dict[str, Any]:
+    hoje_d = today_in_brazil()
+    hoje = hoje_d.isoformat()
+    carteira = _mec_carteira(conn, cid, vendedor)
+    feitos_pc = _mec_ja_feito(conn, cid, "PRIMEIRA_COMPRA")
+    feitos_sl = _mec_ja_feito(conn, cid, "SEM_LIMITE", (hoje_d - timedelta(days=60)).isoformat())
+    um_ano = (hoje_d - timedelta(days=365)).isoformat()
+
+    def item(r: sqlite3.Row, motivo: str) -> dict[str, Any]:
+        return {"clientKey": r["client_code"], "clientName": r["client_name"],
+                "city": r["city_name"] or "", "phone": r["updated_phone"] or r["phone"] or "",
+                "document": r["document_number"] or "", "reason": motivo,
+                "firstSaleAt": (r["first_sale_at"] or "")[:10], "lastSaleAt": (r["last_sale_at"] or "")[:10]}
+
+    primeira, sem_limite, diferenciado = [], [], []
+    for r in carteira:
+        primeira_venda = (r["first_sale_at"] or "")[:10]
+        ultima = (r["last_sale_at"] or "")[:10]
+        pj = len(_mec_so_digitos(r["document_number"])) == 14
+        # 1. Primeira compra entre 2 e 10 dias atrás: ligar para saber como foi
+        if primeira_venda and r["client_code"] not in feitos_pc:
+            dias = (hoje_d - date.fromisoformat(primeira_venda)).days
+            if 2 <= dias <= 10:
+                primeira.append(item(r, f"Primeira compra em {primeira_venda[8:10]}/{primeira_venda[5:7]} — ligue para saber como foi"))
+        # 2. PJ ativo (comprou em 120 dias) sem limite de crédito
+        if pj and float(r["credit_limit"] or 0) <= 0 and ultima and r["client_code"] not in feitos_sl:
+            if (hoje_d - date.fromisoformat(ultima)).days <= 120:
+                sem_limite.append(item(r, "Sem limite de crédito — ficha cadastral + CNH do sócio, ou PIX/cartão"))
+        # 3. Conferir Diferenciado: PJ novo (60 dias) ou parado (30+ dias sem compra)
+        if not pj or r["dif_status"] in ("ATIVO", "SOLICITADO"):
+            continue
+        if r["dif_status"] == "NAO_ELEGIVEL" and (r["dif_checked_at"] or "")[:10] >= um_ano:
+            continue
+        novo = bool(primeira_venda) and (hoje_d - date.fromisoformat(primeira_venda)).days <= 60
+        parado = bool(ultima) and 30 <= (hoje_d - date.fromisoformat(ultima)).days <= 540
+        if novo or parado:
+            diferenciado.append(item(r, "Cliente novo" if novo else f"Sem compra desde {ultima[8:10]}/{ultima[5:7]}/{ultima[:4]}"))
+
+    primeira.sort(key=lambda x: x["firstSaleAt"])
+    sem_limite.sort(key=lambda x: x["lastSaleAt"], reverse=True)
+    diferenciado.sort(key=lambda x: (x["reason"] != "Cliente novo", -int((x["lastSaleAt"] or "0000-00-00").replace("-", ""))))
+    return {
+        "firstPurchase": primeira[:10], "firstPurchaseTotal": len(primeira),
+        "noCredit": sem_limite[:10], "noCreditTotal": len(sem_limite),
+        "diferenciado": diferenciado[:10], "diferenciadoTotal": len(diferenciado),
+        "links": {"sefaz": MEC_LINK_SEFAZ, "receita": MEC_LINK_RECEITA},
+        "cnaes": [{"code": c, "label": l} for c, l in DIFERENCIADO_CNAES],
+        "today": hoje,
+    }
+
+
+def mec_placar_ontem(conn: sqlite3.Connection, cid: int, ctx: dict[str, Any]) -> dict[str, Any]:
+    ontem = _mec_dia_util_anterior(today_in_brazil()).isoformat()
+    filtro_i, args_i, filtro_q, args_q = "", [], "", []
+    if ctx["unidades"] is not None:
+        marcas = ",".join("?" * len(ctx["unidades"])) or "''"
+        filtro_i = f" AND unit_name IN ({marcas})"
+        filtro_q = f" AND unit_name IN ({marcas})"
+        args_i = list(ctx["unidades"])
+        args_q = list(ctx["unidades"])
+    linhas: dict[str, dict[str, Any]] = {}
+
+    def linha(nome: str) -> dict[str, Any]:
+        return linhas.setdefault(nome, {"sellerName": nome, "activeDone": 0, "attempts": 0,
+                                        "quotes": 0, "decided": 0, "closed": 0})
+    for r in conn.execute(
+            f"""
+            SELECT seller_name,
+                   SUM(CASE WHEN result_code NOT IN ('NAO_ATENDEU', 'PEDIU_RETORNO') THEN 1 ELSE 0 END) AS ativos,
+                   SUM(CASE WHEN result_code IN ('NAO_ATENDEU', 'PEDIU_RETORNO') THEN 1 ELSE 0 END) AS tentativas
+            FROM crm_interactions
+            WHERE company_id = ? AND initiative = 'ATIVO' AND substr(occurred_at, 1, 10) = ? {filtro_i}
+            GROUP BY seller_name
+            """, [cid, ontem, *args_i]).fetchall():
+        l_ = linha(r["seller_name"])
+        l_["activeDone"], l_["attempts"] = int(r["ativos"] or 0), int(r["tentativas"] or 0)
+    for r in conn.execute(
+            f"""
+            SELECT seller_name, COUNT(*) AS total,
+                   SUM(CASE WHEN status IN ('FECHOU', 'NAO_FECHOU') THEN 1 ELSE 0 END) AS desfecho,
+                   SUM(CASE WHEN status = 'FECHOU' THEN 1 ELSE 0 END) AS fechou
+            FROM crm_quotes
+            WHERE company_id = ? AND substr(quoted_at, 1, 10) = ? {filtro_q}
+            GROUP BY seller_name
+            """, [cid, ontem, *args_q]).fetchall():
+        l_ = linha(r["seller_name"])
+        l_["quotes"], l_["decided"], l_["closed"] = int(r["total"] or 0), int(r["desfecho"] or 0), int(r["fechou"] or 0)
+    lista = sorted(linhas.values(), key=lambda x: (-x["activeDone"], -x["quotes"], x["sellerName"]))
+    destaque = lista[0]["sellerName"] if lista and lista[0]["activeDone"] > 0 else ""
+    return {"day": ontem, "rows": lista, "highlight": destaque, "goal": MEC_META_CONTATOS_DIA,
+            "totals": {k: sum(x[k] for x in lista) for k in ("activeDone", "attempts", "quotes", "decided", "closed")}}
+
+
+def mec_pedidos_diferenciado(conn: sqlite3.Connection, cid: int) -> list[dict[str, Any]]:
+    return [{
+        "clientKey": r["client_code"], "clientName": r["client_name"] or r["client_code"],
+        "document": r["document_number"] or "", "seller": r["internal_seller_name"] or "",
+        "reason": r["reason"] or "", "requestedAt": (r["checked_at"] or "")[:16].replace("T", " "),
+    } for r in conn.execute(
+        """
+        SELECT d.client_code, d.reason, d.checked_at, p.client_name, p.document_number, p.internal_seller_name
+        FROM client_diferenciado d
+        LEFT JOIN crm_client_profiles p ON p.company_id = d.company_id AND p.client_code = d.client_code
+        WHERE d.company_id = ? AND d.status = 'SOLICITADO'
+        ORDER BY d.checked_at
+        """, (cid,)).fetchall()]
+
+
+def mec_painel(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any]) -> dict[str, Any]:
+    cid = user["company_id"]
+    corpo: dict[str, Any] = {"isSeller": ctx["proprio"], "canApprove": ctx["gerencia_usuarios"],
+                             "blocks": [["08:40", "09:20"], ["16:30", "17:10"]]}
+    if ctx["proprio"]:
+        corpo["today"] = mec_numeros_do_dia(conn, cid, ctx["eu"])
+        corpo["actions"] = mec_acoes_do_dia(conn, cid, ctx["eu"])
+    else:
+        corpo["yesterday"] = mec_placar_ontem(conn, cid, ctx)
+    if ctx["gerencia_usuarios"]:
+        corpo["requests"] = mec_pedidos_diferenciado(conn, cid)
+    return corpo
+
+
+def _mec_cliente(conn: sqlite3.Connection, cid: int, chave: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT client_code, client_name, internal_seller_name FROM crm_client_profiles "
+                        "WHERE company_id = ? AND client_code = ?", (cid, chave)).fetchone()
+
+
+def mec_registrar_acao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    cid = user["company_id"]
+    chave = normalize_whitespace(dados.get("clientKey"))
+    tipo = normalize_upper(dados.get("kind") or "")
+    if tipo not in ("PRIMEIRA_COMPRA", "SEM_LIMITE"):
+        return 400, {"error": "Ação inválida."}
+    if not _mec_cliente(conn, cid, chave):
+        return 404, {"error": "Cliente não encontrado."}
+    resultado = normalize_upper(dados.get("result") or "FEITO")[:40]
+    conn.execute(
+        "INSERT INTO mec_checks (company_id, client_code, kind, result, notes, seller_name, created_at, created_by_user_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (cid, chave, tipo, resultado, normalize_whitespace(dados.get("notes")) or None, ctx["eu"], now_iso(), user["id"]))
+    audit_log(conn, cid, user["id"], "acao_mec", "mec_checks", chave, {"tipo": tipo, "resultado": resultado})
+    conn.commit()
+    return 200, {"ok": True}
+
+
+def mec_conferir_diferenciado(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    cid = user["company_id"]
+    chave = normalize_whitespace(dados.get("clientKey"))
+    if not _mec_cliente(conn, cid, chave):
+        return 404, {"error": "Cliente não encontrado."}
+    if dados.get("hasCnae") is None or dados.get("isMei") is None:
+        return 400, {"error": "Responda as duas perguntas: CNAE e MEI."}
+    tem_cnae, mei = bool(dados.get("hasCnae")), bool(dados.get("isMei"))
+    cnae = normalize_whitespace(dados.get("cnae"))
+    if tem_cnae and not mei:
+        status = "SOLICITADO"
+        motivo = f"Elegível: {cnae or 'CNAE de peças'} · não é MEI — conferido por {ctx['eu']}"
+    else:
+        status = "NAO_ELEGIVEL"
+        motivo = "É MEI" if mei else "Sem CNAE 4530-7/01, /03 ou /04"
+    agora = now_iso()
+    conn.execute(
+        """
+        INSERT INTO client_diferenciado (company_id, client_code, status, reason, source, checked_at,
+            checked_by_user_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'CONFERENCIA', ?, ?, ?, ?)
+        ON CONFLICT(company_id, client_code) DO UPDATE SET status = excluded.status, reason = excluded.reason,
+            source = 'CONFERENCIA', checked_at = excluded.checked_at,
+            checked_by_user_id = excluded.checked_by_user_id, updated_at = excluded.updated_at
+        WHERE client_diferenciado.status <> 'ATIVO'
+        """, (cid, chave, status, motivo, agora, user["id"], agora, agora))
+    audit_log(conn, cid, user["id"], "conferir", "client_diferenciado", chave, {"status": status, "motivo": motivo})
+    conn.commit()
+    return 200, {"status": status, "reason": motivo}
+
+
+def mec_decidir_diferenciado(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    if not ctx["gerencia_usuarios"]:
+        return 403, {"error": "Só a diretoria aprova o Diferenciado."}
+    cid = user["company_id"]
+    chave = normalize_whitespace(dados.get("clientKey"))
+    aprovar = bool(dados.get("approve"))
+    agora = now_iso()
+    cur = conn.execute(
+        "UPDATE client_diferenciado SET status = ?, reason = ?, updated_at = ?, checked_by_user_id = ? "
+        "WHERE company_id = ? AND client_code = ? AND status = 'SOLICITADO'",
+        ("ATIVO" if aprovar else "NAO_ELEGIVEL",
+         "Aprovado pela diretoria" if aprovar else "Recusado pela diretoria",
+         agora, user["id"], cid, chave))
+    if not cur.rowcount:
+        return 404, {"error": "Pedido não encontrado (já decidido?)."}
+    audit_log(conn, cid, user["id"], "aprovar" if aprovar else "recusar", "client_diferenciado", chave, {})
+    conn.commit()
+    return 200, {"ok": True}
+
+
+def rota_mec(conn: sqlite3.Connection, user: Any, metodo: str, path: str, dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    ctx = _cotacao_contexto(conn, user)   # piloto = unidades liberadas para Cotações
+    if ctx is None:
+        return 403, {"error": "O piloto do MEC 2.0 ainda não foi liberado para a sua unidade."}
+    try:
+        if metodo == "GET" and path == "/api/crm/mec/painel":
+            return 200, mec_painel(conn, user, ctx)
+        if metodo == "POST" and path == "/api/crm/mec/acao":
+            return mec_registrar_acao(conn, user, ctx, dados)
+        if metodo == "POST" and path == "/api/crm/mec/diferenciado":
+            return mec_conferir_diferenciado(conn, user, ctx, dados)
+        if metodo == "POST" and path == "/api/crm/mec/diferenciado/decidir":
+            return mec_decidir_diferenciado(conn, user, ctx, dados)
+    except sqlite3.Error as erro:
+        print(f"[mec] {erro}", flush=True)
+        return 500, {"error": "Não consegui gravar. Tente de novo."}
+    return 404, {"error": "Rota não encontrada."}
+
+
 class AppHandler(BaseHTTPRequestHandler):
     # Prazo por operação de socket. Sem ele, uma conexão que para no meio —
     # celular que perdeu sinal enquanto subia o comprovante, aba fechada durante
@@ -28566,6 +28967,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     data = crm_summary_for_user(conn, user["company_id"], user, filters)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
+                return
+            if path.startswith("/api/crm/mec/"):
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    codigo, corpo = rota_mec(conn, user, "GET", path, {})
+                self._set_headers(codigo)
+                self.wfile.write(json_dumps(corpo))
                 return
             if path.startswith("/api/crm/quotes"):
                 user = self._require_auth()
@@ -29641,6 +30051,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 headers = {"Set-Cookie": f"{SESSION_COOKIE}=deleted; HttpOnly; Path=/; Max-Age=0; SameSite=Lax"}
                 self._set_headers(200, extra_headers=headers)
                 self.wfile.write(json_dumps({"ok": True}))
+                return
+            if path.startswith("/api/crm/mec/"):
+                user = self._require_auth()
+                if not user:
+                    return
+                payload = self._read_json()
+                with closing(get_connection()) as conn:
+                    codigo, corpo = rota_mec(conn, user, "POST", path, payload)
+                self._set_headers(codigo)
+                self.wfile.write(json_dumps(corpo))
                 return
             if path.startswith("/api/crm/quotes"):
                 user = self._require_auth()

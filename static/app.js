@@ -6309,6 +6309,7 @@ async function refreshCurrentTab() {
   }
   if (tab === "crm-agenda") {
     promises.push(loadTeamActivity(), loadCrmData());
+    if (mecNoPiloto()) promises.push(mecLoad());
   }
   if (tab === "crm-clientes") {
     // O resumo e as coberturas valem para os dois perfis: o vendedor vê os
@@ -8424,6 +8425,7 @@ function crmAgendaView() {
     return `
       <div class="stack">
         ${faixaGestaoOlhou()}
+        ${mecPainelVendedorHtml()}
         <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;border:none;padding:20px 24px">
           <div class="eyebrow" style="color:#f4c25f;font-weight:800;margin-bottom:8px">🎯 MISSÃO DO DIA</div>
           <h3 style="color:#fff;margin:0 0 4px">${firstName(state.user?.fullName || state.user?.username)}, aqui está sua fila de hoje.</h3>
@@ -8537,6 +8539,7 @@ function crmAgendaView() {
 
   return `
     <div class="stack">
+      ${mecPainelGestorHtml()}
 
       <!-- Cabeçalho estratégico compacto -->
       <div class="panel" style="background:linear-gradient(135deg,#0f3044,#1a5276);color:#fff;border:none;padding:14px 20px">
@@ -9792,6 +9795,7 @@ function clientActionPanel(client) {
           <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:4px">PERGUNTA PARA ABRIR A CONVERSA</div>
           <div style="font-style:italic;font-size:13px">"${escapeHtml(client.questionPrimary)}"</div>
         </div>` : ""}
+      ${mecTresPerguntasHtml()}
 
       ${scripts.length ? `
         <div>
@@ -11295,12 +11299,31 @@ function clientVisitBlock(clientKey) {
           ${!podeGerir && d.canRequestVisit ? `
             <button class="btn btn-primary btn-sm"
               onclick="abrirPedidoVisita('${jsAttr(clientKey)}','${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}')">🙋 Pedir visita</button>` : ""}
+          ${/* O botão desabilitado precisa dizer POR QUE. Antes ele acusava
+                sempre falta de ligação, mesmo quando o motivo era outro —
+                bloqueio da gestão ou standby pós-visita. O vendedor ligava de
+                novo, continuava bloqueado, e concluía que a tela estava
+                quebrada. */""}
           ${!podeGerir && !d.canRequestVisit && !d.pendingRequest ? `
             <button class="btn btn-ghost btn-sm" disabled
-              title="Registre uma ligação para este cliente antes de pedir a visita">🙋 Pedir visita</button>` : ""}
+              title="${escapeHtml(d.blockMessage
+                || "Registre uma ligação para este cliente antes de pedir a visita")}"
+              >🙋 Pedir visita</button>` : ""}
           ${podeGerir ? `
             <button class="btn btn-secondary btn-sm"
               onclick='novaVisita({clientKey:"${jsAttr(clientKey)}",clientName:"${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}"})'>Registrar visita</button>` : ""}
+          ${/* Bloquear/liberar pela FICHA, não só pela tela de roteiro: é na
+                ficha que o gerente está quando decide que não vale ir — e
+                obrigá-lo a procurar o cliente noutra tela faz a decisão se
+                perder. */""}
+          ${podeGerir && d.blockReason === "BLOQUEADO" ? `
+            <button class="btn btn-ghost btn-sm"
+              onclick="devolverAoAutomatico('${jsAttr(clientKey)}').then(()=>loadClientVisitHistory('${jsAttr(clientKey)}'))"
+              title="Volta a valer a régua automática">🔓 Liberar sugestão</button>` : ""}
+          ${podeGerir && d.blockReason !== "BLOQUEADO" ? `
+            <button class="btn btn-ghost btn-sm"
+              onclick="tirarDoRoteiro('${jsAttr(clientKey)}','${jsAttr(state.crm.selectedClient?.summary?.clientName || "")}').then(()=>loadClientVisitHistory('${jsAttr(clientKey)}'))"
+              title="Deixa de sugerir e impede o vendedor de pedir visita">⛔ Bloquear sugestão</button>` : ""}
         </div>
       </div>
 
@@ -11310,7 +11333,13 @@ function clientVisitBlock(clientKey) {
           ${escapeHtml(d.pendingRequest.reason)}
         </div>` : ""}
 
-      ${!d.eligibleForVisit && !d.pendingRequest ? `
+      ${d.blockMessage ? `
+        <div class="message" style="background:#f1f3f4;color:#5f6368;font-size:12px;margin-top:8px">
+          ${d.blockReason === "BLOQUEADO" ? "⛔" : d.blockReason === "SEM_VENDEDOR" ? "👤" : "⏳"}
+          ${escapeHtml(d.blockMessage)}
+        </div>` : ""}
+
+      ${!d.blockMessage && !d.eligibleForVisit && !d.pendingRequest ? `
         <div class="message" style="background:#fff3e0;color:#e65100;font-size:12px;margin-top:8px">
           Sem ligação registrada nos últimos ${d.callWindowDays} dias. Ligue e registre o contato —
           só então dá para pedir visita ou o cliente entrar no roteiro do gerente. O telefone vem antes.
@@ -12491,10 +12520,15 @@ async function ajustarRoteiro(clientKey, action, reason) {
 }
 
 async function tirarDoRoteiro(clientKey, nome) {
+  // O texto mudou junto com a regra. Antes isto só tirava da sugestão; agora
+  // também IMPEDE o vendedor de pedir visita para este cliente. Prometer
+  // menos do que a ação faz é tão ruim quanto prometer mais: o gestor
+  // bloquearia sem saber que está travando a equipe.
   const motivo = window.prompt(
-    `Tirar "${nome}" do roteiro sugerido.\n\n`
-    + `Ele não volta a ser sugerido até você desfazer. Por quê?\n`
-    + `(oficina fechada, visita já marcada, não vale o deslocamento)`);
+    `Bloquear "${nome}" no roteiro.\n\n`
+    + `Ele deixa de ser sugerido E o vendedor não consegue mais pedir visita\n`
+    + `para ele. Só você ou a diretoria libera de novo.\n\n`
+    + `Por quê? (oficina fechada, visita já marcada, não vale o deslocamento)`);
   if (motivo === null) return;
   await ajustarRoteiro(clientKey, "FORA", motivo);
 }
@@ -22424,7 +22458,7 @@ function cotLinhaAberta(q) {
   const ocupado = s.salvando[`q-${q.id}`] ? "disabled" : "";
   const det = s.det[q.id] || {};
   const extra = [
-    escapeHtml(q.clientKey), cotCanal(q.channel), cotQuando(q),
+    escapeHtml(q.clientKey), cotCanal(q.channel), cotQuando(q), cotTempoHtml(q),
     q.status === "DECIDINDO" ? "<em>decidindo · retorno marcado</em>" : "",
     s.data.isSeller ? "" : escapeHtml(q.sellerName),
   ].filter(Boolean).join(" · ");
@@ -22600,3 +22634,346 @@ function difBadge(item) {
   if (!allowedTabsForUser(state.user).includes("crm-cotacoes")) return "";
   return `<span class="dif-badge" title="Cliente no perfil DIFERENCIADO — tabela com até 34%">Diferenciado</span>`;
 }
+
+// ─── MEC 2.0 — piloto (primeiro bloco) ───────────────────────────────────────
+//
+// Só para quem está no piloto (unidade liberada na tela Cotações). Na Missão
+// do Dia: o vendedor vê o bloco ativo, os 2 números do dia e as Ações do MEC;
+// o gerente vê o placar de ontem para a largada das 8h30; a diretoria aprova
+// os pedidos de Diferenciado. Ao agir, só o painel #mec-painel é redesenhado.
+
+function mecNoPiloto() {
+  return Boolean(state.user) && allowedTabsForUser(state.user).includes("crm-cotacoes");
+}
+
+function mecState() {
+  if (!state.mec) state.mec = { data: null, carregando: false, conf: {}, aberto: {}, salvando: {} };
+  return state.mec;
+}
+
+async function mecLoad(repintar = false) {
+  if (!mecNoPiloto()) return;
+  const m = mecState();
+  if (m.carregando) return;
+  m.carregando = true;
+  try {
+    m.data = await api("/api/crm/mec/painel");
+    m.erro = "";
+  } catch (e) {
+    m.erro = e.message;
+  } finally {
+    m.carregando = false;
+  }
+  if (repintar) mecRepintar(); else requestRender();
+}
+
+function mecRepintar() {
+  const el = document.getElementById("mec-painel");
+  if (!el) return;
+  el.outerHTML = roleIsSeller() ? mecPainelVendedorHtml() : mecPainelGestorHtml();
+}
+
+function mecHora(s) { return s.replace(":", "h"); }
+
+function mecBlocoHtml() {
+  const blocos = mecState().data?.blocks || [["08:40", "09:20"], ["16:30", "17:10"]];
+  const agora = new Date();
+  if (agora.getDay() === 0 || agora.getDay() === 6) return `<div id="mec-bloco"></div>`;
+  const hm = agora.getHours() * 60 + agora.getMinutes();
+  const min = (s) => { const [h, m] = s.split(":").map(Number); return h * 60 + m; };
+  const atual = blocos.find(([i, f]) => hm >= min(i) && hm < min(f));
+  if (atual) {
+    return `<div id="mec-bloco" class="mec-bloco on">📞 <b>Bloco ativo agora, até ${mecHora(atual[1])}</b>
+      — 4 contatos da fila + 1 prospecção. Cliente ligou? Atenda e volte para a fila.</div>`;
+  }
+  const prox = blocos.find(([i]) => hm < min(i));
+  return `<div id="mec-bloco" class="mec-bloco">${prox
+    ? `Próximo bloco ativo: <b>${mecHora(prox[0])} às ${mecHora(prox[1])}</b>`
+    : "Blocos ativos de hoje encerrados. Amanhã: 8h40 e 16h30."}</div>`;
+}
+
+// O aviso do bloco muda sozinho na virada do horário, sem redesenhar a tela
+setInterval(() => {
+  const el = document.getElementById("mec-bloco");
+  if (el) el.outerHTML = mecBlocoHtml();
+}, 60000);
+
+function mecCopiar(texto) {
+  const feito = () => mecAviso(`Copiado: ${texto}`);
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(texto).then(feito).catch(() => mecCopiarAntigo(texto, feito));
+  } else {
+    mecCopiarAntigo(texto, feito);
+  }
+}
+
+function mecCopiarAntigo(texto, feito) {
+  // O CRM roda em http na rede interna: a API nova de área de transferência
+  // não funciona fora de https, então usa o método antigo.
+  const campo = document.createElement("textarea");
+  campo.value = texto;
+  campo.style.position = "fixed";
+  campo.style.opacity = "0";
+  document.body.appendChild(campo);
+  campo.select();
+  try { document.execCommand("copy"); feito(); } catch (e) { mecAviso("Não consegui copiar. Selecione o número e copie à mão.", true); }
+  document.body.removeChild(campo);
+}
+
+let mecAvisoTimer = null;
+function mecAviso(texto, erro = false) {
+  const el = document.getElementById("mec-aviso");
+  if (!el) return;
+  el.textContent = texto;
+  el.className = `cot-aviso ${erro ? "erro" : "ok"}`;
+  clearTimeout(mecAvisoTimer);
+  mecAvisoTimer = setTimeout(() => { el.textContent = ""; el.className = "cot-aviso"; }, erro ? 6000 : 3000);
+}
+
+async function mecPost(chave, url, body, aviso) {
+  const m = mecState();
+  if (m.salvando[chave]) return;
+  m.salvando[chave] = true;
+  mecRepintar();
+  try {
+    const r = await api(url, { method: "POST", body: JSON.stringify(body) });
+    delete m.conf[body.clientKey];
+    m.data = await api("/api/crm/mec/painel");
+    mecRepintar();
+    mecAviso(typeof aviso === "function" ? aviso(r) : aviso);
+  } catch (e) {
+    mecRepintar();
+    mecAviso(e.message, true);
+  } finally {
+    delete m.salvando[chave];
+  }
+}
+
+function mecAcao(clientKey, kind, result) {
+  const msg = { OK: "Registrado. Cliente bem atendido volta a comprar.",
+                PROBLEMA: "Registrado. Resolva o problema e avise o gerente.",
+                DOCS: "Registrado. Acompanhe a análise com o Crédito.",
+                PIX: "Registrado. Cliente segue com PIX/cartão." }[result] || "Registrado.";
+  mecPost(`a-${kind}-${clientKey}`, "/api/crm/mec/acao", { clientKey, kind, result }, msg);
+}
+
+function mecConfAbrir(clientKey) {
+  const m = mecState();
+  m.conf[clientKey] = m.conf[clientKey] ? null : { hasCnae: null, isMei: null, cnae: "" };
+  mecRepintar();
+}
+
+function mecConfMarcar(clientKey, campo, valor) {
+  const m = mecState();
+  m.conf[clientKey] = { ...(m.conf[clientKey] || {}), [campo]: valor };
+  mecRepintar();
+}
+
+function mecConfSalvar(clientKey) {
+  const c = mecState().conf[clientKey] || {};
+  if (c.hasCnae === null || c.hasCnae === undefined || c.isMei === null || c.isMei === undefined) {
+    mecAviso("Responda as duas perguntas antes de salvar.", true);
+    return;
+  }
+  mecPost(`d-${clientKey}`, "/api/crm/mec/diferenciado",
+          { clientKey, hasCnae: c.hasCnae, isMei: c.isMei, cnae: c.cnae || "" },
+          (r) => r.status === "SOLICITADO"
+            ? "Elegível! Pedido enviado para a diretoria aprovar o Diferenciado."
+            : `Registrado como não elegível (${r.reason}).`);
+}
+
+function mecDecidir(clientKey, approve) {
+  mecPost(`p-${clientKey}`, "/api/crm/mec/diferenciado/decidir", { clientKey, approve },
+          approve ? "Diferenciado aprovado. O selo já aparece na carteira." : "Pedido recusado.");
+}
+
+function mecToggle(grupo) {
+  const m = mecState();
+  m.aberto[grupo] = !m.aberto[grupo];
+  mecRepintar();
+}
+
+function mecArg(t) { return encodeURIComponent(String(t ?? "")).replaceAll("'", "%27"); }
+
+function mecLinhaCliente(it, botoes, extra = "") {
+  return `
+    <div class="mec-item">
+      <div class="cot-cli"><b>${escapeHtml(it.clientName)}</b>
+        <span>${escapeHtml(it.clientKey)}${it.city ? ` · ${escapeHtml(it.city)}` : ""}${it.phone ? ` · ${escapeHtml(it.phone)}` : ""} · ${escapeHtml(it.reason)}</span></div>
+      <div class="cot-botoes">${botoes}</div>
+      ${extra}
+    </div>`;
+}
+
+function mecConferenciaHtml(it, a) {
+  const c = mecState().conf[it.clientKey];
+  if (!c) return "";
+  const k = mecArg(it.clientKey);
+  const sn = (campo, valor, rotulo) => `
+    <button class="btn cot-btn ${c[campo] === valor ? "mec-on" : "btn-ghost"}"
+            onclick="mecConfMarcar(decodeURIComponent('${k}'),'${campo}',${valor})">${rotulo}</button>`;
+  return `
+    <div class="mec-conf">
+      <ol>
+        <li>CNPJ <b>${escapeHtml(it.document || "não cadastrado")}</b>
+          ${it.document ? `<button class="btn btn-ghost btn-sm" onclick="mecCopiar(decodeURIComponent('${mecArg(_mecDig(it.document))}'))">Copiar</button>` : ""}</li>
+        <li><a href="${escapeHtml(a.links.sefaz)}" target="_blank" rel="noopener">SEFAZ RS</a> — Consulta por CNPJ:
+          confira se <b>não é MEI</b> e se aparece um dos CNAEs abaixo.</li>
+        <li><a href="${escapeHtml(a.links.receita)}" target="_blank" rel="noopener">Receita Federal</a> — confira os CNAEs
+          (às vezes o de peças só aparece na Receita).</li>
+      </ol>
+      <div class="mec-cnaes">${a.cnaes.map((x) => `
+        <label><input type="radio" name="cnae-${escapeHtml(it.clientKey)}" ${c.cnae === x.code ? "checked" : ""}
+          onchange="mecConfMarcar(decodeURIComponent('${k}'),'cnae','${x.code}')"> <b>${x.code}</b> ${escapeHtml(x.label)}</label>`).join("")}
+        <span class="text-small">Vale na atividade principal ou nas secundárias.</span></div>
+      <div class="mec-perg"><span>Tem um desses CNAEs (SEFAZ ou Receita)?</span>${sn("hasCnae", true, "Sim")}${sn("hasCnae", false, "Não")}</div>
+      <div class="mec-perg"><span>É MEI (pela SEFAZ RS)?</span>${sn("isMei", true, "Sim")}${sn("isMei", false, "Não")}</div>
+      <button class="btn cot-btn cot-sim" ${mecState().salvando[`d-${it.clientKey}`] ? "disabled" : ""}
+              onclick="mecConfSalvar(decodeURIComponent('${k}'))">Salvar conferência</button>
+    </div>`;
+}
+
+function _mecDig(t) { return String(t || "").replace(/\D/g, ""); }
+
+function mecGrupo(id, titulo, total, itens, linha, dica) {
+  const aberto = mecState().aberto[id];
+  return `
+    <div class="mec-grupo">
+      <button class="mec-grupo-tit" onclick="mecToggle('${id}')">
+        <span>${aberto ? "▾" : "▸"} ${titulo}</span><span class="mec-cont ${total ? "on" : ""}">${total}</span></button>
+      ${aberto ? `
+        <div class="text-small mec-dica">${dica}</div>
+        ${itens.length ? itens.map(linha).join("") : `<div class="cot-vazio">Nada pendente aqui. 👍</div>`}
+        ${total > itens.length ? `<div class="text-small mec-dica">Mostrando ${itens.length} de ${total}. Os próximos aparecem conforme estes forem resolvidos.</div>` : ""}` : ""}
+    </div>`;
+}
+
+function mecPainelVendedorHtml() {
+  if (!mecNoPiloto()) return "";
+  const m = mecState();
+  if (!m.data) {
+    if (!m.carregando && !m.erro) mecLoad();
+    return `<div id="mec-painel" class="panel mec-painel">${m.erro ? escapeHtml(m.erro) : "Carregando MEC do dia…"}</div>`;
+  }
+  const d = m.data;
+  const t = d.today || {};
+  const a = d.actions || { firstPurchase: [], noCredit: [], diferenciado: [], links: {}, cnaes: [] };
+  const pct = Math.min(100, Math.round((t.activeDone / Math.max(1, t.goal)) * 100));
+  const ocup = (k) => (m.salvando[k] ? "disabled" : "");
+  const kk = (it) => mecArg(it.clientKey);
+  return `
+    <div id="mec-painel" class="panel mec-painel">
+      ${mecBlocoHtml()}
+      <div class="mec-numeros">
+        <div class="mec-num">
+          <span>Contatos ativos concluídos hoje</span>
+          <b>${t.activeDone} <small>de ${t.goal}</small></b>
+          <div class="mec-barra"><div style="width:${pct}%"></div></div>
+          <small>${t.attempts} tentativa${t.attempts === 1 ? "" : "s"} (não atendeu / pediu retorno) — mandou o WhatsApp?</small>
+        </div>
+        <div class="mec-num">
+          <span>Cotações de hoje com desfecho</span>
+          <b>${t.quotesDecided} <small>de ${t.quotesToday}</small></b>
+          ${t.quotesPendingOld
+            ? `<small class="mec-alerta" onclick="goToTab('crm-cotacoes')">⚠ ${t.quotesPendingOld} de dias anteriores sem desfecho — resolver agora</small>`
+            : `<small>Toda cotação: venda ou motivo até amanhã.</small>`}
+        </div>
+      </div>
+      <div class="mec-acoes-tit">Ações do MEC para hoje</div>
+      ${mecGrupo("pc", "📦 Primeira compra — ligar para saber como foi", a.firstPurchaseTotal, a.firstPurchase,
+        (it) => mecLinhaCliente(it, `
+          <button class="btn cot-btn cot-sim" ${ocup(`a-PRIMEIRA_COMPRA-${it.clientKey}`)} onclick="mecAcao(decodeURIComponent('${kk(it)}'),'PRIMEIRA_COMPRA','OK')">Liguei, foi bem</button>
+          <button class="btn cot-btn btn-ghost" ${ocup(`a-PRIMEIRA_COMPRA-${it.clientKey}`)} onclick="mecAcao(decodeURIComponent('${kk(it)}'),'PRIMEIRA_COMPRA','PROBLEMA')">Teve problema</button>`),
+        "Cliente novo que comprou há 2 a 10 dias. Pergunte se chegou certo e no prazo — a segunda compra nasce aqui.")}
+      ${mecGrupo("sl", "💳 Sem limite de crédito", a.noCreditTotal, a.noCredit,
+        (it) => mecLinhaCliente(it, `
+          <button class="btn cot-btn btn-ghost" ${ocup(`a-SEM_LIMITE-${it.clientKey}`)} onclick="mecAcao(decodeURIComponent('${kk(it)}'),'SEM_LIMITE','DOCS')">Pedi ficha + CNH</button>
+          <button class="btn cot-btn btn-ghost" ${ocup(`a-SEM_LIMITE-${it.clientKey}`)} onclick="mecAcao(decodeURIComponent('${kk(it)}'),'SEM_LIMITE','PIX')">Segue PIX/cartão</button>`),
+        "Cliente PJ que comprou nos últimos 120 dias e não tem limite. Peça a ficha cadastral assinada e a CNH de um sócio e envie ao Crédito, ou combine PIX/cartão.")}
+      ${mecGrupo("df", "🏷️ Conferir Diferenciado (até 34%)", a.diferenciadoTotal, a.diferenciado,
+        (it) => mecLinhaCliente(it, `
+          <button class="btn cot-btn ${m.conf[it.clientKey] ? "mec-on" : "cot-canal"}" onclick="mecConfAbrir(decodeURIComponent('${kk(it)}'))">${m.conf[it.clientKey] ? "Fechar" : "Conferir"}</button>`,
+          mecConferenciaHtml(it, a)),
+        "Cliente PJ novo ou sem compra há 30 dias ou mais. Direito ao Diferenciado: CNAE 4530-7/01, 4530-7/03 ou 4530-7/04 e não ser MEI.")}
+      <div id="mec-aviso" class="cot-aviso" role="status" aria-live="polite"></div>
+    </div>`;
+}
+
+function mecPainelGestorHtml() {
+  if (!mecNoPiloto()) return "";
+  const m = mecState();
+  if (!m.data) {
+    if (!m.carregando && !m.erro) mecLoad();
+    return `<div id="mec-painel" class="panel mec-painel">${m.erro ? escapeHtml(m.erro) : "Carregando placar de ontem…"}</div>`;
+  }
+  const y = m.data.yesterday || { rows: [], totals: {} };
+  const dia = (y.day || "").split("-").reverse().join("/");
+  const pedidos = m.data.requests || [];
+  const taxa = (r) => (r.quotes ? `${Math.round((100 * r.decided) / r.quotes)}%` : "–");
+  return `
+    <div id="mec-painel" class="panel mec-painel">
+      <div class="mec-acoes-tit">📣 Largada das 8h30 — placar de ${escapeHtml(dia)} (dia útil anterior)</div>
+      ${y.highlight ? `<div class="mec-destaque">⭐ Destaque: <b>${escapeHtml(y.highlight)}</b> — comece a largada pelo caso dele.</div>` : ""}
+      ${y.rows.length ? `
+        <div class="table-wrap"><table class="mec-tabela">
+          <thead><tr><th>Vendedor</th><th>Contatos ativos</th><th>Tentativas</th><th>Cotações</th><th>Com desfecho</th><th>Fechadas</th></tr></thead>
+          <tbody>${y.rows.map((r) => `
+            <tr><td>${escapeHtml(r.sellerName)}</td>
+              <td class="${r.activeDone >= y.goal ? "mec-ok" : "mec-baixo"}">${r.activeDone} / ${y.goal}</td>
+              <td>${r.attempts}</td><td>${r.quotes}</td><td>${taxa(r)}</td><td>${r.closed}</td></tr>`).join("")}
+          </tbody>
+          <tfoot><tr><td>Unidade</td><td>${y.totals.activeDone || 0}</td><td>${y.totals.attempts || 0}</td>
+            <td>${y.totals.quotes || 0}</td><td>${taxa({ quotes: y.totals.quotes, decided: y.totals.decided })}</td><td>${y.totals.closed || 0}</td></tr></tfoot>
+        </table></div>`
+        : `<div class="cot-vazio">Nenhum contato ativo nem cotação registrados no dia útil anterior.</div>`}
+      <div class="text-small mec-dica">Abaixo de ${y.goal} contatos: sentar junto no bloco ativo de hoje. Cotação sem desfecho: cobrar até o fim do dia.</div>
+      ${m.data.canApprove ? `
+        <div class="mec-acoes-tit" style="margin-top:14px">🏷️ Pedidos de Diferenciado <span class="mec-cont ${pedidos.length ? "on" : ""}">${pedidos.length}</span></div>
+        ${pedidos.length ? pedidos.map((p) => `
+          <div class="mec-item">
+            <div class="cot-cli"><b>${escapeHtml(p.clientName)}</b>
+              <span>${escapeHtml(p.clientKey)} · CNPJ ${escapeHtml(p.document)} · ${escapeHtml(p.seller || "sem vendedor")} · ${escapeHtml(p.reason)} · ${escapeHtml(p.requestedAt)}</span></div>
+            <div class="cot-botoes">
+              <button class="btn cot-btn cot-sim" ${m.salvando[`p-${p.clientKey}`] ? "disabled" : ""} onclick="mecDecidir(decodeURIComponent('${mecArg(p.clientKey)}'), true)">Aprovar (já alterado no Alfa)</button>
+              <button class="btn cot-btn btn-ghost" ${m.salvando[`p-${p.clientKey}`] ? "disabled" : ""} onclick="mecDecidir(decodeURIComponent('${mecArg(p.clientKey)}'), false)">Recusar</button>
+            </div>
+          </div>`).join("") : `<div class="cot-vazio">Nenhum pedido aguardando.</div>`}` : ""}
+      <div id="mec-aviso" class="cot-aviso" role="status" aria-live="polite"></div>
+    </div>`;
+}
+
+function mecTresPerguntasHtml() {
+  if (!mecNoPiloto()) return "";
+  return `
+    <div style="margin-bottom:12px" class="mec-3p">
+      <div style="font-size:11px;font-weight:800;color:var(--muted);letter-spacing:0.06em;margin-bottom:4px">AS 3 PERGUNTAS DO MEC</div>
+      <ol>
+        <li>"O que está entrando mais na oficina esta semana?"</li>
+        <li>"Teve alguma peça que você não achou ou comprou em outro lugar?"</li>
+        <li>"Para esse serviço, já tem o disco / fluido / kit / sensor?"</li>
+      </ol>
+    </div>`;
+}
+
+
+/** "aberta há 12 min" — o MEC pede retorno em até 10 minutos. Só para cotação
+ * de hoje ainda sem desfecho; passou de 10 minutos, fica vermelho. */
+function cotTempoHtml(q) {
+  if (q.status !== "ABERTA" || q.pending || !q.quotedAt) return "";
+  const t = q.quotedAt;
+  const inicio = new Date(Number(t.slice(0, 4)), Number(t.slice(5, 7)) - 1, Number(t.slice(8, 10)),
+                          Number(t.slice(11, 13)), Number(t.slice(14, 16)));
+  const min = Math.max(0, Math.floor((Date.now() - inicio.getTime()) / 60000));
+  if (min > 600) return "";
+  const texto = min < 1 ? "agora" : (min < 60 ? `há ${min} min` : `há ${Math.floor(min / 60)}h${String(min % 60).padStart(2, "0")}`);
+  return `<span class="cot-tempo ${min > 10 ? "atrasada" : ""}" title="Retorno em até 10 minutos">${texto}${min > 10 ? " · retorne já" : ""}</span>`;
+}
+
+// Atualiza o contador das cotações abertas a cada minuto, sem mexer em campo
+// que o vendedor esteja usando.
+setInterval(() => {
+  if (state.activeTab !== "crm-cotacoes" || !state.cotacoes?.data) return;
+  const el = document.getElementById("cot-abertas");
+  if (!el || el.contains(document.activeElement)) return;
+  el.innerHTML = cotAbertasHtml();
+}, 60000);
