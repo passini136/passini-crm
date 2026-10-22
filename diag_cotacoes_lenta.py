@@ -113,9 +113,24 @@ sem_udf = conn.execute(
     (cid, *variantes)).fetchone()["n"]
 t_direto = time.time() - t0
 
+marcas3 = ",".join("?" for _ in variantes)
+t0 = time.time()
+com_trim = conn.execute(
+    f"SELECT COUNT(*) n FROM crm_client_profiles p WHERE p.company_id = ?"
+    f"  AND TRIM(COALESCE(p.internal_seller_name, '')) IN ({marcas3})",
+    (cid, *variantes)).fetchone()["n"]
+t_trim = time.time() - t0
+
 print(f"   {'VERSÃO':<34}{'CLIENTES':>10}{'TEMPO':>9}")
-print(f"   {'sem_acento(coluna) IN (...)  [hoje]':<34}{com_udf:>10,}{t_udf:>8.2f}s")
-print(f"   {'coluna IN (...)  [direto]':<34}{sem_udf:>10,}{t_direto:>8.2f}s")
+print(f"   {'sem_acento(coluna) IN (...)':<34}{com_udf:>10,}{t_udf:>8.2f}s")
+print(f"   {'coluna IN (...)':<34}{sem_udf:>10,}{t_direto:>8.2f}s")
+print(f"   {'TRIM(coluna) IN (...)  [adotado]':<34}{com_trim:>10,}{t_trim:>8.2f}s")
+if com_trim != com_udf:
+    print(f"   >> TRIM ACHA {com_trim} E sem_acento ACHA {com_udf}. Trocar perderia")
+    print("      cliente — alguma grafia difere por acento ou caixa, não só por")
+    print("      espaço. A troca NÃO pode ser feita.")
+else:
+    print("   >> TRIM acha os mesmos clientes, e sem a função Python por linha.")
 if com_udf != sem_udf:
     print(f"   >> CONTAGENS DIFERENTES ({com_udf} x {sem_udf}). A comparação direta")
     print("      perde cliente — alguma grafia do cadastro não está na lista de")

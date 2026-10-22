@@ -27437,9 +27437,12 @@ def _cotacao_filtro(
     args: list[Any] = []
 
     def filtrar_por(nome: str) -> None:
+        # TRIM nativo em vez de sem_acento (função Python por linha) — mesma
+        # razão da carteira: 21x mais rápido, e as variantes já são as
+        # grafias que existem nas tabelas.
         nomes = variantes(nome)
         partes.append(
-            f"sem_acento(seller_name) IN ({','.join('sem_acento(?)' for _ in nomes)})")
+            f"TRIM(seller_name) IN ({','.join('?' for _ in nomes)})")
         args.extend(nomes)
 
     if ctx["proprio"]:
@@ -27572,8 +27575,23 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
     # era aqui, nenhum cliente casa — e a tela abre vazia, sem erro e sem
     # aviso. É exatamente o caso que seller_name_variants existe para
     # resolver, e que o resto do CRM já usa.
+    # COMPARAÇÃO DIRETA, SEM sem_acento() NA COLUNA.
+    #
+    # sem_acento é função Python: o SQLite a chama uma vez por LINHA, e são
+    # 102 mil perfis. Medido: 2,32s com a função contra 0,11s sem — 21 vezes.
+    # Era isso que fazia a tela parecer travada a cada clique.
+    #
+    # Tirar não perde ninguém porque as variantes NÃO são um palpite: elas
+    # saem das próprias tabelas (crm_client_profiles.internal_seller_name está
+    # em SELLER_NAME_SOURCES), então toda grafia que existe na coluna está na
+    # lista. O diagnóstico confirmou no dado real: 148 clientes nas duas
+    # versões. O TRIM é nativo e cobre espaço sobrando na ponta.
+    #
+    # Brecha que resta: espaço DUPLO no meio do nome, que normalize_whitespace
+    # colapsa na variante e o TRIM não colapsa na coluna. diag_cotacoes_lenta.py
+    # compara as duas contagens justamente para essa divergência aparecer.
     variantes = seller_name_variants(conn, cid, vendedor) or [vendedor]
-    marcas_var = ",".join("sem_acento(?)" for _ in variantes)
+    marcas_var = ",".join("?" for _ in variantes)
     args_var = list(variantes)
 
     base = f"""
@@ -27583,7 +27601,7 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) >= ?) AS cot30,
                (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) = ?
-                   AND sem_acento(q.seller_name) IN ({marcas_var})) AS cot_hoje,
+                   AND TRIM(q.seller_name) IN ({marcas_var})) AS cot_hoje,
                (SELECT d.status FROM client_diferenciado d WHERE d.company_id = p.company_id
                    AND d.client_code = p.client_code) AS dif
         FROM crm_client_profiles p
@@ -27601,12 +27619,12 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
             condicoes.append("REPLACE(REPLACE(REPLACE(COALESCE(p.document_number, ''), '.', ''), '/', ''), '-', '') LIKE ?")
             args.append(f"%{digitos}%")
         sql = (base + " AND (" + " OR ".join(condicoes) + ")"
-               f" ORDER BY (sem_acento(COALESCE(p.internal_seller_name, ''))"
+               f" ORDER BY (TRIM(COALESCE(p.internal_seller_name, ''))"
                f"           IN ({marcas_var})) DESC,"
                " cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 30")
         args.extend(args_var)
     else:
-        sql = (base + f" AND sem_acento(COALESCE(p.internal_seller_name, ''))"
+        sql = (base + f" AND TRIM(COALESCE(p.internal_seller_name, ''))"
                       f" IN ({marcas_var})"
                " ORDER BY cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 300")
         args.extend(args_var)
