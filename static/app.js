@@ -22347,7 +22347,7 @@ function cotAviso(texto, erro = false) {
   cotAvisoTimer = setTimeout(() => { el.textContent = ""; el.className = "cot-aviso"; }, erro ? 6000 : 3000);
 }
 
-async function cotAcao(chave, url, body, aviso) {
+async function cotAcao(chave, url, body, aviso, depois) {
   const s = cotState();
   if (s.salvando[chave]) return;
   s.salvando[chave] = true;
@@ -22358,6 +22358,7 @@ async function cotAcao(chave, url, body, aviso) {
     s.data = await api(`/api/crm/quotes?${cotQs()}`);
     await cotLoadCarteira(false);
     if (aviso) cotAviso(typeof aviso === "function" ? aviso(resposta) : aviso);
+    if (depois) depois(resposta);
   } catch (e) {
     cotAviso(e.message, true);
   } finally {
@@ -22381,7 +22382,17 @@ function cotCriar(clientKey, channel) {
           { clientKey, channel, seller: s.data?.isSeller ? undefined : (s.seller || undefined) },
           (r) => `Cotação pelo ${nome} registrada.`
             + (r?.ownerNotified ? ` ${r.ownerNotified} recebeu uma tarefa de Apoio (cliente da carteira dele).` : "")
-            + " Agora é dar o retorno em até 10 minutos.");
+            + " Anote a peça abaixo e dê o retorno em até 10 minutos.",
+          // O campo de observação abre SOZINHO na cotação recém-criada, com o
+          // cursor dentro. O vendedor está ao telefone: se tiver que procurar
+          // onde anotar, não anota. Um clique registra; digitar é opcional.
+          (r) => {
+            const id = r?.quote?.id;
+            if (!id) return;
+            cotState().detalhe = id;
+            cotPaint();
+            cotFocar(`cot-p-${id}`);
+          });
 }
 
 function cotDesfecho(id, status) {
@@ -22423,6 +22434,49 @@ function cotDet(id, campo, valor) {
   s.det[id] = { ...(s.det[id] || {}), [campo]: valor };
 }
 
+
+function cotFocar(idCampo) {
+  // cotPaint troca o innerHTML da seção, o que destrói o foco. Por isso o
+  // foco vai DEPOIS da pintura, no próximo frame. Ver [[crm-render-mata-o-foco]].
+  requestAnimationFrame(() => {
+    const el = document.getElementById(idCampo);
+    if (!el) return;
+    el.focus();
+    // Cursor no fim, não selecionando o texto: quem já tem anotação quer
+    // acrescentar, não substituir sem querer na primeira tecla.
+    const n = el.value.length;
+    try { el.setSelectionRange(n, n); } catch { /* input sem seleção */ }
+  });
+}
+
+
+async function cotSalvarNota(id) {
+  // Salva a observação SEM exigir desfecho. O vendedor anota durante a
+  // ligação; obrigar a fechar a cotação para a anotação sobreviver faria ele
+  // fechar no chute só para não perder o que escreveu.
+  const s = cotState();
+  const d = s.det[id] || {};
+  const q = (s.data?.quotes || []).find((x) => x.id === id);
+  if (!q) return;                       // cotação já saiu da tela
+  const texto = String(d.peca ?? q.itemHint ?? "");
+  if (texto.trim() === String(q.itemHint || "").trim()) return;  // nada mudou
+  const chave = `n-${id}`;
+  if (s.salvando[chave]) return;
+  s.salvando[chave] = true;
+  try {
+    const r = await api("/api/crm/quotes/note", {
+      method: "POST",
+      body: JSON.stringify({ id, itemHint: texto }),
+    });
+    if (q && r?.quote) q.itemHint = r.quote.itemHint;
+    cotAviso("Anotação salva.");
+  } catch (e) {
+    cotAviso(e.message, true);
+  } finally {
+    delete s.salvando[chave];
+  }
+}
+
 function cotArg(texto) {
   return encodeURIComponent(String(texto ?? "")).replaceAll("'", "%27");
 }
@@ -22461,6 +22515,9 @@ function cotLinhaAberta(q) {
     escapeHtml(q.clientKey), cotCanal(q.channel), cotQuando(q), cotTempoHtml(q),
     q.status === "DECIDINDO" ? "<em>decidindo · retorno marcado</em>" : "",
     s.data.isSeller ? "" : escapeHtml(q.sellerName),
+    // A peça anotada aparece na própria linha, sem precisar abrir detalhes:
+    // é o que o vendedor procura quando volta à lista depois da ligação.
+    q.itemHint ? `🔧 ${escapeHtml(q.itemHint)}` : "",
   ].filter(Boolean).join(" · ");
   const botoes = s.abrindoMotivo === q.id
     ? `<span class="cot-pergunta">Por que não fechou?</span>
@@ -22479,9 +22536,13 @@ function cotLinhaAberta(q) {
           <label>Valor aproximado (opcional)
             <input id="cot-v-${q.id}" inputmode="decimal" placeholder="Ex.: 850,00"
                    value="${escapeHtml(det.valor ?? (q.approxValue ?? ""))}" oninput="cotDet(${q.id},'valor',this.value)"></label>
-          <label>Peça ou código (opcional)
-            <input id="cot-p-${q.id}" placeholder="Ex.: pastilha dianteira Gol"
-                   value="${escapeHtml(det.peca ?? q.itemHint)}" oninput="cotDet(${q.id},'peca',this.value)"></label>
+          <label>O que o cliente pediu ${q.itemHint ? "✔" : "(opcional)"}
+            <input id="cot-p-${q.id}"
+                   placeholder="Código da peça, marca pedida, o que faltou…"
+                   value="${escapeHtml(det.peca ?? q.itemHint)}"
+                   oninput="cotDet(${q.id},'peca',this.value)"
+                   onblur="cotSalvarNota(${q.id})"
+                   onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"></label>
         </div>` : ""}
     </div>`;
 }
@@ -22532,7 +22593,11 @@ function cotEncerradasHtml() {
   return lista.map((q) => `
     <div class="cot-linha">
       <div class="cot-cli"><b>${escapeHtml(q.clientName)}</b>
-        <span>${cotCanal(q.channel)} · ${cotQuando(q)}${s.data.isSeller ? "" : ` · ${escapeHtml(q.sellerName)}`}</span></div>
+        <span>${cotCanal(q.channel)} · ${cotQuando(q)}${s.data.isSeller ? "" : ` · ${escapeHtml(q.sellerName)}`}</span>
+        ${/* A anotação precisa continuar visível depois do desfecho: é ela
+              que diz QUAL peça o cliente pediu, e sem ela a cotação
+              encerrada vira só uma contagem. */""}
+        ${q.itemHint ? `<span class="cot-peca">🔧 ${escapeHtml(q.itemHint)}</span>` : ""}</div>
       <div class="cot-botoes">
         ${q.status === "FECHOU"
           ? `<span class="cot-tag cot-tag-sim">✔ Fechou</span>`

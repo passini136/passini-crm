@@ -27747,12 +27747,16 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
     cur = conn.execute(
         """
         INSERT INTO crm_quotes (company_id, client_key, client_name, seller_name, unit_name,
-            channel, initiative, quoted_at, status, created_at, created_by_user_id)
-        VALUES (?,?,?,?,?,?,?,?, 'ABERTA', ?, ?)
+            channel, initiative, quoted_at, status, item_hint, created_at, created_by_user_id)
+        VALUES (?,?,?,?,?,?,?,?, 'ABERTA', ?, ?, ?)
         """,
         (cid, chave, nome, vendedor, unidade, canal,
          "ATIVO" if payload.get("active") else "RECEPTIVO",
-         _cotacao_agora(), now_iso(), user["id"]))
+         _cotacao_agora(),
+         # A tela abre o campo DEPOIS de registrar, mas quem já digitou antes
+         # não pode perder o que escreveu.
+         normalize_texto_longo(payload.get("itemHint"))[:500] or None,
+         now_iso(), user["id"]))
     novo = int(cur.lastrowid)
     audit_log(conn, cid, user["id"], "criar", "crm_quotes", str(novo), {"cliente": chave, "canal": canal})
 
@@ -27787,6 +27791,41 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
     conn.commit()
     r = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (novo,)).fetchone()
     return 200, {"quote": _cotacao_dict(r, today_in_brazil().isoformat()), "ownerNotified": avisado}
+
+
+def anotar_cotacao(
+    conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Grava a observação da cotação SEM exigir desfecho.
+
+    Antes, o que o vendedor escrevia em "peça/código" só era gravado junto com
+    o desfecho. Quem anotava durante a ligação e não fechava a cotação no mesmo
+    dia perdia a anotação no primeiro recarregamento — e a anotação é
+    justamente o que ele precisa para retomar depois.
+
+    Guarda em `item_hint`, a mesma coluna que o desfecho usa: duas colunas para
+    a mesma informação fariam a tela mostrar uma e o relatório ler outra.
+    """
+    r = _cotacao_carregar(conn, user, ctx, payload.get("id"))
+    if not r:
+        return 404, {"error": "Cotação não encontrada."}
+    # Observação é texto escrito à mão: preserva a quebra de linha, como nos
+    # outros campos livres do CRM. Ver normalize_texto_longo.
+    peca = normalize_texto_longo(payload.get("itemHint"))[:500]
+    campos = ["item_hint = ?"]
+    args: list[Any] = [peca or None]
+    if "approxValue" in payload:
+        try:
+            valor = _cotacao_valor(payload.get("approxValue"))
+        except ValueError:
+            return 400, {"error": "Valor inválido."}
+        campos.append("approx_value = ?")
+        args.append(valor)
+    args.append(r["id"])
+    conn.execute(f"UPDATE crm_quotes SET {', '.join(campos)} WHERE id = ?", args)
+    conn.commit()
+    atual = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
+    return 200, {"quote": _cotacao_dict(atual, today_in_brazil().isoformat())}
 
 
 def desfecho_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -27881,6 +27920,8 @@ def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, d
             return liberacoes_cotacao(conn, user, ctx, metodo, dados)
         if metodo == "POST" and path == "/api/crm/quotes/create":
             return criar_cotacao(conn, user, ctx, dados)
+        if metodo == "POST" and path == "/api/crm/quotes/note":
+            return anotar_cotacao(conn, user, ctx, dados)
         if metodo == "POST" and path == "/api/crm/quotes/status":
             return desfecho_cotacao(conn, user, ctx, dados)
         if metodo == "POST" and path == "/api/crm/quotes/undo":
