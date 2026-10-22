@@ -27373,12 +27373,35 @@ def _cotacao_contexto(conn: sqlite3.Connection, user: Any) -> dict[str, Any] | N
     }
 
 
-def _cotacao_filtro(ctx: dict[str, Any], vendedor: str) -> tuple[str, list[Any]]:
+def _cotacao_filtro(
+    ctx: dict[str, Any], vendedor: str,
+    conn: sqlite3.Connection | None = None, company_id: int | None = None,
+) -> tuple[str, list[Any]]:
+    """Recorte das cotações por escopo e por vendedor.
+
+    O nome do vendedor tem mais de uma grafia na casa — o Alfa escreve
+    "(VENDAS)", o login não escreve nada. Comparar por igualdade devolve lista
+    vazia sem erro. `conn` é opcional só para não quebrar chamador antigo; com
+    ela, a comparação passa a cobrir todas as grafias da mesma pessoa.
+    """
+    def variantes(nome: str) -> list[str]:
+        if conn is not None and company_id is not None:
+            achadas = seller_name_variants(conn, company_id, nome)
+            if achadas:
+                return achadas
+        return [nome]
+
     partes: list[str] = []
     args: list[Any] = []
+
+    def filtrar_por(nome: str) -> None:
+        nomes = variantes(nome)
+        partes.append(
+            f"sem_acento(seller_name) IN ({','.join('sem_acento(?)' for _ in nomes)})")
+        args.extend(nomes)
+
     if ctx["proprio"]:
-        partes.append("seller_name = ?")
-        args.append(ctx["eu"])
+        filtrar_por(ctx["eu"])
     else:
         if ctx["unidades"] is not None:
             if not ctx["unidades"]:
@@ -27387,8 +27410,7 @@ def _cotacao_filtro(ctx: dict[str, Any], vendedor: str) -> tuple[str, list[Any]]
                 partes.append(f"unit_name IN ({','.join('?' * len(ctx['unidades']))})")
                 args.extend(ctx["unidades"])
         if vendedor:
-            partes.append("seller_name = ?")
-            args.append(vendedor)
+            filtrar_por(vendedor)
     return ((" AND " + " AND ".join(partes)) if partes else ""), args
 
 
@@ -27450,7 +27472,7 @@ def listar_cotacoes(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], pa
     hoje = hoje_d.isoformat()
     limite = (hoje_d - timedelta(days=14)).isoformat()
     vendedor = "" if ctx["proprio"] else normalize_whitespace(params.get("seller"))
-    filtro, args = _cotacao_filtro(ctx, vendedor)
+    filtro, args = _cotacao_filtro(ctx, vendedor, conn, user["company_id"])
     if ctx["proprio"] and _cotacao_tarefas_pendentes(conn, cid, ctx["eu"], hoje):
         conn.commit()
         invalidate_crm_cache(cid)
@@ -27481,7 +27503,7 @@ def listar_cotacoes(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], pa
 
     vendedores: list[str] = []
     if not ctx["proprio"]:
-        f_all, a_all = _cotacao_filtro(ctx, "")
+        f_all, a_all = _cotacao_filtro(ctx, "", conn, user["company_id"])
         vendedores = [l["seller_name"] for l in conn.execute(
             f"SELECT DISTINCT seller_name FROM crm_quotes WHERE company_id = ? {f_all} ORDER BY seller_name",
             [cid, *a_all]).fetchall()]
@@ -27501,20 +27523,31 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
     vendedor = ctx["eu"] if ctx["proprio"] else (normalize_whitespace(params.get("seller")) or ctx["eu"])
     hoje = today_in_brazil().isoformat()
     desde = (today_in_brazil() - timedelta(days=30)).isoformat()
-    base = """
+    # TODAS AS GRAFIAS DO VENDEDOR, NÃO SÓ A DO LOGIN.
+    #
+    # O cadastro de clientes guarda "HEIDER JOFFRE FARIAS (VENDAS)"; o login
+    # está vinculado a "HEIDER JOFFRE FARIAS". Comparando por igualdade, como
+    # era aqui, nenhum cliente casa — e a tela abre vazia, sem erro e sem
+    # aviso. É exatamente o caso que seller_name_variants existe para
+    # resolver, e que o resto do CRM já usa.
+    variantes = seller_name_variants(conn, cid, vendedor) or [vendedor]
+    marcas_var = ",".join("sem_acento(?)" for _ in variantes)
+    args_var = list(variantes)
+
+    base = f"""
         SELECT p.client_code, p.client_name, p.trade_name, p.city_name,
                p.internal_seller_name, p.last_sale_at,
                (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) >= ?) AS cot30,
                (SELECT COUNT(*) FROM crm_quotes q WHERE q.company_id = p.company_id
                    AND q.client_key = p.client_code AND substr(q.quoted_at, 1, 10) = ?
-                   AND q.seller_name = ?) AS cot_hoje,
+                   AND sem_acento(q.seller_name) IN ({marcas_var})) AS cot_hoje,
                (SELECT d.status FROM client_diferenciado d WHERE d.company_id = p.company_id
                    AND d.client_code = p.client_code) AS dif
         FROM crm_client_profiles p
         WHERE p.company_id = ?
     """
-    args: list[Any] = [desde, hoje, vendedor, cid]
+    args: list[Any] = [desde, hoje, *args_var, cid]
     if len(busca) >= 2:
         termo = f"%{normalize_upper(strip_accents(busca))}%"
         condicoes = ["sem_acento(p.client_name) LIKE ?",
@@ -27526,21 +27559,26 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
             condicoes.append("REPLACE(REPLACE(REPLACE(COALESCE(p.document_number, ''), '.', ''), '/', ''), '-', '') LIKE ?")
             args.append(f"%{digitos}%")
         sql = (base + " AND (" + " OR ".join(condicoes) + ")"
-               " ORDER BY (sem_acento(COALESCE(p.internal_seller_name, '')) = sem_acento(?)) DESC,"
+               f" ORDER BY (sem_acento(COALESCE(p.internal_seller_name, ''))"
+               f"           IN ({marcas_var})) DESC,"
                " cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 30")
-        args.append(vendedor)
+        args.extend(args_var)
     else:
-        sql = (base + " AND sem_acento(COALESCE(p.internal_seller_name, '')) = sem_acento(?)"
+        sql = (base + f" AND sem_acento(COALESCE(p.internal_seller_name, ''))"
+                      f" IN ({marcas_var})"
                " ORDER BY cot30 DESC, COALESCE(p.last_sale_at, '') DESC LIMIT 300")
-        args.append(vendedor)
-    meu = normalize_upper(strip_accents(vendedor))
+        args.extend(args_var)
+    # "É meu?" pela mesma régua: person_key ignora acento, pontuação e o que
+    # está entre parênteses. Comparar com strip_accents só deixaria o cliente
+    # na lista mas sem a marca de dono — meio-certo é pior que errado.
+    chaves_minhas = {person_key(v) for v in variantes}
     clientes = []
     for r in conn.execute(sql, args).fetchall():
         dono = normalize_whitespace(r["internal_seller_name"])
         clientes.append({
             "clientKey": r["client_code"], "clientName": r["client_name"],
             "tradeName": r["trade_name"] or "", "city": r["city_name"] or "",
-            "owner": dono, "mine": bool(dono) and normalize_upper(strip_accents(dono)) == meu,
+            "owner": dono, "mine": bool(dono) and person_key(dono) in chaves_minhas,
             "quotes30": int(r["cot30"] or 0), "quotesToday": int(r["cot_hoje"] or 0),
             "lastSaleAt": (r["last_sale_at"] or "")[:10],
             "diferenciado": r["dif"] == "ATIVO",
@@ -27553,7 +27591,7 @@ def _cotacao_carregar(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], 
         qid = int(qid)
     except (TypeError, ValueError):
         return None
-    filtro, args = _cotacao_filtro(ctx, "")
+    filtro, args = _cotacao_filtro(ctx, "", conn, user["company_id"])
     return conn.execute(f"SELECT * FROM crm_quotes WHERE company_id = ? AND id = ? {filtro}",
                         [user["company_id"], qid, *args]).fetchone()
 
