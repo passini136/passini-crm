@@ -70,6 +70,8 @@ const state = {
   activityGoalEditor: null,    // metas de atividade
   metas: null,                 // painel de metas por unidade e equipe
   faltas: null,                // solicitações de compra do Radar, por mês
+  operacao: null,              // quantidades do período (atendimentos, PJ/PF, perdas)
+  operacaoFiltros: { dias: 30, seller: "", unit: "" },
   faltasFiltros: { competence: "", status: "", brand: "", type: "",
                    search: "", sort: "pedidos", dir: "desc" },
   metasAberta: "",             // unidade expandida no painel
@@ -109,6 +111,7 @@ const state = {
       admin: false,
       metas: false,
       faltas: false,
+      operacao: false,
       integrityAudit: false,
       filters: false,
       meetings: false,
@@ -13801,6 +13804,11 @@ async function setResultadoAba(aba) {
     await loadFaltas();
     return;
   }
+  if (aba === "operacao") {
+    render();
+    await loadOperacao();
+    return;
+  }
   state.resultados = null;          // força o "Montando o painel…"
   render();
   await loadResultados();
@@ -13837,6 +13845,182 @@ async function loadFaltas(competencia) {
   state.ui.loading.faltas = false;
   requestRender();
   return state.faltas;
+}
+
+
+let operacaoSeq = 0;
+
+async function loadOperacao(ajuste) {
+  const f = Object.assign(state.operacaoFiltros, ajuste || {});
+  const meu = ++operacaoSeq;
+  state.ui.loading.operacao = true;
+  requestRender();
+  let resposta;
+  try {
+    const q = new URLSearchParams({ dias: String(f.dias || 30) });
+    if (f.seller) q.set("seller", f.seller);
+    if (f.unit) q.set("unit", f.unit);
+    resposta = await api(`/api/operacao/painel?${q}`);
+  } catch (e) {
+    resposta = { erro: String(e && e.message ? e.message : e) };
+  }
+  // Troca de período duas vezes seguidas: só a última vale, senão a tela
+  // volta sozinha para o recorte que a pessoa já abandonou.
+  if (meu !== operacaoSeq) return state.operacao;
+  state.operacao = resposta || { erro: "resposta vazia do servidor" };
+  state.ui.loading.operacao = false;
+  requestRender();
+  return state.operacao;
+}
+
+
+function abaOperacao() {
+  const d = state.operacao;
+  if (state.ui.loading.operacao || !d) {
+    return `<div class="message">⏳ Apurando o período…</div>`;
+  }
+  if (d.erro) {
+    return `<div class="message" style="background:#fce8e6;color:#a4262c">
+      Não consegui apurar: ${escapeHtml(d.erro)}</div>`;
+  }
+  const f = state.operacaoFiltros;
+  const cot = d.cotacoes || {};
+  const fal = d.faltas || {};
+
+  const cartao = (rot, valor, sub, cor, aviso) => `
+    <div class="panel" style="padding:12px 14px;border-left:4px solid ${cor}">
+      <div class="text-small" style="color:var(--muted);text-transform:uppercase;
+                  letter-spacing:.4px;font-size:10.5px">${rot}</div>
+      <div style="font-size:24px;font-weight:800;color:${cor};line-height:1.2">${valor}</div>
+      <div class="text-small" style="color:var(--muted)">${sub}</div>
+      ${aviso ? `<div class="text-small" style="color:#8a5a00;margin-top:3px">${aviso}</div>` : ""}
+    </div>`;
+
+  const seta = d.variacaoPct === null ? ""
+    : `<span style="color:${d.variacaoPct >= 0 ? "var(--good)" : "var(--bad)"}">
+         ${d.variacaoPct >= 0 ? "▲" : "▼"} ${Math.abs(d.variacaoPct).toFixed(1)}%</span>
+       vs período anterior`;
+
+  // O piloto é declarado em CADA cartão que depende dele. Um aviso solto no
+  // rodapé não acompanha o número quando alguém tira um print do cartão.
+  const pilotoCot = cot.total < 200
+    ? `piloto: ${number(cot.total)} cotação(ões) no período` : "";
+
+  const maxSerie = Math.max(1, ...(d.serie || []).map((x) => x.atendimentos));
+  const barras = (d.serie || []).map((x) => {
+    const alt = Math.round(100 * x.atendimentos / maxSerie);
+    const dia = x.dia.slice(8, 10) + "/" + x.dia.slice(5, 7);
+    return `<div title="${escapeHtml(dia)}: ${x.atendimentos} atendimento(s)${
+      x.perdidos ? `, ${x.perdidos} perdido(s)` : ""}"
+      style="flex:1;min-width:3px;display:flex;flex-direction:column;
+             justify-content:flex-end;height:100%">
+      ${x.perdidos ? `<div style="height:${Math.round(100 * x.perdidos / maxSerie)}%;
+             background:var(--bad);opacity:.75"></div>` : ""}
+      <div style="height:${alt}%;background:var(--accent)"></div>
+    </div>`;
+  }).join("");
+
+  const linhasVend = (d.porVendedor || []).map((v) => `
+    <tr>
+      <td>${escapeHtml(nomeVendedorCurto(v.sellerName))}</td>
+      <td>${escapeHtml(v.unitName || "—")}</td>
+      <td style="text-align:right;font-weight:700">${number(v.atendimentos)}</td>
+      <td style="text-align:right">${number(v.pj)}</td>
+      <td style="text-align:right">${number(v.pf)}</td>
+      <td style="text-align:right">${v.fechou + v.perdeu
+        ? `${v.lossPct.toFixed(0)}% <span class="text-small" style="color:var(--muted)">
+             (${v.fechou + v.perdeu})</span>` : "—"}</td>
+    </tr>`).join("");
+
+  return `
+    <div class="stack" style="margin-top:12px">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select onchange="loadOperacao({dias: Number(this.value)})"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px">
+          ${(d.periodo.opcoes || []).map((o) => `<option value="${o.dias}"
+            ${o.dias === d.periodo.dias ? "selected" : ""}>${escapeHtml(o.label)}</option>`).join("")}
+        </select>
+        <select onchange="loadOperacao({seller: this.value})"
+          style="padding:6px 10px;border:1px solid var(--line);border-radius:6px;max-width:230px">
+          <option value="">Todos os vendedores</option>
+          ${(d.porVendedor || []).map((v) => `<option value="${escapeHtml(v.sellerName)}"
+            ${f.seller === v.sellerName ? "selected" : ""}>${escapeHtml(nomeVendedorCurto(v.sellerName))}</option>`).join("")}
+        </select>
+        ${f.seller ? `<button class="btn btn-ghost btn-sm"
+          onclick="loadOperacao({seller: ''})">Limpar vendedor</button>` : ""}
+        <span style="flex:1"></span>
+        <span class="text-small" style="color:var(--muted)">
+          ${escapeHtml(d.periodo.de.split("-").reverse().join("/"))} a
+          ${escapeHtml(d.periodo.ate.split("-").reverse().join("/"))}
+          ${d.unitName ? " · " + escapeHtml(d.unitName) : " · todas as unidades"}
+        </span>
+      </div>
+
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:10px">
+        ${cartao("Atendimentos", number(d.atendimentos), seta, "#0f3044",
+          "cliente + dia + vendedor")}
+        ${cartao("Atendimentos PJ", number(d.pj), `${d.pjPct}% do total`, "#1a5276")}
+        ${cartao("Atendimentos PF", number(d.pf), `${d.pfPct}% do total`, "#5f6368")}
+        ${cartao("Orçamentos perdidos", number(cot.perdeu || 0),
+          `${number(cot.fechou || 0)} fechado(s)`, "#c5221f", pilotoCot)}
+        ${cartao("Taxa de perda", cot.lossPct === null ? "—" : `${cot.lossPct}%`,
+          cot.lossPct === null ? "sem desfecho no período"
+            : `${number(cot.fechou + cot.perdeu)} com desfecho`, "#b06000", pilotoCot)}
+        ${cartao("Melhor unidade", d.melhorUnidade
+            ? escapeHtml(d.melhorUnidade.unitName) : "—",
+          d.melhorUnidade ? `${number(d.melhorUnidade.atendimentos)} atendimentos` : "",
+          "#1e8e3e")}
+        ${cartao("Pior taxa de perda", d.piorPerda
+            ? escapeHtml(d.piorPerda.unitName) : "—",
+          d.piorPerda ? `${d.piorPerda.lossPct}%` : "sem desfecho", "#c5221f", pilotoCot)}
+        ${cartao("Itens únicos em falta", fal.disponivel ? number(fal.itens) : "—",
+          fal.top ? `Top: ${escapeHtml(fal.top)} (${fal.topPedidos})` : "",
+          "#b06000", fal.disponivel
+            ? `mês ${escapeHtml((fal.competencias || []).join(" e "))}` : "base não gerada")}
+      </div>
+
+      <div class="panel" style="padding:14px 18px">
+        <div class="section-title"><div>
+          <h3>Evolução diária</h3>
+          <div class="text-small">Barra azul: atendimentos. Vermelha: orçamentos
+            perdidos no dia.</div></div></div>
+        <div style="display:flex;gap:2px;align-items:flex-end;height:140px;
+                    border-bottom:1px solid var(--line);padding-top:8px">
+          ${barras || '<div class="text-small">Sem movimento no período.</div>'}
+        </div>
+        <div class="text-small" style="color:var(--muted);margin-top:4px">
+          ${(d.serie || []).length} dia(s) com movimento · pico de
+          ${number(maxSerie)} atendimentos
+        </div>
+      </div>
+
+      <div class="panel" style="padding:0;overflow:auto;max-height:520px">
+        <table class="table" style="margin:0">
+          <thead><tr>
+            <th>Vendedor</th><th>Unidade</th>
+            <th style="text-align:right">Atendimentos</th>
+            <th style="text-align:right">PJ</th>
+            <th style="text-align:right">PF</th>
+            <th style="text-align:right">Perda</th>
+          </tr></thead>
+          <tbody>${linhasVend || `<tr><td colspan="6" style="text-align:center;padding:18px;color:var(--muted)">
+            Sem atendimento no período.</td></tr>`}</tbody>
+        </table>
+      </div>
+      ${d.vendedoresTotal > (d.porVendedor || []).length ? `
+        <div class="text-small" style="color:var(--muted)">
+          Mostrando ${(d.porVendedor || []).length} de ${number(d.vendedoresTotal)} vendedores.
+        </div>` : ""}
+
+      <div class="text-small" style="color:var(--muted)">
+        <strong>Atendimento é aproximação:</strong> o faturamento não traz número
+        de nota nem de pedido, então conta-se cliente + dia + vendedor. Dois
+        pedidos do mesmo cliente no mesmo dia contam como um.
+        ${cot.total < 200 ? `<br><strong>Orçamentos são piloto:</strong> as cotações
+        começaram a ser registradas agora. A taxa de perda só representa a
+        operação quando o módulo estiver rodando em todas as unidades.` : ""}
+      </div>
+    </div>`;
 }
 
 
@@ -14889,7 +15073,7 @@ function resultadosView() {
 
       <div style="display:flex;gap:4px;border-bottom:2px solid var(--line)">
         ${[["fca", "📌 Fato, causa e produtividade"], ["evolucao", "📈 Evolução 12 meses"],
-           ["faltas", "⛔ Faltas e rupturas"]]
+           ["operacao", "📊 Operação no período"], ["faltas", "⛔ Faltas e rupturas"]]
           .map(([id, rot]) => `
             <button onclick="setResultadoAba('${id}')"
               style="background:${f.tab === id ? "#fff" : "transparent"};border:none;
@@ -14907,6 +15091,7 @@ function resultadosView() {
         </div>` : ""}
 
       ${f.tab === "faltas" ? abaFaltas()
+        : f.tab === "operacao" ? abaOperacao()
         : f.tab === "evolucao" ? abaEvolucao
         : `<div class="stack">${montarFca()}</div>`}
     </div>`;

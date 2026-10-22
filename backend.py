@@ -18873,6 +18873,226 @@ def faltas_painel(
         fconn.close()
 
 
+PAINEL_OPERACAO_PERIODOS = [
+    {"id": "7", "label": "Últimos 7 dias", "dias": 7},
+    {"id": "30", "label": "Últimos 30 dias", "dias": 30},
+    {"id": "60", "label": "Últimos 60 dias", "dias": 60},
+    {"id": "90", "label": "Últimos 90 dias", "dias": 90},
+]
+
+
+def painel_operacao(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    dias: int = 30, vendedor: str = "", unidade: str = "",
+) -> dict[str, Any]:
+    """Quantidades da operação no período: atendimentos, PJ/PF, perdas e faltas.
+
+    DUAS ADVERTÊNCIAS QUE A TELA PRECISA REPETIR, porque o número sozinho mente:
+
+    1. ATENDIMENTO NÃO É PEDIDO. O faturamento não traz número de nota nem de
+       pedido, então um atendimento é cliente + dia + vendedor. Dois pedidos
+       do mesmo cliente no mesmo dia contam como um. É aproximação, e a tela
+       diz isso.
+
+    2. ORÇAMENTO É PILOTO. As cotações começaram a ser registradas agora, em
+       uma unidade. A taxa de perda calculada sobre dezessete desfechos é
+       aritmeticamente correta e operacionalmente vazia — por isso vem com o
+       volume ao lado, para ninguém ler como verdade da operação.
+
+    A unidade NÃO existe no faturamento: ela vem do vendedor, pelo mapa que o
+    resto do CRM usa. Ver [[radar-comercial-vendas-unidade]].
+    """
+    hoje = today_in_brazil()
+    dias = max(1, min(int(dias or 30), 365))
+    desde = (hoje - timedelta(days=dias)).isoformat()
+    ate = hoje.isoformat()
+    # Período anterior do MESMO tamanho, para o "vs período anterior".
+    desde_ant = (hoje - timedelta(days=dias * 2)).isoformat()
+
+    escopo = data_scope_for_user(conn, user)
+    filtros = crm_scoped_filters_for_user(
+        conn, company_id, user, {"unit_name": unidade, "seller_name": vendedor})
+    unidade_efetiva = normalize_whitespace(filtros.get("unit_name"))
+    permitidas = crm_allowed_units_for_user(conn, user)
+    alvo_vendedor = (seller_identity_for_user(user) if escopo == "proprio"
+                     else normalize_whitespace(vendedor))
+    chaves_vendedor = ({person_key(n) for n in
+                        seller_name_variants(conn, company_id, alvo_vendedor)}
+                       if alvo_vendedor else set())
+
+    mapa_unidade = seller_unit_map_ultimo(conn, company_id)
+
+    def unidade_do(nome: str) -> str:
+        chave = person_key(nome)
+        return (mapa_unidade.get(chave)
+                or mapa_unidade.get(short_person_key(nome)) or "")
+
+    def no_escopo(nome: str) -> bool:
+        if chaves_vendedor and person_key(nome) not in chaves_vendedor:
+            return False
+        un = unidade_do(nome)
+        if unidade_efetiva and un != unidade_efetiva:
+            return False
+        if permitidas is not None and un and un not in permitidas:
+            return False
+        return True
+
+    # UMA consulta para tudo. São ~12 mil linhas em 30 dias; trazer e agrupar
+    # em Python sai mais barato que cinco consultas com DISTINCT, e deixa
+    # PJ/PF, série diária, unidade e vendedor saírem da mesma passada — sem
+    # risco de dois recortes discordarem.
+    linhas = conn.execute(
+        "SELECT DISTINCT client_name, issue_date, seller_name"
+        "  FROM fact_sales_detail"
+        " WHERE company_id = ? AND issue_date >= ? AND issue_date <= ?"
+        "   AND net_value > 0 AND TRIM(COALESCE(issue_date,'')) <> ''",
+        (company_id, desde_ant, ate)).fetchall()
+
+    atuais, anteriores = [], []
+    for r in linhas:
+        if not no_escopo(r["seller_name"]):
+            continue
+        (atuais if r["issue_date"] >= desde else anteriores).append(r)
+
+    tipos = client_person_type_map(
+        conn, company_id, [r["client_name"] for r in atuais])
+
+    por_dia: dict[str, int] = {}
+    por_vendedor: dict[str, dict[str, Any]] = {}
+    por_unidade: dict[str, dict[str, Any]] = {}
+    pj = pf = 0
+    for r in atuais:
+        dia = r["issue_date"]
+        por_dia[dia] = por_dia.get(dia, 0) + 1
+        tipo = tipos.get(normalize_client_key(r["client_name"]), "PF")
+        if tipo == "PJ":
+            pj += 1
+        else:
+            pf += 1
+        nome = normalize_whitespace(r["seller_name"])
+        v = por_vendedor.setdefault(nome, {"sellerName": nome, "atendimentos": 0,
+                                           "pj": 0, "pf": 0, "unitName": unidade_do(nome),
+                                           "fechou": 0, "perdeu": 0})
+        v["atendimentos"] += 1
+        v["pj" if tipo == "PJ" else "pf"] += 1
+        un = v["unitName"] or "(sem unidade)"
+        u = por_unidade.setdefault(un, {"unitName": un, "atendimentos": 0,
+                                        "fechou": 0, "perdeu": 0})
+        u["atendimentos"] += 1
+
+    # ── Cotações (piloto) ───────────────────────────────────────────────────
+    cot = {"fechou": 0, "perdeu": 0, "aberta": 0, "decidindo": 0, "total": 0}
+    cot_por_dia: dict[str, int] = {}
+    try:
+        for r in conn.execute(
+                "SELECT status, seller_name, unit_name, date(quoted_at) dia"
+                "  FROM crm_quotes WHERE company_id = ?"
+                "   AND date(quoted_at) >= date(?) AND date(quoted_at) <= date(?)",
+                (company_id, desde, ate)):
+            if not no_escopo(r["seller_name"]):
+                continue
+            cot["total"] += 1
+            chave = {"FECHOU": "fechou", "NAO_FECHOU": "perdeu",
+                     "ABERTA": "aberta", "DECIDINDO": "decidindo"}.get(r["status"])
+            if chave:
+                cot[chave] += 1
+            if r["status"] == "NAO_FECHOU":
+                cot_por_dia[r["dia"]] = cot_por_dia.get(r["dia"], 0) + 1
+            nome = normalize_whitespace(r["seller_name"])
+            v = por_vendedor.get(nome)
+            un = (normalize_unit(r["unit_name"]) or unidade_do(nome)
+                  or "(sem unidade)")
+            if v is None:
+                v = por_vendedor.setdefault(nome, {
+                    "sellerName": nome, "atendimentos": 0, "pj": 0, "pf": 0,
+                    "unitName": unidade_do(nome), "fechou": 0, "perdeu": 0})
+            u = por_unidade.setdefault(un, {"unitName": un, "atendimentos": 0,
+                                            "fechou": 0, "perdeu": 0})
+            if chave in ("fechou", "perdeu"):
+                v[chave] += 1
+                u[chave] += 1
+    except sqlite3.Error as exc:
+        print(f"[operacao] cotações indisponíveis: {exc}", flush=True)
+
+    def taxa(fechou: int, perdeu: int) -> float | None:
+        base = fechou + perdeu
+        # None, não zero: "não há desfecho" é diferente de "não perdeu nada".
+        return round(100 * perdeu / base, 1) if base else None
+
+    # ── Faltas, do arquivo do Radar ─────────────────────────────────────────
+    faltas = {"itens": 0, "pedidos": 0, "top": "", "topPedidos": 0,
+              "competencias": [], "disponivel": False}
+    fconn = faltas_conexao()
+    if fconn is not None:
+        try:
+            # A base de faltas é por COMPETÊNCIA (mês), não por dia. O período
+            # da tela é em dias, então arredondamos para os meses tocados — e
+            # a tela declara isso, em vez de fingir que o recorte é o mesmo.
+            comps = sorted({desde[:7], ate[:7]})
+            marcas = ",".join("?" * len(comps))
+            onde_un = ""
+            par: list[Any] = list(comps)
+            if unidade_efetiva:
+                onde_un = " AND unidade = ?"
+                par.append(unidade_efetiva)
+            r = fconn.execute(
+                f"SELECT COUNT(DISTINCT item_code) i, SUM(pedidos) p"
+                f"  FROM faltas_resumo WHERE competencia IN ({marcas}){onde_un}",
+                par).fetchone()
+            top = fconn.execute(
+                f"SELECT item_code, MAX(item) item, SUM(pedidos) p"
+                f"  FROM faltas_resumo WHERE competencia IN ({marcas}){onde_un}"
+                f" GROUP BY item_code ORDER BY p DESC LIMIT 1", par).fetchone()
+            faltas = {
+                "disponivel": True,
+                "itens": int(r["i"] or 0), "pedidos": int(r["p"] or 0),
+                "top": (top["item_code"] if top else ""),
+                "topNome": normalize_whitespace(top["item"]) if top else "",
+                "topPedidos": int(top["p"] or 0) if top else 0,
+                "competencias": comps,
+            }
+        except sqlite3.Error as exc:
+            print(f"[operacao] faltas indisponíveis: {exc}", flush=True)
+        finally:
+            fconn.close()
+
+    unidades = sorted(por_unidade.values(), key=lambda x: -x["atendimentos"])
+    for u in unidades:
+        u["lossPct"] = taxa(u["fechou"], u["perdeu"])
+    vendedores = sorted(por_vendedor.values(), key=lambda x: -x["atendimentos"])
+    for v in vendedores:
+        v["lossPct"] = taxa(v["fechou"], v["perdeu"])
+
+    com_perda = [u for u in unidades if u["lossPct"] is not None]
+    total_atual, total_ant = len(atuais), len(anteriores)
+    serie = [{"dia": d, "atendimentos": n, "perdidos": cot_por_dia.get(d, 0)}
+             for d, n in sorted(por_dia.items())]
+
+    return {
+        "periodo": {"dias": dias, "de": desde, "ate": ate,
+                    "opcoes": PAINEL_OPERACAO_PERIODOS},
+        "escopo": escopo,
+        "unitName": unidade_efetiva,
+        "sellerName": alvo_vendedor,
+        "atendimentos": total_atual,
+        "atendimentosAnterior": total_ant,
+        "variacaoPct": (round(100 * (total_atual - total_ant) / total_ant, 1)
+                        if total_ant else None),
+        "pj": pj, "pf": pf,
+        "pjPct": round(100 * pj / total_atual, 1) if total_atual else 0.0,
+        "pfPct": round(100 * pf / total_atual, 1) if total_atual else 0.0,
+        "cotacoes": {**cot, "lossPct": taxa(cot["fechou"], cot["perdeu"])},
+        "melhorUnidade": unidades[0] if unidades else None,
+        "piorPerda": (max(com_perda, key=lambda x: x["lossPct"])
+                      if com_perda else None),
+        "faltas": faltas,
+        "serie": serie,
+        "porUnidade": unidades,
+        "porVendedor": vendedores[:40],
+        "vendedoresTotal": len(vendedores),
+    }
+
+
 def codigos_do_termo(
     conn: sqlite3.Connection, company_id: int, termo: str, limite: int = 500
 ) -> set[str]:
@@ -29228,6 +29448,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         }
                     )
                 )
+                return
+            if path == "/api/operacao/painel":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = painel_operacao(
+                        conn, user["company_id"], user,
+                        dias=parse_int(query.get("dias", ["30"])[0]) or 30,
+                        vendedor=query.get("seller", [""])[0],
+                        unidade=query.get("unit", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
                 return
             if path == "/api/faltas/painel":
                 user = self._require_auth()
