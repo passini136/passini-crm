@@ -7538,6 +7538,46 @@ def chave_canonica(conn: sqlite3.Connection, company_id: int, nome: str) -> str:
     return chave
 
 
+_nomes_vendedor_cache: dict[int, list[str]] = {}
+_nomes_vendedor_lock = threading.Lock()
+
+
+def invalidate_nomes_vendedor_cache(company_id: int | None = None) -> None:
+    """Esquece a lista de nomes de vendedor. Chamado quando o cadastro muda."""
+    with _nomes_vendedor_lock:
+        if company_id is None:
+            _nomes_vendedor_cache.clear()
+        else:
+            _nomes_vendedor_cache.pop(company_id, None)
+
+
+def _nomes_vendedor_cached(conn: sqlite3.Connection, company_id: int) -> list[str]:
+    """Todos os nomes que aparecem como vendedor em qualquer tabela.
+
+    São nove varreduras, uma delas sobre o faturamento inteiro. O resultado
+    muda só quando entra gente nova ou um arquivo é importado, e as duas
+    coisas já derrubam os caches do CRM — por isso dá para guardar no
+    processo em vez de refazer a cada requisição.
+    """
+    with _nomes_vendedor_lock:
+        em_cache = _nomes_vendedor_cache.get(company_id)
+    if em_cache is not None:
+        return em_cache
+    candidatos: list[str] = []
+    for tabela, coluna in SELLER_NAME_SOURCES:
+        try:
+            linhas = conn.execute(
+                f"SELECT DISTINCT {coluna} AS nome FROM {tabela} WHERE company_id = ?",
+                (company_id,)).fetchall()
+        except sqlite3.OperationalError:
+            continue
+        candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
+    resultado = sorted(set(candidatos))
+    with _nomes_vendedor_lock:
+        _nomes_vendedor_cache[company_id] = resultado
+    return resultado
+
+
 def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str) -> list[str]:
     """Todas as grafias do mesmo vendedor que existem nas tabelas.
 
@@ -7563,21 +7603,20 @@ def seller_name_variants(conn: sqlite3.Connection, company_id: int, *nomes: str)
 
     # A lista de nomes candidatos é a MESMA para todo mundo: varrer as nove
     # tabelas uma vez por vendedor custava 279 varreduras numa apuração de 31
-    # vendedores, várias sobre as 250 mil linhas do faturamento. O cache vive na
-    # conexão, que é de uma requisição só — não corre risco de servir nome
-    # velho depois de uma importação.
+    # vendedores, várias sobre as 250 mil linhas do faturamento.
+    #
+    # O cache vivia só na CONEXÃO, e o servidor abre uma conexão por
+    # requisição — então cada clique na tela pagava as nove varreduras de
+    # novo, às vezes duas ou três vezes seguidas (criar a cotação, recarregar
+    # a lista, recarregar a carteira). Foi o que deixou Cotações lenta.
+    #
+    # Agora o cache é de PROCESSO, com a mesma invalidação que o resto do CRM
+    # usa quando o cadastro muda. Nome de vendedor só aparece ou some em
+    # importação e em cadastro de pessoa — os dois já chamam
+    # invalidate_crm_cache.
     candidatos = getattr(conn, "_cache_nomes_vendedor", None)
     if candidatos is None:
-        candidatos = []
-        for tabela, coluna in SELLER_NAME_SOURCES:
-            try:
-                linhas = conn.execute(
-                    f"SELECT DISTINCT {coluna} AS nome FROM {tabela} WHERE company_id = ?",
-                    (company_id,)).fetchall()
-            except sqlite3.OperationalError:
-                continue
-            candidatos.extend(normalize_whitespace(r["nome"]) for r in linhas if r["nome"])
-        candidatos = sorted(set(candidatos))
+        candidatos = _nomes_vendedor_cached(conn, company_id)
         conn._cache_nomes_vendedor = candidatos
 
     encontrados = set(informados)
@@ -15910,6 +15949,9 @@ def invalidate_crm_cache(company_id: int | None = None) -> None:
     invalidate_recompra_cache(company_id)
     invalidate_novidades_cache(company_id)
     invalidate_prospeccao_cache(company_id)
+    # Nome de vendedor nasce e some em importação e em cadastro de pessoa —
+    # as duas situações passam por aqui.
+    invalidate_nomes_vendedor_cache(company_id)
 
 
 def invalidate_activity_caches(company_id: int | None = None) -> None:
