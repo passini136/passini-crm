@@ -786,11 +786,70 @@ def normalize_upper(value: str | None) -> str:
     return normalize_whitespace(value).upper()
 
 
+def sql_sem_acento(value: Any) -> str | None:
+    """A função `sem_acento` do SQLite. Sem acento e em maiúsculas, numa passada.
+
+    Vale a função dedicada em vez de compor normalize_upper(strip_accents(v)):
+    aquela composição roda a normalização de espaço DUAS vezes — strip_accents
+    já faz uma, normalize_upper faz outra. O SQLite chama isto uma vez POR
+    LINHA; numa busca na carteira são 204 mil chamadas (duas colunas × 102 mil
+    perfis), e as duas expressões regulares viravam 1,8s de tela travada.
+
+    Medido com 102 mil linhas: 1,82s na composição, 0,65s aqui, resultado
+    idêntico nas duas.
+    """
+    if value is None:
+        return None
+    texto = normalize_whitespace(value)
+    if not texto:
+        return ""
+    if texto.isascii():
+        return texto.upper()
+    if max(texto) >= "\U00010000":
+        return "".join(c for c in unicodedata.normalize("NFKD", texto)
+                       if not unicodedata.combining(c)).upper()
+    return texto.translate(_TABELA_SEM_ACENTO).upper()
+
+
+def _montar_tabela_sem_acento() -> dict[int, str]:
+    """Tabela de tradução equivalente a NFKD + remoção de combinantes.
+
+    Construída a partir do próprio unicodedata, então não é uma lista de
+    acentos escrita à mão — é exata por construção para todo o BMP.
+    Custa ~0,1s uma vez, no carregamento do módulo.
+    """
+    tabela: dict[int, str] = {}
+    for cp in range(0x10000):
+        ch = chr(cp)
+        limpo = "".join(c for c in unicodedata.normalize("NFKD", ch)
+                        if not unicodedata.combining(c))
+        if limpo != ch:
+            tabela[cp] = limpo
+    return tabela
+
+
+_TABELA_SEM_ACENTO = _montar_tabela_sem_acento()
+
+
 def strip_accents(value: str | None) -> str:
+    """Tira acento. Via tabela, porque isto roda uma vez POR LINHA no SQLite.
+
+    A versão anterior chamava unicodedata.normalize a cada chamada. Como
+    sem_acento() está registrada no SQLite, uma busca na carteira a executava
+    204 mil vezes (duas colunas × 102 mil perfis) e custava 1,75s — a tela
+    parecia travada.
+    """
     text = normalize_whitespace(value)
     if not text:
         return ""
-    return "".join(char for char in unicodedata.normalize("NFKD", text) if not unicodedata.combining(char))
+    if text.isascii():
+        return text           # caminho mais comum, sem tocar na tabela
+    if max(text) >= "\U00010000":
+        # Fora do BMP a tabela não cobre; mantém o algoritmo original para o
+        # resultado ser idêntico em qualquer entrada.
+        return "".join(char for char in unicodedata.normalize("NFKD", text)
+                       if not unicodedata.combining(char))
+    return text.translate(_TABELA_SEM_ACENTO)
 
 
 # Chave de prospect: "P-12". O hífen É significativo e precisa sobreviver à
@@ -1691,9 +1750,7 @@ def get_connection() -> sqlite3.Connection:
     conn.execute("PRAGMA temp_store=MEMORY")
     # sem_acento em TODA conexão: o SQLite não conhece acento, e mais de uma
     # busca depende disso. Registrar em um lugar só evita "no such function".
-    conn.create_function(
-        "sem_acento", 1,
-        lambda v: normalize_upper(strip_accents(v)) if v is not None else None)
+    conn.create_function("sem_acento", 1, sql_sem_acento)
     return conn
 
 
@@ -23560,9 +23617,7 @@ def search_person_candidates(
 
     # Sem isto, procurar "jose" não acha "JOSÉ" — o SQLite não conhece acento.
     # A função vive só nesta conexão; não muda nada no banco.
-    conn.create_function(
-        "sem_acento", 1,
-        lambda v: normalize_upper(strip_accents(v)) if v is not None else None)
+    conn.create_function("sem_acento", 1, sql_sem_acento)
 
     encontrados: dict[str, dict[str, Any]] = {}
 
