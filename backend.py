@@ -27846,7 +27846,24 @@ def desfecho_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], p
         return 400, {"error": "Valor inválido."}
     if valor is None:
         valor = r["approx_value"]
-    peca = normalize_whitespace(payload.get("itemHint")) or r["item_hint"]
+    peca = normalize_texto_longo(payload.get("itemHint")) or normalize_whitespace(
+        r["item_hint"])
+
+    # PERDA SEM A PEÇA NÃO É INFORMAÇÃO, É CONTAGEM.
+    #
+    # "Perdi por preço" não diz onde o preço está errado; "perdi por falta"
+    # não diz o que comprar. O motivo sozinho produz um gráfico bonito e
+    # nenhuma ação. Por isso a peça é obrigatória para registrar a perda — e
+    # só para ela: fechou e decidindo continuam passando sem exigir nada,
+    # porque ali o atrito não compra informação nenhuma.
+    #
+    # A checagem é no SERVIDOR porque a tela pode ser contornada. Dois
+    # caracteres é o piso: barra o Enter vazio sem obrigar ninguém a escrever
+    # redação com o cliente esperando.
+    if status == "NAO_FECHOU" and len(peca.strip()) < 2:
+        return 400, {"error": "Escreva o que o cliente pediu (código, peça ou "
+                              "marca) antes de registrar a perda. Sem isso o "
+                              "motivo não diz o que corrigir."}
     cid = user["company_id"]
     # Qualquer tarefa ligada à cotação fecha; DECIDINDO abre uma nova no bloco ativo
     _cotacao_fechar_tarefa(conn, r["task_id"])

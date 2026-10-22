@@ -22400,6 +22400,11 @@ function cotDesfecho(id, status) {
   if (status === "NAO_FECHOU") {
     s.abrindoMotivo = id;
     cotPaint();
+    // Os campos abrem junto com os motivos, e o cursor vai para a peça: o
+    // motivo "Falta" ou "Marca" só vale alguma coisa com o QUE faltou ao
+    // lado. Perguntar o motivo sem oferecer onde escrever a peça produz
+    // estatística sem conteúdo.
+    cotFocar(`cot-p-${id}`);
     return;
   }
   const aviso = status === "FECHOU" ? "Venda registrada. Boa!" : "Retorno marcado para amanhã às 8h40.";
@@ -22408,6 +22413,20 @@ function cotDesfecho(id, status) {
 
 function cotMotivo(id, motivo) {
   const s = cotState();
+  // A mesma exigência do servidor, conferida aqui para o vendedor não levar
+  // um erro depois de clicar. A regra vale nos dois lugares porque a tela
+  // pode ser contornada e o servidor não pode ser.
+  const d = s.det[id] || {};
+  const q = (s.data?.quotes || []).find((x) => x.id === id);
+  const peca = String(d.peca ?? q?.itemHint ?? "").trim();
+  if (peca.length < 2) {
+    cotAviso("Escreva o que o cliente pediu antes de registrar a perda — "
+             + "o motivo sozinho não diz o que corrigir.", true);
+    s.abrindoMotivo = id;      // mantém os motivos à vista
+    cotPaint();
+    cotFocar(`cot-p-${id}`);
+    return;
+  }
   s.abrindoMotivo = null;
   cotAcao(`q-${id}`, "/api/crm/quotes/status",
           { id, status: "NAO_FECHOU", lossReason: motivo, ...cotDetalhes(id) },
@@ -22421,12 +22440,6 @@ function cotCancelarMotivo() {
 
 function cotDesfazer(id) {
   cotAcao(`q-${id}`, "/api/crm/quotes/undo", { id }, "Desfeito. A cotação voltou para as abertas.");
-}
-
-function cotToggleDetalhe(id) {
-  const s = cotState();
-  s.detalhe = s.detalhe === id ? null : id;
-  cotPaint();
 }
 
 function cotDet(id, campo, valor) {
@@ -22525,18 +22538,31 @@ function cotLinhaAberta(q) {
        <button class="btn btn-ghost cot-btn" onclick="cotCancelarMotivo()">Voltar</button>`
     : `<button class="btn cot-btn cot-sim" ${ocupado} onclick="cotDesfecho(${q.id},'FECHOU')">✔ Fechou</button>
        <button class="btn cot-btn cot-nao" ${ocupado} onclick="cotDesfecho(${q.id},'NAO_FECHOU')">✖ Não fechou</button>
-       ${q.status !== "DECIDINDO" ? `<button class="btn btn-ghost cot-btn" ${ocupado} onclick="cotDesfecho(${q.id},'DECIDINDO')">⏳ Decidindo</button>` : ""}
-       <button class="btn btn-ghost btn-sm" onclick="cotToggleDetalhe(${q.id})">${s.detalhe === q.id ? "− detalhes" : "+ detalhes"}</button>`;
+       ${q.status !== "DECIDINDO" ? `<button class="btn btn-ghost cot-btn" ${ocupado} onclick="cotDesfecho(${q.id},'DECIDINDO')">⏳ Decidindo</button>` : ""}`;
+
+  // SEM BOTÃO "DETALHES": os campos aparecem nos momentos em que servem.
+  //
+  // O botão exigia que o vendedor soubesse que havia algo escondido ali e se
+  // lembrasse de abrir — no balcão, com o cliente na frente, isso não
+  // acontece. Três momentos justificam mostrar:
+  //   1. acabou de registrar o canal (é quando ele tem a peça na cabeça);
+  //   2. está respondendo "por que não fechou" (preço? marca? falta do quê?);
+  //   3. já existe anotação ou valor — senão o que foi escrito ficaria
+  //      inacessível para corrigir.
+  const mostrarCampos = (s.detalhe === q.id || s.abrindoMotivo === q.id
+                         || Boolean(q.itemHint) || q.approxValue !== null);
   return `
     <div class="cot-linha ${q.pending ? "cot-pendente" : ""}">
       <div class="cot-cli"><b>${escapeHtml(q.clientName)}</b><span>${extra}</span></div>
       <div class="cot-botoes">${botoes}</div>
-      ${s.detalhe === q.id ? `
+      ${mostrarCampos ? `
         <div class="cot-detalhe">
           <label>Valor aproximado (opcional)
             <input id="cot-v-${q.id}" inputmode="decimal" placeholder="Ex.: 850,00"
                    value="${escapeHtml(det.valor ?? (q.approxValue ?? ""))}" oninput="cotDet(${q.id},'valor',this.value)"></label>
-          <label>O que o cliente pediu ${q.itemHint ? "✔" : "(opcional)"}
+          <label>O que o cliente pediu ${s.abrindoMotivo === q.id
+              ? '<strong style="color:var(--bad)">— obrigatório para registrar a perda</strong>'
+              : (q.itemHint ? "✔" : "(opcional)")}
             <input id="cot-p-${q.id}"
                    placeholder="Código da peça, marca pedida, o que faltou…"
                    value="${escapeHtml(det.peca ?? q.itemHint)}"
