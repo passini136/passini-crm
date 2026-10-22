@@ -27687,12 +27687,19 @@ def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, An
     # está entre parênteses. Comparar com strip_accents só deixaria o cliente
     # na lista mas sem a marca de dono — meio-certo é pior que errado.
     chaves_minhas = {person_key(v) for v in variantes}
+    linhas = conn.execute(sql, args).fetchall()
+    # PF ou PJ pela MESMA função da carteira (client_person_type_map), não por
+    # uma regra nova aqui: a mesma oficina classificada como PJ numa tela e PF
+    # noutra é a divergência que ninguém reporta e todo mundo desconfia.
+    # A função recebe só os nomes desta página e tem cache por requisição.
+    tipos = client_person_type_map(conn, cid, [r["client_name"] for r in linhas])
     clientes = []
-    for r in conn.execute(sql, args).fetchall():
+    for r in linhas:
         dono = normalize_whitespace(r["internal_seller_name"])
         clientes.append({
             "clientKey": r["client_code"], "clientName": r["client_name"],
             "tradeName": r["trade_name"] or "", "city": r["city_name"] or "",
+            "personType": tipos.get(normalize_client_key(r["client_name"]), "PF"),
             "owner": dono, "mine": bool(dono) and person_key(dono) in chaves_minhas,
             "quotes30": int(r["cot30"] or 0), "quotesToday": int(r["cot_hoje"] or 0),
             "lastSaleAt": (r["last_sale_at"] or "")[:10],

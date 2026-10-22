@@ -22600,13 +22600,25 @@ function cotCarteiraHtml() {
       cl.quotes30 ? `cotou ${cl.quotes30}× em 30 dias` : "",
       cl.quotesToday ? `<b>${cl.quotesToday}× hoje</b>` : "",
     ].filter(Boolean).join(" · ");
+    // PF e PJ mudam a conversa: oficina compra para revender e pergunta prazo;
+    // consumidor leva uma peça e pergunta preço. O selo fica junto do nome,
+    // onde o olho já está, e não dentro da linha de detalhes.
+    const tipo = cl.personType === "PJ"
+      ? '<span class="cot-tipo cot-pj" title="Pessoa jurídica — oficina, frota, revenda">PJ</span>'
+      : '<span class="cot-tipo cot-pf" title="Pessoa física — consumidor final">PF</span>';
     return `
       <div class="cot-linha">
-        <div class="cot-cli"><b>${escapeHtml(cl.clientName)} ${difBadge(cl)}</b><span>${info}</span></div>
+        <div class="cot-cli"><b>${escapeHtml(cl.clientName)} ${tipo} ${difBadge(cl)}</b><span>${info}</span></div>
         <div class="cot-botoes">
           ${COT_CANAIS.map(([id, label, icone]) => `
             <button class="btn cot-btn cot-canal" ${ocupado} title="Cotou pelo ${label}"
                     onclick="cotCriar(decodeURIComponent('${cotArg(cl.clientKey)}'),'${id}')">${icone} ${label}</button>`).join("")}
+          ${/* Ficha em aba nova NÃO: a tela de Cotações é o posto de trabalho
+                do vendedor durante o atendimento, e trocar de aba perderia a
+                cotação em digitação. openCrmClient com switchToClientsTab
+                false abre a gaveta por cima e volta fechando. */""}
+          <button class="btn btn-ghost cot-btn" title="Abrir a ficha deste cliente"
+                  onclick="openCrmClient(decodeURIComponent('${cotArg(cl.clientKey)}'), false, true, { outside: true })">📇 Ficha</button>
         </div>
       </div>`;
   }).join("");
