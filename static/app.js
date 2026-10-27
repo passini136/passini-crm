@@ -14106,7 +14106,7 @@ function abaFaltas() {
 
   // Barra de status: proporção visual antes dos números, porque o gerente
   // olha isto de relance e a pergunta dele é "melhorou ou piorou".
-  const barra = ["TEM", "VOLTOU", "ABERTO", "SEM_INFO"]
+  const barra = ["TEM", "SUBSTITUTO", "VOLTOU", "ABERTO", "SEM_INFO"]
     .filter((k) => porStatus[k])
     .map((k) => `<div title="${escapeHtml(st[k].label)}: ${porStatus[k]}"
          style="width:${(100 * porStatus[k] / Math.max(1, total)).toFixed(1)}%;
@@ -14146,7 +14146,15 @@ function abaFaltas() {
       <td style="text-align:right">${dt}</td>
       <td style="color:${s.cor};font-weight:700;white-space:nowrap">
         ${s.icon || ""} ${escapeHtml(s.label || l.status)}</td>
-      <td style="text-align:right">${l.stock === null ? "—" : number(l.stock)}</td>
+      ${/* DUAS COLUNAS, não uma. A anterior mostrava o saldo da FAMÍLIA numa
+            linha identificada por um código e uma marca — a 101487/SYL
+            aparecia com "5" que eram de outro código (80539/TRW), e quem foi
+            à prateleira não achou. O saldo da peça vem primeiro, porque é o
+            que a linha diz ser. */""}
+      <td style="text-align:right;${l.stockItem === 0 ? "color:var(--bad);font-weight:700" : ""}">
+        ${l.stockItem === null || l.stockItem === undefined ? "—" : number(l.stockItem)}</td>
+      <td style="text-align:right;color:var(--muted)">
+        ${l.stock === null ? "—" : number(l.stock)}</td>
     </tr>`;
   }).join("");
 
@@ -14161,7 +14169,7 @@ function abaFaltas() {
         <select onchange="setFaltaFiltro('status', this.value)" title="Situação"
           style="padding:6px 10px;border:1px solid var(--line);border-radius:6px">
           <option value="">Todas as situações</option>
-          ${["ABERTO", "VOLTOU", "TEM", "SEM_INFO"].map((k) => `<option value="${k}"
+          ${["ABERTO", "VOLTOU", "SUBSTITUTO", "TEM", "SEM_INFO"].map((k) => `<option value="${k}"
             ${ft.status === k ? "selected" : ""}>${st[k].icon} ${escapeHtml(st[k].label)}
             (${number(porStatus[k] || 0)})</option>`).join("")}
         </select>
@@ -14208,13 +14216,16 @@ function abaFaltas() {
           "entrou depois do pedido", st.VOLTOU ? st.VOLTOU.cor : "#b06000")}
         ${cartao("Em aberto", number(porStatus.ABERTO || 0),
           "família ainda zerada", st.ABERTO ? st.ABERTO.cor : "#c5221f")}
+        ${porStatus.SUBSTITUTO ? cartao("Só substituto",
+          number(porStatus.SUBSTITUTO),
+          "a peça pedida está zerada", st.SUBSTITUTO ? st.SUBSTITUTO.cor : "#1a73e8") : ""}
       </div>
 
       <div style="height:10px;border-radius:5px;overflow:hidden;display:flex;background:#eef2f5">
         ${barra}
       </div>
       <div class="text-small" style="color:var(--muted)">
-        ${["TEM", "VOLTOU", "ABERTO", "SEM_INFO"].map((k) =>
+        ${["TEM", "SUBSTITUTO", "VOLTOU", "ABERTO", "SEM_INFO"].map((k) =>
           `<span style="margin-right:12px">
              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;
                    background:${st[k].cor};margin-right:4px"></span>
@@ -14238,9 +14249,11 @@ function abaFaltas() {
             ${thFalta("Marcas", "marcas", "right")}
             ${thFalta("Último", "ultimo", "right")}
             ${thFalta("Situação", "situacao")}
-            ${thFalta("Estoque", "estoque", "right")}
+            ${thFalta("Estoque da peça", "estoque", "right")}
+            <th style="text-align:right;color:var(--muted)"
+                title="Soma de todos os códigos substitutos da família nesta unidade">Família</th>
           </tr></thead>
-          <tbody>${linhas || `<tr><td colspan="${d.unitName ? 7 : 8}" style="text-align:center;padding:18px;color:var(--muted)">
+          <tbody>${linhas || `<tr><td colspan="${d.unitName ? 8 : 9}" style="text-align:center;padding:18px;color:var(--muted)">
             ${filtrosAtivos ? "Nenhuma peça com esses filtros." : "Nenhuma falta registrada neste mês."}</td></tr>`}</tbody>
         </table>
       </div>

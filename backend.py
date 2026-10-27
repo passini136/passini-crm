@@ -18571,13 +18571,21 @@ def faltas_por_item(
 # sentido depois de saber que o saldo está zerado hoje.
 FALTA_STATUS = {
     "TEM": {"id": "TEM", "label": "Tem na loja", "icon": "✅", "cor": "#1e8e3e"},
+    # "SÓ SUBSTITUTO" existe por um erro de leitura real: a peça 101487 (SYL)
+    # estava zerada na Zona Sul e a família tinha 5, de outro código (80539,
+    # TRW). A tela dizia "Tem na loja" e o gerente foi à prateleira e não
+    # achou. Família com saldo e peça pedida zerada são situações diferentes:
+    # uma resolve o cliente só se ele aceitar outra marca.
+    "SUBSTITUTO": {"id": "SUBSTITUTO", "label": "Só substituto", "icon": "🔄",
+                   "cor": "#1a73e8"},
     "VOLTOU": {"id": "VOLTOU", "label": "Chegou e acabou", "icon": "🔁", "cor": "#b06000"},
     "ABERTO": {"id": "ABERTO", "label": "Em aberto", "icon": "⛔", "cor": "#c5221f"},
     "SEM_INFO": {"id": "SEM_INFO", "label": "Sem informação", "icon": "–", "cor": "#5f6368"},
 }
 
 
-def _falta_status(estoque, ultima_entrada, ultima_data) -> str:
+def _falta_status(estoque, ultima_entrada, ultima_data,
+                  estoque_pedido=None) -> str:
     """Classifica uma falta pelo estoque da FAMÍLIA, não da peça.
 
     A regra é do Radar: ruptura só existe quando a família inteira de
@@ -18593,6 +18601,11 @@ def _falta_status(estoque, ultima_entrada, ultima_data) -> str:
     if estoque is None:
         return "SEM_INFO"
     if float(estoque or 0) > 0:
+        # A família tem saldo. Mas de QUEM? Se o código que o vendedor pediu
+        # está zerado, dizer "tem na loja" manda o gerente procurar a peça
+        # errada — foi exatamente o que aconteceu com a 101487 na Zona Sul.
+        if estoque_pedido is not None and float(estoque_pedido or 0) <= 0:
+            return "SUBSTITUTO"
         return "TEM"
     # Entrou depois do pedido e mesmo assim está zerado: chegou e vendeu tudo.
     # É o caso mais informativo dos quatro — demanda maior que a reposição.
@@ -18728,18 +18741,25 @@ def faltas_painel(
 
         # Quem da família está na prateleira — para dizer "pediu A, chegou B".
         atendidos: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        # Saldo do PRÓPRIO código, inclusive zero. É o que separa "a peça está
+        # na prateleira" de "um substituto está na prateleira".
+        saldo_do_codigo: dict[tuple[str, str], float] = {}
         try:
             for r in fconn.execute(
                     "SELECT unidade, familia, item_code, estoque, ultima_entrada"
-                    "  FROM estoque_item WHERE estoque > 0"):
-                atendidos.setdefault((r["unidade"], r["familia"]), []).append({
-                    "code": r["item_code"], "stock": float(r["estoque"] or 0),
-                    "lastEntry": r["ultima_entrada"] or "",
-                })
+                    "  FROM estoque_item"):
+                saldo_do_codigo[(r["unidade"], r["item_code"])] = float(
+                    r["estoque"] or 0)
+                if float(r["estoque"] or 0) > 0:
+                    atendidos.setdefault((r["unidade"], r["familia"]), []).append({
+                        "code": r["item_code"], "stock": float(r["estoque"] or 0),
+                        "lastEntry": r["ultima_entrada"] or "",
+                    })
         except sqlite3.Error:
             # Arquivo antigo, sem a tabela. A tela perde o "chegou o Y" e
             # mantém todo o resto — melhor que derrubar o painel inteiro.
             atendidos = {}
+            saldo_do_codigo = {}
 
         todas = []
         for (unidade_l, familia), g in por_familia.items():
@@ -18747,6 +18767,9 @@ def faltas_painel(
             principal = g["itens"][0]
             na_prateleira = atendidos.get((unidade_l, familia), [])
             pedidos_codigos = {i["code"] for i in g["itens"]}
+            # Saldo do código que encabeça a linha — o mais pedido da família.
+            # None quando não há posição nenhuma (diferente de zero).
+            saldo_principal = saldo_do_codigo.get((unidade_l, principal["code"]))
             todas.append({
                 **g,
                 "itemCode": principal["code"],
@@ -18765,8 +18788,11 @@ def faltas_painel(
                                    if a["code"] in pedidos_codigos][:4],
                 "atendidoOutro": [a for a in na_prateleira
                                   if a["code"] not in pedidos_codigos][:4],
+                # stock = da FAMÍLIA (regra do Radar). stockItem = do código
+                # pedido. A tela precisa dos dois, e precisa dizer qual é qual.
+                "stockItem": saldo_principal,
                 "status": _falta_status(g["stock"], g["lastEntry"],
-                                        g["lastRequest"]),
+                                        g["lastRequest"], saldo_principal),
             })
 
         # As opções dos filtros saem do recorte do usuário, antes de filtrar:
@@ -18816,7 +18842,11 @@ def faltas_painel(
             vazio = v is None or v == ""
             if campo == "situacao":
                 # Ordem útil, não alfabética: o que está em aberto primeiro.
-                ordem = {"ABERTO": 0, "VOLTOU": 1, "SEM_INFO": 2, "TEM": 3}
+                # "Só substituto" fica entre o que falta e o que está
+                # resolvido: o cliente pode sair atendido, mas só se aceitar
+                # outra marca — merece mais atenção que uma falta coberta.
+                ordem = {"ABERTO": 0, "VOLTOU": 1, "SUBSTITUTO": 2,
+                         "SEM_INFO": 3, "TEM": 4}
                 return (False, ordem.get(v, 9))
             if isinstance(v, (int, float)):
                 return (vazio, v)
@@ -18831,6 +18861,9 @@ def faltas_painel(
 
         linhas = todas[:limite]
         pecas = sum(contagem.values())
+        # "Só substituto" NÃO entra como resolvido. A peça pedida continua
+        # faltando; o que existe é outra marca. Contar como resolvido inflaria
+        # o percentual justamente nos casos que ainda exigem decisão.
         resolvidas = contagem["TEM"]
         # O percentual ignora SEM_INFO no denominador: incluir o que não se
         # sabe como se fosse não resolvido puniria a unidade por cadastro.

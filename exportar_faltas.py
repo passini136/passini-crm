@@ -494,8 +494,9 @@ def resolver_vendedores(
 
 
 def familia_e_estoque(
-    sources: Path, mapa_unidade: dict[str, str]
-) -> tuple[dict, "pd.DataFrame"]:
+    sources: Path, mapa_unidade: dict[str, str],
+    codigos_pedidos: set[str] | None = None,
+) -> tuple[dict, "pd.DataFrame", "pd.DataFrame"]:
     """Famílias de substitutos e estoque consolidado, pela regra do Radar.
 
     Usa gerar_familias_substitutos e _prepare_stock IMPORTADAS do Radar, não
@@ -557,13 +558,20 @@ def familia_e_estoque(
           f"zeradas: {len(fam) - com:,}")
     print(f"   Unidades: {', '.join(sorted(set(est['unidade'])))}")
 
-    # Item a item, só o que tem saldo — para dizer QUAL da família chegou.
-    itens = est[est["qtd"] > 0].groupby(
+    # Item a item: tudo que tem saldo, MAIS os códigos pedidos mesmo com zero.
+    # O zero é o que permite a tela dizer "a peça pedida está zerada, quem tem
+    # é o substituto" em vez de um "Tem na loja" que manda o gerente procurar
+    # na prateleira errada.
+    com_saldo = est["qtd"] > 0
+    pedido = est["codigo"].isin(codigos_pedidos) if codigos_pedidos else False
+    itens = est[com_saldo | pedido].groupby(
         ["unidade", "codigo"], as_index=False).agg(
         familia=("familia", "first"), estoque=("qtd", "sum"),
         ultima_entrada=("entrada", "max"))
     itens["ultima_entrada"] = itens["ultima_entrada"].dt.strftime("%Y-%m-%d")
-    print(f"   Itens com saldo: {len(itens):,} (de {len(est):,} posições)")
+    zerados = int((itens["estoque"] <= 0).sum())
+    print(f"   Posições guardadas: {len(itens):,} "
+          f"({len(itens) - zerados:,} com saldo, {zerados:,} zeradas de peça pedida)")
     return familias, fam, itens
 
 
@@ -620,13 +628,21 @@ CREATE TABLE estoque_familia (
     ultima_entrada TEXT,
     PRIMARY KEY (unidade, familia)
 );
--- Quem, DENTRO da família, está na prateleira. Só os códigos com saldo.
+-- Posição por CÓDIGO, dentro da família.
 --
--- O vendedor pede a pastilha da marca A, da B e da C — uma necessidade, três
--- pedidos. Chega a da B. Sem esta tabela o painel diria "resolvido" sem saber
--- dizer o que chegou, e o vendedor continuaria oferecendo a A.
--- Guardar só o que tem saldo reduz de 343 mil posições para algumas dezenas
--- de milhares: é tudo que a resposta precisa.
+-- Guarda duas coisas diferentes e as duas são necessárias:
+--   · quem da família TEM saldo (para dizer "pediu A, chegou B");
+--   · quanto o código PEDIDO tem, mesmo que seja ZERO.
+--
+-- O zero é o que faltava e gerou erro de leitura: a peça 101487 (SYL) tem 0
+-- na Zona Sul e a família tem 5, que são de outro código (80539, TRW). A tela
+-- mostrava "Estoque 5 · Tem na loja" numa linha identificada como 101487/SYL,
+-- e o gerente foi conferir na prateleira e não achou. Sem a linha de zero não
+-- há como a tela distinguir "a peça está lá" de "o substituto está lá".
+--
+-- Só os códigos que aparecem nas faltas entram: guardar as 343 mil posições
+-- do estoque inteiro triplicaria o arquivo para responder o que ninguém
+-- pergunta.
 CREATE TABLE estoque_item (
     unidade        TEXT NOT NULL,
     item_code      TEXT NOT NULL,
@@ -913,7 +929,8 @@ def main() -> int:
               f"({', '.join(numericas[:5])}) — vale olhar o cadastro.")
 
     # ── Família e estoque ───────────────────────────────────────────────────
-    familias, estoque, estoque_itens = familia_e_estoque(origem.parent, mapa)
+    familias, estoque, estoque_itens = familia_e_estoque(
+        origem.parent, mapa, set(resumo["item_code"]))
     resumo["familia"] = resumo["item_code"].map(
         lambda c: familias.get(c, {}).get("FamiliaID", c))
     meses = sorted(resumo["competencia"].unique())
