@@ -647,9 +647,34 @@ def main() -> int:
                     help="apura e relata sem gravar")
     ap.add_argument("--depara", default=DEPARA_PADRAO,
                     help="arquivo de de-para login do Radar → vendedor do CRM")
+    ap.add_argument("--se-mudou", action="store_true",
+                    help="só reprocessa se o arquivo do Radar for mais novo que "
+                         "o destino (para rodar de hora em hora sem custo)")
     args = ap.parse_args()
 
     origem = achar_pickle()
+
+    # SAI ANTES DE LER OS 44 MB.
+    #
+    # A comparação é de data de modificação, feita antes de abrir qualquer
+    # coisa. É o que permite agendar de hora em hora: nos dias em que o Radar
+    # não foi importado, o script custa milissegundos e não toca no arquivo
+    # que o CRM está lendo. O de-para à mão também conta como mudança — editar
+    # o CSV e não ver efeito até o Radar ser importado seria desconcertante.
+    if args.se_mudou and not args.simular:
+        destino_atual = Path(args.destino)
+        if destino_atual.exists():
+            t_destino = destino_atual.stat().st_mtime
+            t_origem = origem.stat().st_mtime
+            dp = Path(args.depara)
+            t_depara = dp.stat().st_mtime if dp.exists() else 0
+            if t_origem <= t_destino and t_depara <= t_destino:
+                from datetime import datetime as _dt
+                print(f"Sem novidade: {origem.name} de "
+                      f"{_dt.fromtimestamp(t_origem):%d/%m %H:%M} e destino de "
+                      f"{_dt.fromtimestamp(t_destino):%d/%m %H:%M}. Nada a fazer.")
+                return 0
+
     print(f"Origem:  {origem}")
     print(f"Destino: {args.destino}{'  (SIMULAÇÃO, nada será gravado)' if args.simular else ''}\n")
 
