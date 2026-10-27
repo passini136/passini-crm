@@ -14124,17 +14124,26 @@ function abaFaltas() {
     // "Pediu A, chegou B" — o que o vendedor precisa saber para voltar ao
     // cliente. Substituto que ele não pediu vem destacado: é a informação
     // que ele não tem como adivinhar.
+    // O SINAL VERDE SÓ QUANDO A PEÇA PEDIDA ESTÁ LÁ.
+    //
+    // Antes esta linha dizia "✅ na loja: 80539 (5)" mesmo com o status
+    // "Só substituto" logo ao lado — dois sinais contrários na mesma linha, e
+    // o ✅ é o que o olho pega. Com a peça zerada, tudo aqui vira azul de
+    // substituição, e a marca vai junto: é ela que o vendedor oferece.
+    const soSubstituto = l.status === "SUBSTITUTO";
+    const comMarca = (a) => `${escapeHtml(a.code)}${
+      a.brand ? ` · ${escapeHtml(a.brand)}` : ""} (${number(a.stock)})`;
     const chegou = [];
     if ((l.atendidoPedido || []).length) {
-      chegou.push(`✅ na loja: ${l.atendidoPedido
-        .map((a) => `${escapeHtml(a.code)} (${number(a.stock)})`).join(", ")}`);
+      chegou.push(`${soSubstituto ? "🔄 outro código na loja" : "✅ na loja"}: ${
+        l.atendidoPedido.map(comMarca).join(", ")}`);
     }
     if ((l.atendidoOutro || []).length) {
-      chegou.push(`🔄 substituto: ${l.atendidoOutro
-        .map((a) => `${escapeHtml(a.code)} (${number(a.stock)})`).join(", ")}`);
+      chegou.push(`🔄 substituto: ${l.atendidoOutro.map(comMarca).join(", ")}`);
     }
     const bloco = chegou.length
-      ? `<div class="text-small" style="color:#1e6b34">${chegou.join(" · ")}</div>` : "";
+      ? `<div class="text-small" style="color:${soSubstituto ? "#1a73e8" : "#1e6b34"}">
+           ${chegou.join(" · ")}</div>` : "";
     return `<tr>
       <td style="font-family:ui-monospace,monospace">${escapeHtml(l.itemCode)}</td>
       <td>${escapeHtml(l.item || "—")}<div class="text-small" style="color:var(--muted)">
@@ -14197,8 +14206,14 @@ function abaFaltas() {
           ${d.sellerName ? " · " + escapeHtml(d.sellerName) : ""}
         </span>
         <span style="flex:1"></span>
+        ${/* A HORA DA FOTO DO ESTOQUE, não a do processamento.
+              O estoque sai do Alfa de manhã; o painel pode ser aberto à
+              tarde. Sem a hora, "Estoque da peça: 5" afirma um saldo de
+              agora que a fonte não sustenta — e foi assim que o painel
+              mandou alguém procurar na prateleira uma peça já vendida. */""}
         <span class="text-small" style="color:var(--muted)">
-          Base de ${escapeHtml((d.arquivo || {}).geradoEm || "—")}
+          Estoque de ${escapeHtml((d.arquivo || {}).estoqueEm
+            || (d.arquivo || {}).geradoEm || "—")}
         </span>
       </div>
 

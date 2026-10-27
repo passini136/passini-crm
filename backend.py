@@ -18490,6 +18490,12 @@ def faltas_status() -> dict[str, Any]:
         return {
             "disponivel": True,
             "geradoEm": meta.get("gerado_em", ""),
+            # A hora da FOTO do estoque, que não é a hora do processamento.
+            # A tela mostra esta, porque é ela que limita o que o número
+            # pode afirmar.
+            "estoqueEm": meta.get("estoque_em", ""),
+            "solicitacaoEm": meta.get("solicitacao_em", ""),
+            "substitutosEm": meta.get("substitutos_em", ""),
             "competenciaMin": meta.get("competencia_min", ""),
             "competenciaMax": meta.get("competencia_max", ""),
             "linhas": int(meta.get("linhas_resumo") or 0),
@@ -18746,14 +18752,17 @@ def faltas_painel(
         saldo_do_codigo: dict[tuple[str, str], float] = {}
         try:
             for r in fconn.execute(
-                    "SELECT unidade, familia, item_code, estoque, ultima_entrada"
-                    "  FROM estoque_item"):
+                    "SELECT unidade, familia, item_code, estoque, ultima_entrada,"
+                    "       COALESCE(marca, '') AS marca FROM estoque_item"):
                 saldo_do_codigo[(r["unidade"], r["item_code"])] = float(
                     r["estoque"] or 0)
                 if float(r["estoque"] or 0) > 0:
                     atendidos.setdefault((r["unidade"], r["familia"]), []).append({
                         "code": r["item_code"], "stock": float(r["estoque"] or 0),
                         "lastEntry": r["ultima_entrada"] or "",
+                        # Marca do que está na prateleira: é o que o vendedor
+                        # precisa dizer ao cliente para oferecer o substituto.
+                        "brand": normalize_whitespace(r["marca"]),
                     })
         except sqlite3.Error:
             # Arquivo antigo, sem a tabela. A tela perde o "chegou o Y" e

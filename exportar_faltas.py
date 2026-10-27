@@ -84,6 +84,22 @@ DESTINO_PADRAO = "/srv/passini/data/compartilhado/faltas.db"
 DEPARA_PADRAO = "/srv/passini/data/compartilhado/vendedores_faltas.csv"
 
 
+def _data_do_arquivo(caminho: Path) -> str:
+    """Quando o arquivo de origem foi gravado. Vazio se não existir.
+
+    É a hora em que o relatório saiu do Alfa e entrou no servidor — o Felipe
+    exporta e importa no mesmo momento. É ESSA data que a tela precisa
+    mostrar ao lado do estoque, não a hora em que este script rodou.
+    """
+    try:
+        if caminho.exists():
+            return datetime.fromtimestamp(
+                caminho.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    except OSError:
+        pass
+    return ""
+
+
 def achar_pickle() -> Path:
     candidatos = [
         (os.environ.get("RUNTIME_DIR", "") or "x") + "/sources/solicitacao.pkl",
@@ -546,6 +562,10 @@ def familia_e_estoque(
         "familia": preparado["FamiliaID"].astype(str),
         "qtd": preparado["quantity"],
         "entrada": preparado["Ultima_Entrada"],
+        # Marca direto do estoque: o substituto pode ser peça que a casa nunca
+        # vendeu, e aí não existe marca no faturamento para consultar.
+        "marca": (preparado["Marca_Estoque"].map(limpa)
+                  if "Marca_Estoque" in preparado.columns else ""),
     })
     est = est[est["familia"].ne("")]
     est["codigo"] = preparado["GTIN"].astype(str)
@@ -567,7 +587,7 @@ def familia_e_estoque(
     itens = est[com_saldo | pedido].groupby(
         ["unidade", "codigo"], as_index=False).agg(
         familia=("familia", "first"), estoque=("qtd", "sum"),
-        ultima_entrada=("entrada", "max"))
+        ultima_entrada=("entrada", "max"), marca=("marca", "first"))
     itens["ultima_entrada"] = itens["ultima_entrada"].dt.strftime("%Y-%m-%d")
     zerados = int((itens["estoque"] <= 0).sum())
     print(f"   Posições guardadas: {len(itens):,} "
@@ -649,6 +669,12 @@ CREATE TABLE estoque_item (
     familia        TEXT NOT NULL,
     estoque        REAL NOT NULL,
     ultima_entrada TEXT,
+    -- A MARCA DE QUEM ESTÁ NA PRATELEIRA.
+    -- Vem do próprio estoque (itemBrandName), não do faturamento: o
+    -- substituto que resolve o cliente pode ser uma peça que a Passini nunca
+    -- vendeu, e aí não há marca no faturamento para consultar. Sem ela a tela
+    -- diz "tem o 80539" e o vendedor não sabe o que está oferecendo.
+    marca          TEXT,
     PRIMARY KEY (unidade, item_code)
 );
 CREATE INDEX idx_estoque_item_fam ON estoque_item(unidade, familia);
@@ -983,19 +1009,30 @@ def main() -> int:
         if len(estoque_itens):
             conn.executemany(
                 "INSERT OR REPLACE INTO estoque_item"
-                " (unidade, item_code, familia, estoque, ultima_entrada)"
-                " VALUES (?,?,?,?,?)",
+                " (unidade, item_code, familia, estoque, ultima_entrada, marca)"
+                " VALUES (?,?,?,?,?,?)",
                 estoque_itens[["unidade", "codigo", "familia", "estoque",
-                               "ultima_entrada"]]
+                               "ultima_entrada", "marca"]]
                 .astype(object).where(pd.notna(estoque_itens[[
                     "unidade", "codigo", "familia", "estoque",
-                    "ultima_entrada"]]), None)
+                    "ultima_entrada", "marca"]]), None)
                 .itertuples(index=False, name=None),
             )
         conn.executemany(
             "INSERT INTO faltas_meta (chave, valor) VALUES (?,?)",
             [
                 ("gerado_em", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+                # QUANDO A FOTO DO ESTOQUE FOI TIRADA.
+                #
+                # Não é a mesma coisa que "gerado_em": este script roda às 10h
+                # e às 14h sobre um estoque que foi exportado do Alfa às 7h30.
+                # Mostrar só a hora do processamento faria a tela afirmar um
+                # saldo de agora que a fonte não sustenta — e foi assim que o
+                # painel disse "tem 5" de uma peça que já tinha saído.
+                ("estoque_em", _data_do_arquivo(origem.parent / "stock.pkl")),
+                ("solicitacao_em", _data_do_arquivo(origem)),
+                ("substitutos_em",
+                 _data_do_arquivo(origem.parent / "substitutos.pkl")),
                 ("origem", str(origem)),
                 ("linhas_cruas", str(total_cru)),
                 ("linhas_resumo", str(len(resumo))),
