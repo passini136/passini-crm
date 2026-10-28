@@ -22482,7 +22482,11 @@ const COT_CANAIS = [["WHATSAPP", "WhatsApp", "💬"], ["TELEFONE", "Telefone", "
 function cotState() {
   if (!state.cotacoes) {
     state.cotacoes = { data: null, carteira: null, busca: "", seller: "", abrindoMotivo: null,
-                       detalhe: null, det: {}, salvando: {}, releases: null, erro: "" };
+                       detalhe: null, det: {}, salvando: {}, releases: null, erro: "",
+                       // Cliente sem cadastro e resumo por dia:
+                       novoNome: "", novoFone: "",
+                       resumo: null, resumoCarregando: false,
+                       resumoDia: "", resumoDias: 14 };
   }
   return state.cotacoes;
 }
@@ -22587,6 +22591,145 @@ function cotDetalhes(id) {
   if (d.peca !== undefined && String(d.peca).trim() !== "") out.itemHint = String(d.peca).trim();
   return out;
 }
+
+async function cotLoadResumo(ajuste) {
+  const s = cotState();
+  // Carrega SÓ quando a seção é aberta. É um resumo de consulta, não a tela
+  // de trabalho — somá-lo ao carregamento inicial atrasaria o que o vendedor
+  // usa a cada atendimento.
+  Object.assign(s, ajuste || {});
+  if (s.resumoCarregando) return;
+  s.resumoCarregando = true;
+  try {
+    const q = new URLSearchParams();
+    if (s.resumoDia) q.set("dia", s.resumoDia);
+    if (s.resumoDias) q.set("dias", String(s.resumoDias));
+    if (!s.data?.isSeller && s.seller) q.set("seller", s.seller);
+    s.resumo = await api(`/api/crm/quotes/summary?${q}`);
+  } catch (e) {
+    s.resumo = { erro: e.message };
+  } finally {
+    s.resumoCarregando = false;
+    const el = document.getElementById("cot-resumo");
+    if (el) el.innerHTML = cotResumoHtml();
+  }
+}
+
+
+function cotResumoHtml() {
+  const s = cotState();
+  const r = s.resumo;
+  if (s.resumoCarregando && !r) return `<div class="cot-vazio">Apurando…</div>`;
+  if (!r) return `<div class="cot-vazio">Abra para ver o resumo.</div>`;
+  if (r.erro) return `<div class="message error">${escapeHtml(r.erro)}</div>`;
+
+  // Percentual só quando houve desfecho. "0%" com nenhuma decidida diria
+  // "não perdeu nenhuma", que é diferente de "ainda não respondeu".
+  const pct = (v) => (v === null || v === undefined
+    ? `<span style="color:var(--muted)">—</span>` : `${v.toFixed(0)}%`);
+  const linha = (x, rotulo, destaque) => `
+    <tr${destaque ? ' style="background:#eef4fa;font-weight:700"' : ""}>
+      <td>${rotulo}</td>
+      <td style="text-align:right">${number(x.total)}</td>
+      <td style="text-align:right;color:var(--good)">${number(x.fechou)}</td>
+      <td style="text-align:right;color:var(--bad)">${number(x.perdeu)}</td>
+      <td style="text-align:right">${pct(x.lossPct)}</td>
+      <td style="text-align:right">${x.semDesfecho
+        ? `<span style="color:#b06000;font-weight:700">${number(x.semDesfecho)}</span>`
+        : "0"}</td>
+      <td style="text-align:right">${number(x.clientes)}</td>
+      <td style="text-align:right">${x.novos
+        ? `<span style="color:var(--accent);font-weight:700">${number(x.novos)}</span>` : "0"}</td>
+    </tr>`;
+
+  const cabecalho = `
+    <thead><tr>
+      <th>${r.isSeller ? "Dia" : "Vendedor"}</th>
+      <th style="text-align:right">Cotações</th>
+      <th style="text-align:right">Fechou</th>
+      <th style="text-align:right">Perdeu</th>
+      <th style="text-align:right" title="Perdidas ÷ decididas">Perda</th>
+      <th style="text-align:right" title="Cotações do dia ainda sem desfecho">Sem desfecho</th>
+      <th style="text-align:right">Clientes</th>
+      <th style="text-align:right" title="Clientes que ainda não tinham cadastro">Novos</th>
+    </tr></thead>`;
+
+  if (r.isSeller) {
+    const hoje = (r.porDia || []).find((x) => x.dia === r.hoje);
+    return `
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+        <select onchange="cotLoadResumo({resumoDias: Number(this.value)})"
+          style="padding:5px 9px;border:1px solid var(--line);border-radius:6px">
+          ${[7, 14, 30].map((n) => `<option value="${n}"
+            ${n === r.dias ? "selected" : ""}>Últimos ${n} dias</option>`).join("")}
+        </select>
+        <span class="text-small" style="color:var(--muted)">
+          ${hoje ? `Hoje: ${number(hoje.total)} cotação(ões), ${number(hoje.fechou)} fechada(s)`
+                 : "Nenhuma cotação registrada hoje."}
+        </span>
+      </div>
+      <table class="table" style="margin:0">${cabecalho}
+        <tbody>${(r.porDia || []).map((x) => linha(
+          x, escapeHtml(x.dia.split("-").reverse().join("/")), x.dia === r.hoje)).join("")
+          || `<tr><td colspan="8" style="text-align:center;padding:16px;color:var(--muted)">
+              Nenhuma cotação no período.</td></tr>`}</tbody>
+      </table>`;
+  }
+
+  return `
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <select onchange="cotLoadResumo({resumoDia: this.value})"
+        style="padding:5px 9px;border:1px solid var(--line);border-radius:6px">
+        ${(r.diasDisponiveis || []).map((d) => `<option value="${d}"
+          ${d === r.dia ? "selected" : ""}>${d.split("-").reverse().join("/")}${
+            d === r.hoje ? " (hoje)" : ""}</option>`).join("")
+          || `<option>${r.dia}</option>`}
+      </select>
+      <span class="text-small" style="color:var(--muted)">
+        ${(r.porVendedor || []).length} vendedor(es) com cotação neste dia
+      </span>
+    </div>
+    <table class="table" style="margin:0">${cabecalho}
+      <tbody>${(r.porVendedor || []).map((x) => linha(
+        x, escapeHtml(nomeVendedorCurto(x.seller_name)))).join("")
+        || `<tr><td colspan="8" style="text-align:center;padding:16px;color:var(--muted)">
+            Nenhuma cotação registrada neste dia.</td></tr>`}</tbody>
+    </table>
+    <div class="text-small" style="color:var(--muted);margin-top:8px">
+      <strong>Sem desfecho</strong> é o que exige ação na reunião da manhã: a
+      cotação ficou aberta e o cliente não teve resposta.
+    </div>`;
+}
+
+
+function cotCriarNovo(channel) {
+  const s = cotState();
+  const nome = String(s.novoNome || "").trim();
+  if (nome.length < 3) {
+    cotAviso("Escreva o nome do cliente antes de registrar.", true);
+    cotFocar("cot-novo-nome");
+    return;
+  }
+  const canal = COT_CANAIS.find((c) => c[0] === channel)?.[1] || channel;
+  cotAcao("c-novo", "/api/crm/quotes/create",
+          { channel, newClientName: nome,
+            newClientPhone: String(s.novoFone || "").trim() || undefined,
+            seller: s.data?.isSeller ? undefined : (s.seller || undefined) },
+          (r) => `Cotação pelo ${canal} registrada para ${nome}.`
+            + (r?.quote?.clientKey?.startsWith?.("P-")
+               ? " Ele entrou como prospecção na sua carteira." : ""),
+          (r) => {
+            // Limpa os campos: deixá-los preenchidos faria o próximo clique
+            // criar um segundo prospect com o mesmo nome.
+            s.novoNome = ""; s.novoFone = "";
+            const id = r?.quote?.id;
+            if (!id) { cotPaint(); return; }
+            s.detalhe = id;
+            cotPaint();
+            cotFocar(`cot-p-${id}`);
+          });
+}
+
 
 function cotCriar(clientKey, channel) {
   const s = cotState();
@@ -22802,8 +22945,33 @@ function cotCarteiraHtml() {
   const c = s.carteira;
   if (!c) return `<div class="cot-vazio">Carregando…</div>`;
   if (c.error) return `<div class="message error">${escapeHtml(c.error)}</div>`;
+  // O ATALHO APARECE ONDE A FALTA DOCE: quem buscou e não achou é
+  // exatamente quem tem um cliente sem cadastro na linha. Pedir que ele vá
+  // até a tela de Prospecção, cadastre e volte faria a oportunidade se perder
+  // no caminho — com o cliente esperando preço do outro lado.
+  const novoCliente = `
+    <div class="cot-novo">
+      <div class="text-small" style="margin-bottom:6px">
+        Cliente ainda sem cadastro? Registre a cotação assim mesmo — ele entra
+        como <strong>prospecção</strong> na sua carteira.
+      </div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <input id="cot-novo-nome" placeholder="Nome da oficina ou do cliente"
+               value="${escapeHtml(s.novoNome || "")}"
+               style="flex:1;min-width:200px"
+               oninput="cotState().novoNome=this.value" />
+        <input id="cot-novo-fone" placeholder="Telefone (opcional)"
+               value="${escapeHtml(s.novoFone || "")}"
+               style="width:150px"
+               oninput="cotState().novoFone=this.value" />
+        ${COT_CANAIS.map(([id, label, icone]) => `
+          <button class="btn cot-btn cot-canal" title="Cotou pelo ${label}"
+                  onclick="cotCriarNovo('${id}')">${icone} ${label}</button>`).join("")}
+      </div>
+    </div>`;
+
   if (!c.clients.length) {
-    return `<div class="cot-vazio">${s.busca.trim().length >= 2 ? "Nenhum cliente encontrado com essa busca." : "Nenhum cliente na carteira. Use a busca acima para achar qualquer cliente."}</div>`;
+    return `<div class="cot-vazio">${s.busca.trim().length >= 2 ? "Nenhum cliente encontrado com essa busca." : "Nenhum cliente na carteira. Use a busca acima para achar qualquer cliente."}</div>${novoCliente}`;
   }
   return c.clients.map((cl) => {
     const ocupado = s.salvando[`c-${cl.clientKey}`] ? "disabled" : "";
@@ -22834,7 +23002,7 @@ function cotCarteiraHtml() {
                   onclick="openCrmClient(decodeURIComponent('${cotArg(cl.clientKey)}'), false, true, { outside: true })">📇 Ficha</button>
         </div>
       </div>`;
-  }).join("");
+  }).join("") + novoCliente;
 }
 
 function cotEncerradasHtml() {
@@ -22935,6 +23103,10 @@ function cotacoesView() {
         <h3>${d.isSeller ? "Minha carteira" : "Carteira"} <span class="text-small">cliente cotou? toque no canal</span></h3>
         <div id="cot-carteira">${cotCarteiraHtml()}</div>
       </section>
+      <details class="table-card cot-bloco" ontoggle="if(this.open) cotLoadResumo()">
+        <summary>${d.isSeller ? "Meu resumo por dia" : "Resumo do dia por vendedor"}</summary>
+        <div id="cot-resumo">${cotResumoHtml()}</div>
+      </details>
       <details class="table-card cot-bloco">
         <summary>Encerradas hoje</summary>
         <div id="cot-encerradas">${cotEncerradasHtml()}</div>

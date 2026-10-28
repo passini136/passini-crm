@@ -2259,3 +2259,15 @@ tbody tr:hover {
 .mec-3p ol { margin: 0 0 0 18px; padding: 0; font-style: italic; font-size: 13px; line-height: 1.6; }
 .cot-tempo { font-weight: 700; }
 .cot-tempo.atrasada { color: var(--bad); }
+
+/* Cliente sem cadastro na tela de Cotações. Fica depois da carteira, com
+   fundo próprio: é uma ação diferente de "cotar quem já é cliente", e
+   misturá-la às linhas da carteira faria o vendedor clicar no canal errado. */
+.cot-novo {
+  margin-top: 10px; padding: 12px 14px; border-radius: 10px;
+  background: #f7fafc; border: 1px dashed var(--line);
+}
+.cot-novo input {
+  padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+  font-size: 13px;
+}

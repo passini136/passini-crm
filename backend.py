@@ -27879,6 +27879,95 @@ def listar_cotacoes(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], pa
     }
 
 
+def resumo_cotacoes(
+    conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]
+) -> dict[str, Any]:
+    """Resumo do módulo: por DIA para o vendedor, por VENDEDOR para o gestor.
+
+    São duas perguntas diferentes e por isso dois recortes:
+
+    · O vendedor pergunta "como foi meu dia, e ontem?" — uma linha por dia,
+      para ele ver o próprio ritmo sem depender do gerente.
+    · O gestor pergunta "como foi o dia da equipe?" — uma linha por vendedor
+      no dia escolhido, que é a leitura da reunião da manhã.
+
+    O mesmo filtro de escopo das outras consultas do módulo: o vendedor só vê
+    o dele, o gestor vê a unidade dele.
+    """
+    hoje_d = today_in_brazil()
+    dias = max(1, min(parse_int(params.get("dias")) or 14, 90))
+    desde = (hoje_d - timedelta(days=dias - 1)).isoformat()
+    dia_alvo = normalize_whitespace(params.get("dia")) or hoje_d.isoformat()
+    vendedor = "" if ctx["proprio"] else normalize_whitespace(params.get("seller"))
+    filtro, args = _cotacao_filtro(ctx, vendedor, conn, user["company_id"])
+    cid = user["company_id"]
+
+    def medir(linhas: list[sqlite3.Row], chave: str) -> list[dict[str, Any]]:
+        saida = []
+        for r in linhas:
+            fechou, perdeu = int(r["fechou"] or 0), int(r["perdeu"] or 0)
+            decididas = fechou + perdeu
+            saida.append({
+                chave: r[chave],
+                "total": int(r["total"] or 0),
+                "fechou": fechou, "perdeu": perdeu,
+                "aberta": int(r["aberta"] or 0),
+                "decidindo": int(r["decidindo"] or 0),
+                # None quando nada foi decidido: zero diria "não perdeu
+                # nenhuma", que é diferente de "ainda não respondeu".
+                "lossPct": round(100 * perdeu / decididas, 1) if decididas else None,
+                "closeRate": round(100 * fechou / decididas, 1) if decididas else None,
+                "semDesfecho": int(r["total"] or 0) - decididas,
+                "clientes": int(r["clientes"] or 0),
+                "novos": int(r["novos"] or 0),
+            })
+        return saida
+
+    COLUNAS = """
+        COUNT(*) AS total,
+        SUM(status = 'FECHOU') AS fechou,
+        SUM(status = 'NAO_FECHOU') AS perdeu,
+        SUM(status = 'ABERTA') AS aberta,
+        SUM(status = 'DECIDINDO') AS decidindo,
+        COUNT(DISTINCT client_key) AS clientes,
+        -- Cliente sem cadastro entra com chave P-<id>: contar separado mostra
+        -- quanta oportunidade nova o dia gerou, que é o motivo de existir
+        -- o registro de cliente novo.
+        COUNT(DISTINCT CASE WHEN client_key LIKE 'P-%' THEN client_key END) AS novos
+    """
+
+    por_dia = medir(conn.execute(
+        f"""SELECT substr(quoted_at, 1, 10) AS dia, {COLUNAS}
+              FROM crm_quotes WHERE company_id = ? {filtro}
+               AND substr(quoted_at, 1, 10) >= ?
+             GROUP BY dia ORDER BY dia DESC""",
+        [cid, *args, desde]).fetchall(), "dia")
+
+    por_vendedor: list[dict[str, Any]] = []
+    if not ctx["proprio"]:
+        f_dia, a_dia = _cotacao_filtro(ctx, vendedor, conn, cid)
+        por_vendedor = medir(conn.execute(
+            f"""SELECT seller_name, {COLUNAS}
+                  FROM crm_quotes WHERE company_id = ? {f_dia}
+                   AND substr(quoted_at, 1, 10) = ?
+                 GROUP BY seller_name ORDER BY total DESC""",
+            [cid, *a_dia, dia_alvo]).fetchall(), "seller_name")
+
+    dias_disponiveis = [r[0] for r in conn.execute(
+        f"""SELECT DISTINCT substr(quoted_at, 1, 10) d FROM crm_quotes
+             WHERE company_id = ? {filtro} ORDER BY d DESC LIMIT 60""",
+        [cid, *args]).fetchall()]
+
+    return {
+        "isSeller": ctx["proprio"],
+        "dias": dias, "dia": dia_alvo, "hoje": hoje_d.isoformat(),
+        "diasDisponiveis": dias_disponiveis,
+        "porDia": por_dia,
+        "porVendedor": por_vendedor,
+        "selectedSeller": vendedor,
+    }
+
+
 def carteira_para_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
     cid = user["company_id"]
     busca = normalize_whitespace(params.get("q"))
@@ -27995,15 +28084,59 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
     cid = user["company_id"]
     chave = normalize_whitespace(payload.get("clientKey"))
     canal = normalize_upper(payload.get("channel") or "")
-    if not chave:
-        return 400, {"error": "Escolha o cliente."}
+    # A validação do cliente desceu: agora há DOIS caminhos válidos — cliente
+    # do cadastro (clientKey) ou cliente novo (newClientName). A checagem fica
+    # depois de tentar criar o prospect.
     if canal not in COTACAO_CANAIS:
         return 400, {"error": "Escolha o canal: WhatsApp, telefone ou balcão."}
+    # CLIENTE SEM CADASTRO VIRA PROSPECT, NÃO TEXTO SOLTO.
+    #
+    # A oficina que liga pedindo preço e não está no cadastro é uma
+    # oportunidade — e o CRM já tem o lugar certo para ela: a Prospecção.
+    # Gravar só o nome na cotação documentaria o orçamento e perderia o
+    # cliente; criando o prospect, a mesma digitação alimenta o funil que o
+    # MEC já define, e a cotação aponta para ele pela chave P-<id>.
+    #
+    # Sem exigir CNPJ, telefone e e-mail: isso é o que a tela de Prospecção
+    # pede para ABRIR CADASTRO. Aqui o vendedor está ao telefone com o cliente
+    # esperando preço, e exigir quatro campos faria ele não registrar nada.
+    novo_nome = normalize_whitespace(payload.get("newClientName"))
+    prospect_id = None
+    if novo_nome and not chave:
+        try:
+            criado = save_prospect(conn, cid, user, {
+                "companyName": novo_nome,
+                "phone": payload.get("newClientPhone") or "",
+                "cityName": payload.get("newClientCity") or "",
+                "sellerName": payload.get("seller") or "",
+                "origin": "Cotação",
+                "closingTrigger": "COTACAO",
+                "notes": "Criado a partir de uma cotação do dia.",
+            }, exigir_contato=False)
+        except (ValueError, PermissionError) as exc:
+            return 400, {"error": str(exc)}
+        prospect_id = criado.get("prospectId")
+        # try_convert_prospect pode ter achado um cliente existente com o
+        # mesmo CNPJ; nesse caso a cotação aponta para o cliente de verdade.
+        chave = (normalize_whitespace(criado.get("clientCode"))
+                 or f"P-{prospect_id}")
+
+    if not chave:
+        return 400, {"error": "Escolha o cliente ou informe o nome do novo."}
+
     cli = conn.execute(
         "SELECT client_name, NULLIF(TRIM(internal_seller_name), '') AS dono "
         "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?",
         (cid, chave)).fetchone()
     nome = normalize_whitespace(cli["client_name"]) if cli else ""
+    if not nome and prospect_id:
+        nome = novo_nome          # prospect recém-criado: ainda não há perfil
+    if not nome:
+        p = conn.execute(
+            "SELECT company_name FROM prospects WHERE company_id = ? AND id = ?",
+            (cid, str(chave)[2:] if str(chave).upper().startswith("P-") else -1),
+        ).fetchone()
+        nome = normalize_whitespace(p["company_name"]) if p else ""
     if not nome:
         return 400, {"error": "Cliente não encontrado no cadastro."}
     vendedor = ctx["eu"] if ctx["proprio"] else (normalize_whitespace(payload.get("seller")) or ctx["eu"])
@@ -28200,6 +28333,8 @@ def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, d
     try:
         if metodo == "GET" and path == "/api/crm/quotes":
             return 200, listar_cotacoes(conn, user, ctx, dados)
+        if metodo == "GET" and path == "/api/crm/quotes/summary":
+            return 200, resumo_cotacoes(conn, user, ctx, dados)
         if metodo == "GET" and path == "/api/crm/quotes/portfolio":
             return 200, carteira_para_cotacao(conn, user, ctx, dados)
         if path == "/api/crm/quotes/releases":
