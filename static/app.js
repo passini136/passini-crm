@@ -22485,6 +22485,10 @@ function cotState() {
                        detalhe: null, det: {}, salvando: {}, releases: null, erro: "",
                        // Cliente sem cadastro e resumo por dia:
                        novoNome: "", novoFone: "", carteiraAberta: true,
+                       // Encerradas com filtro por data (começa em hoje, que
+                       // é a conferência de fim de turno):
+                       encerradas: null, encCarregando: false, encPeriodo: "hoje",
+                       encDe: "", encAte: "", encResultado: "",
                        resumo: null, resumoCarregando: false,
                        resumoDia: "", resumoDias: 14 };
   }
@@ -22550,6 +22554,10 @@ function cotTrocarVendedor(valor) {
   s.seller = valor;
   s.data = null;
   s.carteira = null;
+  // As encerradas do vendedor anterior não valem para o novo: zerar obriga a
+  // seção a buscar de novo em vez de mostrar a lista de outra pessoa.
+  s.encerradas = null;
+  s.resumo = null;
   cotLoad();
 }
 
@@ -22586,6 +22594,9 @@ async function cotAcao(chave, url, body, aviso, depois) {
     state.tasks = null;   // desfecho pode criar/fechar tarefa: a tela Tarefas recarrega
     s.data = await api(`/api/crm/quotes?${cotQs()}`);
     await cotLoadCarteira(false);
+    // Só recarrega as encerradas se a seção já estiver aberta: fechada, ela
+    // não mostra nada e o pedido seria uma ida ao servidor a cada clique.
+    if (s.encerradas) cotLoadEncerradas();
     if (aviso) cotAviso(typeof aviso === "function" ? aviso(resposta) : aviso);
     if (depois) depois(resposta);
   } catch (e) {
@@ -23026,14 +23037,132 @@ function cotCarteiraHtml() {
   }).join("");
 }
 
+// ENCERRADAS DEIXA DE SER "HOJE": o motivo da perda é assunto de reunião de
+// segunda, não de turno. Com a lista presa ao dia, a sexta-feira sumia às
+// 23h59 e o caso chegava à reunião sem o que o cliente pediu.
+const COT_PERIODOS = [["hoje", "Hoje"], ["7", "Últimos 7 dias"],
+                      ["30", "Últimos 30 dias"], ["mes", "Este mês"],
+                      ["custom", "Escolher datas"]];
+
+function cotDataBR(iso) {
+  const t = String(iso || "").slice(0, 10).split("-");
+  return t.length === 3 ? `${t[2]}/${t[1]}` : "";
+}
+
+function cotPeriodoDatas(periodo) {
+  const s = cotState();
+  // "Hoje" é o de quem vende, não o do relógio do navegador: depois da
+  // primeira carga usamos a data que o servidor devolveu (fuso do Brasil).
+  const hoje = s.encerradas?.hoje || s.resumo?.hoje || new Date().toISOString().slice(0, 10);
+  const iso = (x) => x.toISOString().slice(0, 10);
+  if (periodo === "7" || periodo === "30") {
+    const de = new Date(`${hoje}T12:00:00`);
+    de.setDate(de.getDate() - (Number(periodo) - 1));
+    return { encDe: iso(de), encAte: hoje };
+  }
+  if (periodo === "mes") return { encDe: `${hoje.slice(0, 7)}-01`, encAte: hoje };
+  return { encDe: hoje, encAte: hoje };
+}
+
+async function cotLoadEncerradas(ajuste) {
+  const s = cotState();
+  Object.assign(s, ajuste || {});
+  if (s.encPeriodo !== "custom") Object.assign(s, cotPeriodoDatas(s.encPeriodo));
+  // Pedido numerado: trocar de período duas vezes rápido não pode deixar a
+  // resposta antiga sobrescrever a nova na tela.
+  const pedido = (s._pedidoEnc = (s._pedidoEnc || 0) + 1);
+  s.encCarregando = true;
+  const pintar = () => {
+    const el = document.getElementById("cot-encerradas");
+    if (el) el.innerHTML = cotEncerradasHtml();
+  };
+  pintar();
+  try {
+    const q = new URLSearchParams({ de: s.encDe || "", ate: s.encAte || "" });
+    if (s.encResultado) q.set("resultado", s.encResultado);
+    if (!s.data?.isSeller && s.seller) q.set("seller", s.seller);
+    const r = await api(`/api/crm/quotes/closed?${q}`);
+    if (pedido !== s._pedidoEnc) return;
+    s.encerradas = r;
+  } catch (e) {
+    if (pedido !== s._pedidoEnc) return;
+    s.encerradas = { erro: e.message };
+  } finally {
+    if (pedido === s._pedidoEnc) {
+      s.encCarregando = false;
+      pintar();
+    }
+  }
+}
+
+function cotEncPeriodo(valor) {
+  cotLoadEncerradas({ encPeriodo: valor });
+}
+
+function cotEncData(campo, valor) {
+  const s = cotState();
+  s[campo] = valor;
+  s.encPeriodo = "custom";
+  clearTimeout(cotEncTimer);
+  cotEncTimer = setTimeout(() => cotLoadEncerradas(), 400);
+}
+let cotEncTimer = null;
+
+function cotEncResultado(valor) {
+  cotLoadEncerradas({ encResultado: valor });
+}
+
 function cotEncerradasHtml() {
   const s = cotState();
-  const lista = (s.data.quotes || []).filter((q) => q.status === "FECHOU" || q.status === "NAO_FECHOU");
-  if (!lista.length) return `<div class="cot-vazio">Nada encerrado hoje ainda.</div>`;
-  return lista.map((q) => `
+  const r = s.encerradas;
+  const sel = (id, valor, opcoes, acao) => `
+    <select id="${id}" onchange="${acao}(this.value)">
+      ${opcoes.map(([v, l]) => `<option value="${v}" ${v === valor ? "selected" : ""}>${escapeHtml(l)}</option>`).join("")}
+    </select>`;
+  const controles = `
+    <div class="cot-enc-filtros">
+      ${sel("cot-enc-periodo", s.encPeriodo, COT_PERIODOS, "cotEncPeriodo")}
+      <label>de <input type="date" value="${escapeHtml(s.encDe || "")}"
+             max="${escapeHtml(s.encAte || "")}"
+             onchange="cotEncData('encDe', this.value)"></label>
+      <label>até <input type="date" value="${escapeHtml(s.encAte || "")}"
+             onchange="cotEncData('encAte', this.value)"></label>
+      ${sel("cot-enc-res", s.encResultado,
+            [["", "Fechadas e perdidas"], ["FECHOU", "Só fechadas"], ["NAO_FECHOU", "Só perdidas"]],
+            "cotEncResultado")}
+      ${s.encCarregando ? `<span class="text-small">apurando…</span>` : ""}
+    </div>`;
+
+  if (!r) return `${controles}<div class="cot-vazio">Abra para ver as cotações encerradas.</div>`;
+  if (r.erro) return `${controles}<div class="message error">${escapeHtml(r.erro)}</div>`;
+
+  const placar = `
+    <div class="cot-enc-placar">
+      <span><b>${r.total}</b> encerradas</span>
+      <span class="ok"><b>${r.closed}</b> fechadas</span>
+      <span class="ruim"><b>${r.lost}</b> perdidas</span>
+      <span><b>${r.rate == null ? "—" : `${r.rate}%`}</b> de conversão</span>
+      <span><b>${r.clients}</b> cliente(s)</span>
+    </div>`;
+  // Os motivos no topo respondem a pergunta da reunião antes de rolar a
+  // lista: perdemos por preço, por falta ou por prazo?
+  const motivos = (r.reasons || []).length && r.lost
+    ? `<div class="cot-enc-motivos">${(r.reasons).map((m) =>
+        `<span>${escapeHtml(m.label)} <b>${m.total}</b></span>`).join("")}</div>`
+    : "";
+
+  if (!r.quotes.length) {
+    return `${controles}${placar}<div class="cot-vazio">Nenhuma cotação encerrada
+      entre ${cotDataBR(r.de)} e ${cotDataBR(r.ate)}.</div>`;
+  }
+  const corte = r.truncated
+    ? `<div class="cot-vazio">Mostrando as ${r.limit} mais recentes de ${r.total}.
+       Diminua o período para ver o resto.</div>`
+    : "";
+  const linhas = r.quotes.map((q) => `
     <div class="cot-linha">
       <div class="cot-cli"><b>${escapeHtml(q.clientName)}</b>
-        <span>${cotCanal(q.channel)} · ${cotQuando(q)}${s.data.isSeller ? "" : ` · ${escapeHtml(q.sellerName)}`}</span>
+        <span>${cotDataBR(q.decidedAt || q.quotedAt)} · ${cotCanal(q.channel)}${r.isSeller ? "" : ` · ${escapeHtml(q.sellerName)}`}</span>
         ${/* A anotação precisa continuar visível depois do desfecho: é ela
               que diz QUAL peça o cliente pediu, e sem ela a cotação
               encerrada vira só uma contagem. */""}
@@ -23045,6 +23174,7 @@ function cotEncerradasHtml() {
         ${q.canUndo ? `<button class="btn btn-ghost btn-sm" ${s.salvando[`q-${q.id}`] ? "disabled" : ""} onclick="cotDesfazer(${q.id})">Desfazer</button>` : ""}
       </div>
     </div>`).join("");
+  return `${controles}${placar}${motivos}${corte}${linhas}`;
 }
 
 async function cotLoadReleases(paint = true) {
@@ -23139,8 +23269,9 @@ function cotacoesView() {
         <summary>${d.isSeller ? "Meu resumo por dia" : "Resumo do dia por vendedor"}</summary>
         <div id="cot-resumo">${cotResumoHtml()}</div>
       </details>
-      <details class="table-card cot-bloco">
-        <summary>Encerradas hoje</summary>
+      <details class="table-card cot-bloco"
+               ontoggle="if(this.open && !cotState().encerradas) cotLoadEncerradas()">
+        <summary>Encerradas <span class="text-small">fechadas e perdidas, por período</span></summary>
         <div id="cot-encerradas">${cotEncerradasHtml()}</div>
       </details>
     </div>`;

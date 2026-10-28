@@ -27879,6 +27879,100 @@ def listar_cotacoes(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], pa
     }
 
 
+def encerradas_cotacoes(
+    conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]
+) -> dict[str, Any]:
+    """Cotações já decididas num período escolhido.
+
+    A lista da tela mostrava só o dia de hoje, porque é ela que o vendedor
+    confere antes de ir embora. Mas "o que o cliente pediu e nós perdemos" é
+    uma pergunta de semana e de mês, não de turno: sem data, o motivo da perda
+    sumia às 23h59 e a reunião de segunda ficava sem o caso.
+
+    O recorte é pelo DESFECHO (decided_at), não pela abertura: quem procura
+    uma perda procura o dia em que ela foi dada por perdida.
+    """
+    hoje_d = today_in_brazil()
+    cid = user["company_id"]
+
+    def data(nome: str, padrao: str) -> str:
+        valor = normalize_whitespace(params.get(nome))[:10]
+        try:
+            return date.fromisoformat(valor).isoformat()
+        except ValueError:
+            return padrao
+
+    ate = data("ate", hoje_d.isoformat())
+    de = data("de", ate)
+    if de > ate:
+        de, ate = ate, de
+    # Teto de 366 dias: a tela é uma lista, não um relatório anual.
+    if (date.fromisoformat(ate) - date.fromisoformat(de)).days > 366:
+        de = (date.fromisoformat(ate) - timedelta(days=366)).isoformat()
+
+    vendedor = "" if ctx["proprio"] else normalize_whitespace(params.get("seller"))
+    filtro, args = _cotacao_filtro(ctx, vendedor, conn, cid)
+    resultado = normalize_whitespace(params.get("resultado")).upper()
+    # O parâmetro do resultado vai DEPOIS das datas na lista de valores, porque
+    # é onde o ? dele está no SQL. Juntá-lo a `args` o faria ocupar o lugar da
+    # data inicial, e a consulta voltaria vazia sem erro nenhum.
+    extra, arg_resultado = "", []
+    if resultado in ("FECHOU", "NAO_FECHOU"):
+        extra, arg_resultado = " AND status = ?", [resultado]
+
+    LIMITE = 400
+    rows = conn.execute(
+        f"""SELECT * FROM crm_quotes
+             WHERE company_id = ? {filtro}
+               AND status IN ('FECHOU', 'NAO_FECHOU')
+               AND substr(COALESCE(decided_at, quoted_at), 1, 10) BETWEEN ? AND ?
+               {extra}
+             ORDER BY COALESCE(decided_at, quoted_at) DESC
+             LIMIT {LIMITE + 1}""",
+        [cid, *args, de, ate, *arg_resultado]).fetchall()
+    cortou = len(rows) > LIMITE
+    itens = [_cotacao_dict(r, hoje_d.isoformat()) for r in rows[:LIMITE]]
+
+    # O placar vem de uma contagem própria, não da lista: com o corte de 400 a
+    # lista mente sobre o total, e é o total que vale na reunião.
+    r = conn.execute(
+        f"""SELECT COUNT(*) AS total,
+                   SUM(status = 'FECHOU') AS fechou,
+                   SUM(status = 'NAO_FECHOU') AS perdeu,
+                   COUNT(DISTINCT client_key) AS clientes
+              FROM crm_quotes WHERE company_id = ? {filtro}
+               AND status IN ('FECHOU', 'NAO_FECHOU')
+               AND substr(COALESCE(decided_at, quoted_at), 1, 10) BETWEEN ? AND ?
+               {extra}""",
+        [cid, *args, de, ate, *arg_resultado]).fetchone()
+    fechou, perdeu = int(r["fechou"] or 0), int(r["perdeu"] or 0)
+
+    # Os motivos só fazem sentido quando as perdas estão na tela. Filtrando
+    # "só fechou", listar motivos de perda seria um número sem lista por trás.
+    motivos: list[dict[str, Any]] = []
+    if resultado != "FECHOU":
+        base, args_base = _cotacao_filtro(ctx, vendedor, conn, cid)
+        motivos = [{"id": l["loss_reason"] or "",
+                    "label": COTACAO_MOTIVOS.get(l["loss_reason"] or "", "Sem motivo"),
+                    "total": int(l["n"])}
+                   for l in conn.execute(
+                       f"""SELECT loss_reason, COUNT(*) n FROM crm_quotes
+                            WHERE company_id = ? {base} AND status = 'NAO_FECHOU'
+                              AND substr(COALESCE(decided_at, quoted_at), 1, 10) BETWEEN ? AND ?
+                            GROUP BY loss_reason ORDER BY n DESC""",
+                       [cid, *args_base, de, ate]).fetchall()]
+
+    return {
+        "de": de, "ate": ate, "hoje": hoje_d.isoformat(),
+        "resultado": resultado if resultado in ("FECHOU", "NAO_FECHOU") else "",
+        "quotes": itens, "truncated": cortou, "limit": LIMITE,
+        "total": int(r["total"] or 0), "closed": fechou, "lost": perdeu,
+        "clients": int(r["clientes"] or 0),
+        "rate": round(100 * fechou / (fechou + perdeu)) if (fechou + perdeu) else None,
+        "reasons": motivos, "isSeller": ctx["proprio"],
+    }
+
+
 def resumo_cotacoes(
     conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]
 ) -> dict[str, Any]:
@@ -28333,6 +28427,8 @@ def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, d
     try:
         if metodo == "GET" and path == "/api/crm/quotes":
             return 200, listar_cotacoes(conn, user, ctx, dados)
+        if metodo == "GET" and path == "/api/crm/quotes/closed":
+            return 200, encerradas_cotacoes(conn, user, ctx, dados)
         if metodo == "GET" and path == "/api/crm/quotes/summary":
             return 200, resumo_cotacoes(conn, user, ctx, dados)
         if metodo == "GET" and path == "/api/crm/quotes/portfolio":
