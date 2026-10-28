@@ -2264,9 +2264,20 @@ tbody tr:hover {
    fundo próprio: é uma ação diferente de "cotar quem já é cliente", e
    misturá-la às linhas da carteira faria o vendedor clicar no canal errado. */
 .cot-novo {
-  margin-top: 10px; padding: 12px 14px; border-radius: 10px;
+  padding: 12px 14px; border-radius: 10px;
   background: #f7fafc; border: 1px dashed var(--line);
 }
+/* A lista recolhida não pode parecer um bloco quebrado: o resumo vira uma
+   faixa clicável, e a busca logo acima continua funcionando fechada. */
+.cot-recolher { margin-top: 10px; }
+.cot-recolher > summary {
+  list-style: none; display: flex; align-items: center; gap: 6px;
+  font-size: 13px; font-weight: 600; color: var(--muted);
+  padding: 6px 2px; border-top: 1px solid var(--line);
+}
+.cot-recolher > summary::-webkit-details-marker { display: none; }
+.cot-recolher > summary::before { content: "▸"; font-size: 11px; }
+.cot-recolher[open] > summary::before { content: "▾"; }
 .cot-novo input {
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
   font-size: 13px;

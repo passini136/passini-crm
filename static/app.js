@@ -22484,7 +22484,7 @@ function cotState() {
     state.cotacoes = { data: null, carteira: null, busca: "", seller: "", abrindoMotivo: null,
                        detalhe: null, det: {}, salvando: {}, releases: null, erro: "",
                        // Cliente sem cadastro e resumo por dia:
-                       novoNome: "", novoFone: "",
+                       novoNome: "", novoFone: "", carteiraAberta: true,
                        resumo: null, resumoCarregando: false,
                        resumoDia: "", resumoDias: 14 };
   }
@@ -22532,7 +22532,15 @@ async function cotLoadCarteira(paint = true) {
 
 let cotBuscaTimer = null;
 function cotBuscar(valor) {
-  cotState().busca = valor;
+  const s = cotState();
+  s.busca = valor;
+  // Buscar com a lista recolhida devolveria resultado nenhum na tela. Quem
+  // digita está procurando um cliente: a lista reabre sozinha.
+  if (valor.trim().length >= 2 && s.carteiraAberta === false) {
+    s.carteiraAberta = true;
+    const d = document.getElementById("cot-carteira-lista");
+    if (d) d.open = true;
+  }
   clearTimeout(cotBuscaTimer);
   cotBuscaTimer = setTimeout(() => cotLoadCarteira(true), 300);
 }
@@ -22550,6 +22558,10 @@ function cotPaint() {
   if (!cotState().data) return;
   set("cot-placar", cotPlacarHtml());
   set("cot-abertas", cotAbertasHtml());
+  // Nunca redesenhar o bloco do cliente novo enquanto o vendedor digita nele:
+  // trocar o innerHTML apaga o foco e o cursor no meio do nome.
+  const foco = document.activeElement;
+  if (!(foco && foco.closest && foco.closest("#cot-novo"))) set("cot-novo", cotNovoHtml());
   set("cot-carteira", cotCarteiraHtml());
   set("cot-encerradas", cotEncerradasHtml());
 }
@@ -22720,8 +22732,14 @@ function cotCriarNovo(channel) {
                ? " Ele entrou como prospecção na sua carteira." : ""),
           (r) => {
             // Limpa os campos: deixá-los preenchidos faria o próximo clique
-            // criar um segundo prospect com o mesmo nome.
+            // criar um segundo prospect com o mesmo nome. Limpa no DOM
+            // também — o foco está no botão, dentro do bloco que cotPaint
+            // deixa de redesenhar justamente para não atrapalhar quem digita.
             s.novoNome = ""; s.novoFone = "";
+            ["cot-novo-nome", "cot-novo-fone"].forEach((id) => {
+              const el = document.getElementById(id);
+              if (el) el.value = "";
+            });
             const id = r?.quote?.id;
             if (!id) { cotPaint(); return; }
             s.detalhe = id;
@@ -22940,16 +22958,13 @@ function cotAbertasHtml() {
   return lista.map(cotLinhaAberta).join("");
 }
 
-function cotCarteiraHtml() {
+// CLIENTE SEM CADASTRO É A PRIMEIRA OPÇÃO, NÃO A ÚLTIMA: o vendedor está ao
+// telefone com o cliente esperando preço. Se o caminho mais rápido estiver no
+// fim de uma lista de centenas de clientes, a oportunidade se perde no rolar.
+// Mandar ele à tela de Prospecção, cadastrar e voltar, perderia na mesma.
+function cotNovoHtml() {
   const s = cotState();
-  const c = s.carteira;
-  if (!c) return `<div class="cot-vazio">Carregando…</div>`;
-  if (c.error) return `<div class="message error">${escapeHtml(c.error)}</div>`;
-  // O ATALHO APARECE ONDE A FALTA DOCE: quem buscou e não achou é
-  // exatamente quem tem um cliente sem cadastro na linha. Pedir que ele vá
-  // até a tela de Prospecção, cadastre e volte faria a oportunidade se perder
-  // no caminho — com o cliente esperando preço do outro lado.
-  const novoCliente = `
+  return `
     <div class="cot-novo">
       <div class="text-small" style="margin-bottom:6px">
         Cliente ainda sem cadastro? Registre a cotação assim mesmo — ele entra
@@ -22969,9 +22984,15 @@ function cotCarteiraHtml() {
                   onclick="cotCriarNovo('${id}')">${icone} ${label}</button>`).join("")}
       </div>
     </div>`;
+}
 
+function cotCarteiraHtml() {
+  const s = cotState();
+  const c = s.carteira;
+  if (!c) return `<div class="cot-vazio">Carregando…</div>`;
+  if (c.error) return `<div class="message error">${escapeHtml(c.error)}</div>`;
   if (!c.clients.length) {
-    return `<div class="cot-vazio">${s.busca.trim().length >= 2 ? "Nenhum cliente encontrado com essa busca." : "Nenhum cliente na carteira. Use a busca acima para achar qualquer cliente."}</div>${novoCliente}`;
+    return `<div class="cot-vazio">${s.busca.trim().length >= 2 ? "Nenhum cliente encontrado com essa busca." : "Nenhum cliente na carteira. Use a busca acima para achar qualquer cliente."}</div>`;
   }
   return c.clients.map((cl) => {
     const ocupado = s.salvando[`c-${cl.clientKey}`] ? "disabled" : "";
@@ -23002,7 +23023,7 @@ function cotCarteiraHtml() {
                   onclick="openCrmClient(decodeURIComponent('${cotArg(cl.clientKey)}'), false, true, { outside: true })">📇 Ficha</button>
         </div>
       </div>`;
-  }).join("") + novoCliente;
+  }).join("");
 }
 
 function cotEncerradasHtml() {
@@ -23086,12 +23107,7 @@ function cotacoesView() {
     <div class="stack cot">
       ${d.canRelease ? `<div id="cot-liberacao">${cotLiberacaoHtml()}</div>` : ""}
       <div class="form-card cot-topo">
-        <div class="cot-busca">
-          <input id="cot-busca" type="search" autocomplete="off"
-                 placeholder="Buscar cliente por nome, código ou CNPJ"
-                 value="${escapeHtml(s.busca)}" oninput="cotBuscar(this.value)">
-          ${seletor}
-        </div>
+        ${seletor ? `<div class="cot-busca">${seletor}</div>` : ""}
         <div id="cot-placar">${cotPlacarHtml()}</div>
         <div id="cot-aviso" class="cot-aviso" role="status" aria-live="polite"></div>
       </div>
@@ -23100,8 +23116,24 @@ function cotacoesView() {
         <div id="cot-abertas">${cotAbertasHtml()}</div>
       </section>
       <section class="table-card cot-bloco">
+        <h3>Registrar cotação <span class="text-small">cliente sem cadastro? comece por aqui</span></h3>
+        <div id="cot-novo">${cotNovoHtml()}</div>
+      </section>
+      <section class="table-card cot-bloco">
         <h3>${d.isSeller ? "Minha carteira" : "Carteira"} <span class="text-small">cliente cotou? toque no canal</span></h3>
-        <div id="cot-carteira">${cotCarteiraHtml()}</div>
+        ${/* A busca fica FORA do <details>: continua acessível com a lista
+              recolhida, e quem busca com ela fechada tem a lista reaberta
+              por cotBuscar — buscar e não ver resultado seria um engano. */""}
+        <div class="cot-busca">
+          <input id="cot-busca" type="search" autocomplete="off"
+                 placeholder="Buscar cliente por nome, código ou CNPJ"
+                 value="${escapeHtml(s.busca)}" oninput="cotBuscar(this.value)">
+        </div>
+        <details id="cot-carteira-lista" class="cot-recolher" ${s.carteiraAberta === false ? "" : "open"}
+                 ontoggle="cotState().carteiraAberta=this.open">
+          <summary>Lista de clientes da carteira</summary>
+          <div id="cot-carteira">${cotCarteiraHtml()}</div>
+        </details>
       </section>
       <details class="table-card cot-bloco" ontoggle="if(this.open) cotLoadResumo()">
         <summary>${d.isSeller ? "Meu resumo por dia" : "Resumo do dia por vendedor"}</summary>
