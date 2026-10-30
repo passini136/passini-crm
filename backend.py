@@ -16084,6 +16084,74 @@ def get_dashboard_data_cached(
     return data
 
 
+def resumo_do_grupo(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row,
+    query: dict[str, list[str]]
+) -> dict[str, Any]:
+    """Resultado consolidado da Passini inteira, para quem só enxerga a própria parte.
+
+    POR QUE ESTA ROTA EXISTE SEPARADA DO /api/dashboard
+
+    Todo o resto do sistema NARRA para baixo: o vendedor vê o que é dele, o
+    gerente vê a unidade dele. Esta rota faz o contrário de propósito — mostra
+    o grupo a quem não teria acesso a ele. Por isso ela é uma porta só, com a
+    regra escrita num lugar só, em vez de um parâmetro solto no dashboard que
+    algum filtro futuro poderia alargar sem ninguém perceber.
+
+    O QUE CADA PERFIL RECEBE (decidido pela diretoria em 30/10/2026):
+
+    · vendedor  -> só o CONSOLIDADO. Ele vê como a Passini está, e não vê
+                   faturamento, meta nem margem de nenhuma outra loja.
+    · gerente   -> consolidado + a tabela por unidade, que é o que responde se
+      e acima     o problema é da loja dele ou do mês.
+
+    O corte é feito AQUI, no servidor. Esconder a tabela no navegador deixaria
+    os números viajando na resposta, a um F12 de distância.
+    """
+    filtros = apply_default_competence(conn, company_id, {
+        "competence_start": normalize_whitespace(query.get("competenceStart", [None])[0]),
+        "competence_end": normalize_whitespace(query.get("competenceEnd", [None])[0]),
+    })
+    # Nada de unit_name/seller_name: a ausência deles é o que torna isto "o grupo".
+    dados = get_dashboard_data_cached(conn, company_id, filtros)
+    s = dados.get("summary") or {}
+    escopo = data_scope_for_user(conn, user)
+    ve_unidades = escopo != "proprio"
+
+    CAMPOS = ("revenueNet", "revenueGoal", "goalAttainmentPct", "projectedRevenue",
+              "projectedGoalAttainmentPct", "returnsValue", "returnRatioPct",
+              "warrantyReturnsValue", "marginAverage", "qtySold", "ticketPerPiece",
+              "ticketAverage", "distinctClients", "dailyRevenueActual", "dailyGoal",
+              "pace", "farol", "paceExpectedPct", "workingDaysTotal", "workingDaysElapsed")
+    COLUNAS_UNIDADE = ("unitName", "revenueNet", "revenueGoal", "goalAttainmentPct",
+                       "projectedRevenue", "projectedGoalAttainmentPct", "returnsValue",
+                       "returnRatioPct", "warrantyReturnsValue", "marginValue",
+                       "qtySold", "ticketPerPiece", "dailyGoal", "pace", "farol")
+
+    unidades = dados.get("unitPerformance") or []
+    # Para o vendedor nem a POSIÇÃO da unidade dele sai daqui: a decisão foi
+    # "só o total do grupo". Ranking é informação sobre as outras lojas, ainda
+    # que em forma de número ordinal.
+    minha, posicao = "", None
+    if ve_unidades:
+        vinculadas = linked_units_for_user(user)
+        minha = vinculadas[0] if vinculadas else ""
+        if minha:
+            posicao = next((i + 1 for i, u in enumerate(unidades)
+                            if normalize_unit(u.get("unitName")) == minha), None)
+
+    return {
+        "competence": selected_primary_competence(filtros, query_competences(conn, company_id)),
+        "summary": {k: s.get(k) for k in CAMPOS},
+        "units": [{k: u.get(k) for k in COLUNAS_UNIDADE} for u in unidades] if ve_unidades else [],
+        "unitCount": len(unidades),
+        "myUnit": minha,
+        "myUnitRank": posicao,
+        "showsUnits": ve_unidades,
+        "generatedAt": now_iso(),
+    }
+
+
 def warm_dashboard_cache(company_id: int | None = None) -> None:
     """Pré-calcula o dashboard de cada competência para que a troca seja instantânea."""
     try:
@@ -29077,6 +29145,15 @@ class AppHandler(BaseHTTPRequestHandler):
                     data = get_dashboard_data_cached(conn, user["company_id"], filters)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(data))
+                return
+            if path == "/api/dashboard/grupo":
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    grupo = resumo_do_grupo(conn, user["company_id"], user, parse_qs(parsed.query))
+                self._set_headers(200)
+                self.wfile.write(json_dumps(grupo))
                 return
             if path == "/api/audit/integrity":
                 user = self._require_auth()

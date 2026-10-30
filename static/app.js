@@ -112,6 +112,7 @@ const state = {
       metas: false,
       faltas: false,
       operacao: false,
+      grupo: false,
       integrityAudit: false,
       filters: false,
       meetings: false,
@@ -166,6 +167,7 @@ const state = {
       details: false,
       ranking: false,
       comparisons: false,
+      grupo: false,
       units: false,
     },
     sellerSections: {
@@ -858,6 +860,10 @@ function buildQuery() {
 
 async function loadDashboard() {
   setLoading("dashboard", true);
+  // O consolidado do grupo é de uma competência específica. Trocar o mês sem
+  // zerar aqui deixaria o grupo falando de setembro ao lado do número de
+  // outubro — e ninguém perceberia, porque os dois são números plausíveis.
+  state.grupo = null;
   try {
     const dashboard = await api(`/api/dashboard?${buildQuery()}`);
     state.dashboard = dashboard;
@@ -21015,9 +21021,115 @@ function missoesDoVendedor(eu, s) {
         </div>
         ${blocoMinhasFaltas()}
       </div>
+
+      ${/* O GRUPO, DEPOIS DO PESSOAL. O vendedor vem aqui ver o ponto dele;
+            o consolidado é contexto — serve para ele saber se o mês fraco é
+            dele ou de todo mundo. Em cima roubaria a atenção do que é dele. */""}
+      <div class="form-card" style="padding:14px 18px">
+        <div class="section-title">
+          <div>
+            <h3>🏢 Como está o grupo</h3>
+            <div class="text-small">Passini inteira na mesma competência do seu
+              placar.</div>
+          </div>
+        </div>
+        ${blocoGrupo()}
+      </div>
     </div>`;
 }
 
+
+// ─── Performance do grupo ────────────────────────────────────────────────────
+//
+// Todo o resto do sistema estreita para baixo: o vendedor vê o que é dele, o
+// gerente vê a unidade dele. Este bloco faz o contrário de propósito — mostra
+// a Passini inteira para quem só enxerga a própria parte. Quem vende sem saber
+// como o grupo está não tem como saber se o mês ruim é dele ou de todo mundo.
+//
+// O QUE CADA UM VÊ é decidido no SERVIDOR (/api/dashboard/grupo), não aqui:
+// para o vendedor a resposta vem sem a tabela por unidade. Esconder no
+// navegador deixaria os números de todas as lojas viajando na resposta.
+
+async function loadGrupo(forcar = false) {
+  if (state.ui.loading.grupo) return;
+  if (state.grupo && !forcar) return;
+  state.ui.loading.grupo = true;
+  const pintar = () => {
+    document.querySelectorAll(".grupo-slot").forEach((el) => { el.innerHTML = grupoHtml(); });
+  };
+  pintar();
+  try {
+    // Mesma competência da tela: o grupo tem que falar do mesmo mês que o
+    // número do vendedor logo acima, senão a comparação engana.
+    const qs = new URLSearchParams();
+    const f = state.filters || {};
+    if (f.competenceStart) qs.set("competenceStart", f.competenceStart);
+    if (f.competenceEnd) qs.set("competenceEnd", f.competenceEnd);
+    state.grupo = await api(`/api/dashboard/grupo?${qs}`);
+  } catch (e) {
+    state.grupo = { erro: e.message };
+  } finally {
+    state.ui.loading.grupo = false;
+    pintar();
+  }
+}
+
+function grupoHtml() {
+  const g = state.grupo;
+  if (!g) return `<div class="message">⏳ Somando as unidades…</div>`;
+  if (g.erro) return `<div class="message error">${escapeHtml(g.erro)}</div>`;
+  const s = g.summary || {};
+  const num = (v) => (v == null ? "—" : `${Number(v).toFixed(1).replace(".", ",")}%`);
+
+  const cartoes = `
+    <div class="kpi-grid">
+      ${kpiCard("Líquido do grupo", currency(s.revenueNet), "Meta", currency(s.revenueGoal))}
+      ${kpiCard("Atingimento", num(s.goalAttainmentPct), "Ritmo esperado", num(s.paceExpectedPct))}
+      ${kpiCard("Projeção do mês", currency(s.projectedRevenue), "da meta", num(s.projectedGoalAttainmentPct))}
+      ${kpiCard("Devolução comercial", currency(s.returnsValue), "sobre o líquido", num(s.returnRatioPct))}
+      ${kpiCard("Margem média", num(s.marginAverage), "Peças", number(s.qtySold))}
+      ${kpiCard("Clientes atendidos", number(s.distinctClients), "Ticket médio", currency(s.ticketAverage))}
+    </div>`;
+
+  if (!g.showsUnits) {
+    return `${cartoes}
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        Consolidado das ${g.unitCount} unidades da Passini na competência
+        ${escapeHtml(g.competence || "")}. Seu resultado individual continua
+        no quadro acima.</div>`;
+  }
+
+  const linhas = (g.units || []).map((u) => `
+    <tr${u.unitName === g.myUnit ? ' style="background:var(--panel-soft);font-weight:600"' : ""}>
+      <td>${escapeHtml(u.unitName)}${u.unitName === g.myUnit ? " <span class=\"text-small\">(sua unidade)</span>" : ""}</td>
+      <td style="text-align:right">${currency(u.revenueNet)}<div class="text-small">meta ${currency(u.revenueGoal)}</div></td>
+      <td style="text-align:right">${num(u.goalAttainmentPct)}</td>
+      <td style="text-align:right">${currency(u.projectedRevenue)}<div class="text-small">${num(u.projectedGoalAttainmentPct)}</div></td>
+      <td style="text-align:right">${currency(u.returnsValue)}<div class="text-small">${num(u.returnRatioPct)}</div></td>
+      <td style="text-align:right">${num(u.marginValue)}</td>
+      <td style="text-align:right">${number(u.qtySold)}</td>
+    </tr>`).join("");
+
+  return `${cartoes}
+    <div class="table-wrap" style="margin-top:12px">
+      <table>
+        <thead><tr><th>Unidade</th><th style="text-align:right">Líquido e meta</th>
+          <th style="text-align:right">Atingimento</th><th style="text-align:right">Projeção</th>
+          <th style="text-align:right">Devolução</th><th style="text-align:right">Margem</th>
+          <th style="text-align:right">Peças</th></tr></thead>
+        <tbody>${linhas || `<tr><td colspan="7" style="text-align:center;padding:16px;color:var(--muted)">Sem unidades nesta competência.</td></tr>`}</tbody>
+      </table>
+    </div>
+    ${g.myUnitRank ? `<div class="text-small" style="color:var(--muted);margin-top:8px">
+      Sua unidade está em ${g.myUnitRank}º de ${g.unitCount} em faturamento líquido.</div>` : ""}`;
+}
+
+function blocoGrupo() {
+  // Carrega quando a tela abre, e uma vez — igual às faltas. O consolidado é
+  // leitura de contexto, não o número que a pessoa veio ver.
+  if (!state.grupo && !state.ui.loading.grupo) loadGrupo();
+  return `<div class="grupo-slot">${grupoHtml()}</div>`;
+}
 
 function blocoMinhasFaltas() {
   // Carrega só quando a tela abre, e uma vez. O placar já faz várias
@@ -21475,6 +21587,11 @@ function executivoView() {
             📄 Baixar PDF executivo</button>
         </div>`}
 
+      ${/* blocoGrupo() só é chamado com a seção aberta: ele dispara a busca do
+            consolidado, e pagar essa ida ao servidor com o quadro fechado
+            atrasaria a tela para quem nem vai abrir. */""}
+      ${executiveExpandSection("grupo", "Ver performance do grupo",
+         state.ui.executiveSections.grupo ? blocoGrupo() : "")}
       ${executiveExpandSection("units", "Ver performance por unidade", `
         <div class="table-wrap">
           <table>
