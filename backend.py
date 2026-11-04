@@ -16161,9 +16161,13 @@ def resumo_do_grupo(
             posicao = next((i + 1 for i, u in enumerate(unidades)
                             if normalize_unit(u.get("unitName")) == minha), None)
 
+    resumo = {k: s.get(k) for k in CAMPOS}
+    if ve_unidades:
+        for k in ("revenueForGoal", "projectedRevenueForGoal", "unitsWithoutGoal"):
+            resumo[k] = s.get(k)
     return {
         "competence": selected_primary_competence(filtros, query_competences(conn, company_id)),
-        "summary": {k: s.get(k) for k in CAMPOS},
+        "summary": resumo,
         "units": [{k: u.get(k) for k in COLUNAS_UNIDADE} for u in unidades] if ve_unidades else [],
         "unitCount": len(unidades),
         "myUnit": minha,
@@ -21509,6 +21513,38 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     summary_revenue_with_warranty = summary_revenue
     summary_revenue = summary_revenue + summary_warranty
 
+    # ── Atingimento do GRUPO só compara quem TEM meta ─────────────────────────
+    #
+    # A meta do grupo é a soma das metas das unidades. Somar no realizado a
+    # venda de uma unidade SEM meta (Zona Norte em 2026, em implantação) inflava
+    # o % de atingimento e a projeção: venda sem compromisso correspondente.
+    # O faturamento exibido continua sendo o total; só o atingimento, a projeção
+    # contra a meta e o ritmo usam a base com meta.
+    summary_revenue_for_goal = summary_revenue
+    units_without_goal: list[dict[str, Any]] = []
+    if not filters["seller_name"] and not filters.get("unit_name") and summary_goal:
+        _com_meta = {normalize_unit(u) for u, v in goal_by_unit.items()
+                     if float(v.get("revenueGoal") or 0) > 0}
+        if use_detail_summary:
+            _venda_unidade = {normalize_unit(u): float(v.get("revenueNet") or 0)
+                              for u, v in detail_by_unit.items()}
+        else:
+            _venda_unidade = {u: float(r.get("net_value") or 0)
+                              for u, r in unit_summary_by_unit.items()}
+        _sem_meta = sorted(u for u, v in _venda_unidade.items()
+                           if u and u not in _com_meta and abs(v) > 0.005)
+        if _sem_meta:
+            _ph_sm = ", ".join("?" for _ in _sem_meta)
+            _gar_sm = {normalize_unit(r["unit_name"]): float(r["total"] or 0) for r in conn.execute(
+                f"SELECT unit_name, COALESCE(SUM(total_value), 0) AS total FROM fact_warranty_returns "
+                f"WHERE {' AND '.join(_ret_conditions)} AND reason = ? AND unit_name IN ({_ph_sm}) "
+                f"GROUP BY unit_name",
+                [*_ret_params, RETURN_REASON_WARRANTY, *_sem_meta]).fetchall()}
+            for _u in _sem_meta:
+                _v = _venda_unidade[_u] + _gar_sm.get(_u, 0.0)
+                units_without_goal.append({"unitName": _u, "revenueNet": round(_v, 2)})
+                summary_revenue_for_goal -= _v
+
     # ── As quebras respeitam o total oficial ──────────────────────────────────
     #
     # Carteira x fora e PJ x PF saem do relatório DETALHADO; o faturamento do
@@ -21537,6 +21573,8 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     total_days_current = summary_calendar["totalWorkingDays"]
     daily_revenue_actual_raw, projection_revenue_raw = dashboard_metric_projection(summary_revenue, elapsed_days_current, total_days_current)
     projection_revenue = round(projection_revenue_raw, 2)
+    _, _proj_meta_raw = dashboard_metric_projection(summary_revenue_for_goal, elapsed_days_current, total_days_current)
+    projection_revenue_for_goal = round(_proj_meta_raw, 2)
     score_average = round(sum(item["score"] for item in seller_rows) / len(seller_rows), 2) if seller_rows else 0.0
     daily_revenue_actual = round(daily_revenue_actual_raw, 2)
     daily_goal = round(safe_div(summary_goal, total_days_current), 2) if total_days_current else 0.0
@@ -21607,8 +21645,9 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         "dailyRevenueActual": daily_revenue_actual,
         "dailyGoal": daily_goal,
         "projectedRevenue": projection_revenue,
-        "goalAttainmentPct": round(safe_div(summary_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
-        "projectedGoalAttainmentPct": round(safe_div(projection_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
+        "revenueForGoal": round(summary_revenue_for_goal, 2),
+        "goalAttainmentPct": round(safe_div(summary_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
+        "projectedGoalAttainmentPct": round(safe_div(projection_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
         "formula": {
             "cutoffDate": "today - 1 day",
             "dailyRevenueActual": "revenueNet / elapsedWorkingDays",
@@ -21686,11 +21725,15 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "returnRatioPct": round(safe_div(summary_returns, summary_revenue) * 100 if summary_revenue else 0.0, 2),
             "warrantyRatioPct": round(safe_div(summary_warranty, summary_revenue) * 100 if summary_revenue else 0.0, 2),
             "returnsTotalRatioPct": round(safe_div(summary_returns_total, summary_revenue) * 100 if summary_revenue else 0.0, 2),
-            "goalAttainmentPct": round(safe_div(summary_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
-            "projectedGoalAttainmentPct": round(safe_div(projection_revenue, summary_goal) * 100 if summary_goal else 0.0, 2),
+            # Base do atingimento: o líquido menos as unidades sem meta.
+            "revenueForGoal": round(summary_revenue_for_goal, 2),
+            "projectedRevenueForGoal": projection_revenue_for_goal,
+            "unitsWithoutGoal": units_without_goal,
+            "goalAttainmentPct": round(safe_div(summary_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
+            "projectedGoalAttainmentPct": round(safe_div(projection_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
             "dailyRevenueActual": daily_revenue_actual,
             "dailyGoal": daily_goal,
-            "pace": daily_pace(summary_revenue, summary_goal,
+            "pace": daily_pace(summary_revenue_for_goal, summary_goal,
                                summary_calendar["elapsedWorkingDays"],
                                summary_calendar["totalWorkingDays"]),
             "revenuePfPct": revenue_pf_pct,
@@ -21729,11 +21772,11 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             "farol": {
                 "goalAttainment": evaluate_farol(
                     "goal_attainment",
-                    safe_div(summary_revenue, summary_goal) * 100 if summary_goal else None,
+                    safe_div(summary_revenue_for_goal, summary_goal) * 100 if summary_goal else None,
                     farol_thresholds, pace_pct),
                 "projectedAttainment": evaluate_farol(
                     "projected_attainment",
-                    safe_div(projection_revenue, summary_goal) * 100 if summary_goal else None,
+                    safe_div(projection_revenue_for_goal, summary_goal) * 100 if summary_goal else None,
                     farol_thresholds),
                 "returnRatio": evaluate_farol(
                     "return_ratio",
@@ -22650,8 +22693,11 @@ def audit_projection_integrity(
     expected_daily = audit_round(safe_div(summary["revenueNet"], calendar["elapsedWorkingDays"]))
     expected_projected = audit_round(expected_daily * calendar["totalWorkingDays"]) if calendar["elapsedWorkingDays"] and calendar["totalWorkingDays"] else 0.0
     expected_daily_goal = audit_round(safe_div(summary["revenueGoal"], calendar["totalWorkingDays"]))
-    expected_goal_attainment = audit_round(safe_div(summary["revenueNet"], summary["revenueGoal"]) * 100 if summary["revenueGoal"] else 0.0)
-    expected_projected_goal_attainment = audit_round(safe_div(expected_projected, summary["revenueGoal"]) * 100 if summary["revenueGoal"] else 0.0)
+    _base_meta = summary.get("revenueForGoal", summary["revenueNet"])
+    expected_goal_attainment = audit_round(safe_div(_base_meta, summary["revenueGoal"]) * 100 if summary["revenueGoal"] else 0.0)
+    _proj_meta = (safe_div(_base_meta, calendar["elapsedWorkingDays"]) * calendar["totalWorkingDays"]
+                  if calendar["elapsedWorkingDays"] and calendar["totalWorkingDays"] else 0.0)
+    expected_projected_goal_attainment = audit_round(safe_div(_proj_meta, summary["revenueGoal"]) * 100 if summary["revenueGoal"] else 0.0)
     expected_cutoff = dashboard_cutoff_date(competence_state["today"]).isoformat()
     if debug_projection.get("cutoffDate") != expected_cutoff:
         append_audit_issue(issues, "CRITICO", "PROJECAO", "Cutoff D-1 está incorreto.", expected_cutoff, debug_projection.get("cutoffDate"))
@@ -25576,6 +25622,90 @@ def compute_manager_mission(
 RESULTADOS_MESES = 12
 
 
+def cadastros_novos_painel(
+    conn: sqlite3.Connection, company_id: int, user: dict[str, Any],
+    nivel: str = "empresa", alvo: str = "", meses: int = 12,
+) -> dict[str, Any]:
+    """Cadastros novos por mês, do grupo e por unidade, em quatro perfis.
+
+    O mês vem da FAIXA DE CÓDIGO (mes_cadastro.py), não de data: o Alfa não
+    exporta a data de cadastro. Perfis:
+      - PF x PJ: pelo CPF/CNPJ; sem documento, pela mesma regra de nome da
+        carteira, para os dois lugares classificarem o cliente do mesmo jeito.
+      - Carteira x balcão: tem vendedor interno HOJE x não tem. Para cliente
+        novo não existe "recorrente" ainda, então a régua da carteira sem dono
+        não se aplica — é a fotografia do cadastro atual.
+    Unidade: pela CIDADE/BAIRRO do cliente (território, depois mapa de
+    cidades), não pelo vendedor — assim o balcão também tem unidade.
+    Só conta quem continua no cadastro do Alfa; código excluído lá some daqui.
+    """
+    mes_cadastro.garantir_tabela(conn)
+    permitidas = crm_allowed_units_for_user(conn, user)
+    if data_scope_for_user(conn, user) == "proprio":
+        return {"erro": "Cadastros novos é um painel de gestão (grupo e unidade)."}
+    nivel = "unidade" if normalize_whitespace(nivel).lower() == "unidade" else "empresa"
+    alvo = normalize_unit(alvo) if alvo else ""
+    if permitidas is not None:
+        _p = [normalize_unit(u) for u in permitidas]
+        if nivel == "empresa" or alvo not in _p:
+            nivel, alvo = "unidade", (_p[0] if _p else "")
+
+    hoje = today_in_brazil()
+    meses = max(3, min(int(meses or 12), 36))
+    atual = hoje.strftime("%Y-%m")
+    janela = [shift_competence(atual, -i) for i in range(meses - 1, -1, -1)]
+
+    faixas = [f for f in mes_cadastro.listar_faixas(conn, company_id)
+              if f["competencia"] and f["competencia"] in set(janela)]
+    vazio = {"level": nivel, "target": alvo, "months": janela, "series": [], "units": [],
+             "currentCompetence": atual, "lastCoveredCode": None}
+    if not faixas:
+        return vazio
+    resolv = mes_cadastro.Resolvedor(faixas)
+    menor = min(f["codeStart"] for f in faixas)
+
+    territorio = build_territory_map(conn, company_id, atual)
+    cidades = build_city_unit_map(conn, company_id, atual)
+    PERFIS = ("PJ_CARTEIRA", "PJ_BALCAO", "PF_CARTEIRA", "PF_BALCAO")
+    por_mes = {c: {k: 0 for k in PERFIS} for c in janela}
+    por_unidade: dict[str, dict[str, Any]] = {}
+    for r in conn.execute(
+        "SELECT client_code, client_name, document_number, city_name, neighborhood, "
+        "internal_seller_name FROM crm_client_profiles WHERE company_id = ? "
+        "AND TRIM(client_code) GLOB '[0-9]*' AND CAST(client_code AS INTEGER) >= ?",
+        (company_id, menor)):
+        f = resolv.faixa(r["client_code"])
+        if not f:
+            continue
+        comp = f["competencia"]
+        unidade = unit_for_client_row(None, r["city_name"], r["neighborhood"], {},
+                                      territorio, cidades) or "SEM UNIDADE"
+        tipo, _ = person_type_from_document(r["document_number"])
+        if not tipo:
+            tipo, _, _ = infer_person_type_from_name(r["client_name"])
+        perfil = f"{tipo or 'PF'}_{'CARTEIRA' if normalize_whitespace(r['internal_seller_name']) else 'BALCAO'}"
+        u = por_unidade.setdefault(unidade, {"unit": unidade, "byMonth": {c: 0 for c in janela},
+                                             **{k: 0 for k in PERFIS}, "total": 0})
+        u["byMonth"][comp] += 1
+        u[perfil] += 1
+        u["total"] += 1
+        if nivel == "empresa" or unidade == alvo:
+            por_mes[comp][perfil] += 1
+
+    series = [{"competence": c, **v, "total": sum(v.values())} for c, v in por_mes.items()]
+    ordem = {u: i for i, u in enumerate(CANONICAL_UNITS)}
+    unidades = sorted(por_unidade.values(), key=lambda u: (ordem.get(u["unit"], 99), u["unit"]))
+    if permitidas is not None:
+        _p = {normalize_unit(x) for x in permitidas}
+        unidades = [u for u in unidades if u["unit"] in _p]
+    for u in unidades:
+        u["byMonth"] = [{"competence": c, "total": u["byMonth"][c]} for c in janela]
+    return {**vazio, "series": series, "units": unidades,
+            "lastCoveredCode": max(f["codeEnd"] for f in faixas),
+            "lastCoveredLabel": next((f["rotulo"] for f in faixas
+                                      if f["codeEnd"] == max(x["codeEnd"] for x in faixas)), "")}
+
+
 def resultados_serie(
     conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
     alvo: str = "", meses: int = RESULTADOS_MESES,
@@ -25699,6 +25829,29 @@ def resultados_serie(
     metas = {r["competence"]: float(r["meta"] or 0)
              for r in conn.execute(meta_sql, meta_par).fetchall()}
 
+    # Empresa: o atingimento compara a meta (soma das unidades) só com a venda
+    # das unidades que TÊM meta naquele mês. Unidade sem meta — Zona Norte em
+    # 2026 — entra no faturamento, mas não no % de atingimento.
+    venda_sem_meta: dict[str, float] = defaultdict(float)
+    if nivel not in ("unidade", "vendedor") or not alvo:
+        com_meta = {(r["competence"], normalize_unit(r["unit_name"])) for r in conn.execute(
+            f"SELECT competence, unit_name FROM goals_unit WHERE company_id = ? "
+            f"AND competence IN ({marc}) GROUP BY competence, unit_name "
+            f"HAVING SUM(revenue_goal) > 0", [company_id, *competencias]).fetchall()}
+        for r in conn.execute(
+                f"SELECT competence, unit_name, SUM(net_value) v FROM fact_unit_summary "
+                f"WHERE company_id = ? AND competence IN ({marc}) GROUP BY competence, unit_name",
+                [company_id, *competencias]).fetchall():
+            if (r["competence"], normalize_unit(r["unit_name"])) not in com_meta:
+                venda_sem_meta[r["competence"]] += float(r["v"] or 0)
+        for r in conn.execute(
+                f"SELECT competence, unit_name, SUM(total_value) v FROM fact_warranty_returns "
+                f"WHERE company_id = ? AND reason = ? AND competence IN ({marc}) "
+                f"GROUP BY competence, unit_name",
+                [company_id, RETURN_REASON_WARRANTY, *competencias]).fetchall():
+            if (r["competence"], normalize_unit(r["unit_name"])) not in com_meta:
+                venda_sem_meta[r["competence"]] += float(r["v"] or 0)
+
     # ── 5. Execução: ligações ativas registradas ──────────────────────────────
     lig_onde, lig_par = "", []
     if nivel == "vendedor" and alvo:
@@ -25730,6 +25883,7 @@ def resultados_serie(
         dev_comercial = max(float(o.get("dev") or 0) - gar, 0.0)
         bruto = float(o.get("bruto") or 0)
         meta = metas.get(comp, 0.0)
+        liq_meta = liq - venda_sem_meta.get(comp, 0.0) if meta else liq
         d = detalhe.get(comp, {})
         clientes = int(d.get("clientes") or 0)
         serie.append({
@@ -25737,7 +25891,9 @@ def resultados_serie(
             "revenueNet": round(liq, 2),
             "revenueGross": round(bruto, 2),
             "revenueGoal": round(meta, 2),
-            "attainmentPct": round(safe_div(liq, meta) * 100, 1) if meta else None,
+            "revenueForGoal": round(liq_meta, 2),
+            "revenueWithoutGoal": round(liq - liq_meta, 2),
+            "attainmentPct": round(safe_div(liq_meta, meta) * 100, 1) if meta else None,
             "returnsCommercial": round(dev_comercial, 2),
             "returnsWarranty": round(gar, 2),
             "returnRatioPct": round(safe_div(dev_comercial, liq) * 100, 2) if liq else 0.0,
@@ -25845,11 +26001,13 @@ def resultados_fatos(
     # A meta entra como fato próprio: é o compromisso, não a tendência.
     if atual.get("revenueGoal"):
         esperado = float(atual["revenueGoal"]) * ritmo
-        v = safe_div(float(atual["revenueNet"]) - esperado, esperado)
+        # Só a venda de quem tem meta: unidade sem meta não ajuda nem atrapalha.
+        _base = float(atual.get("revenueForGoal", atual["revenueNet"]))
+        v = safe_div(_base - esperado, esperado)
         if abs(v) >= 0.05:
             fatos.append({
                 "id": "goal", "label": "Atingimento da meta", "format": "moeda",
-                "value": round(float(atual["revenueNet"]), 2),
+                "value": round(_base, 2),
                 "reference": round(esperado, 2),
                 "referenceLabel": ("meta do mês"
                                    + (" proporcional aos dias úteis" if ritmo < 0.999 else "")),
@@ -29842,6 +30000,20 @@ class AppHandler(BaseHTTPRequestHandler):
                         dias=parse_int(query.get("dias", ["30"])[0]) or 30,
                         vendedor=query.get("seller", [""])[0],
                         unidade=query.get("unit", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
+            if path == "/api/cadastros-novos/painel":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = cadastros_novos_painel(
+                        conn, user["company_id"], user,
+                        nivel=query.get("level", ["empresa"])[0],
+                        alvo=query.get("target", [""])[0],
+                        meses=parse_int(query.get("meses", ["12"])[0]) or 12)
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return

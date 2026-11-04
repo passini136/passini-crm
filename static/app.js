@@ -13791,7 +13791,10 @@ function setResultadoNivel(level, target) {
   state.resultadosFiltros.level = level;
   state.resultadosFiltros.target = target || "";
   state.resultadosFiltros.competence = "";
-  void loadResultados();
+  // Na aba de cadastros, o recorte (grupo/unidade) muda os números dela também.
+  void loadResultados().then(() => {
+    if (state.resultadosFiltros.tab === "cadastros") void loadCadastrosNovos();
+  });
 }
 
 /* Trocar de aba busca os dados daquela aba.
@@ -13815,11 +13818,157 @@ async function setResultadoAba(aba) {
     await loadOperacao();
     return;
   }
+  if (aba === "cadastros") {
+    render();
+    await loadCadastrosNovos();
+    return;
+  }
   state.resultados = null;          // força o "Montando o painel…"
   render();
   await loadResultados();
 }
 
+
+/* ─── Cadastros novos (aba do Painel de Resultados) ─────────────────────────
+ * Mês de cadastro vem da faixa de código (Importações › Mês de cadastro).
+ * Perfis: PF/PJ pelo documento × carteira (tem vendedor interno) / balcão.
+ * Unidade pela cidade/bairro do cliente, para o balcão também ter unidade. */
+const CAD_PERFIS = [
+  ["PJ_CARTEIRA", "PJ carteira", "#1a5276"],
+  ["PJ_BALCAO", "PJ balcão", "#7fb3d5"],
+  ["PF_CARTEIRA", "PF carteira", "#b9770e"],
+  ["PF_BALCAO", "PF balcão", "#f5cba7"],
+];
+const CAD_MES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
+const cadRotulo = (c) => `${CAD_MES[Number(c.slice(5, 7)) - 1]}/${c.slice(2, 4)}`;
+
+let cadastrosSeq = 0;
+async function loadCadastrosNovos() {
+  const meu = ++cadastrosSeq;
+  state.ui.loading.cadastrosNovos = true;
+  requestRender();
+  let resposta;
+  try {
+    const f = state.resultadosFiltros;
+    const q = new URLSearchParams({ level: f.level || "empresa", meses: "12" });
+    if (f.target) q.set("target", f.target);
+    resposta = await api(`/api/cadastros-novos/painel?${q}`);
+  } catch (e) {
+    resposta = { erro: String(e && e.message ? e.message : e) };
+  }
+  if (meu !== cadastrosSeq) return state.cadastrosNovos;
+  state.cadastrosNovos = resposta || { erro: "resposta vazia do servidor" };
+  state.ui.loading.cadastrosNovos = false;
+  requestRender();
+  return state.cadastrosNovos;
+}
+
+function grafCadastrosEmpilhado(series, parcialIdx) {
+  const { w, ml, mr, mt, mb } = GRAF;
+  const h = 260;
+  const areaW = w - ml - mr, areaH = h - mt - mb;
+  const max = Math.max(1, ...series.map((s) => s.total)) * 1.12;
+  const n = series.length;
+  const passo = areaW / Math.max(n, 1);
+  const larg = Math.min(passo * 0.62, 44);
+  const y = (v) => mt + areaH - (v / max) * areaH;
+  const cx = (i) => ml + passo * i + passo / 2;
+  const grade = [0, 0.25, 0.5, 0.75, 1].map((t) => `
+    <line x1="${ml}" y1="${y(max * t).toFixed(1)}" x2="${w - mr}" y2="${y(max * t).toFixed(1)}" stroke="#e4eaef"/>
+    <text x="${ml - 7}" y="${(y(max * t) + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="#8797a3">${Math.round(max * t)}</text>`).join("");
+  const cols = series.map((s, i) => {
+    let base = 0;
+    const partes = CAD_PERFIS.map(([k, rot, cor]) => {
+      const v = s[k] || 0;
+      if (!v) return "";
+      const y1 = y(base + v), alt = Math.max(y(base) - y1, 0.5);
+      base += v;
+      return `<rect x="${(cx(i) - larg / 2).toFixed(1)}" y="${y1.toFixed(1)}" width="${larg.toFixed(1)}"
+        height="${alt.toFixed(1)}" fill="${cor}" stroke="#fff" stroke-width="0.6"
+        ${i === parcialIdx ? 'opacity="0.7"' : ""}>
+        <title>${cadRotulo(s.competence)} · ${rot}: ${v}</title></rect>`;
+    }).join("");
+    const total = s.total ? `<text x="${cx(i).toFixed(1)}" y="${(y(s.total) - 5).toFixed(1)}" text-anchor="middle"
+        font-size="10.5" font-weight="700" fill="#0f3044">${s.total}</text>` : "";
+    const eixo = `<text x="${cx(i).toFixed(1)}" y="${h - 12}" text-anchor="middle" font-size="10"
+        fill="${i === parcialIdx ? "#8a6100" : "#5b6b78"}" font-weight="${i === parcialIdx ? "700" : "400"}">${cadRotulo(s.competence)}</text>`;
+    return partes + total + eixo;
+  }).join("");
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" role="img" style="display:block"
+      preserveAspectRatio="xMidYMid meet">${grade}${cols}
+      <line x1="${ml}" y1="${mt + areaH}" x2="${w - mr}" y2="${mt + areaH}" stroke="#c8d3db"/></svg>`;
+}
+
+function abaCadastrosNovos() {
+  const d = state.cadastrosNovos;
+  if (!d && !state.ui.loading.cadastrosNovos) { void loadCadastrosNovos(); }
+  if (state.ui.loading.cadastrosNovos || !d) return `<div class="message">⏳ Contando os cadastros…</div>`;
+  if (d.erro) return `<div class="message" style="background:#fce8e6;color:#a4262c">${escapeHtml(d.erro)}</div>`;
+  const series = d.series || [];
+  if (!series.some((s) => s.total)) {
+    return `<div class="message">Nenhum cadastro com mês informado nos últimos 12 meses.
+      Confira as faixas em Importações › Mês de cadastro dos clientes.</div>`;
+  }
+  const fmt = (n) => Number(n || 0).toLocaleString("pt-BR");
+  const parcialIdx = series.findIndex((s) => s.competence === d.currentCompetence);
+  const ult = series[series.length - 1] || {};
+  const fechados = series.filter((s) => s.competence !== d.currentCompetence);
+  const ultFechado = fechados[fechados.length - 1] || {};
+  const media = fechados.length ? fechados.reduce((a, s) => a + s.total, 0) / fechados.length : 0;
+  const soma = (k) => series.reduce((a, s) => a + (s[k] || 0), 0);
+  const total12 = series.reduce((a, s) => a + s.total, 0);
+  const pct = (v) => total12 ? `${Math.round((v / total12) * 100)}%` : "—";
+  const alvo = d.level === "unidade" ? d.target : "Grupo";
+
+  const cartao = (rot, valor, sub) => `
+    <div class="panel" style="padding:12px 14px;border-left:4px solid #1a5276">
+      <div class="text-small" style="color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-size:10.5px">${rot}</div>
+      <div style="font-size:24px;font-weight:800;color:#0f3044;line-height:1.2">${valor}</div>
+      <div class="text-small" style="color:var(--muted)">${sub}</div>
+    </div>`;
+
+  const legenda = CAD_PERFIS.map(([k, rot, cor]) => `
+    <span style="display:inline-flex;align-items:center;gap:5px;margin-right:14px;font-size:12px">
+      <span style="width:11px;height:11px;border-radius:2px;background:${cor};display:inline-block"></span>
+      ${rot} <strong>${fmt(soma(k))}</strong> <span style="color:var(--muted)">(${pct(soma(k))})</span></span>`).join("");
+
+  const unidades = d.units || [];
+  const tabela = d.level === "empresa" && unidades.length ? `
+    <div class="table-card">
+      <div class="section-title"><div><h3>Por unidade</h3>
+        <div class="text-small">Cadastros por mês e perfil nos 12 meses. Unidade pela cidade/bairro do cliente.</div></div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Unidade</th>
+          ${series.map((s) => `<th style="text-align:right">${cadRotulo(s.competence)}</th>`).join("")}
+          <th style="text-align:right">12 meses</th>
+          ${CAD_PERFIS.map(([, rot]) => `<th style="text-align:right">${rot}</th>`).join("")}</tr></thead>
+        <tbody>${unidades.map((u) => `
+          <tr><td><a href="javascript:void 0" onclick="setResultadoNivel('unidade','${jsAttr(u.unit)}')"
+                style="font-weight:700">${escapeHtml(u.unit)}</a></td>
+            ${u.byMonth.map((m) => `<td style="text-align:right">${m.total ? fmt(m.total) : "·"}</td>`).join("")}
+            <td style="text-align:right;font-weight:800">${fmt(u.total)}</td>
+            ${CAD_PERFIS.map(([k]) => `<td style="text-align:right">${fmt(u[k])}</td>`).join("")}</tr>`).join("")}
+        </tbody></table></div>
+    </div>` : "";
+
+  return `
+    <div class="stack">
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
+        ${cartao(`${escapeHtml(cadRotulo(ultFechado.competence || ""))} (último mês fechado)`, fmt(ultFechado.total),
+                 `média de ${fmt(Math.round(media))}/mês nos meses fechados`)}
+        ${cartao(`${escapeHtml(cadRotulo(ult.competence || ""))} até agora`, fmt(ult.total), "mês em andamento")}
+        ${cartao("12 meses", fmt(total12), `${escapeHtml(alvo)} · PJ ${pct(soma("PJ_CARTEIRA") + soma("PJ_BALCAO"))} · balcão ${pct(soma("PJ_BALCAO") + soma("PF_BALCAO"))}`)}
+      </div>
+      <div class="table-card">
+        <div class="section-title"><div><h3>Cadastros novos por mês — ${escapeHtml(alvo)}</h3>
+          <div class="text-small">Mês de cadastro pela faixa de código. Carteira = já tem vendedor interno hoje;
+            balcão = ainda sem vendedor. Só conta quem continua no cadastro do Alfa.</div></div></div>
+        <div style="margin:4px 0 8px">${legenda}</div>
+        ${grafCadastrosEmpilhado(series, parcialIdx)}
+      </div>
+      ${tabela}
+    </div>`;
+}
 
 let faltasRequestSeq = 0;
 
@@ -14627,11 +14776,12 @@ function resultadosView() {
         </div>`}
 
       ${grafCartao("Faturamento contra meta", leituraDe("revenuePerDay"),
-        grafBarrasComMeta(rotulosOf, serieChart.map((r) => r.revenueNet),
+        grafBarrasComMeta(rotulosOf, serieChart.map((r) => r.revenueForGoal ?? r.revenueNet),
           serieChart.map((r) => r.revenueGoal || 0), parcialOf)
         + grafLegenda([["Bateu a meta (≥95%)", "#2e7d32"], ["Abaixo da meta", "#c0504d"],
           ["Sem meta cadastrada", "#5b9bd5"], ["Meta", "#e0a800", true]]),
-        "Barra verde bateu a meta, vermelha não, azul é mês sem meta cadastrada. A coluna hachurada é o mês em curso.")}
+        "Barra verde bateu a meta, vermelha não, azul é mês sem meta cadastrada. A coluna hachurada é o mês em curso."
+        + (serieChart.some((r) => r.revenueWithoutGoal > 0.5) ? " No grupo, a barra é só a venda das unidades com meta: unidade sem meta (ex.: em implantação) fica fora da comparação." : ""))}
 
       ${grafCartao("Positivação da carteira e clientes parados", leituraDe("positivationPct"),
         grafLinhas(meses, [
@@ -15107,7 +15257,8 @@ function resultadosView() {
 
       <div style="display:flex;gap:4px;border-bottom:2px solid var(--line)">
         ${[["fca", "📌 Fato, causa e produtividade"], ["evolucao", "📈 Evolução 12 meses"],
-           ["operacao", "📊 Operação no período"], ["faltas", "⛔ Faltas e rupturas"]]
+           ["operacao", "📊 Operação no período"], ["faltas", "⛔ Faltas e rupturas"],
+           ["cadastros", "🆕 Cadastros novos"]]
           .map(([id, rot]) => `
             <button onclick="setResultadoAba('${id}')"
               style="background:${f.tab === id ? "#fff" : "transparent"};border:none;
@@ -15125,6 +15276,7 @@ function resultadosView() {
         </div>` : ""}
 
       ${f.tab === "faltas" ? abaFaltas()
+        : f.tab === "cadastros" ? abaCadastrosNovos()
         : f.tab === "operacao" ? abaOperacao()
         : f.tab === "evolucao" ? abaEvolucao
         : `<div class="stack">${montarFca()}</div>`}
@@ -21225,7 +21377,8 @@ function grupoHtml() {
       ${kpiCard("Devolução comercial", currency(s.returnsValue), "sobre o líquido", num(s.returnRatioPct))}
       ${kpiCard("Margem média", num(s.marginAverage), "Peças", number(s.qtySold))}
       ${kpiCard("Clientes atendidos", number(s.distinctClients), "Ticket médio", currency(s.ticketAverage))}
-    </div>`;
+    </div>
+    ${notaUnidadesSemMeta(s)}`;
 
   if (!g.showsUnits) {
     return `${cartoes}
@@ -21582,6 +21735,18 @@ function blocoRitmoDiario(pace, titulo) {
     </div>`;
 }
 
+/** Aviso de que o atingimento do grupo deixou de fora unidade sem meta. */
+function notaUnidadesSemMeta(s) {
+  const sem = (s && s.unitsWithoutGoal) || [];
+  if (!sem.length) return "";
+  return `<div class="text-small" style="margin-top:6px;padding:7px 10px;border-radius:8px;
+      background:#f3f6f9;color:#3d5566">
+    ℹ️ % de atingimento e projeção contra a meta consideram só unidades com meta
+    (base ${currency(s.revenueForGoal)}). Fora do cálculo, por não terem meta no mês:
+    ${sem.map((u) => `<strong>${escapeHtml(u.unitName)}</strong> (${currency(u.revenueNet)})`).join(", ")}.
+    O faturamento líquido exibido continua sendo o total.</div>`;
+}
+
 function executivoView() {
   if (!state.dashboard) return `<div class="loader panel">Carregando dashboard…</div>`;
   // Gerente vê o MESMO Executivo de diretor e admin — os dados já vêm recortados
@@ -21601,8 +21766,8 @@ function executivoView() {
                           "Ver a lista com a carteira de cada um",
                           "abrirClientesDoVendedor('','todos')")}
         ${kpiCard("Projeção do mês", currency(s.projectedRevenue || 0),
-                  Number(s.revenueGoal || 0) > Number(s.projectedRevenue || 0) ? "Faltam" : "Acima da meta",
-                  currency(Math.abs(Number(s.revenueGoal || 0) - Number(s.projectedRevenue || 0))),
+                  Number(s.revenueGoal || 0) > Number(s.projectedRevenueForGoal ?? s.projectedRevenue ?? 0) ? "Faltam" : "Acima da meta",
+                  currency(Math.abs(Number(s.revenueGoal || 0) - Number(s.projectedRevenueForGoal ?? s.projectedRevenue ?? 0))),
                   s.farol?.projectedAttainment)}
         ${kpiCard("Ticket médio", currency(s.ticketAverage), "Clientes", number(s.distinctClients))}
         ${kpiCard("Ticket PJ", currency(s.ticketAveragePj || 0), "Clientes PJ", number(s.pjClients || 0))}
@@ -21612,6 +21777,7 @@ function executivoView() {
         ${kpiCard("Desconto médio", pct(s.discountPct), "Mix SKU", number(s.mixSku), s.farol?.discountPct)}
         ${kpiCard("Dias úteis", `${number(s.workingDaysElapsed)}/${number(s.workingDaysTotal)}`, "Meta diária", currency(s.dailyRevenueTarget))}
       </div>
+      ${notaUnidadesSemMeta(s)}
       ${farolLegend(s.paceExpectedPct)}
       ${(() => {
         // O vendedor vê o ritmo DELE, que inclui a faixa de 105% — a faixa de
