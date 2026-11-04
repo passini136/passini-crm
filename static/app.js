@@ -13835,9 +13835,9 @@ async function setResultadoAba(aba) {
  * Unidade pela cidade/bairro do cliente, para o balcão também ter unidade. */
 const CAD_PERFIS = [
   ["PJ_CARTEIRA", "PJ carteira", "#1a5276"],
-  ["PJ_BALCAO", "PJ balcão", "#7fb3d5"],
+  ["PJ_BALCAO", "PJ sem carteira", "#7fb3d5"],
   ["PF_CARTEIRA", "PF carteira", "#b9770e"],
-  ["PF_BALCAO", "PF balcão", "#f5cba7"],
+  ["PF_BALCAO", "PF sem carteira", "#f5cba7"],
 ];
 const CAD_MES = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"];
 const cadRotulo = (c) => `${CAD_MES[Number(c.slice(5, 7)) - 1]}/${c.slice(2, 4)}`;
@@ -13920,11 +13920,28 @@ function abaCadastrosNovos() {
   const pct = (v) => total12 ? `${Math.round((v / total12) * 100)}%` : "—";
   const alvo = d.level === "unidade" ? d.target : "Grupo";
 
-  const cartao = (rot, valor, sub) => `
+  // PJ em destaque: é a oficina, o cliente que a Passini quer na carteira.
+  // "Sem carteira" = cadastrado sem vendedor interno — é o PJ esperando dono.
+  const destaquePj = (carteira, sem) => `
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">
+      <div style="background:#1a5276;color:#fff;border-radius:8px;padding:7px 9px">
+        <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.3px;opacity:.85">PJ carteira</div>
+        <div style="font-size:22px;font-weight:800;line-height:1.1">${fmt(carteira)}</div>
+      </div>
+      <div style="background:#d6eaf8;color:#0f3044;border-radius:8px;padding:7px 9px;border:1px solid #7fb3d5">
+        <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.3px">PJ sem carteira</div>
+        <div style="font-size:22px;font-weight:800;line-height:1.1">${fmt(sem)}</div>
+      </div>
+    </div>`;
+  const cartao = (rot, valor, sub, pj) => `
     <div class="panel" style="padding:12px 14px;border-left:4px solid #1a5276">
       <div class="text-small" style="color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-size:10.5px">${rot}</div>
-      <div style="font-size:24px;font-weight:800;color:#0f3044;line-height:1.2">${valor}</div>
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <div style="font-size:24px;font-weight:800;color:#0f3044;line-height:1.2">${valor}</div>
+        <div class="text-small" style="color:var(--muted)">cadastros</div>
+      </div>
       <div class="text-small" style="color:var(--muted)">${sub}</div>
+      ${pj ? destaquePj(pj[0], pj[1]) : ""}
     </div>`;
 
   const legenda = CAD_PERFIS.map(([k, rot, cor]) => `
@@ -13955,14 +13972,17 @@ function abaCadastrosNovos() {
     <div class="stack">
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
         ${cartao(`${escapeHtml(cadRotulo(ultFechado.competence || ""))} (último mês fechado)`, fmt(ultFechado.total),
-                 `média de ${fmt(Math.round(media))}/mês nos meses fechados`)}
-        ${cartao(`${escapeHtml(cadRotulo(ult.competence || ""))} até agora`, fmt(ult.total), "mês em andamento")}
-        ${cartao("12 meses", fmt(total12), `${escapeHtml(alvo)} · PJ ${pct(soma("PJ_CARTEIRA") + soma("PJ_BALCAO"))} · balcão ${pct(soma("PJ_BALCAO") + soma("PF_BALCAO"))}`)}
+                 `média de ${fmt(Math.round(media))}/mês nos meses fechados`,
+                 [ultFechado.PJ_CARTEIRA || 0, ultFechado.PJ_BALCAO || 0])}
+        ${cartao(`${escapeHtml(cadRotulo(ult.competence || ""))} até agora`, fmt(ult.total), "mês em andamento",
+                 [ult.PJ_CARTEIRA || 0, ult.PJ_BALCAO || 0])}
+        ${cartao("12 meses", fmt(total12), `${escapeHtml(alvo)} · PJ ${pct(soma("PJ_CARTEIRA") + soma("PJ_BALCAO"))} do total`,
+                 [soma("PJ_CARTEIRA"), soma("PJ_BALCAO")])}
       </div>
       <div class="table-card">
         <div class="section-title"><div><h3>Cadastros novos por mês — ${escapeHtml(alvo)}</h3>
           <div class="text-small">Mês de cadastro pela faixa de código. Carteira = já tem vendedor interno hoje;
-            balcão = ainda sem vendedor. Só conta quem continua no cadastro do Alfa.</div></div></div>
+            sem carteira = ainda sem vendedor. Só conta quem continua no cadastro do Alfa.</div></div></div>
         <div style="margin:4px 0 8px">${legenda}</div>
         ${grafCadastrosEmpilhado(series, parcialIdx)}
       </div>
@@ -15328,7 +15348,9 @@ function resultadosView() {
         <div class="table-wrap">
           <table>
             <thead><tr>
-              <th>Mês</th><th style="text-align:right">Líquido</th><th style="text-align:right">Meta</th>
+              <th>Mês</th><th style="text-align:right">Líquido</th>
+              <th style="text-align:right" title="Líquido dividido pelos dias úteis do mês (no mês em curso, pelos dias já decorridos)">Por dia útil</th>
+              <th style="text-align:right">Meta</th>
               <th style="text-align:right">%</th><th style="text-align:right">Dev. comercial</th>
               <th style="text-align:right">Ticket</th><th style="text-align:right">Clientes</th>
               <th style="width:120px"></th>
@@ -15338,6 +15360,9 @@ function resultadosView() {
                 <tr style="${r.competence === d.facts.competence ? "background:#eef4fa;font-weight:600" : ""}">
                   <td>${escapeHtml(r.competence)}</td>
                   <td style="text-align:right">${currency(r.revenueNet)}</td>
+                  <td style="text-align:right">${r.revenuePerDay == null ? "—" : currency(r.revenuePerDay)}
+                    <div class="text-small" style="color:var(--muted)">${r.workingDays
+                      ? `${r.workingDays}${r.workingDaysTotal && r.workingDays !== r.workingDaysTotal ? ` de ${r.workingDaysTotal}` : ""} dias` : ""}</div></td>
                   <td style="text-align:right;color:var(--muted)">${r.revenueGoal ? currency(r.revenueGoal) : "—"}</td>
                   <td style="text-align:right;font-weight:700;color:${
                     r.attainmentPct === null ? "var(--muted)"
@@ -15358,7 +15383,7 @@ function resultadosView() {
           </table>
         </div>
         <div class="text-small" style="color:var(--muted);margin-top:8px">
-          Devolução comercial já exclui garantia. Mês sem meta cadastrada aparece com "—".
+          Devolução comercial já exclui garantia. Mês sem meta cadastrada aparece com "—". Por dia útil = líquido ÷ dias úteis do mês; no mês em curso, ÷ dias já decorridos.
         </div>
       </div>`;
   }

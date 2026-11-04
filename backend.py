@@ -25728,6 +25728,7 @@ def resultados_serie(
         return []
     marc = ",".join("?" for _ in competencias)
     nivel = normalize_whitespace(nivel).lower() or "empresa"
+    hoje_comp = today_in_brazil().strftime("%Y-%m")
 
     # ── 1. Oficial: faturamento, devolução, margem ────────────────────────────
     if nivel == "unidade" and alvo:
@@ -25884,6 +25885,13 @@ def resultados_serie(
         bruto = float(o.get("bruto") or 0)
         meta = metas.get(comp, 0.0)
         liq_meta = liq - venda_sem_meta.get(comp, 0.0) if meta else liq
+        # Faturamento por dia útil: compara meses de tamanho diferente (um mês
+        # com feriado tem menos dias para vender). Mês em curso divide pelos
+        # dias já decorridos, igual à tela de Produtividade.
+        _cal = get_business_calendar(conn, company_id, comp)
+        _tot = int(_cal.get("totalWorkingDays") or 0)
+        _dec = int(_cal.get("elapsedWorkingDays") or 0)
+        dias_uteis = (_dec if comp == hoje_comp and _dec else _tot) or 0
         d = detalhe.get(comp, {})
         clientes = int(d.get("clientes") or 0)
         serie.append({
@@ -25893,6 +25901,9 @@ def resultados_serie(
             "revenueGoal": round(meta, 2),
             "revenueForGoal": round(liq_meta, 2),
             "revenueWithoutGoal": round(liq - liq_meta, 2),
+            "workingDays": dias_uteis,
+            "workingDaysTotal": _tot,
+            "revenuePerDay": round(liq / dias_uteis, 2) if dias_uteis else None,
             "attainmentPct": round(safe_div(liq_meta, meta) * 100, 1) if meta else None,
             "returnsCommercial": round(dev_comercial, 2),
             "returnsWarranty": round(gar, 2),
