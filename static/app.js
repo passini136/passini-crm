@@ -17215,6 +17215,7 @@ function clientDrawerView() {
               <div class="section-title"><h3>Identificação</h3></div>
               <div class="crm-mini-grid crm-detail-grid">
                 <div><span>Código do cliente</span><strong>${escapeHtml(client.clientCode || client.clientKey || "-")}</strong></div>
+                <div><span>Mês de cadastro</span><strong>${escapeHtml(detail?.mesCadastro?.rotulo || "Não informado")}</strong></div>
                 <div><span>Nome do cliente</span><strong>${escapeHtml(client.clientName || "-")}</strong></div>
                 <div><span>Cidade</span><strong>${escapeHtml(client.cityName || profile.city_name || "-")}</strong></div>
                 <div><span>Unidade</span><strong>${escapeHtml(client.unitName || "-")}</strong></div>
@@ -19224,12 +19225,147 @@ function metasVendedorView() {
     </div>`;
 }
 
+// ─── Mês de cadastro dos clientes ────────────────────────────────────────────
+// O Alfa não exporta a data de cadastro. O controle é por FAIXA DE CÓDIGO
+// (código é sequencial): cada mês/ano = um intervalo de códigos. A importação
+// do cadastro substitui a base, por isso as faixas moram em tabela própria.
+const MESES_NOME = ["janeiro", "fevereiro", "março", "abril", "maio", "junho",
+  "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"];
+
+async function loadMesCadastro() {
+  state.mesCadastro = { loading: true };
+  try {
+    state.mesCadastro = await api("/api/clientes/mes-cadastro");
+  } catch (e) {
+    state.mesCadastro = { error: e.message };
+  }
+  requestRender();
+}
+
+function preencherFaixaMesCadastro(inicio, fim) {
+  const a = document.getElementById("mc-inicio");
+  const b = document.getElementById("mc-fim");
+  if (a) a.value = inicio;
+  if (b) b.value = fim;
+  if (a) a.scrollIntoView({ block: "center", behavior: "smooth" });
+}
+
+async function salvarFaixaMesCadastro() {
+  const val = (id) => (document.getElementById(id)?.value || "").trim();
+  const body = { codeStart: val("mc-inicio"), codeEnd: val("mc-fim"),
+                 mes: val("mc-mes"), ano: val("mc-ano") };
+  try {
+    const r = await api("/api/clientes/mes-cadastro/faixa", { method: "POST", body: JSON.stringify(body) });
+    addMessage("success", `Faixa ${r.faixa.codeStart}–${r.faixa.codeEnd} gravada como ${r.faixa.rotulo}.`);
+    ["mc-inicio", "mc-fim"].forEach((id) => { const el = document.getElementById(id); if (el) el.value = ""; });
+    await loadMesCadastro();
+  } catch (e) {
+    addMessage("error", e.message);
+  }
+}
+
+async function excluirFaixaMesCadastro(id, texto) {
+  if (!window.confirm(`Excluir a faixa ${texto}? Os códigos voltam para a lista de pendentes.`)) return;
+  try {
+    await api("/api/clientes/mes-cadastro/excluir", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", `Faixa ${texto} excluída.`);
+    await loadMesCadastro();
+  } catch (e) {
+    addMessage("error", e.message);
+  }
+}
+
+function mesCadastroPanel() {
+  const mc = state.mesCadastro;
+  if (!mc) { loadMesCadastro(); }
+  const fmt = (n) => Number(n || 0).toLocaleString("pt-BR");
+  const titulo = `
+    <div class="section-title"><div>
+      <h3>📅 Mês de cadastro dos clientes</h3>
+      <div class="text-small">O Alfa não traz a data de cadastro. O controle é por faixa de código:
+        cada mês/ano corresponde a um intervalo de códigos. A cada importação do cadastro,
+        os códigos novos acima do último já controlado recebem sozinhos o mês da importação
+        (marcados como "automático"). Só lacuna antiga fica pendente aqui.</div>
+    </div>
+    ${botaoAtualizar("mesCadastro", "loadMesCadastro()", { mensagem: "Mês de cadastro atualizado." })}
+    </div>`;
+  if (!mc || mc.loading) return `<div class="form-card">${titulo}<div class="message">Carregando…</div></div>`;
+  if (mc.error) return `<div class="form-card">${titulo}<div class="message error">${escapeHtml(mc.error)}</div></div>`;
+
+  const p = mc.pendencias || {};
+  const blocos = p.blocos || [];
+  const anoAtual = new Date().getFullYear();
+  const manuais = (mc.faixas || []).filter((f) => f.source !== "PLANILHA").slice(-12).reverse();
+  const ultimas = (mc.faixas || []).slice(-4).reverse();
+
+  const blocoHtml = (b) => `
+    <div class="subtle-card padded-card" style="margin-top:8px">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+        <div><strong>Códigos ${b.codeStart} a ${b.codeEnd}</strong>
+          <span class="text-small"> · ${fmt(b.quantidade)} cliente(s) no cadastro</span></div>
+        <button class="btn btn-secondary btn-sm" onclick="preencherFaixaMesCadastro(${b.codeStart}, ${b.codeEnd})">Usar esta faixa</button>
+      </div>
+      ${(b.pistaPrimeiraCompra || []).length ? `
+        <div class="text-small" style="margin-top:6px;color:var(--muted)">
+          Pista pela 1ª compra (o cliente não compra antes de ser cadastrado — serve para conferir, não substitui o seu controle):</div>
+        <div class="table-wrap" style="margin-top:4px"><table>
+          <thead><tr><th>1ª compra em</th><th>Códigos</th><th>Clientes</th><th></th></tr></thead>
+          <tbody>${b.pistaPrimeiraCompra.map((x) => `
+            <tr><td>${escapeHtml(x.rotulo)}</td><td>${x.codeMin}–${x.codeMax}</td><td>${fmt(x.clientes)}</td>
+              <td><button class="btn btn-ghost btn-sm" onclick="preencherFaixaMesCadastro(${x.codeMin}, ${x.codeMax})">usar</button></td></tr>`).join("")}
+          </tbody></table></div>
+        ${b.semCompra ? `<div class="text-small" style="color:var(--muted)">${fmt(b.semCompra)} código(s) ainda sem compra.</div>` : ""}` : ""}
+    </div>`;
+
+  return `
+    <div class="form-card">
+      ${titulo}
+      <div style="display:flex;flex-wrap:wrap;gap:16px;padding:10px 14px;background:rgba(15,48,68,0.06);border-radius:8px;font-size:13px">
+        <div><span style="color:var(--muted);font-weight:600">Com mês: </span><strong>${fmt(p.cobertos)}</strong> de ${fmt(p.totalClientes)}</div>
+        <div><span style="color:var(--muted);font-weight:600">Sem mês: </span><strong style="color:${p.semMes ? "var(--danger, #b42318)" : "inherit"}">${fmt(p.semMes)}</strong></div>
+        <div><span style="color:var(--muted);font-weight:600">Último código com mês: </span><strong>${p.ultimoCodigoCoberto ?? "—"}</strong>
+          ${ultimas[0] ? `<span class="text-small">(${escapeHtml(ultimas[0].rotulo)})</span>` : ""}</div>
+        ${p.naoNumericos ? `<div><span style="color:var(--muted);font-weight:600">Códigos não numéricos (ignorados): </span><strong>${fmt(p.naoNumericos)}</strong></div>` : ""}
+      </div>
+
+      ${blocos.length ? `
+        <div style="margin-top:12px"><strong>Faixas pendentes de definir</strong></div>
+        ${blocos.slice(0, 6).map(blocoHtml).join("")}` : `
+        <div class="message success" style="margin-top:12px">Todos os códigos do cadastro têm mês de cadastro.</div>`}
+
+      <div class="subtle-card padded-card" style="margin-top:14px">
+        <div style="margin-bottom:8px"><strong>Informar faixa</strong></div>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;align-items:end">
+          <div class="field"><label>Código inicial</label><input id="mc-inicio" inputmode="numeric" /></div>
+          <div class="field"><label>Código final</label><input id="mc-fim" inputmode="numeric" /></div>
+          <div class="field"><label>Mês</label><select id="mc-mes">
+            ${MESES_NOME.map((m, i) => `<option value="${i + 1}">${m}</option>`).join("")}</select></div>
+          <div class="field"><label>Ano</label><input id="mc-ano" inputmode="numeric" value="${anoAtual}" /></div>
+          <div><button class="btn btn-primary" onclick="salvarFaixaMesCadastro()">Gravar faixa</button></div>
+        </div>
+        <div class="text-small" style="margin-top:6px;color:var(--muted)">O sistema recusa faixa que se sobreponha a outra,
+          mês no futuro e mês fora de ordem em relação aos códigos vizinhos.</div>
+      </div>
+
+      ${manuais.length ? `
+        <div class="table-wrap" style="margin-top:12px"><table>
+          <thead><tr><th>Faixa</th><th>Mês de cadastro</th><th>Origem</th><th>Quando</th><th></th></tr></thead>
+          <tbody>${manuais.map((f) => `
+            <tr><td>${f.codeStart}–${f.codeEnd}</td><td>${escapeHtml(f.rotulo)}</td>
+              <td>${f.source === "AUTO" ? "automático (importação)" : "informado na tela"}</td>
+              <td>${escapeHtml(String(f.createdAt || "").slice(0, 10).split("-").reverse().join("/"))}</td>
+              <td><button class="btn btn-ghost btn-sm" onclick="excluirFaixaMesCadastro(${f.id}, '${f.codeStart}–${f.codeEnd}')">excluir</button></td></tr>`).join("")}
+          </tbody></table></div>` : ""}
+    </div>`;
+}
+
 function importacoesView() {
   if (!state.admin) return `<div class="loader panel">Carregando importações...</div>`;
   if (!state.autoImport) loadAutoImportStatus();
   return `
     <div class="stack">
       ${autoImportPanel()}
+      ${mesCadastroPanel()}
       ${guiaDeImportacao(state.autoImport?.types || [])}
       ${(() => {
         const cov = state.admin?.salesCoverage;

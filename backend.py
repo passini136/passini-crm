@@ -41,6 +41,8 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
+import mes_cadastro  # mês de cadastro do cliente por faixa de código
+
 
 ROOT_DIR = Path(__file__).resolve().parent
 LEGACY_APPDATA_DIR = Path(os.environ.get("LOCALAPPDATA", str(ROOT_DIR / "runtime_data"))) / "PassiniDashboard"
@@ -2026,6 +2028,8 @@ FEATURE_GATES: dict[str, str] = {"crm-cotacoes": "cotacoes"}
 
 
 DIFERENCIADO_SEED = ROOT_DIR / "seeds" / "diferenciado_inicial.csv"
+# Planilha antiga do Felipe (código do cliente x mês de cadastro), já em faixas.
+MES_CADASTRO_SEED = ROOT_DIR / "seeds" / "mes_cadastro_inicial.csv"
 
 
 def carregar_diferenciado_inicial(conn: sqlite3.Connection, company_id: int) -> None:
@@ -3479,6 +3483,8 @@ def init_db() -> None:
         seed_territory_mappings(conn, company_id)
         repair_prospect_keys(conn, company_id)
         carregar_diferenciado_inicial(conn, company_id)
+        mes_cadastro.garantir_tabela(conn)
+        mes_cadastro.carregar_planilha_inicial(conn, company_id, MES_CADASTRO_SEED, now_iso())
 
         user = conn.execute("SELECT id FROM users WHERE username = ?", (DEFAULT_ADMIN_USER,)).fetchone()
         if not user:
@@ -6111,6 +6117,21 @@ def import_package(
         if _leads_marcados:
             result["leadsMarkedAsClients"] = _leads_marcados
             _msg += f" · {_leads_marcados} lead(s) da base de prospecção viraram clientes"
+        # Controle do mês de cadastro: código novo chega sem mês e fica
+        # registrado aqui, em toda importação, até alguém informar a faixa.
+        try:
+            _auto_mes = mes_cadastro.registrar_codigos_novos(
+                conn, company_id, today_in_brazil(), now_iso())
+            if _auto_mes:
+                result["registrationMonthAssigned"] = _auto_mes
+                _msg += (f" · {_auto_mes['novos']} código(s) novo(s) "
+                         f"({_auto_mes['codeStart']}–{_auto_mes['codeEnd']}) marcados como "
+                         f"{_auto_mes['rotulo']}")
+            _pend_mes = mes_cadastro.pendencias(conn, company_id)
+            result["clientsWithoutRegistrationMonth"] = _pend_mes["semMes"]
+            _msg += mes_cadastro.resumo_para_importacao(conn, company_id)
+        except sqlite3.OperationalError:
+            pass
         result["message"] = _msg
     return result
 
@@ -29275,6 +29296,17 @@ class AppHandler(BaseHTTPRequestHandler):
                                  "margin": DEFAULT_MARGIN_TARGET},
                 }))
                 return
+            if path == "/api/clientes/mes-cadastro":
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                with closing(get_connection()) as conn:
+                    mes_cadastro.garantir_tabela(conn)
+                    faixas = mes_cadastro.listar_faixas(conn, user["company_id"])
+                    pend = mes_cadastro.pendencias(conn, user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"faixas": faixas, "pendencias": pend}))
+                return
             if path == "/api/auto-import/status":
                 user = self._require_auth()
                 if not user:
@@ -29885,6 +29917,11 @@ class AppHandler(BaseHTTPRequestHandler):
                         data["ownerName"] = normalize_whitespace(dono["v"]) if dono else ""
                         data["isOwnClient"] = not client_is_outside_own_portfolio(
                             conn, user["company_id"], user, client_key)
+                        try:
+                            data["mesCadastro"] = mes_cadastro.mes_cadastro_do_cliente(
+                                conn, user["company_id"], client_key)
+                        except sqlite3.OperationalError:
+                            data["mesCadastro"] = None
                         # Marca a passagem. Fica DENTRO do if: ficha que não
                         # existe não é visita a cliente nenhum.
                         registrar_visualizacao_cliente(
@@ -30112,6 +30149,11 @@ class AppHandler(BaseHTTPRequestHandler):
                     if data:
                         data["isOwnClient"] = not client_is_outside_own_portfolio(
                             conn, user["company_id"], user, client_key)
+                        try:
+                            data["mesCadastro"] = mes_cadastro.mes_cadastro_do_cliente(
+                                conn, user["company_id"], client_key)
+                        except sqlite3.OperationalError:
+                            data["mesCadastro"] = None
                         # É AQUI que a ficha abre de verdade.
                         #
                         # Eu tinha posto o registro em /api/crm/client, que a tela
@@ -31220,6 +31262,33 @@ class AppHandler(BaseHTTPRequestHandler):
                 invalidate_dashboard_cache(user["company_id"])
                 self._set_headers(200)
                 self.wfile.write(json_dumps({"ok": True}))
+                return
+            if path in ("/api/clientes/mes-cadastro/faixa", "/api/clientes/mes-cadastro/excluir"):
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                try:
+                    with closing(get_connection()) as conn:
+                        mes_cadastro.garantir_tabela(conn)
+                        if path.endswith("/faixa"):
+                            res = mes_cadastro.salvar_faixa(
+                                conn, user["company_id"], user["id"], payload,
+                                today_in_brazil(), now_iso())
+                            acao = "create"
+                        else:
+                            res = mes_cadastro.excluir_faixa(conn, user["company_id"], payload.get("id"))
+                            acao = "delete"
+                        audit_log(conn, user["company_id"], user["id"], acao,
+                                  "mes_cadastro_faixa", f"{res['codeStart']}-{res['codeEnd']}", res)
+                        conn.commit()
+                        pend = mes_cadastro.pendencias(conn, user["company_id"])
+                except ValueError as exc:
+                    self._set_headers(400)
+                    self.wfile.write(json_dumps({"error": str(exc)}))
+                    return
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True, "faixa": res, "pendencias": pend}))
                 return
             if path == "/api/auto-import/run":
                 user = self._require_auth()
