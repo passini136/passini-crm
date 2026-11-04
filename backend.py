@@ -25622,6 +25622,50 @@ def compute_manager_mission(
 RESULTADOS_MESES = 12
 
 
+def _cadastros_escopo(conn: sqlite3.Connection, user: dict[str, Any], nivel: str,
+                      alvo: str) -> tuple[str, str, list[str] | None]:
+    """Mesmo recorte para o painel e para a lista: gerente fica na unidade dele."""
+    permitidas = crm_allowed_units_for_user(conn, user)
+    nivel = "unidade" if normalize_whitespace(nivel).lower() == "unidade" else "empresa"
+    alvo = normalize_unit(alvo) if alvo else ""
+    if permitidas is not None:
+        _p = [normalize_unit(u) for u in permitidas]
+        if nivel == "empresa" or alvo not in _p:
+            nivel, alvo = "unidade", (_p[0] if _p else "")
+    return nivel, alvo, permitidas
+
+
+def _cadastros_novos_linhas(conn: sqlite3.Connection, company_id: int,
+                            faixas: list[dict[str, Any]], atual: str):
+    """Cada cliente com mês de cadastro nas faixas dadas: (mês, unidade, perfil, linha).
+
+    Um lugar só classifica — o painel conta e a lista mostra exatamente os
+    mesmos clientes. Se cada um tivesse a sua regra, o número do balão e o
+    tamanho da lista acabariam diferentes.
+    """
+    resolv = mes_cadastro.Resolvedor(faixas)
+    menor = min(f["codeStart"] for f in faixas)
+    territorio = build_territory_map(conn, company_id, atual)
+    cidades = build_city_unit_map(conn, company_id, atual)
+    for r in conn.execute(
+        "SELECT client_code, client_name, trade_name, document_number, city_name, neighborhood, "
+        "address_line, address_number, phone, updated_phone, primary_contact_name, email, "
+        "first_sale_at, last_sale_at, credit_limit, internal_seller_name, external_seller_name "
+        "FROM crm_client_profiles WHERE company_id = ? "
+        "AND TRIM(client_code) GLOB '[0-9]*' AND CAST(client_code AS INTEGER) >= ?",
+        (company_id, menor)):
+        f = resolv.faixa(r["client_code"])
+        if not f:
+            continue
+        unidade = unit_for_client_row(None, r["city_name"], r["neighborhood"], {},
+                                      territorio, cidades) or "SEM UNIDADE"
+        tipo, _ = person_type_from_document(r["document_number"])
+        if not tipo:
+            tipo, _, _ = infer_person_type_from_name(r["client_name"])
+        perfil = f"{tipo or 'PF'}_{'CARTEIRA' if normalize_whitespace(r['internal_seller_name']) else 'BALCAO'}"
+        yield f["competencia"], unidade, perfil, r, f
+
+
 def cadastros_novos_painel(
     conn: sqlite3.Connection, company_id: int, user: dict[str, Any],
     nivel: str = "empresa", alvo: str = "", meses: int = 12,
@@ -25640,15 +25684,9 @@ def cadastros_novos_painel(
     Só conta quem continua no cadastro do Alfa; código excluído lá some daqui.
     """
     mes_cadastro.garantir_tabela(conn)
-    permitidas = crm_allowed_units_for_user(conn, user)
     if data_scope_for_user(conn, user) == "proprio":
         return {"erro": "Cadastros novos é um painel de gestão (grupo e unidade)."}
-    nivel = "unidade" if normalize_whitespace(nivel).lower() == "unidade" else "empresa"
-    alvo = normalize_unit(alvo) if alvo else ""
-    if permitidas is not None:
-        _p = [normalize_unit(u) for u in permitidas]
-        if nivel == "empresa" or alvo not in _p:
-            nivel, alvo = "unidade", (_p[0] if _p else "")
+    nivel, alvo, permitidas = _cadastros_escopo(conn, user, nivel, alvo)
 
     hoje = today_in_brazil()
     meses = max(3, min(int(meses or 12), 36))
@@ -25661,29 +25699,10 @@ def cadastros_novos_painel(
              "currentCompetence": atual, "lastCoveredCode": None}
     if not faixas:
         return vazio
-    resolv = mes_cadastro.Resolvedor(faixas)
-    menor = min(f["codeStart"] for f in faixas)
-
-    territorio = build_territory_map(conn, company_id, atual)
-    cidades = build_city_unit_map(conn, company_id, atual)
     PERFIS = ("PJ_CARTEIRA", "PJ_BALCAO", "PF_CARTEIRA", "PF_BALCAO")
     por_mes = {c: {k: 0 for k in PERFIS} for c in janela}
     por_unidade: dict[str, dict[str, Any]] = {}
-    for r in conn.execute(
-        "SELECT client_code, client_name, document_number, city_name, neighborhood, "
-        "internal_seller_name FROM crm_client_profiles WHERE company_id = ? "
-        "AND TRIM(client_code) GLOB '[0-9]*' AND CAST(client_code AS INTEGER) >= ?",
-        (company_id, menor)):
-        f = resolv.faixa(r["client_code"])
-        if not f:
-            continue
-        comp = f["competencia"]
-        unidade = unit_for_client_row(None, r["city_name"], r["neighborhood"], {},
-                                      territorio, cidades) or "SEM UNIDADE"
-        tipo, _ = person_type_from_document(r["document_number"])
-        if not tipo:
-            tipo, _, _ = infer_person_type_from_name(r["client_name"])
-        perfil = f"{tipo or 'PF'}_{'CARTEIRA' if normalize_whitespace(r['internal_seller_name']) else 'BALCAO'}"
+    for comp, unidade, perfil, _r, _f in _cadastros_novos_linhas(conn, company_id, faixas, atual):
         u = por_unidade.setdefault(unidade, {"unit": unidade, "byMonth": {c: 0 for c in janela},
                                              **{k: 0 for k in PERFIS}, "total": 0})
         u["byMonth"][comp] += 1
@@ -25705,6 +25724,93 @@ def cadastros_novos_painel(
             "lastCoveredLabel": next((f["rotulo"] for f in faixas
                                       if f["codeEnd"] == max(x["codeEnd"] for x in faixas)), "")}
 
+
+
+def cadastros_novos_clientes(
+    conn: sqlite3.Connection, company_id: int, user: dict[str, Any],
+    nivel: str = "empresa", alvo: str = "", competencia: str = "",
+    perfil: str = "PJ_BALCAO", meses: int = 12,
+) -> dict[str, Any]:
+    """Os clientes por trás de um número do painel de cadastros novos.
+
+    `competencia` vazia = os 12 meses do painel. Resumo de compra vem do
+    consolidado por cliente (crm_client_summary), por CÓDIGO — o nome tem três
+    grafias no CRM e só o código casa os lados.
+    """
+    mes_cadastro.garantir_tabela(conn)
+    if data_scope_for_user(conn, user) == "proprio":
+        return {"erro": "Cadastros novos é um painel de gestão (grupo e unidade)."}
+    nivel, alvo, _perm = _cadastros_escopo(conn, user, nivel, alvo)
+    perfil = normalize_upper(perfil) or "PJ_BALCAO"
+    if perfil not in ("PJ_CARTEIRA", "PJ_BALCAO", "PF_CARTEIRA", "PF_BALCAO", "TODOS"):
+        perfil = "PJ_BALCAO"
+    atual = today_in_brazil().strftime("%Y-%m")
+    meses = max(3, min(int(meses or 12), 36))
+    janela = {shift_competence(atual, -i) for i in range(meses)}
+    competencia = normalize_whitespace(competencia)
+    alvo_meses = {competencia} if competencia in janela else janela
+    faixas = [f for f in mes_cadastro.listar_faixas(conn, company_id)
+              if f["competencia"] and f["competencia"] in alvo_meses]
+    base = {"level": nivel, "target": alvo, "competence": competencia if competencia in janela else "",
+            "profile": perfil, "items": []}
+    if not faixas:
+        return base
+
+    linhas = []
+    for comp, unidade, perf, r, f in _cadastros_novos_linhas(conn, company_id, faixas, atual):
+        if perfil != "TODOS" and perf != perfil:
+            continue
+        if nivel == "unidade" and unidade != alvo:
+            continue
+        linhas.append((comp, unidade, perf, r, f))
+
+    compras: dict[str, dict[str, Any]] = {}
+    codigos = [normalize_whitespace(x[3]["client_code"]) for x in linhas]
+    for i in range(0, len(codigos), 400):
+        lote = codigos[i:i + 400]
+        marc = ",".join("?" for _ in lote)
+        for c in conn.execute(
+            f"SELECT client_code, COUNT(DISTINCT competence) meses, SUM(net_value) liq, "
+            f"MAX(last_purchase_at) ultima, MAX(seller_name) vendedor "
+            f"FROM crm_client_summary WHERE company_id = ? AND client_code IN ({marc}) "
+            f"AND net_value > 0 GROUP BY client_code", (company_id, *lote)).fetchall():
+            compras[normalize_whitespace(c["client_code"])] = dict(c)
+
+    itens = []
+    for comp, unidade, perf, r, f in linhas:
+        cod = normalize_whitespace(r["client_code"])
+        cp = compras.get(cod) or {}
+        endereco = ", ".join(x for x in (normalize_whitespace(r["address_line"]),
+                                         normalize_whitespace(r["address_number"])) if x)
+        itens.append({
+            "clientCode": cod,
+            "clientName": normalize_whitespace(r["client_name"]),
+            "tradeName": normalize_whitespace(r["trade_name"]),
+            "document": normalize_whitespace(r["document_number"]),
+            "cityName": normalize_whitespace(r["city_name"]),
+            "neighborhood": normalize_whitespace(r["neighborhood"]),
+            "address": endereco,
+            "phone": normalize_whitespace(r["updated_phone"]) or normalize_whitespace(r["phone"]),
+            "contact": normalize_whitespace(r["primary_contact_name"]),
+            "email": normalize_whitespace(r["email"]),
+            "unit": unidade,
+            "profile": perf,
+            "registeredIn": f["rotulo"],
+            "registeredCompetence": comp,
+            "firstSaleAt": (r["first_sale_at"] or "")[:10],
+            "lastSaleAt": (cp.get("ultima") or r["last_sale_at"] or "")[:10],
+            "creditLimit": float(r["credit_limit"] or 0),
+            "externalSeller": normalize_whitespace(r["external_seller_name"]),
+            "monthsWithPurchase": int(cp.get("meses") or 0),
+            "revenueTotal": round(float(cp.get("liq") or 0), 2),
+            "lastSoldBy": normalize_whitespace(cp.get("vendedor")),
+        })
+    # Quem já compra vem primeiro: é o PJ sem dono que mais vale distribuir.
+    itens.sort(key=lambda x: (-x["revenueTotal"], -int(x["clientCode"] or 0)))
+    compraram = [x for x in itens if x["monthsWithPurchase"]]
+    return {**base, "items": itens,
+            "totals": {"clients": len(itens), "buyers": len(compraram),
+                       "revenue": round(sum(x["revenueTotal"] for x in itens), 2)}}
 
 def resultados_serie(
     conn: sqlite3.Connection, company_id: int, nivel: str = "empresa",
@@ -30011,6 +30117,21 @@ class AppHandler(BaseHTTPRequestHandler):
                         dias=parse_int(query.get("dias", ["30"])[0]) or 30,
                         vendedor=query.get("seller", [""])[0],
                         unidade=query.get("unit", [""])[0])
+                self._set_headers(200)
+                self.wfile.write(json_dumps(dados))
+                return
+            if path == "/api/cadastros-novos/clientes":
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    dados = cadastros_novos_clientes(
+                        conn, user["company_id"], user,
+                        nivel=query.get("level", ["empresa"])[0],
+                        alvo=query.get("target", [""])[0],
+                        competencia=query.get("competence", [""])[0],
+                        perfil=query.get("profile", ["PJ_BALCAO"])[0])
                 self._set_headers(200)
                 self.wfile.write(json_dumps(dados))
                 return

@@ -13922,17 +13922,25 @@ function abaCadastrosNovos() {
 
   // PJ em destaque: é a oficina, o cliente que a Passini quer na carteira.
   // "Sem carteira" = cadastrado sem vendedor interno — é o PJ esperando dono.
-  const destaquePj = (carteira, sem) => `
+  // Cada caixa abre a lista dos clientes por trás do número.
+  const destaquePj = (carteira, sem, comp) => {
+    const abre = (perfil, n) => n ? `onclick="abrirCadastrosNovosLista('${perfil}','${comp || ""}')"
+      title="Ver a relação dos clientes" role="button"` : "";
+    const ver = (n, cor) => n ? `<div style="font-size:10.5px;margin-top:2px;text-decoration:underline;color:${cor}">ver clientes ›</div>` : "";
+    return `
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px">
-      <div style="background:#1a5276;color:#fff;border-radius:8px;padding:7px 9px">
+      <div ${abre("PJ_CARTEIRA", carteira)} style="background:#1a5276;color:#fff;border-radius:8px;padding:7px 9px;${carteira ? "cursor:pointer" : ""}">
         <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.3px;opacity:.85">PJ carteira</div>
         <div style="font-size:22px;font-weight:800;line-height:1.1">${fmt(carteira)}</div>
+        ${ver(carteira, "#d6eaf8")}
       </div>
-      <div style="background:#d6eaf8;color:#0f3044;border-radius:8px;padding:7px 9px;border:1px solid #7fb3d5">
+      <div ${abre("PJ_BALCAO", sem)} style="background:#d6eaf8;color:#0f3044;border-radius:8px;padding:7px 9px;border:1px solid #7fb3d5;${sem ? "cursor:pointer" : ""}">
         <div style="font-size:10.5px;text-transform:uppercase;letter-spacing:.3px">PJ sem carteira</div>
         <div style="font-size:22px;font-weight:800;line-height:1.1">${fmt(sem)}</div>
+        ${ver(sem, "#1a5276")}
       </div>
     </div>`;
+  };
   const cartao = (rot, valor, sub, pj) => `
     <div class="panel" style="padding:12px 14px;border-left:4px solid #1a5276">
       <div class="text-small" style="color:var(--muted);text-transform:uppercase;letter-spacing:.4px;font-size:10.5px">${rot}</div>
@@ -13941,7 +13949,7 @@ function abaCadastrosNovos() {
         <div class="text-small" style="color:var(--muted)">cadastros</div>
       </div>
       <div class="text-small" style="color:var(--muted)">${sub}</div>
-      ${pj ? destaquePj(pj[0], pj[1]) : ""}
+      ${pj ? destaquePj(pj[0], pj[1], pj[2]) : ""}
     </div>`;
 
   const legenda = CAD_PERFIS.map(([k, rot, cor]) => `
@@ -13973,9 +13981,9 @@ function abaCadastrosNovos() {
       <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px">
         ${cartao(`${escapeHtml(cadRotulo(ultFechado.competence || ""))} (último mês fechado)`, fmt(ultFechado.total),
                  `média de ${fmt(Math.round(media))}/mês nos meses fechados`,
-                 [ultFechado.PJ_CARTEIRA || 0, ultFechado.PJ_BALCAO || 0])}
+                 [ultFechado.PJ_CARTEIRA || 0, ultFechado.PJ_BALCAO || 0, ultFechado.competence])}
         ${cartao(`${escapeHtml(cadRotulo(ult.competence || ""))} até agora`, fmt(ult.total), "mês em andamento",
-                 [ult.PJ_CARTEIRA || 0, ult.PJ_BALCAO || 0])}
+                 [ult.PJ_CARTEIRA || 0, ult.PJ_BALCAO || 0, ult.competence])}
         ${cartao("12 meses", fmt(total12), `${escapeHtml(alvo)} · PJ ${pct(soma("PJ_CARTEIRA") + soma("PJ_BALCAO"))} do total`,
                  [soma("PJ_CARTEIRA"), soma("PJ_BALCAO")])}
       </div>
@@ -13987,6 +13995,91 @@ function abaCadastrosNovos() {
         ${grafCadastrosEmpilhado(series, parcialIdx)}
       </div>
       ${tabela}
+    </div>`;
+}
+
+/* Lista por trás dos números de PJ do painel de cadastros novos. */
+async function abrirCadastrosNovosLista(perfil, competencia) {
+  const f = state.resultadosFiltros;
+  state.cadastrosLista = { loading: true, profile: perfil, competence: competencia || "" };
+  requestRender();
+  try {
+    const q = new URLSearchParams({ level: f.level || "empresa", profile: perfil });
+    if (f.target) q.set("target", f.target);
+    if (competencia) q.set("competence", competencia);
+    const r = await api(`/api/cadastros-novos/clientes?${q}`);
+    state.cadastrosLista = { ...r, loading: false };
+  } catch (e) {
+    state.cadastrosLista = { error: e.message, loading: false, items: [] };
+  }
+  requestRender();
+}
+
+function fecharCadastrosNovosLista() {
+  state.cadastrosLista = null;
+  requestRender();
+}
+
+function abrirFichaDaListaCadastros(codigo) {
+  state.cadastrosLista = null;
+  void openCrmClient(codigo, false, true, { outside: true });
+}
+
+function cadastrosNovosListaModal() {
+  const d = state.cadastrosLista;
+  if (!d) return "";
+  const rotPerfil = (CAD_PERFIS.find(([k]) => k === d.profile) || [null, d.profile])[1];
+  const periodo = d.competence ? cadRotulo(d.competence) : "últimos 12 meses";
+  const recorte = d.level === "unidade" ? d.target : "Grupo";
+  const itens = d.items || [];
+  const t = d.totals || {};
+  const linha = (i) => `
+    <tr>
+      <td class="text-small">${escapeHtml(i.clientCode)}</td>
+      <td><strong>${escapeHtml(i.clientName)}</strong>
+        ${i.tradeName && i.tradeName !== i.clientName ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(i.tradeName)}</div>` : ""}
+        <div class="text-small" style="color:var(--muted)">${escapeHtml(formatarDocumento(i.document) || "sem documento")}</div></td>
+      <td class="text-small">${escapeHtml(i.cityName || "—")}${i.neighborhood ? `<div style="color:var(--muted)">${escapeHtml(i.neighborhood)}</div>` : ""}
+        ${d.level !== "unidade" ? `<div style="color:var(--muted)">${escapeHtml(i.unit)}</div>` : ""}</td>
+      <td class="text-small">${escapeHtml(i.phone || "—")}${i.contact ? `<div style="color:var(--muted)">${escapeHtml(i.contact)}</div>` : ""}</td>
+      <td class="text-small">${escapeHtml(i.registeredIn)}</td>
+      <td style="text-align:right">${i.monthsWithPurchase
+        ? `<strong>${currency(i.revenueTotal)}</strong>
+           <div class="text-small" style="color:var(--muted)">${i.monthsWithPurchase} mês(es) com compra</div>`
+        : `<span class="text-small" style="color:var(--muted)">ainda não comprou</span>`}</td>
+      <td class="text-small">${i.lastSaleAt ? shortDate(i.lastSaleAt) : "—"}
+        ${i.lastSoldBy ? `<div style="color:var(--muted)">por ${escapeHtml(i.lastSoldBy)}</div>` : ""}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="abrirFichaDaListaCadastros('${jsAttr(i.clientCode)}')">Ficha</button></td>
+    </tr>`;
+  return `
+    <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharCadastrosNovosLista)">
+      <div class="panel modal-panel" style="max-width:1100px;margin:5vh auto;padding:22px;max-height:90vh;overflow:auto"
+           onclick="event.stopPropagation()">
+        <div class="section-title">
+          <div><h3>Cadastros novos · ${escapeHtml(rotPerfil)}</h3>
+            <div class="text-small">${escapeHtml(recorte)} · ${escapeHtml(periodo)} · unidade pela cidade/bairro do cliente</div></div>
+          <button class="btn btn-ghost btn-sm" onclick="fecharCadastrosNovosLista()">Fechar</button>
+        </div>
+        ${d.loading ? '<div class="loader panel">Carregando…</div>' : ""}
+        ${d.error || d.erro ? `<div class="message error">${escapeHtml(d.error || d.erro)}</div>` : ""}
+        ${!d.loading && !(d.error || d.erro) ? `
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin:8px 0 12px">
+            ${[["Clientes", number(t.clients || 0), ""],
+               ["Já compraram", number(t.buyers || 0), t.clients ? `${Math.round(100 * (t.buyers || 0) / t.clients)}% da lista` : ""],
+               ["Compraram no total", currency(t.revenue || 0), "consolidado por cliente"]].map(([r, v, sub]) => `
+              <div style="flex:1;min-width:160px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 11px">
+                <div class="text-small" style="color:var(--muted)">${r}</div>
+                <div style="font-size:18px;font-weight:800">${v}</div>
+                <div class="text-small" style="color:var(--muted)">${sub}</div></div>`).join("")}
+          </div>
+          ${d.profile === "PJ_BALCAO" ? `<div class="text-small" style="margin-bottom:8px;color:var(--muted)">
+            PJ cadastrado sem vendedor interno. Quem já compra vem primeiro — é o candidato natural a ganhar dono.</div>` : ""}
+          <div class="table-wrap"><table class="data-table">
+            <thead><tr><th>Código</th><th>Cliente</th><th>Cidade</th><th>Telefone / contato</th>
+              <th>Cadastro</th><th style="text-align:right">Compras</th><th>Última compra</th><th></th></tr></thead>
+            <tbody>${itens.map(linha).join("") || `<tr><td colspan="8">${emptyStateCard("Nenhum cliente neste recorte.")}</td></tr>`}</tbody>
+          </table></div>` : ""}
+      </div>
     </div>`;
 }
 
@@ -22211,6 +22304,7 @@ function dashboardView() {
       ${clientesDoVendedorModal()}
       ${muralEditorModal()}
       ${ticketSemanalModal()}
+      ${cadastrosNovosListaModal()}
       ${apoioModal()}
       ${coberturaModal()}
       ${receptiveModal()}
