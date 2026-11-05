@@ -19229,6 +19229,22 @@ function placarParaImpressao(d) {
     </div>`;
 }
 
+// PDFs da premiação gerados no servidor, sempre de UM mês (o "até" do
+// período): premiação é paga por mês. Lançamento não salvo não entra — o PDF
+// lê o que está gravado, então avisa antes de baixar algo desatualizado.
+function baixarPdfPremiacao(tipo) {
+  const f = state.awardFilters || {};
+  const d = state.awards || {};
+  const mes = f.to || d.to || "";
+  const pendentes = Object.keys(state.awardEdits || {}).length;
+  if (pendentes && !window.confirm(`Há ${pendentes} lançamento(s) de EAD/Redes não salvos. `
+      + "O PDF sai com o que está gravado. Baixar mesmo assim?")) return;
+  if ((d.competences || []).length > 1) {
+    addMessage("info", `O PDF é mensal: saindo da competência ${mes}.`);
+  }
+  downloadFile(`/api/awards/${tipo === "pagamento" ? "pagamento" : "relatorio"}.pdf?competence=${encodeURIComponent(mes)}`);
+}
+
 // Monta a folha fora da árvore do app, imprime e limpa. Deixar o conteúdo lá
 // depois faria o #print-root continuar "não vazio" e a próxima impressão de
 // outra tela sairia com o placar junto.
@@ -19288,7 +19304,12 @@ function placarEquipeView() {
               ? `<button class="btn btn-primary btn-sm" onclick="salvarLancamentos()">
                    Salvar lançamentos</button>`
               : ""}
-            <button class="btn btn-secondary btn-sm" onclick="imprimirPlacar()">⬇ PDF</button>
+            ${d.canInput ? `
+              <button class="btn btn-secondary btn-sm" onclick="baixarPdfPremiacao('relatorio')"
+                title="Resumo por unidade, quem recebe e indicadores por unidade — mês ${escapeHtml(f.to || "")}">📄 Relatório PDF</button>
+              <button class="btn btn-primary btn-sm" onclick="baixarPdfPremiacao('pagamento')"
+                title="Só quem tem valor a receber, por unidade, com total e assinaturas — mês ${escapeHtml(f.to || "")}">💰 PDF Financeiro</button>`
+              : `<button class="btn btn-secondary btn-sm" onclick="imprimirPlacar()">⬇ PDF</button>`}
           </div>
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap">

@@ -42,6 +42,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 import mes_cadastro  # mês de cadastro do cliente por faixa de código
+import premiacao_pdf  # PDFs da premiação: relatório completo e pagamento
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -29536,6 +29537,33 @@ class AppHandler(BaseHTTPRequestHandler):
                     traceback.print_exc()
                     self._set_headers(500)
                     self.wfile.write(json_dumps({"error": str(_e), "sellers": [], "totalContactsToday": 0, "teamGoal": 0}))
+                return
+            if path in ("/api/awards/relatorio.pdf", "/api/awards/pagamento.pdf"):
+                # Documento de gestão: quem só enxerga o próprio placar não emite
+                # a folha de pagamento da equipe.
+                user = self._require_auth()
+                if not user:
+                    return
+                q = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    if data_scope_for_user(conn, user) == "proprio" and not user_can_manage_users(conn, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Disponível para gestão."}))
+                        return
+                    mes = valid_competence(q.get("competence", [""])[0]) or crm_latest_competence(
+                        conn, user["company_id"]) or ""
+                    res = team_award_results(conn, user["company_id"], user,
+                                             competence=mes, competence_end=mes)
+                gerado = datetime.now(APP_TIMEZONE).strftime("%d/%m/%Y %H:%M")
+                if path.endswith("pagamento.pdf"):
+                    corpo = premiacao_pdf.pagamento_financeiro(res, gerado)
+                    nome = f"premiacao-{mes}-pagamento-financeiro"
+                else:
+                    corpo = premiacao_pdf.relatorio_completo(res, gerado)
+                    nome = f"premiacao-{mes}-relatorio-completo"
+                self._set_headers(200, "application/pdf", {
+                    "Content-Disposition": f'attachment; filename="{nome}.pdf"'})
+                self.wfile.write(corpo)
                 return
             if path == "/api/awards":
                 user = self._require_auth()
