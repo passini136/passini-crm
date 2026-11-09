@@ -11909,7 +11909,8 @@ async function novoFeedback(kind, personName, unitName) {
     competence, highlights: "", improvements: "", agreements: "",
     tacticalGoal: "", tacticalReality: "", tacticalOptions: "", tacticalWill: "",
     ratings: {}, indicators: {}, guidance: [], items: [], groups: [], script: [], pdi: [],
-    status: "RASCUNHO", saving: false, loading: true, tab: "conversa",
+    pdiGuide: null, focosIds: null,
+    status: "RASCUNHO", saving: false, loading: true, tab: kind === "GERENTE" ? "conversa" : "preparar",
   };
   requestRender();
   await carregarPreviaFeedback();
@@ -11928,9 +11929,13 @@ async function carregarPreviaFeedback() {
     Object.assign(e, {
       indicators: r.indicators || {}, guidance: r.guidance || [],
       items: r.items || [], groups: r.groups || [], script: r.script || [],
-      pdi: r.pdi || [], notes: r.notes || [],
+      pdi: r.pdi || [], notes: r.notes || [], pdiGuide: r.pdiGuide || null,
       loading: false,
     });
+    // Trocar de vendedor ou de mês refaz a sugestão; recarregar depois de
+    // adicionar um ponto ao PDI mantém a escolha que o gerente já fez.
+    const chave = `${e.personName}|${e.competence}`;
+    if (e._chaveFocos !== chave) { e.focosIds = null; e._chaveFocos = chave; }
   } catch (err) {
     e.loading = false;
     addMessage("error", err.message);
@@ -11951,8 +11956,8 @@ async function editarFeedback(feedbackId) {
       tacticalOptions: fb.tacticalOptions, tacticalWill: fb.tacticalWill,
       ratings: fb.ratings || {}, indicators: fb.indicators || {}, guidance: fb.guidance || [],
       items: fb.items || [], groups: fb.groups || [], script: fb.script || [],
-      pdi: fb.pdi || [], notes: fb.notes || [],
-      status: fb.status, saving: false, loading: false, tab: "conversa",
+      pdi: fb.pdi || [], notes: fb.notes || [], pdiGuide: fb.pdiGuide || null, focosIds: null,
+      status: fb.status, saving: false, loading: false, tab: fb.kind === "GERENTE" ? "conversa" : "preparar",
     };
     requestRender();
   } catch (e) { addMessage("error", e.message); }
@@ -12071,6 +12076,7 @@ async function salvarPdi() {
     state.pdiEditor = null;
     if (state.feedbackEditor) await carregarPreviaFeedback();
     await loadFeedback(true);
+    state.pdiEquipe = null;
   } catch (e) {
     addMessage("error", e.message);
     if (state.pdiEditor) state.pdiEditor.saving = false;
@@ -12233,6 +12239,16 @@ function painelPdi(itens, personName, unitName, feedbackId, podeEditar) {
                 ${i.action ? `<div style="font-size:12px;margin-top:4px"><strong>Como:</strong> ${escapeHtml(i.action)}</div>` : ""}
                 ${i.support ? `<div style="font-size:12px"><strong>Apoio:</strong> ${escapeHtml(i.support)}</div>` : ""}
                 ${i.progressNote ? `<div style="font-size:12px;margin-top:4px;color:var(--muted)">Evolução: ${escapeHtml(i.progressNote)}</div>` : ""}
+                ${i.focusCode ? `
+                  <div style="font-size:12px;margin-top:6px;display:flex;gap:12px;flex-wrap:wrap">
+                    <span>Começou: <strong>${fmtPdiValor(i.baselineValue, i.valueFormat)}</strong></span>
+                    <span>Meta: <strong>${fmtPdiValor(i.targetValue, i.valueFormat)}</strong></span>
+                    ${i.currentTxt ? `<span>Hoje: <strong style="color:${i.currentOk ? "var(--good)" : "var(--bad)"}">${escapeHtml(i.currentTxt)}</strong></span>` : ""}
+                  </div>` : ""}
+                ${(i.checkins || []).length ? `
+                  <div class="text-small" style="color:var(--muted);margin-top:4px">
+                    Acompanhamentos: ${(i.checkins || []).slice(-4).map((c) => `${shortDate(c.date)} ${c.result === "AVANCOU" ? "▲" : c.result === "PIOROU" ? "▼" : "●"}`).join(" · ")}
+                  </div>` : ""}
               </div>
               <div style="text-align:right">
                 ${pdiStatusBadge(i.status)}
@@ -12241,7 +12257,12 @@ function painelPdi(itens, personName, unitName, feedbackId, podeEditar) {
               </div>
             </div>
             ${podeEditar ? `
-              <div class="actions" style="gap:6px;margin-top:6px">
+              <div class="actions" style="gap:6px;margin-top:6px;flex-wrap:wrap">
+                <span class="text-small" style="color:var(--muted)">Acompanhamento da semana:</span>
+                <button class="btn btn-secondary btn-sm" onclick="checkinPdi(${i.id},'AVANCOU',${i.currentValue ?? "null"})">▲ Avançou</button>
+                <button class="btn btn-ghost btn-sm" onclick="checkinPdi(${i.id},'PARADO',${i.currentValue ?? "null"})">● Parado</button>
+                <button class="btn btn-ghost btn-sm" onclick="checkinPdi(${i.id},'PIOROU',${i.currentValue ?? "null"})">▼ Piorou</button>
+                <span style="flex:1"></span>
                 <button class="btn btn-ghost btn-sm" onclick='editarPdi(${JSON.stringify(i).replace(/'/g, "&#39;")},"${jsAttr(personName)}","${jsAttr(unitName || "")}")'>Atualizar</button>
                 <button class="btn btn-ghost btn-sm" onclick="excluirPdi(${i.id})">Excluir</button>
               </div>` : ""}
@@ -15728,6 +15749,8 @@ function feedbackView() {
         </div>
       </div>
 
+      ${podeDar ? painelPdiEquipe() : ""}
+
       ${podeDar && faltando.length && (!f.kind || f.kind === "VENDEDOR") ? `
         <div class="table-card">
           <div class="section-title">
@@ -15820,18 +15843,308 @@ function feedbackCard(x, podeDar) {
     </div>`;
 }
 
+// ─── PDI guiado (09/11/2026) ────────────────────────────────────────────────
+//
+// Os gerentes não têm prática de feedback nem de PDI. Em vez de um formulário
+// em branco, o sistema conduz: escolhe pelos números o que elogiar e os 2
+// pontos do MEC a desenvolver, entrega a fala pronta e monta o PDI com meta
+// medida pelo próprio CRM. O gerente confirma, ajusta o número e conversa.
+
+function fmtPdiValor(v, formato) {
+  if (v === null || v === undefined || v === "") return "—";
+  if (formato === "pct") return pct(v);
+  if (formato === "brl") return currency(v);
+  return number(Math.round(Number(v)));
+}
+
+/** Focos escolhidos para esta conversa: por padrão, os 2 que o sistema sugeriu. */
+function focosEscolhidos(e) {
+  const g = e.pdiGuide || {};
+  const todos = [...(g.focos || []), ...(g.outros || [])];
+  if (!e.focosIds) e.focosIds = (g.focos || []).map((f) => f.id);
+  return e.focosIds.map((id) => todos.find((f) => f.id === id)).filter(Boolean);
+}
+
+function alternarFocoConversa(id) {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  focosEscolhidos(e);
+  if (e.focosIds.includes(id)) e.focosIds = e.focosIds.filter((x) => x !== id);
+  else if (e.focosIds.length >= 2) { addMessage("info", "No máximo 2 pontos por conversa. Tire um antes de escolher outro."); return; }
+  else e.focosIds = [...e.focosIds, id];
+  requestRender();
+}
+
+function usarSugestaoFeedback(campo) {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  const g = e.pdiGuide || {};
+  const focos = focosEscolhidos(e);
+  if (campo === "highlights") e.highlights = (g.forcas || []).map((f) => f.falaForca).join("\n");
+  if (campo === "improvements") e.improvements = focos.map((f) => f.falaEvoluir).join("\n");
+  if (campo === "agreements") {
+    const ativos = (e.pdi || []).filter((i) => ["ABERTO", "EVOLUINDO"].includes(i.status));
+    const linhas = ativos.length
+      ? ativos.map((i, n) => `${n + 1}. ${i.title}: ${i.action || ""}${i.targetValue != null
+          ? ` Meta: ${fmtPdiValor(i.targetValue, i.valueFormat)}.` : ""}${i.dueDate ? ` Até ${shortDate(i.dueDate)}.` : ""}`)
+      : focos.map((f, n) => `${n + 1}. ${f.combinar}`);
+    e.agreements = [...linhas, "Acompanhamento: toda segunda-feira, 5 minutos, olhando o número juntos."].join("\n");
+  }
+  requestRender();
+}
+
+async function adicionarFocoAoPdi(id) {
+  const e = state.feedbackEditor;
+  if (!e) return;
+  const g = e.pdiGuide || {};
+  const f = [...(g.focos || []), ...(g.outros || [])].find((x) => x.id === id);
+  if (!f) return;
+  const alvoEditado = document.getElementById(`pdi-alvo-${id}`)?.value;
+  const alvo = alvoEditado !== undefined && alvoEditado !== "" ? Number(String(alvoEditado).replace(",", ".")) : f.alvoMes;
+  try {
+    await api("/api/feedback/pdi/save", { method: "POST", body: JSON.stringify({
+      personName: e.personName, unitName: e.unitName,
+      title: f.titulo, why: f.porque, action: f.acoes.join(" "),
+      support: state.feedback?.myName || "", dueDate: dateInDays(30), status: "ABERTO",
+      progressNote: "", originFeedbackId: e.id || null,
+      focusCode: f.id, metricLabel: f.metrica, baselineValue: f.valor,
+      targetValue: alvo, valueFormat: f.formato,
+    }) });
+    addMessage("success", `"${f.titulo}" entrou no PDI, com prazo de 30 dias.`);
+    state.pdiEquipe = null;
+    await carregarPreviaFeedback();
+  } catch (err) { addMessage("error", err.message); }
+}
+
+async function loadPdiEquipe() {
+  state.pdiEquipe = { loading: true, items: [] };
+  try { state.pdiEquipe = await api("/api/feedback/pdi/equipe"); }
+  catch (e) { state.pdiEquipe = { error: e.message, items: [] }; }
+  requestRender();
+}
+
+/** Segunda-feira, 5 minutos: os PDIs da equipe com o check-in da semana. */
+function painelPdiEquipe() {
+  const d = state.pdiEquipe;
+  if (!d) { loadPdiEquipe(); return ""; }
+  const itens = d.items || [];
+  if (!itens.length) return "";
+  const pend = itens.filter((i) => !i.checkinThisWeek).length;
+  return `
+    <div class="table-card" style="border-left:4px solid ${pend ? "#f39c12" : "var(--good)"}">
+      <div class="section-title">
+        <div><h3>🎯 PDI da equipe — acompanhamento da semana</h3>
+          <div class="text-small">5 minutos por pessoa: olhe o número, marque se avançou e diga isso a ela.
+            ${pend ? `<strong>${pend} sem acompanhamento esta semana.</strong>` : "Tudo acompanhado esta semana."}</div></div>
+        <div class="soft-badge">${itens.length}</div>
+      </div>
+      <div class="table-wrap"><table class="data-table">
+        <thead><tr><th>Pessoa</th><th>Ponto do PDI</th><th>Começou → meta</th><th>Prazo</th><th>Última</th><th>Esta semana</th></tr></thead>
+        <tbody>${itens.map((i) => `
+          <tr>
+            <td><strong>${escapeHtml(i.personName)}</strong></td>
+            <td>${escapeHtml(i.title)}${i.metricLabel ? `<div class="text-small" style="color:var(--muted)">${escapeHtml(i.metricLabel)}</div>` : ""}</td>
+            <td class="text-small">${i.focusCode ? `${fmtPdiValor(i.baselineValue, i.valueFormat)} → <strong>${fmtPdiValor(i.targetValue, i.valueFormat)}</strong>` : "—"}</td>
+            <td class="text-small" style="color:${i.overdue ? "var(--bad)" : "inherit"}">${i.dueDate ? shortDate(i.dueDate) : "—"}</td>
+            <td class="text-small">${i.lastCheckin ? shortDate(i.lastCheckin) : "nunca"}</td>
+            <td>${i.checkinThisWeek ? '<span class="status-tag good">✓ feito</span>' : `
+              <div style="display:flex;gap:4px">
+                <button class="btn btn-secondary btn-sm" onclick="checkinPdi(${i.id},'AVANCOU',null)">▲</button>
+                <button class="btn btn-ghost btn-sm" onclick="checkinPdi(${i.id},'PARADO',null)">●</button>
+                <button class="btn btn-ghost btn-sm" onclick="checkinPdi(${i.id},'PIOROU',null)">▼</button>
+              </div>`}</td>
+          </tr>`).join("")}</tbody>
+      </table></div>
+      <div class="text-small" style="color:var(--muted);margin-top:6px">▲ avançou · ● parado · ▼ piorou. Para ver o número de hoje, abra o feedback da pessoa (aba ③).</div>
+    </div>`;
+}
+
+async function checkinPdi(pdiId, resultado, valorHoje) {
+  try {
+    await api("/api/feedback/pdi/checkin", { method: "POST",
+      body: JSON.stringify({ pdiId, result: resultado, value: valorHoje ?? null }) });
+    addMessage("success", resultado === "AVANCOU" ? "Avanço registrado. Elogie na hora, com o número."
+      : "Registrado. Pergunte o que travou e combine o próximo passo.");
+    if (state.feedbackEditor) await carregarPreviaFeedback();
+    await Promise.all([loadFeedback(true), loadPdiEquipe()]);
+  } catch (err) { addMessage("error", err.message); }
+}
+
+function cartaoSemaforo(f) {
+  const cor = f.ok ? "var(--good)" : "var(--bad)";
+  return `
+    <div style="border:1px solid var(--line);border-left:4px solid ${cor};border-radius:8px;padding:8px 10px;background:#fff">
+      <div class="text-small" style="color:var(--muted)">${escapeHtml(f.titulo)}</div>
+      <div style="font-size:17px;font-weight:800;color:${cor}">${escapeHtml(f.valorTxt)}</div>
+      <div class="text-small" style="color:var(--muted)">${escapeHtml(f.metrica)} · esperado ${escapeHtml(f.alvoTxt)}</div>
+    </div>`;
+}
+
+function abaPrepararGuiado(e) {
+  const g = e.pdiGuide || {};
+  if (e.loading) return '<div class="loader" style="margin-top:12px">Lendo os números do vendedor…</div>';
+  if (!e.personName) return '<div class="message" style="margin-top:12px">Escolha o vendedor acima.</div>';
+  if (g.semDados) return `
+    <div class="message" style="margin-top:12px">Sem números de ${escapeHtml(e.competence || "")} para este vendedor.
+      A conversa pode acontecer assim mesmo: use o roteiro da aba ② e os registros do mês.</div>
+    ${painelIndicadores(e.indicators, e.kind)}`;
+  const focos = focosEscolhidos(e);
+  const todos = [...(g.focos || []), ...(g.outros || [])];
+  const forca = (g.forcas || [])[0];
+  const ativos = (e.pdi || []).filter((i) => ["ABERTO", "EVOLUINDO"].includes(i.status));
+  return `
+    <div class="subtle-card padded-card" style="margin-top:12px;border-left:4px solid var(--accent)">
+      <div class="eyebrow">SUA CONVERSA EM 1 MINUTO</div>
+      <div style="font-size:13px;line-height:1.6;margin-top:6px">
+        <div>👏 <strong>Elogiar:</strong> ${forca ? escapeHtml(forca.falaForca) : "procure um fato bom do mês nos registros — sempre existe um."}</div>
+        ${focos.length ? focos.map((f, i) => `
+          <div>🎯 <strong>Desenvolver ${i + 1}:</strong> ${escapeHtml(f.titulo)} — hoje ${escapeHtml(f.valorTxt)}, esperado ${escapeHtml(f.alvoTxt)}.</div>`).join("")
+          : `<div>✅ Todos os pontos do MEC estão no esperado. Use a conversa para dar um <strong>próximo desafio</strong>.</div>`}
+        ${ativos.length ? `<div>📌 <strong>PDI em andamento:</strong> ${ativos.length} ponto(s) — comece perguntando como foi.</div>` : ""}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:6px">O sistema escolheu pela ordem do MEC: contato → retorno → cotação → carteira → cobertura → desconto → devolução → ticket. Você pode trocar abaixo (máximo 2).</div>
+    </div>
+
+    <div style="margin-top:12px"><div class="eyebrow">COMO ESTÁ NO MEC · clique para escolher o que desenvolver</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:8px;margin-top:6px">
+        ${todos.map((f) => `
+          <div onclick="alternarFocoConversa('${f.id}')" style="cursor:pointer;outline:${(e.focosIds || []).includes(f.id) ? "2px solid var(--accent)" : "none"};border-radius:8px">
+            ${cartaoSemaforo(f)}
+          </div>`).join("")}
+      </div>
+    </div>
+
+    <div class="subtle-card padded-card" style="margin-top:12px">
+      <div class="eyebrow">ANTES DE CHAMAR O VENDEDOR (5 MIN)</div>
+      <ul style="margin:6px 0 0 18px;padding:0;font-size:13px;line-height:1.7">
+        <li>Reserve 20 minutos, em lugar reservado, sem celular.</li>
+        <li>Abra 3 registros recentes dele no CRM e veja se dizem com quem falou, o que o cliente precisa e o próximo passo.</li>
+        <li>${(e.notes || []).length ? `Releia os <strong>${(e.notes || []).length} registro(s)</strong> do mês (aba Registros).` : "Não há registros pontuais no mês — da próxima vez, anote os fatos na hora."}</li>
+        ${ativos.length ? "<li>Veja na aba ③ como estão os pontos do PDI anterior.</li>" : ""}
+      </ul>
+    </div>
+
+    <details style="margin-top:10px"><summary class="text-small" style="cursor:pointer;color:var(--muted)">Ver todos os números do mês</summary>
+      ${painelIndicadores(e.indicators, e.kind)}</details>`;
+}
+
+function abaConversarGuiado(e) {
+  const g = e.pdiGuide || {};
+  const focos = focosEscolhidos(e);
+  const forca = (g.forcas || [])[0];
+  const subst = {
+    forca: forca ? forca.falaForca : "[cite um fato bom do mês, com número]",
+    evoluir: focos[0] ? focos[0].falaEvoluir : "Você está dentro do esperado no MEC. Qual é o próximo passo que você quer dar?",
+    pergunta: focos[0] ? focos[0].perguntas.join(" ") : "O que você fez diferente neste mês? Dá para ensinar para a equipe?",
+    combinar: focos.length ? focos.map((f) => f.combinar).join(" ") : "um próximo desafio: [cliente maior, linha nova ou ajudar um colega].",
+  };
+  const fala = (t) => t.replace(/\{(\w+)\}/g, (_, k) => subst[k] ?? "");
+  return `
+    <div class="text-small" style="color:var(--muted);margin-top:10px">Leia as falas em voz alta, do seu jeito. Os números já estão nelas.
+      ${focos[1] ? ` O segundo ponto (<strong>${escapeHtml(focos[1].titulo)}</strong>) entra no passo 3 depois do primeiro: “${escapeHtml(focos[1].falaEvoluir)}”` : ""}</div>
+    <div class="stack" style="margin-top:8px">
+      ${(g.roteiro || []).map((p, i) => `
+        <div style="display:flex;gap:12px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:#fff">
+          <div style="min-width:28px;height:28px;border-radius:50%;background:var(--accent);color:#fff;
+                      display:flex;align-items:center;justify-content:center;font-weight:800">${i + 1}</div>
+          <div style="flex:1">
+            <div style="font-weight:700;font-size:13px">${escapeHtml(p.passo)} <span class="text-small" style="color:var(--muted);font-weight:400">· ${escapeHtml(p.tempo)}</span></div>
+            <div style="font-size:13.5px;margin-top:4px;line-height:1.5;background:#f5f9ff;padding:6px 9px;border-radius:6px">💬 “${escapeHtml(fala(p.fala))}”</div>
+            <div class="text-small" style="color:var(--muted);margin-top:4px">${escapeHtml(p.dica)}</div>
+          </div>
+        </div>`).join("")}
+    </div>
+    <div class="eyebrow" style="margin-top:14px">ANOTE ENQUANTO CONVERSA</div>
+    <div class="field"><label>O que foi bem <button type="button" class="btn btn-ghost btn-sm" onclick="usarSugestaoFeedback('highlights')">usar sugestão</button></label>
+      <textarea rows="2" style="font-family:inherit" oninput="state.feedbackEditor.highlights=this.value"
+        placeholder="Fato e número.">${escapeHtml(e.highlights)}</textarea></div>
+    <div class="field"><label>O que precisa evoluir — e o que ele disse que atrapalha <button type="button" class="btn btn-ghost btn-sm" onclick="usarSugestaoFeedback('improvements')">usar sugestão</button></label>
+      <textarea rows="3" style="font-family:inherit" oninput="state.feedbackEditor.improvements=this.value"
+        placeholder="O fato, o número e a causa que ele contou.">${escapeHtml(e.improvements)}</textarea></div>`;
+}
+
+function abaPdiGuiado(e) {
+  const g = e.pdiGuide || {};
+  const ativos = (e.pdi || []).filter((i) => ["ABERTO", "EVOLUINDO"].includes(i.status));
+  const codigosAtivos = new Set(ativos.map((i) => i.focusCode).filter(Boolean));
+  const focos = focosEscolhidos(e).filter((f) => !codigosAtivos.has(f.id));
+  const max = state.feedback?.pdiMaxActive || 3;
+  const cheio = ativos.length >= max;
+  const cartaoFoco = (f) => `
+    <div style="border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:10px 12px;background:#fff">
+      <div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap">
+        <div><div style="font-weight:800;font-size:14px">${escapeHtml(f.titulo)}</div>
+          <div class="text-small" style="color:var(--muted)">${escapeHtml(f.porque)}</div></div>
+        <div style="text-align:right;font-size:12px">hoje <strong>${escapeHtml(f.valorTxt)}</strong><br>
+          <span class="text-small" style="color:var(--muted)">${escapeHtml(f.metrica)}</span></div>
+      </div>
+      <div style="font-size:12.5px;margin-top:8px"><strong>O que ele vai fazer:</strong>
+        <ul style="margin:4px 0 0 18px;padding:0;line-height:1.55">${f.acoes.map((a) => `<li>${escapeHtml(a)}</li>`).join("")}</ul></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-top:8px">
+        <div class="field" style="margin:0;min-width:150px"><label>Meta em 30 dias</label>
+          <input id="pdi-alvo-${f.id}" value="${escapeHtml(String(f.alvoMes ?? ""))}" inputmode="decimal" style="max-width:150px" /></div>
+        <div class="text-small" style="color:var(--muted);flex:1;min-width:180px">Onde acompanhar: <strong>${escapeHtml(f.onde)}</strong></div>
+        <button class="btn btn-primary btn-sm" ${cheio ? "disabled title='PDI já tem o máximo de pontos ativos'" : ""}
+          onclick="adicionarFocoAoPdi('${f.id}')">✔ Adicionar ao PDI</button>
+      </div>
+    </div>`;
+  return `
+    <div class="text-small" style="color:var(--muted);margin-top:10px">
+      O PDI é o combinado da conversa, por escrito: <strong>um comportamento do MEC, um número e um prazo</strong>.
+      O sistema mede o número sozinho — você só acompanha.</div>
+    ${focos.length ? `
+      <div class="eyebrow" style="margin-top:12px">SUGERIDOS PARA ESTA CONVERSA</div>
+      <div class="stack" style="margin-top:6px">${focos.map(cartaoFoco).join("")}</div>`
+      : (g.semDados ? "" : `<div class="message" style="margin-top:12px">Nenhum foco novo a sugerir${ativos.length ? " — os pontos escolhidos já estão no PDI" : ""}.</div>`)}
+    ${painelPdi(e.pdi, e.personName, e.unitName, e.id, true)}
+    <div class="subtle-card padded-card" style="margin-top:10px">
+      <div class="eyebrow">DEPOIS DA CONVERSA</div>
+      <ul style="margin:6px 0 0 18px;padding:0;font-size:13px;line-height:1.7">
+        ${(g.acompanhamento || []).map((d) => `<li>${escapeHtml(d)}</li>`).join("")}
+      </ul>
+    </div>`;
+}
+
+function abaFecharGuiado(e) {
+  return `
+    <div class="subtle-card padded-card" style="margin-top:12px">
+      <div class="eyebrow">PARA FECHAR BEM</div>
+      <ul style="margin:6px 0 0 18px;padding:0;font-size:13px;line-height:1.7">
+        <li>Peça para ele repetir o combinado com as palavras dele.</li>
+        <li>Marque a data do primeiro acompanhamento (próxima segunda-feira).</li>
+        <li>Publique: ele recebe no CRM e dá ciência.</li>
+      </ul>
+    </div>
+    <div class="field" style="margin-top:10px"><label>O que ficou combinado <span style="color:var(--bad)">*</span>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="usarSugestaoFeedback('agreements')">montar com o PDI</button></label>
+      <textarea rows="5" style="font-family:inherit" oninput="state.feedbackEditor.agreements=this.value"
+        placeholder="É o que a pessoa leva da conversa.">${escapeHtml(e.agreements)}</textarea></div>`;
+}
+
 function feedbackEditorModal() {
   const e = state.feedbackEditor;
   const pessoas = (state.feedback?.people || []);
   const avaliados = Object.keys(e.ratings || {}).length;
   const total = (e.items || []).length;
-  const abas = [
+  const nPdi = (e.pdi || []).filter((i) => ["ABERTO","EVOLUINDO"].includes(i.status)).length;
+  const guiado = e.kind !== "GERENTE";
+  // Vendedor: passo a passo guiado. A avaliação item a item continua
+  // disponível, mas como opcional — não é ela que faz a conversa acontecer.
+  const abas = guiado ? [
+    { id: "preparar", label: "① Preparar" },
+    { id: "conversar", label: "② Conversar" },
+    { id: "pdi", label: `③ Combinar o PDI (${nPdi})` },
+    { id: "fechar", label: "④ Fechar" },
+    { id: "registros", label: `Registros do mês (${(e.notes || []).length})` },
+    { id: "avaliacao", label: `Avaliação detalhada · opcional (${avaliados}/${total})` },
+  ] : [
     { id: "conversa", label: "Conversa" },
     { id: "avaliacao", label: `Avaliação (${avaliados}/${total})` },
     { id: "registros", label: `Registros do mês (${(e.notes || []).length})` },
-    { id: "pdi", label: `PDI (${(e.pdi || []).filter((i) => ["ABERTO","EVOLUINDO"].includes(i.status)).length})` },
+    { id: "pdi", label: `PDI (${nPdi})` },
     { id: "guia", label: "Guia do gestor" },
   ];
+  if (guiado && ["conversa", "guia"].includes(e.tab)) e.tab = "preparar";
 
   return `
     <div class="client-drawer-overlay open modal-dim" onclick="fecharComGuarda(fecharFeedbackEditor)">
@@ -15873,11 +16186,11 @@ function feedbackEditorModal() {
           </div>
         </div>
 
-        <div class="subtle-card padded-card" style="margin-top:4px">
+        ${guiado ? "" : `<div class="subtle-card padded-card" style="margin-top:4px">
           <div class="section-title"><div><h3>📊 Os números de ${escapeHtml(e.competence || "")}</h3>
             <div class="text-small">Ficam gravados junto com o feedback — a conversa continua fazendo sentido daqui a seis meses.</div></div></div>
           ${e.loading ? '<div class="loader">Buscando indicadores…</div>' : painelIndicadores(e.indicators, e.kind)}
-        </div>
+        </div>`}
 
         <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:14px;border-bottom:1px solid var(--line);padding-bottom:8px">
           ${abas.map((a) => `
@@ -15889,7 +16202,12 @@ function feedbackEditorModal() {
             </button>`).join("")}
         </div>
 
-        ${e.tab === "conversa" ? `
+        ${guiado && e.tab === "preparar" ? abaPrepararGuiado(e) : ""}
+        ${guiado && e.tab === "conversar" ? abaConversarGuiado(e) : ""}
+        ${guiado && e.tab === "pdi" ? abaPdiGuiado(e) : ""}
+        ${guiado && e.tab === "fechar" ? abaFecharGuiado(e) : ""}
+
+        ${!guiado && e.tab === "conversa" ? `
           ${e.kind === "GERENTE" ? `
             <div class="text-small" style="color:var(--muted);margin-top:10px">
               Estrutura GROW: objetivo, realidade, caminhos e compromisso. Deixe o gerente propor antes de você dar a solução.
@@ -15971,7 +16289,7 @@ function feedbackEditorModal() {
               || '<div class="text-small" style="color:var(--muted)">Nenhum registro neste mês. Os fatos do dia a dia se perdem quando não são anotados na hora.</div>'}
           </div>` : ""}
 
-        ${e.tab === "pdi" ? painelPdi(e.pdi, e.personName, e.unitName, e.id, true) : ""}
+        ${!guiado && e.tab === "pdi" ? painelPdi(e.pdi, e.personName, e.unitName, e.id, true) : ""}
 
         ${e.tab === "guia" ? `
           ${e.guidance?.length ? `

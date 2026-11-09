@@ -1491,6 +1491,16 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
             if coluna not in prospect_columns:
                 conn.execute(f"ALTER TABLE prospects ADD COLUMN {coluna} {tipo}")
 
+    # PDI guiado (09/11/2026): cada ponto pode estar ligado a um foco do MEC
+    # medido pelo CRM, com ponto de partida, alvo e os check-ins semanais.
+    pdi_columns = {row["name"] for row in conn.execute("PRAGMA table_info(pdi_items)").fetchall()}
+    if pdi_columns:
+        for coluna, tipo in (("focus_code", "TEXT"), ("metric_label", "TEXT"),
+                             ("baseline_value", "REAL"), ("target_value", "REAL"),
+                             ("value_format", "TEXT"), ("checkins_json", "TEXT")):
+            if coluna not in pdi_columns:
+                conn.execute(f"ALTER TABLE pdi_items ADD COLUMN {coluna} {tipo}")
+
     lead_columns = {row["name"] for row in conn.execute("PRAGMA table_info(prospect_leads)").fetchall()}
     if lead_columns and "client_code" not in lead_columns:
         conn.execute("ALTER TABLE prospect_leads ADD COLUMN client_code TEXT")
@@ -7840,6 +7850,29 @@ def seller_indicators_for_feedback(
     meta_ligacoes_ate_hoje = (round(meta_ligacoes_mes * dias_decorridos / dias_totais)
                               if dias_decorridos and dias_totais else meta_ligacoes_mes)
 
+    # Retornos vencidos e cotações paradas: são os dois focos do MEC que o
+    # faturamento não mostra. Medidos AGORA (não no fim do mês), porque o PDI
+    # acompanha o hoje. Falha aqui não derruba o feedback.
+    tarefas_vencidas = cotacoes_mes = cotacoes_paradas = 0
+    try:
+        agora_txt = datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+        tarefas_vencidas = conn.execute(
+            f"SELECT COUNT(*) n FROM crm_tasks WHERE company_id = ? "
+            f"AND UPPER(seller_name) IN ({marcadores}) AND status IN ('ABERTA','REAGENDADA') "
+            f"AND replace(substr(due_at,1,16),'T',' ') < ?",
+            (company_id, *nomes_upper, agora_txt)).fetchone()["n"]
+        ontem = (today_in_brazil() - timedelta(days=1)).isoformat()
+        r_cot = conn.execute(
+            f"SELECT COUNT(*) total, SUM(CASE WHEN status = 'ABERTA' AND substr(quoted_at,1,10) < ? "
+            f"THEN 1 ELSE 0 END) paradas FROM crm_quotes WHERE company_id = ? "
+            f"AND UPPER(seller_name) IN ({marcadores}) "
+            f"AND substr(quoted_at,1,10) BETWEEN ? AND ?",
+            (ontem, company_id, *nomes_upper, inicio, fim)).fetchone()
+        cotacoes_mes = int(r_cot["total"] or 0)
+        cotacoes_paradas = int(r_cot["paradas"] or 0)
+    except sqlite3.Error as exc:
+        print(f"[feedback] tarefas/cotações indisponíveis para {nome_vendas}: {exc}", flush=True)
+
     return {
         "found": True,
         "competence": competence,
@@ -7873,7 +7906,130 @@ def seller_indicators_for_feedback(
         "portfolioActive": por_status.get("ATIVO", 0),
         "portfolioPreInactive": por_status.get("PRE_INATIVO", 0),
         "portfolioInactive": por_status.get("INATIVO", 0),
+        "overdueTasks": int(tarefas_vencidas or 0),
+        "quotesMonth": cotacoes_mes,
+        "quotesStale": cotacoes_paradas,
     }
+
+
+def _fmt_pdi(valor: float | None, formato: str) -> str:
+    if valor is None:
+        return "—"
+    if formato == "pct":
+        return f"{valor:.1f}%".replace(".", ",")
+    if formato == "brl":
+        return "R$ " + f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{int(round(valor)):,}".replace(",", ".")
+
+
+def pdi_medir_focos(ind: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Valor atual, alvo e situação de cada foco do PDI, a partir dos números do mês.
+
+    Um lugar só mede: a sugestão do PDI, o "como está hoje" do plano aberto e o
+    check-in semanal leem daqui. Foco sem dado (cotação nunca usada, unidade
+    sem média) simplesmente não aparece — sugerir o que não dá para medir é
+    pedir ao gerente que cobre no escuro.
+    """
+    if not ind or not ind.get("found"):
+        return {}
+    f = lambda k: float(ind.get(k) or 0)  # noqa: E731
+    out: dict[str, dict[str, Any]] = {}
+
+    def medida(cod, valor, alvo, ok, alvo_mes=None):
+        out[cod] = {"valor": valor, "alvo": alvo, "alvoMes": alvo_mes if alvo_mes is not None else alvo,
+                    "ok": bool(ok)}
+
+    alvo_cont = f("callsTargetToDate") or f("callsTarget") or 60
+    medida("contatos", f("contacts"), alvo_cont, f("contacts") >= alvo_cont, f("callsTarget") or 60)
+    medida("retornos", f("overdueTasks"), 2, f("overdueTasks") <= 2)
+    if f("quotesMonth"):
+        medida("cotacoes", f("quotesStale"), 0, f("quotesStale") <= 1)
+    if f("portfolioTotal"):
+        parados = f("portfolioInactive") + f("portfolioPreInactive")
+        ok = safe_div(parados, f("portfolioTotal")) <= 0.35
+        medida("carteira", parados, parados if ok else round(parados * 0.85), ok)
+    if f("distinctClientsUnit"):
+        medida("cobertura", f("distinctClients"), round(f("distinctClientsUnit")),
+               f("distinctClients") >= f("distinctClientsUnit") * 0.8)
+    if f("discountPctUnit"):
+        medida("desconto", f("discountPct"), round(f("discountPctUnit"), 1),
+               f("discountPct") <= f("discountPctUnit") * 1.15)
+    if f("revenueNet"):
+        medida("devolucao", f("returnsPct"), 3.0, f("returnsPct") <= 3)
+    if f("ticketAverageUnit"):
+        medida("ticket", f("ticketAverage"), round(f("ticketAverageUnit"), 2),
+               f("ticketAverage") >= f("ticketAverageUnit") * 0.85)
+    return out
+
+
+def pdi_sugestoes(ind: dict[str, Any]) -> dict[str, Any]:
+    """O que o gerente deve elogiar e o que deve desenvolver, já com as falas.
+
+    Desenvolver: os DOIS primeiros focos fora do esperado na ORDEM do MEC
+    (contato → retorno → cotação → carteira → ...), não os dois piores. Elogiar:
+    o foco com maior folga sobre o esperado — elogio com número.
+    """
+    mec = _mec_content()
+    medidas = pdi_medir_focos(ind)
+    if not medidas:
+        return {"focos": [], "forcas": [], "outros": [], "semDados": True}
+
+    def montar(foco: dict[str, Any]) -> dict[str, Any]:
+        m = medidas[foco["id"]]
+        vals = {"valor": _fmt_pdi(m["valor"], foco["formato"]), "alvo": _fmt_pdi(m["alvo"], foco["formato"]),
+                "alvoMes": _fmt_pdi(m["alvoMes"], foco["formato"])}
+        preenche = lambda t: t.format(**vals)  # noqa: E731
+        return {
+            "id": foco["id"], "titulo": foco["titulo"], "metrica": foco["metrica"],
+            "formato": foco["formato"], "melhor": foco["melhor"], "ok": m["ok"],
+            "valor": m["valor"], "alvo": m["alvo"], "alvoMes": m["alvoMes"],
+            "valorTxt": vals["valor"], "alvoTxt": vals["alvo"], "alvoMesTxt": vals["alvoMes"],
+            "porque": foco["porque"], "acoes": foco["acoes"], "onde": foco["onde"],
+            "perguntas": foco["perguntas"],
+            "falaEvoluir": preenche(foco["falaEvoluir"]), "falaForca": preenche(foco["falaForca"]),
+            "combinar": preenche(foco["combinar"]),
+        }
+
+    def folga(foco: dict[str, Any]) -> float:
+        m = medidas[foco["id"]]
+        v, a = float(m["valor"]), float(m["alvo"])
+        if foco["melhor"] == "maior":
+            return safe_div(v, a) - 1 if a else 0.0
+        if a:
+            return 1 - safe_div(v, a)
+        return 0.5 if v == 0 else -1.0
+
+    disponiveis = [fc for fc in mec.PDI_FOCOS if fc["id"] in medidas]
+    fora = [montar(fc) for fc in disponiveis if not medidas[fc["id"]]["ok"]]
+    bons = sorted((fc for fc in disponiveis if medidas[fc["id"]]["ok"] and folga(fc) > 0.05),
+                  key=folga, reverse=True)
+    forcas = [montar(fc) for fc in bons[:2]]
+    ritmo = ind.get("projectedGoalAttainmentPct") or ind.get("goalAttainmentPct")
+    if ritmo is not None and float(ritmo) >= 100 and not ind.get("inDeployment"):
+        forcas.insert(0, {"id": "meta", "titulo": "Meta de venda", "ok": True,
+                          "falaForca": f"Você está projetando {_fmt_pdi(float(ritmo), 'pct')} da sua meta. "
+                                       "Isso é resultado do seu trabalho no mês."})
+    return {
+        "focos": fora[:2],
+        "outros": fora[2:] + [montar(fc) for fc in disponiveis if medidas[fc["id"]]["ok"]],
+        "forcas": forcas[:2],
+        "semDados": False,
+    }
+
+
+def pdi_guia(ind: dict[str, Any], itens_pdi: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pacote do PDI guiado para a tela, e o "hoje" de cada ponto já aberto."""
+    mec = _mec_content()
+    sug = pdi_sugestoes(ind)
+    medidas = pdi_medir_focos(ind)
+    formatos = {fc["id"]: fc["formato"] for fc in mec.PDI_FOCOS}
+    for item in itens_pdi:
+        m = medidas.get(item.get("focusCode") or "")
+        if m:
+            item["currentValue"] = m["valor"]
+            item["currentTxt"] = _fmt_pdi(m["valor"], formatos.get(item["focusCode"], "num"))
+            item["currentOk"] = m["ok"]
+    return {**sug, "roteiro": mec.ROTEIRO_GUIADO, "acompanhamento": mec.ACOMPANHAMENTO_DICAS}
 
 
 def feedback_guidance(indicadores: dict[str, Any]) -> list[dict[str, Any]]:
@@ -8045,6 +8201,9 @@ def load_feedback(
     fb["script"] = (_mec_content().FEEDBACK_SCRIPT_MANAGER if fb["kind"] == "GERENTE"
                     else _mec_content().FEEDBACK_SCRIPT_SELLER)
     fb["pdi"] = list_pdi_items(conn, company_id, fb["personKey"])
+    # PDI guiado sobre os números gravados no feedback; o "hoje" de cada ponto
+    # aberto vem da mesma foto (o gerente reabre para ajustar, não para medir).
+    fb["pdiGuide"] = pdi_guia(fb["indicators"], fb["pdi"]) if fb["kind"] == "VENDEDOR" else None
     # Registros pontuais do mesmo mês: viram a memória da conversa. Sem isso o
     # gerente escreve de cabeça e só lembra da última semana.
     fb["notes"] = list_feedback_notes(conn, company_id, user, fb["personKey"], fb["competence"])
@@ -8555,6 +8714,12 @@ def list_pdi_items(
             "closedAt": r["closed_at"] or "",
             "overdue": bool(r["due_date"] and r["status"] in ("ABERTO", "EVOLUINDO")
                             and r["due_date"] < hoje),
+            "focusCode": (r["focus_code"] if "focus_code" in r.keys() else "") or "",
+            "metricLabel": (r["metric_label"] if "metric_label" in r.keys() else "") or "",
+            "baselineValue": r["baseline_value"] if "baseline_value" in r.keys() else None,
+            "targetValue": r["target_value"] if "target_value" in r.keys() else None,
+            "valueFormat": (r["value_format"] if "value_format" in r.keys() else "") or "num",
+            "checkins": json.loads(r["checkins_json"] or "[]") if "checkins_json" in r.keys() else [],
         }
         for r in conn.execute(sql, params).fetchall()
     ]
@@ -8613,6 +8778,9 @@ def save_pdi_item(
             (*campos, now_iso(), fechado, company_id, int(item_id)),
         )
         novo_id = int(item_id)
+        if "targetValue" in payload:
+            conn.execute("UPDATE pdi_items SET target_value = ? WHERE company_id = ? AND id = ?",
+                         (_num_ou_none(payload.get("targetValue")), company_id, novo_id))
     else:
         cursor = conn.execute(
             """
@@ -8624,11 +8792,64 @@ def save_pdi_item(
             (*campos, company_id, payload.get("originFeedbackId"), user["id"], now_iso(), fechado),
         )
         novo_id = int(cursor.lastrowid)
+        foco = normalize_whitespace(payload.get("focusCode"))
+        if foco:
+            conn.execute(
+                "UPDATE pdi_items SET focus_code=?, metric_label=?, baseline_value=?, target_value=?, "
+                "value_format=?, checkins_json='[]' WHERE company_id = ? AND id = ?",
+                (foco, normalize_whitespace(payload.get("metricLabel")),
+                 _num_ou_none(payload.get("baselineValue")), _num_ou_none(payload.get("targetValue")),
+                 normalize_whitespace(payload.get("valueFormat")) or "num", company_id, novo_id))
 
     audit_log(conn, company_id, user["id"], "salvar", "pdi_items", str(novo_id),
               {"pessoa": person_name, "status": status})
     conn.commit()
     return {"pdiId": novo_id}
+
+
+def _num_ou_none(v: Any) -> float | None:
+    try:
+        return None if v in (None, "") else float(str(v).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
+PDI_CHECKIN_RESULTS = {"AVANCOU": "Avançou", "PARADO": "Parado", "PIOROU": "Piorou"}
+
+
+def checkin_pdi_item(
+    conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Acompanhamento semanal do PDI em um clique: avançou, parado ou piorou.
+
+    Grava a foto do número no dia, para o histórico mostrar a trajetória e não
+    só a última impressão. "Avançou" com o ponto ainda aberto vira EVOLUINDO.
+    """
+    if not user_can_give_feedback(conn, user):
+        raise PermissionError("Apenas gestão acompanha o PDI.")
+    pdi_id = int(payload.get("pdiId") or 0)
+    row = conn.execute("SELECT * FROM pdi_items WHERE company_id = ? AND id = ?",
+                       (company_id, pdi_id)).fetchone()
+    if not row:
+        raise ValueError("Ponto do PDI não encontrado.")
+    resultado = normalize_upper(payload.get("result"))
+    if resultado not in PDI_CHECKIN_RESULTS:
+        raise ValueError("Marque se avançou, ficou parado ou piorou.")
+    lista = json.loads(row["checkins_json"] or "[]") if "checkins_json" in row.keys() else []
+    lista.append({
+        "date": today_in_brazil().isoformat(), "result": resultado,
+        "value": _num_ou_none(payload.get("value")),
+        "note": normalize_whitespace(payload.get("note")),
+        "by": normalize_whitespace(user["full_name"] or user["username"]),
+    })
+    status = row["status"]
+    if resultado == "AVANCOU" and status == "ABERTO":
+        status = "EVOLUINDO"
+    conn.execute("UPDATE pdi_items SET checkins_json = ?, status = ?, updated_at = ? "
+                 "WHERE company_id = ? AND id = ?",
+                 (json.dumps(lista, ensure_ascii=False), status, now_iso(), company_id, pdi_id))
+    conn.commit()
+    return {"pdiId": pdi_id, "status": status, "checkins": lista}
 
 
 def delete_pdi_item(conn: sqlite3.Connection, company_id: int, user: sqlite3.Row, pdi_id: int) -> None:
@@ -30041,6 +30262,36 @@ class AppHandler(BaseHTTPRequestHandler):
                 self._set_headers(200)
                 self.wfile.write(json_dumps(payload))
                 return
+            if path == "/api/feedback/pdi/equipe":
+                # Acompanhamento semanal: todos os PDIs ativos do recorte do
+                # gestor numa lista só, para o check-in de segunda não exigir
+                # abrir feedback por feedback.
+                user = self._require_auth()
+                if not user:
+                    return
+                with closing(get_connection()) as conn:
+                    if not user_can_give_feedback(conn, user):
+                        self._set_headers(403)
+                        self.wfile.write(json_dumps({"error": "Apenas gestão."}))
+                        return
+                    permitidas = crm_allowed_units_for_user(conn, user)
+                    chaves = [r["person_key"] for r in conn.execute(
+                        "SELECT DISTINCT person_key, unit_name FROM pdi_items WHERE company_id = ? "
+                        "AND status IN ('ABERTO','EVOLUINDO')", (user["company_id"],)).fetchall()
+                        if permitidas is None or normalize_unit(r["unit_name"]) in
+                        {normalize_unit(u) for u in permitidas}]
+                    itens = []
+                    for ch in dict.fromkeys(chaves):
+                        itens += list_pdi_items(conn, user["company_id"], ch, include_closed=False)
+                inicio_semana = (today_in_brazil() - timedelta(days=today_in_brazil().weekday())).isoformat()
+                for i in itens:
+                    ult = (i.get("checkins") or [])[-1:] or [{}]
+                    i["lastCheckin"] = ult[0].get("date", "")
+                    i["checkinThisWeek"] = bool(ult[0].get("date") and ult[0]["date"] >= inicio_semana)
+                itens.sort(key=lambda i: (i["checkinThisWeek"], i["personName"]))
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"items": itens}))
+                return
             if path == "/api/feedback/pdi":
                 user = self._require_auth()
                 if not user:
@@ -32284,6 +32535,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if path in ("/api/feedback/save", "/api/feedback/publish", "/api/feedback/detail",
                         "/api/feedback/acknowledge", "/api/feedback/delete",
                         "/api/feedback/pdi/save", "/api/feedback/pdi/delete",
+                        "/api/feedback/pdi/checkin",
                         "/api/feedback/preview", "/api/feedback/note/save",
                         "/api/feedback/note/acknowledge", "/api/feedback/note/delete"):
                 user = self._require_auth()
@@ -32322,6 +32574,8 @@ class AppHandler(BaseHTTPRequestHandler):
                         elif path == "/api/feedback/pdi/delete":
                             delete_pdi_item(conn, user["company_id"], user, int(payload.get("pdiId") or 0))
                             resultado = {}
+                        elif path == "/api/feedback/pdi/checkin":
+                            resultado = checkin_pdi_item(conn, user["company_id"], user, payload)
                         elif path == "/api/feedback/note/save":
                             resultado = save_feedback_note(conn, user["company_id"], user, payload)
                         elif path == "/api/feedback/note/acknowledge":
@@ -32342,16 +32596,17 @@ class AppHandler(BaseHTTPRequestHandler):
                                 conn, user["company_id"], kind,
                                 normalize_whitespace(payload.get("personName")),
                                 normalize_whitespace(payload.get("unitName")), competence)
+                            _itens_pdi = list_pdi_items(
+                                conn, user["company_id"], person_key(payload.get("personName") or ""))
                             resultado = {
+                                "pdiGuide": pdi_guia(indicadores, _itens_pdi) if kind == "VENDEDOR" else None,
                                 "indicators": indicadores,
                                 "guidance": feedback_guidance(indicadores) if kind == "VENDEDOR" else [],
                                 "items": feedback_items_for_kind(kind),
                                 "groups": feedback_groups_for_kind(kind),
                                 "script": (_mec_content().FEEDBACK_SCRIPT_MANAGER if kind == "GERENTE"
                                            else _mec_content().FEEDBACK_SCRIPT_SELLER),
-                                "pdi": list_pdi_items(
-                                    conn, user["company_id"],
-                                    person_key(payload.get("personName") or "")),
+                                "pdi": _itens_pdi,
                                 "notes": list_feedback_notes(
                                     conn, user["company_id"], user,
                                     person_key(payload.get("personName") or ""), competence),

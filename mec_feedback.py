@@ -5,7 +5,13 @@ Fica em arquivo separado de propósito. O MEC ainda está sendo construído, e
 ajustar um item de avaliação ou o texto de uma orientação não deveria exigir
 mexer no motor do sistema. Editar aqui e reiniciar o serviço já vale.
 
-Base: MEC - Método de Execução Comercial, Vendedor Passini, versão 4.0 (31/07/2026).
+Base: MEC - Método de Execução Comercial, Vendedor Passini, versão 4.1 (15/09/2026),
+com as decisões do MEC 2.0 de 21/10/2026 (blocos de ligação, cotações do dia).
+
+Revisão de 09/11/2026: os gerentes não têm prática de feedback nem de PDI.
+O sistema passa a CONDUZIR a conversa — escolhe o elogio e os 2 pontos a
+desenvolver pelos números, entrega as falas prontas e monta o PDI com meta
+medida pelo próprio CRM. O gerente confirma e ajusta; não precisa criar do zero.
 
 Os três níveis foram escolhidos para não ter meio-termo confortável: ou a pessoa
 supera, ou faz o combinado, ou precisa evoluir. Escala de 1 a 5 faz todo mundo
@@ -38,11 +44,11 @@ FEEDBACK_ITEMS_SELLER = [
      "evidence": "Missão do Dia e Tarefas: retornos atrasados acumulados?"},
     {"id": "mec_top5", "group": "Execução do MEC",
      "label": "Faz o TOP 5 com a composição certa",
-     "hint": "2 Bronze/Prata, 2 Ouro/Diamante e 1 prospecção. São 5, não 8.",
+     "hint": "Os 4 primeiros da Missão do Dia + 1 prospecção na tela Prospecção. São 5, não 8.",
      "evidence": "Missão do Dia: quantos dos 5 saem por dia."},
     {"id": "mec_ligacoes", "group": "Execução do MEC",
-     "label": "Mantém o mínimo de ligações",
-     "hint": "Pelo menos 3 ligações por dia e 60 no mês.",
+     "label": "Mantém o mínimo de contatos ativos",
+     "hint": "60 contatos ativos concluídos no mês (≈3 por dia útil), nos blocos de 8h40–9h20 e 16h30–17h10.",
      "evidence": "Indicador de ligações do mês, no quadro acima."},
     {"id": "mec_registro", "group": "Execução do MEC",
      "label": "Faz registro válido",
@@ -173,14 +179,14 @@ INDICATOR_GUIDE = {
                     "ou recuperação de inativo — e defina o número. Três frentes ao mesmo tempo não sai do lugar.",
     },
     "calls_low": {
-        "titulo": "Ligações abaixo do mínimo do MEC",
-        "leitura": "3 por dia e 60 no mês é o piso, não a meta. Abaixo disso o resto do funil não tem "
-                   "matéria-prima, e nenhuma outra correção funciona.",
+        "titulo": "Contatos ativos abaixo do mínimo do MEC",
+        "leitura": "60 contatos ativos concluídos no mês (≈3 por dia) é o piso, não a meta. Abaixo disso "
+                   "o resto do funil não tem matéria-prima, e nenhuma outra correção funciona.",
         "perguntar": [
             "Em que horário do dia você costuma ligar?",
             "O que atrapalha: balcão, cotação, falta de lista?",
         ],
-        "combinar": "Bloco fixo de ligação na agenda, no mesmo horário todo dia. "
+        "combinar": "Os dois blocos de ligação do MEC, todo dia: 8h40–9h20 e 16h30–17h10. "
                     "Combine o número diário e confira na segunda-feira seguinte.",
     },
     "returns_high": {
@@ -303,4 +309,213 @@ FEEDBACK_SCRIPT_MANAGER = [
     {"etapa": "5. Comportamento", "tempo": "5 min",
      "texto": "Se houver ponto de postura, descreva situação, comportamento e impacto. "
               "Um ponto por conversa — mais que isso vira lista de defeitos."},
+]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDI GUIADO — biblioteca de focos de desenvolvimento do vendedor
+#
+# Cada foco é UM comportamento do MEC, medido por UM número que o CRM já tem.
+# É isso que torna o PDI simples para quem nunca fez: o gerente não escreve o
+# plano, escolhe o foco que o sistema sugeriu e ajusta o número.
+#
+# Ordem = prioridade do MEC. Sem contato não há venda; sem retorno o contato se
+# perde; só depois vêm carteira, margem e qualidade. Quando vários estão fora,
+# o sistema sugere os DOIS primeiros desta ordem, não os dois piores — corrigir
+# desconto de quem não liga não muda o mês.
+#
+# Campos de texto aceitam {valor}, {alvo} e {alvoMes}, preenchidos com o número
+# formatado. Edite as frases à vontade; reinicie o serviço para valer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+PDI_FOCOS = [
+    {
+        "id": "contatos",
+        "titulo": "Volume de contato ativo",
+        "metrica": "contatos ativos registrados no mês",
+        "formato": "num", "melhor": "maior",
+        "porque": "Sem contato não existe venda nova. É a matéria-prima de todo o resto do MEC.",
+        "acoes": [
+            "Fazer os dois blocos de ligação, todo dia: 8h40–9h20 e 16h30–17h10.",
+            "Seguir o TOP 5: os 4 primeiros da Missão do Dia + 1 prospecção.",
+            "Registrar cada contato na hora, inclusive 'não atendeu' — o que não está no CRM não aconteceu.",
+        ],
+        "onde": "Meu Placar (ligações) e Missão do Dia",
+        "perguntas": [
+            "Em que horário do dia você costuma ligar?",
+            "O que tira você do telefone: balcão, cotação, falta de lista?",
+        ],
+        "falaEvoluir": "Até agora foram {valor} contatos ativos registrados; o MEC pede {alvo} até esta data. "
+                       "Sem esse volume, o resto não acontece.",
+        "falaForca": "Você fez {valor} contatos ativos registrados, acima dos {alvo} que o MEC pede até aqui. "
+                     "É isso que sustenta o resultado.",
+        "combinar": "Fazer os dois blocos de ligação todo dia e chegar a {alvoMes} contatos ativos no mês.",
+    },
+    {
+        "id": "retornos",
+        "titulo": "Retorno no prazo combinado",
+        "metrica": "tarefas de retorno vencidas e em aberto",
+        "formato": "num", "melhor": "menor",
+        "porque": "Retorno atrasado é cliente esperando. Ele compra de quem responde primeiro.",
+        "acoes": [
+            "Abrir o dia pela fila de Tarefas e zerar as atrasadas antes de qualquer contato novo.",
+            "Se não puder resolver, avisar o cliente a hora exata do retorno — e cumprir.",
+            "Ao registrar, marcar sempre a próxima ação com data e hora.",
+        ],
+        "onde": "Tarefas (filtro: atrasadas)",
+        "perguntas": [
+            "Por que essas tarefas ficaram para trás?",
+            "Tem tarefa ali que não faz mais sentido e só precisa ser encerrada?",
+        ],
+        "falaEvoluir": "Hoje você tem {valor} retornos vencidos em aberto. Cada um é um cliente que ficou esperando.",
+        "falaForca": "Sua fila de retornos está em dia: {valor} tarefas vencidas. Cliente seu não fica esperando.",
+        "combinar": "Começar o dia pelas tarefas atrasadas e manter no máximo {alvo} vencidas.",
+    },
+    {
+        "id": "cotacoes",
+        "titulo": "Fechamento de cotação",
+        "metrica": "cotações sem desfecho há mais de 1 dia",
+        "formato": "num", "melhor": "menor",
+        "porque": "Cotação sem retorno vira compra no concorrente. O MEC pede ligar em até 10 minutos.",
+        "acoes": [
+            "Depois de mandar o orçamento, ligar em até 10 minutos para confirmar e perguntar o que falta para fechar.",
+            "Marcar no mesmo dia se fechou ou perdeu — e o motivo da perda.",
+            "Perda por falta de peça: registrar a peça, para compras enxergar.",
+        ],
+        "onde": "Cotações do Dia",
+        "perguntas": [
+            "Das cotações em aberto, quais ainda dá para fechar hoje?",
+            "Por que a última que você perdeu foi perdida?",
+        ],
+        "falaEvoluir": "Você tem {valor} cotações sem desfecho há mais de um dia. Cotação parada é venda indo para o concorrente.",
+        "falaForca": "Suas cotações têm desfecho no prazo — {valor} paradas. Isso mostra controle do funil.",
+        "combinar": "Retornar toda cotação em até 10 minutos e dar desfecho (fechou ou perdeu, com motivo) até o dia seguinte.",
+    },
+    {
+        "id": "carteira",
+        "titulo": "Recuperar a carteira parada",
+        "metrica": "clientes da carteira pré-inativos ou inativos",
+        "formato": "num", "melhor": "menor",
+        "porque": "Cliente parado é venda já conquistada sendo perdida. Recuperar custa menos que prospectar.",
+        "acoes": [
+            "Separar na Carteira os pré-inativos (filtro de situação) e ligar primeiro para eles — ainda dá para segurar.",
+            "Em cada ligação, descobrir e registrar o motivo real de ter parado.",
+            "Usar a peça-isca sugerida na ficha para dar um motivo de compra.",
+        ],
+        "onde": "Carteira (situação: pré-inativo e inativo)",
+        "perguntas": [
+            "Você sabe por que cada um desses clientes parou?",
+            "Quantos você conseguiu falar nos últimos 30 dias?",
+        ],
+        "falaEvoluir": "Hoje {valor} clientes da sua carteira estão parados (pré-inativos ou inativos). "
+                       "Cada um já comprou de você.",
+        "falaForca": "Sua carteira está ativa: só {valor} clientes parados. Você cuida de quem já é cliente.",
+        "combinar": "Ligar para os pré-inativos primeiro e baixar a carteira parada para {alvo} clientes.",
+    },
+    {
+        "id": "cobertura",
+        "titulo": "Atender mais clientes",
+        "metrica": "clientes diferentes atendidos no mês",
+        "formato": "num", "melhor": "maior",
+        "porque": "Faturamento em poucos clientes é frágil: basta um parar para o mês virar.",
+        "acoes": [
+            "Toda semana, falar com clientes da carteira que ainda não compraram no mês.",
+            "Usar a Missão do Dia: ela já mostra quem está sem compra.",
+        ],
+        "onde": "Carteira (sem compra no mês) e Missão do Dia",
+        "perguntas": [
+            "Quantos clientes da sua carteira você não falou nenhuma vez este mês?",
+            "Quanto do seu faturamento vem dos 3 maiores clientes?",
+        ],
+        "falaEvoluir": "Você atendeu {valor} clientes no mês; a média da sua unidade é {alvo}.",
+        "falaForca": "Você atendeu {valor} clientes diferentes, acima da média da unidade ({alvo}). Seu resultado não depende de poucos.",
+        "combinar": "Chegar a {alvo} clientes diferentes atendidos no mês.",
+    },
+    {
+        "id": "desconto",
+        "titulo": "Negociar antes de dar desconto",
+        "metrica": "desconto médio concedido",
+        "formato": "pct", "melhor": "menor",
+        "porque": "Desconto alto vende hoje e destrói a margem e o preço de referência do cliente.",
+        "acoes": [
+            "Antes de baixar preço, oferecer duas alternativas: marca equivalente ou condição de prazo.",
+            "Desconto fora da política só com autorização do gerente.",
+        ],
+        "onde": "Meu Placar (margem) e ficha do cliente",
+        "perguntas": [
+            "Em quais clientes você deu mais desconto e o que pediram em troca?",
+            "Você tentou outra marca ou prazo antes de baixar o preço?",
+        ],
+        "falaEvoluir": "Seu desconto médio está em {valor}; a média da unidade é {alvo}.",
+        "falaForca": "Seu desconto médio ({valor}) está abaixo da média da unidade ({alvo}). Você vende sem queimar margem.",
+        "combinar": "Trazer o desconto médio para {alvo}, oferecendo marca ou prazo antes de baixar preço.",
+    },
+    {
+        "id": "devolucao",
+        "titulo": "Confirmar a aplicação antes de faturar",
+        "metrica": "devolução sobre o faturamento",
+        "formato": "pct", "melhor": "menor",
+        "porque": "Devolução é erro de aplicação ou pressa. Custa frete, retrabalho e a confiança do cliente.",
+        "acoes": [
+            "Confirmar veículo, motor e ano antes de faturar peça de linha crítica.",
+            "Na dúvida técnica, pedir apoio — perder a venda custa menos que devolver.",
+        ],
+        "onde": "Devoluções",
+        "perguntas": [
+            "Quais foram as últimas 3 devoluções e o motivo real de cada uma?",
+            "Você confirmou a aplicação antes de faturar?",
+        ],
+        "falaEvoluir": "Sua devolução está em {valor} do faturamento; o limite é {alvo}.",
+        "falaForca": "Sua devolução está em {valor}, dentro do limite de {alvo}. Você vende a peça certa.",
+        "combinar": "Confirmar a aplicação em toda venda de linha crítica e ficar abaixo de {alvo} de devolução.",
+    },
+    {
+        "id": "ticket",
+        "titulo": "Oferecer o complemento",
+        "metrica": "ticket médio por cliente",
+        "formato": "brl", "melhor": "maior",
+        "porque": "Ticket baixo é venda de item único: atende o pedido e não oferece o que acompanha a peça.",
+        "acoes": [
+            "Em todo atendimento, oferecer o item que acompanha a peça (kit, fluido, junta).",
+            "Usar a sugestão de mix e de recompra que a ficha do cliente já mostra.",
+        ],
+        "onde": "Ficha do cliente (sugestões) e Meu Placar",
+        "perguntas": [
+            "Nas últimas vendas, você ofereceu o item que acompanha a peça?",
+            "Você usa as sugestões da ficha do cliente?",
+        ],
+        "falaEvoluir": "Seu ticket médio está em {valor}; a média da unidade é {alvo}.",
+        "falaForca": "Seu ticket médio ({valor}) está acima da unidade ({alvo}). Você oferece o complemento.",
+        "combinar": "Uma oferta complementar por atendimento, chegando a {alvo} de ticket médio.",
+    },
+]
+
+
+# Roteiro guiado: quatro passos, com a FALA pronta. Para quem nunca deu
+# feedback, frase pronta vale mais que princípio. {forca} e {evoluir} são
+# preenchidos com as falas do foco escolhido.
+ROTEIRO_GUIADO = [
+    {"passo": "Abrir", "tempo": "2 min",
+     "fala": "Essa conversa é para você crescer, não é advertência. Antes de eu falar, "
+             "como você avalia o seu mês?",
+     "dica": "Deixe ele falar primeiro. Não interrompa."},
+    {"passo": "Reconhecer", "tempo": "3 min",
+     "fala": "{forca}",
+     "dica": "Elogio com número. 'Bom trabalho' sozinho não é levado a sério."},
+    {"passo": "Mostrar o ponto a desenvolver", "tempo": "5 min",
+     "fala": "{evoluir} O que está atrapalhando?",
+     "dica": "Mostre o número na tela. Fale do fato, nunca da pessoa ('você é desorganizado' não)."},
+    {"passo": "Ouvir", "tempo": "5 min",
+     "fala": "{pergunta}",
+     "dica": "Pergunte e fique quieto. A causa aparece aqui. Anote."},
+    {"passo": "Combinar", "tempo": "5 min",
+     "fala": "Então combinamos: {combinar} Vou acompanhar com você toda segunda. Me fala com as suas palavras o que ficou combinado?",
+     "dica": "No máximo 2 pontos. Ele repete o combinado — se não souber repetir, não entendeu."},
+]
+
+# O que fazer depois da conversa — a parte que mais se perde.
+ACOMPANHAMENTO_DICAS = [
+    "Toda segunda, 5 minutos: abra o PDI, olhe o número e marque se avançou.",
+    "Avançou: elogie na hora, com o número. Parado: pergunte o que travou e ajude a destravar.",
+    "Não espere o fim do mês para corrigir. O registro pontual serve para isso.",
 ]
