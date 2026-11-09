@@ -24032,7 +24032,7 @@ function mecConferenciaHtml(it, a) {
       <ol>
         <li>CNPJ <b>${escapeHtml(it.document || "não cadastrado")}</b>
           ${it.document ? `<button class="btn btn-ghost btn-sm" onclick="mecCopiar(decodeURIComponent('${mecArg(_mecDig(it.document))}'))">Copiar</button>` : ""}</li>
-        <li><a href="${escapeHtml(a.links.sefaz)}" target="_blank" rel="noopener">SEFAZ RS</a> — Consulta por CNPJ:
+        <li><a href="${escapeHtml(a.links.sefaz)}" target="_blank" rel="noopener">SEFAZ RS — Consultas Contribuinte</a>: cole o CNPJ e
           confira se <b>não é MEI</b> e se aparece um dos CNAEs abaixo.</li>
         <li><a href="${escapeHtml(a.links.receita)}" target="_blank" rel="noopener">Receita Federal</a> — confira os CNAEs
           (às vezes o de peças só aparece na Receita).</li>
@@ -24109,7 +24109,7 @@ function mecPainelVendedorHtml() {
         (it) => mecLinhaCliente(it, `
           <button class="btn cot-btn ${m.conf[it.clientKey] ? "mec-on" : "cot-canal"}" onclick="mecConfAbrir(decodeURIComponent('${kk(it)}'))">${m.conf[it.clientKey] ? "Fechar" : "Conferir"}</button>`,
           mecConferenciaHtml(it, a)),
-        "Cliente PJ novo ou sem compra há 30 dias ou mais. Direito ao Diferenciado: CNAE 4530-7/01, 4530-7/03 ou 4530-7/04 e não ser MEI.")}
+        "Cliente PJ novo, sem compra há 30 dias ou mais, ou com queda de faturamento. Direito ao Diferenciado: CNAE 4530-7/01, 4530-7/03 ou 4530-7/04 e não ser MEI.")}
       <div id="mec-aviso" class="cot-aviso" role="status" aria-live="polite"></div>
     </div>`;
 }

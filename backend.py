@@ -28826,7 +28826,7 @@ def rota_cotacoes(conn: sqlite3.Connection, user: Any, metodo: str, path: str, d
 #  - Pedidos de Diferenciado para a diretoria aprovar.
 # ─────────────────────────────────────────────────────────────────────────────
 MEC_META_CONTATOS_DIA = 3   # fase 1 do piloto; na fase 2 passa a 4 (~80/mês)
-MEC_LINK_SEFAZ = "https://www.sefaz.rs.gov.br/"
+MEC_LINK_SEFAZ = "https://www.sefaz.rs.gov.br/consultas/contribuinte/"   # link que a equipe usa (Felipe, 09/11/2026)
 MEC_LINK_RECEITA = "https://solucoes.receita.fazenda.gov.br/servicos/cnpjreva/cnpjreva_solicitacao.asp"
 DIFERENCIADO_CNAES = [
     ("4530-7/01", "Comércio por atacado de peças e acessórios novos para veículos automotores"),
@@ -28906,6 +28906,18 @@ def mec_acoes_do_dia(conn: sqlite3.Connection, cid: int, vendedor: str) -> dict[
                 "document": r["document_number"] or "", "reason": motivo,
                 "firstSaleAt": (r["first_sale_at"] or "")[:10], "lastSaleAt": (r["last_sale_at"] or "")[:10]}
 
+    # Queda de faturamento: a mesma régua da fila (QUEDA_FATURAMENTO) — média dos
+    # 3 meses anteriores > 0 e mês atual 10% ou mais abaixo, no ritmo do mês.
+    quedas: dict[str, float] = {}
+    try:
+        filtros = build_filters_from_query({})
+        filtros["seller_name"] = vendedor
+        for linha in crm_client_rows_for_scope(conn, cid, filtros):
+            if float(linha.get("averageRevenue") or 0) > 0 and float(linha.get("growthPct") or 0) <= -0.1:
+                quedas[normalize_client_key(linha.get("clientKey"))] = float(linha.get("growthPct") or 0)
+    except Exception as erro:  # noqa: BLE001
+        print(f"[mec] queda de faturamento indisponível: {erro}", flush=True)
+
     primeira, sem_limite, diferenciado = [], [], []
     for r in carteira:
         primeira_venda = (r["first_sale_at"] or "")[:10]
@@ -28927,12 +28939,19 @@ def mec_acoes_do_dia(conn: sqlite3.Connection, cid: int, vendedor: str) -> dict[
             continue
         novo = bool(primeira_venda) and (hoje_d - date.fromisoformat(primeira_venda)).days <= 60
         parado = bool(ultima) and 30 <= (hoje_d - date.fromisoformat(ultima)).days <= 540
-        if novo or parado:
-            diferenciado.append(item(r, "Cliente novo" if novo else f"Sem compra desde {ultima[8:10]}/{ultima[5:7]}/{ultima[:4]}"))
+        queda = quedas.get(normalize_client_key(r["client_code"]))
+        if novo:
+            diferenciado.append(item(r, "Cliente novo"))
+        elif parado:
+            diferenciado.append(item(r, f"Sem compra desde {ultima[8:10]}/{ultima[5:7]}/{ultima[:4]}"))
+        elif queda is not None:
+            diferenciado.append(item(r, f"Queda de faturamento: {abs(round(queda * 100))}% abaixo da média"))
 
     primeira.sort(key=lambda x: x["firstSaleAt"])
     sem_limite.sort(key=lambda x: x["lastSaleAt"], reverse=True)
-    diferenciado.sort(key=lambda x: (x["reason"] != "Cliente novo", -int((x["lastSaleAt"] or "0000-00-00").replace("-", ""))))
+    ordem = {"Cliente novo": 0}
+    diferenciado.sort(key=lambda x: (ordem.get(x["reason"], 2 if x["reason"].startswith("Queda") else 1),
+                                     -int((x["lastSaleAt"] or "0000-00-00").replace("-", ""))))
     return {
         "firstPurchase": primeira[:10], "firstPurchaseTotal": len(primeira),
         "noCredit": sem_limite[:10], "noCreditTotal": len(sem_limite),
