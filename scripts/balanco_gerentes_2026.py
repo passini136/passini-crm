@@ -16,6 +16,8 @@ from pathlib import Path
 
 os.environ.setdefault("PASSINI_CRM_DATA", "/srv/passini/data/crm")
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))  # backend importa módulos irmãos (mes_cadastro etc.)
+os.chdir(ROOT)
 spec = importlib.util.spec_from_file_location("passini_backend", ROOT / "backend.py")
 b = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(b)
