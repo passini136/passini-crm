@@ -72,12 +72,12 @@ for u in unidades:
         # (mesma régua do Extra Positivação). Jan e fev não têm 2025 importado.
         if comp >= "2026-03" and vend:
             mv = ",".join("?" for _ in vend)
-            q = (f"SELECT client_code FROM fact_sales_detail WHERE company_id = ? AND competence = ? "
-                 f"AND seller_name IN ({mv}) AND client_code <> '' GROUP BY client_code "
+            q = (f"SELECT client_name FROM fact_sales_detail WHERE company_id = ? AND competence = ? "
+                 f"AND seller_name IN ({mv}) AND client_name <> '' GROUP BY client_name "
                  f"HAVING SUM(net_value) >= 999")
             atual = {r[0] for r in conn.execute(q, (CID, comp, *vend)).fetchall()}
             antes = {r[0] for r in conn.execute(
-                "SELECT DISTINCT client_code FROM fact_sales_detail WHERE company_id = ? "
+                "SELECT DISTINCT client_name FROM fact_sales_detail WHERE company_id = ? "
                 "AND competence IN (?, ?) AND net_value > 0",
                 (CID, mes_menos(comp, 1), mes_menos(comp, 2))).fetchall()}
             row["recuperados"] = len(atual - antes)
