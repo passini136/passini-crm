@@ -29088,6 +29088,112 @@ def mec_decidir_diferenciado(conn: sqlite3.Connection, user: Any, ctx: dict[str,
     return 200, {"ok": True}
 
 
+# ─── "Não atendeu" → mensagem de WhatsApp com gatilho, isca e CTA ────────────
+# Textos do MEC 2.0 (21/10/2026). A isca é o item de ticket baixo e alto giro
+# com estoque na unidade: o primeiro item com saldo da régua da peça-isca
+# (mix_opportunities). O vendedor sempre pode editar antes de enviar.
+def _mec_primeiro_nome(nome: str) -> str:
+    partes = normalize_whitespace(nome).split()
+    return partes[0].title() if partes else ""
+
+
+def _mec_isca(conn: sqlite3.Connection, cid: int, unidade: str) -> str:
+    if not unidade:
+        return ""
+    try:
+        res = mix_opportunities_cached(conn, cid, unidade)
+    except Exception as erro:  # noqa: BLE001
+        print(f"[mec] isca indisponível: {erro}", flush=True)
+        return ""
+    for it in res.get("items") or []:
+        if it.get("inStock") is False:
+            continue
+        nome = " ".join(p for p in (str(it.get("line") or "").title(), str(it.get("brand") or "").title()) if p)
+        return nome or str(it.get("ref") or "")
+    return ""
+
+
+def mec_whatsapp(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    cid = user["company_id"]
+    chave = normalize_whitespace(params.get("clientKey"))
+    if not chave:
+        return 400, {"error": "Cliente não informado."}
+    vendedor = _mec_primeiro_nome(ctx["eu"])
+    unidade = ctx["minha_unidade"] or ""
+    hoje_d = today_in_brazil()
+    contato, empresa, telefone, cidade = "", "", "", ""
+    prospect = chave.upper().startswith("P-")
+    if prospect:
+        r = conn.execute("SELECT company_name, trade_name, contact_name, phone, city_name FROM prospects "
+                         "WHERE company_id = ? AND id = ?", (cid, chave[2:])).fetchone()
+        if r:
+            contato, empresa = r["contact_name"] or "", r["trade_name"] or r["company_name"] or ""
+            telefone, cidade = r["phone"] or "", r["city_name"] or ""
+    else:
+        r = conn.execute("SELECT client_name, trade_name, primary_contact_name, phone, updated_phone, city_name "
+                         "FROM crm_client_profiles WHERE company_id = ? AND client_code = ?", (cid, chave)).fetchone()
+        if r:
+            contato, empresa = r["primary_contact_name"] or "", r["trade_name"] or r["client_name"] or ""
+            telefone, cidade = r["updated_phone"] or r["phone"] or "", r["city_name"] or ""
+    if not empresa:
+        return 404, {"error": "Cliente não encontrado."}
+    # Sem nome de contato, cumprimenta sem nome: "Oi Auto Pecas Ltda" soa robô
+    nome = _mec_primeiro_nome(contato)
+    oi = f"Oi {nome}" if nome else "Oi"
+    isca = _mec_isca(conn, cid, unidade)
+    loja = f"da Passini {unidade.title()}" if unidade else "da Passini"
+
+    # Qual situação: cotou e não fechou (30 dias) > parou de cotar > prospect > inativo/parado
+    tipo = "PROSPECCAO" if prospect else "INATIVO"
+    peca = ""
+    if not prospect:
+        desde30 = (hoje_d - timedelta(days=30)).isoformat()
+        perdida = conn.execute(
+            "SELECT item_hint, quoted_at FROM crm_quotes WHERE company_id = ? AND client_key = ? "
+            "AND status = 'NAO_FECHOU' AND substr(quoted_at, 1, 10) >= ? ORDER BY quoted_at DESC LIMIT 1",
+            (cid, chave, desde30)).fetchone()
+        if perdida:
+            tipo = "COTOU"
+            peca = perdida["item_hint"] or ""
+        else:
+            ult = conn.execute("SELECT MAX(substr(quoted_at, 1, 10)) AS d, COUNT(*) AS n FROM crm_quotes "
+                               "WHERE company_id = ? AND client_key = ?", (cid, chave)).fetchone()
+            if ult and int(ult["n"] or 0) >= 2 and ult["d"] and (hoje_d - date.fromisoformat(ult["d"])).days >= 45:
+                tipo = "PAROU"
+
+    agora = datetime.now(APP_TIMEZONE)
+    prazo = "até as 15h, já sai na entrega de hoje" if agora.hour < 13 else "ainda hoje, sai na primeira entrega de amanhã"
+    if tipo == "COTOU":
+        texto = (f"{oi}, aqui é o {vendedor}, {loja}. Tentei te ligar agora há pouco. "
+                 f"Revisei a cotação{(' de ' + peca) if peca else ''} e consegui melhorar [preço / marca / prazo]. "
+                 f"Ainda precisa? Se me responder {prazo}.")
+    elif tipo == "PAROU":
+        oferta = f"esta semana tenho {isca} com condição especial para ti" if isca else "esta semana tenho uma condição especial para ti"
+        texto = (f"{oi}, aqui é o {vendedor}, {loja}. Te liguei e não consegui falar. "
+                 f"Faz um tempo que não cotamos juntos e quero uma nova chance: {oferta}. "
+                 f"O que vais precisar esta semana?")
+    elif tipo == "PROSPECCAO":
+        oferta = (f"Para começar, tenho {isca} a pronta entrega com preço de primeira compra. " if isca
+                  else "Para começar, tenho condição especial na primeira compra. ")
+        texto = (f"{oi}, sou o {vendedor}, da Passini Autopeças, distribuidora aqui da região. "
+                 f"Tentei te ligar. Atendemos oficinas{(' de ' + cidade.title()) if cidade else ''} com entrega rápida. "
+                 + oferta +
+                 f"Me manda uma peça que estás precisando hoje e te mostro preço e prazo.")
+    else:
+        oferta = (f"Separei {isca} com preço especial só até sexta, tenho estoque aqui. " if isca
+                  else "Separei uma condição especial que vale só até sexta. ")
+        texto = (f"{oi}, tudo bem? Aqui é o {vendedor}, {loja}. Te liguei agora há pouco. "
+                 + oferta +
+                 f"Me manda a lista do que está entrando hoje que te devolvo preço em 10 minutos.")
+    digitos = _mec_so_digitos(telefone)
+    if digitos and not digitos.startswith("55") and len(digitos) in (10, 11):
+        digitos = "55" + digitos
+    rotulo = {"COTOU": "Cotou e não comprou", "PAROU": "Parou de cotar",
+              "PROSPECCAO": "Prospecção", "INATIVO": "Cliente parado / sem compra"}[tipo]
+    return 200, {"kind": tipo, "kindLabel": rotulo, "client": empresa, "phone": telefone,
+                 "phoneDigits": digitos, "bait": isca, "message": texto}
+
+
 def rota_mec(conn: sqlite3.Connection, user: Any, metodo: str, path: str, dados: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     ctx = _cotacao_contexto(conn, user)   # piloto = unidades liberadas para Cotações
     if ctx is None:
@@ -29095,6 +29201,8 @@ def rota_mec(conn: sqlite3.Connection, user: Any, metodo: str, path: str, dados:
     try:
         if metodo == "GET" and path == "/api/crm/mec/painel":
             return 200, mec_painel(conn, user, ctx)
+        if metodo == "GET" and path == "/api/crm/mec/whatsapp":
+            return mec_whatsapp(conn, user, ctx, dados)
         if metodo == "POST" and path == "/api/crm/mec/acao":
             return mec_registrar_acao(conn, user, ctx, dados)
         if metodo == "POST" and path == "/api/crm/mec/diferenciado":
@@ -30095,8 +30203,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 user = self._require_auth()
                 if not user:
                     return
+                params = {k: v[0] for k, v in parse_qs(parsed.query).items() if v}
                 with closing(get_connection()) as conn:
-                    codigo, corpo = rota_mec(conn, user, "GET", path, {})
+                    codigo, corpo = rota_mec(conn, user, "GET", path, params)
                 self._set_headers(codigo)
                 self.wfile.write(json_dumps(corpo))
                 return

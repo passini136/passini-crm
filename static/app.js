@@ -18521,6 +18521,11 @@ async function submitCrmInteraction() {
       NAO_ATENDEU: "✅ Tentativa registrada.",
     }[form.resultCode] || "✅ Contato registrado!";
     addMessage("success", resultLabel);
+    // MEC 2.0 (piloto): não atendeu vira WhatsApp na hora; números do dia atualizam
+    if (mecNoPiloto()) {
+      if (form.resultCode === "NAO_ATENDEU") mecWhatsAbrir(form.clientCode || form.clientKey, form.updatedPhone);
+      mecLoad(true);
+    }
     // Remove da fila na hora, sem esperar o reload. A comparação normaliza os
     // códigos do mesmo jeito que o servidor faz — comparar as strings cruas
     // deixava o cliente na lista quando havia diferença de espaço ou zero à esquerda.
@@ -24187,3 +24192,75 @@ setInterval(() => {
   if (!el || el.contains(document.activeElement)) return;
   el.innerHTML = cotAbertasHtml();
 }, 60000);
+
+// ─── "Não atendeu" → WhatsApp pronto (MEC 2.0) ───────────────────────────────
+// Janela própria, fora do #app: o render() troca o #app inteiro e apagaria o
+// texto que o vendedor estiver ajustando.
+async function mecWhatsAbrir(clientKey, telefoneDigitado) {
+  if (!mecNoPiloto() || !clientKey) return;
+  let d;
+  try {
+    d = await api(`/api/crm/mec/whatsapp?clientKey=${encodeURIComponent(clientKey)}`);
+  } catch (e) {
+    addMessage("warn", `Tentativa registrada. Não montei a mensagem de WhatsApp: ${e.message}`);
+    return;
+  }
+  const digitado = String(telefoneDigitado || "").replace(/\D/g, "");
+  let fone = d.phoneDigits || "";
+  if (digitado.length >= 10) fone = digitado.startsWith("55") ? digitado : `55${digitado}`;
+  mecWhatsFechar();
+  const caixa = document.createElement("div");
+  caixa.id = "mec-whats";
+  caixa.className = "mec-whats-fundo";
+  caixa.innerHTML = `
+    <div class="mec-whats" role="dialog" aria-label="Mensagem de WhatsApp">
+      <div class="mec-whats-topo">
+        <div><b>💬 Não atendeu? Mande o WhatsApp agora</b>
+          <div class="text-small">${escapeHtml(d.client)} · ${escapeHtml(d.kindLabel)}${d.bait ? ` · isca: <b>${escapeHtml(d.bait)}</b>` : ""}</div></div>
+        <button class="btn btn-ghost btn-sm" onclick="mecWhatsFechar()">Fechar</button>
+      </div>
+      <label class="text-small">Telefone (com DDD)</label>
+      <input id="mec-whats-fone" value="${escapeHtml(fone)}" placeholder="51999999999">
+      <label class="text-small">Mensagem — ajuste o que estiver entre [colchetes]</label>
+      <textarea id="mec-whats-texto" rows="6">${escapeHtml(d.message)}</textarea>
+      <div class="cot-botoes" style="margin-top:10px">
+        <button class="btn cot-btn cot-sim" onclick="mecWhatsEnviar()">Abrir no WhatsApp</button>
+        <button class="btn cot-btn btn-ghost" onclick="mecWhatsCopiar()">Copiar texto</button>
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:8px">
+        Gatilho (prazo) + isca (item barato com estoque) + pergunta no final. Mensagem curta, enviada no mesmo minuto da ligação.</div>
+    </div>`;
+  document.body.appendChild(caixa);
+  caixa.addEventListener("click", (ev) => { if (ev.target === caixa) mecWhatsFechar(); });
+}
+
+function mecWhatsFechar() {
+  const el = document.getElementById("mec-whats");
+  if (el) el.remove();
+}
+
+function mecWhatsEnviar() {
+  let fone = (document.getElementById("mec-whats-fone")?.value || "").replace(/\D/g, "");
+  const texto = document.getElementById("mec-whats-texto")?.value || "";
+  if (texto.includes("[")) {
+    if (!window.confirm("A mensagem ainda tem um trecho entre [colchetes]. Enviar assim mesmo?")) return;
+  }
+  if (fone.length >= 10 && !fone.startsWith("55")) fone = `55${fone}`;
+  const url = fone.length >= 12
+    ? `https://wa.me/${fone}?text=${encodeURIComponent(texto)}`
+    : `https://wa.me/?text=${encodeURIComponent(texto)}`;
+  window.open(url, "_blank", "noopener");
+  mecWhatsFechar();
+}
+
+function mecWhatsCopiar() {
+  const texto = document.getElementById("mec-whats-texto")?.value || "";
+  const campo = document.getElementById("mec-whats-texto");
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(texto).then(() => addMessage("success", "Mensagem copiada."));
+    return;
+  }
+  campo.select();
+  try { document.execCommand("copy"); addMessage("success", "Mensagem copiada."); }
+  catch (e) { addMessage("warn", "Selecione o texto e copie à mão."); }
+}
