@@ -21558,10 +21558,19 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         )
     seller_rows.sort(key=lambda item: item["score"], reverse=True)
 
-    unit_calendar = summary_calendar
     unit_rows = []
     unit_names = sorted(set(unit_summary_by_unit) | set(goal_by_unit))
     for unit_name in unit_names:
+        # CALENDÁRIO DA PRÓPRIA UNIDADE. Usar o do grupo ignorava feriado
+        # municipal e dia de loja fechada: Lajeado fechou 3 dias para a
+        # mudança, cadastrou como feriado, e a meta diária e a projeção dela
+        # continuaram divididas pelos dias úteis do grupo.
+        unit_calendar = get_business_calendar(
+            conn, company_id, primary_competence,
+            reference_today=competence_state["today"],
+            include_current_day=False,
+            unit_name=unit_name,
+        )
         official_row = unit_summary_by_unit.get(unit_name, {})
         unit_goal = goal_by_unit.get(unit_name, {"revenueGoal": 0.0, "returnsGoal": 0.0})
         revenue_goal = float(unit_goal["revenueGoal"] or 0)
@@ -21632,6 +21641,10 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
                 "qtySold": round(qty_sold, 2),
                 "ticketPerPiece": round(safe_div(revenue_net, qty_sold), 2),
                 "metaDiaria": round(daily_goal_value, 2),
+                "workingDaysTotal": unit_calendar["totalWorkingDays"],
+                "workingDaysElapsed": unit_calendar["elapsedWorkingDays"],
+                "localHolidays": [h for h in unit_calendar["holidays"]
+                                  if h not in summary_calendar["holidays"]],
             }
         )
     unit_rows.sort(key=lambda item: item["revenueNet"], reverse=True)
@@ -21856,8 +21869,23 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
     elapsed_days_current = summary_calendar["elapsedWorkingDays"]
     total_days_current = summary_calendar["totalWorkingDays"]
     daily_revenue_actual_raw, projection_revenue_raw = dashboard_metric_projection(summary_revenue, elapsed_days_current, total_days_current)
+    projecao_por_unidade = False
+    # Grupo sem recorte: a projeção é a SOMA das projeções das unidades, cada
+    # uma no próprio calendário. Projetar o total pelos dias do grupo faria a
+    # loja fechada (feriado municipal, mudança) puxar a projeção de todas.
+    if (not filters.get("seller_name") and not filters.get("unit_name")
+            and not use_detail_summary and unit_rows):
+        _soma_proj = sum(float(r.get("projectedRevenue") or 0) for r in unit_rows)
+        _soma_real = sum(float(r.get("revenueNet") or 0) for r in unit_rows)
+        if _soma_real and abs(_soma_real - summary_revenue) <= max(1.0, abs(summary_revenue) * 0.001):
+            projection_revenue_raw = _soma_proj
+            projecao_por_unidade = True
     projection_revenue = round(projection_revenue_raw, 2)
     _, _proj_meta_raw = dashboard_metric_projection(summary_revenue_for_goal, elapsed_days_current, total_days_current)
+    if projecao_por_unidade:
+        _sem_meta_nomes = {u["unitName"] for u in units_without_goal}
+        _proj_meta_raw = sum(float(r.get("projectedRevenue") or 0) for r in unit_rows
+                             if normalize_unit(r["unitName"]) not in _sem_meta_nomes)
     projection_revenue_for_goal = round(_proj_meta_raw, 2)
     score_average = round(sum(item["score"] for item in seller_rows) / len(seller_rows), 2) if seller_rows else 0.0
     daily_revenue_actual = round(daily_revenue_actual_raw, 2)
@@ -22012,6 +22040,10 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
             # Base do atingimento: o líquido menos as unidades sem meta.
             "revenueForGoal": round(summary_revenue_for_goal, 2),
             "projectedRevenueForGoal": projection_revenue_for_goal,
+            # True quando a projeção do grupo é a soma das unidades (cada uma
+            # com o próprio calendário). A auditoria usa isso para não acusar
+            # diferença contra a conta simples pelos dias do grupo.
+            "projectionByUnit": projecao_por_unidade,
             "unitsWithoutGoal": units_without_goal,
             "goalAttainmentPct": round(safe_div(summary_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
             "projectedGoalAttainmentPct": round(safe_div(projection_revenue_for_goal, summary_goal) * 100 if summary_goal else 0.0, 2),
@@ -22994,6 +23026,11 @@ def audit_projection_integrity(
     future_summary = single_competence_summary(conn, company_id, future_competence, audit_filters_for_competence(future_competence))
     if future_summary and audit_round(future_summary.get("revenueNet")) == 0.0 and audit_round(future_summary.get("dailyRevenue")) != 0.0:
         append_audit_issue(issues, "ATENCAO", "PROJECAO", "Competência futura tem média diária diferente de zero.", 0.0, future_summary.get("dailyRevenue"))
+    if summary.get("projectionByUnit"):
+        expected_projected = audit_round(summary["projectedRevenue"])
+        expected_projected_goal_attainment = audit_round(
+            safe_div(summary.get("projectedRevenueForGoal") or 0, summary["revenueGoal"]) * 100
+            if summary["revenueGoal"] else 0.0)
     for label, expected, actual in [
         ("dailyRevenueActual", expected_daily, summary["dailyRevenueActual"]),
         ("dailyGoal", expected_daily_goal, summary["dailyGoal"]),
