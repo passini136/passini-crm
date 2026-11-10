@@ -21273,14 +21273,20 @@ Cancelar edição
       </div>
       <div class="grid-2">
         <div class="form-card">
-          <div class="section-title"><div><h3>Feriados</h3><div class="text-small">Cadastro de feriados do calendário comercial.</div></div></div>
+          <div class="section-title"><div><h3>Feriados</h3><div class="text-small">Cadastro de feriados do calendário comercial.
+            Feriado municipal vale só para a unidade escolhida: tira o dia útil da meta e do ritmo dela, sem mexer nas outras.</div></div></div>
           <div class="stack">
             <form onsubmit="saveHoliday(event)" class="stack">
               <strong>Feriado</strong>
               <div class="two-column-form">
                 <div class="field"><label>Data</label><input id="holiday-date" type="date" required /></div>
-                <div class="field"><label>Descrição</label><input id="holiday-name" required /></div>
+                <div class="field"><label>Descrição</label><input id="holiday-name" required placeholder="Ex.: Feriado municipal de Pelotas" /></div>
               </div>
+              <div class="field"><label>Vale para</label>
+                <select id="holiday-unit">
+                  <option value="">Todas as unidades (nacional / estadual)</option>
+                  ${feriadoUnidades().map((u) => `<option value="${escapeHtml(u)}">Só ${escapeHtml(u)} (municipal)</option>`).join("")}
+                </select></div>
               <button class="btn btn-secondary" type="submit">Salvar feriado</button>
             </form>
           </div>
@@ -21290,7 +21296,7 @@ Cancelar edição
           ${scoreEnabled() && userCanManageUsers() ? adminTableCard("Configuração do score", ["valid_from_competence", "weight_goal", "weight_ticket", "weight_clients", "weight_mix", "weight_returns"], state.admin.scoreConfigs) : ""}
           ${sellerGoalsTableCard()}
           ${unitGoalsTableCard()}
-          ${adminTableCard("Feriados", ["holiday_date", "holiday_name", "scope"], state.admin.holidays || [])}
+          ${feriadosTableCard()}
           ${vacationTableCard()}
         </div>
       </div>
@@ -22871,6 +22877,65 @@ async function resolveIssue(issueId, type) {
   } catch (error) {
     addMessage("error", error.message);
   }
+}
+
+// ─── Feriados (com abrangência por unidade) ─────────────────────────────────
+function feriadoUnidades() {
+  // Lista fixa = as unidades que o servidor reconhece. A lista da tela de
+  // Acessos traz grafias antigas do cadastro de pessoas, que o servidor recusaria.
+  return ["MATRIZ", "LAJEADO", "PELOTAS", "ZONA SUL", "ZONA NORTE", "XANGRILA"];
+}
+
+function feriadoAbrangencia(scope) {
+  const u = String(scope || "").toUpperCase();
+  return feriadoUnidades().includes(u) ? u : "Todas";
+}
+
+async function saveHoliday(event) {
+  event.preventDefault();
+  const data = document.getElementById("holiday-date")?.value;
+  const nome = document.getElementById("holiday-name")?.value?.trim();
+  const unidade = document.getElementById("holiday-unit")?.value || "";
+  if (!data || !nome) { addMessage("error", "Informe a data e a descrição."); return; }
+  try {
+    await api("/api/admin/holiday", { method: "POST",
+      body: JSON.stringify({ holiday_date: data, holiday_name: nome, unit_name: unidade }) });
+    addMessage("success", `Feriado salvo${unidade ? ` para ${unidade}` : " para todas as unidades"}.`);
+    ["holiday-date", "holiday-name"].forEach((id) => { const el = document.getElementById(id); if (el) el.value = ""; });
+    await loadAdmin();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+async function deleteHoliday(id, texto) {
+  if (!confirm(`Excluir o feriado ${texto}?`)) return;
+  try {
+    await api("/api/admin/holiday/delete", { method: "POST", body: JSON.stringify({ id }) });
+    addMessage("success", "Feriado excluído.");
+    await loadAdmin();
+  } catch (e) { addMessage("error", e.message); }
+}
+
+function feriadosTableCard() {
+  const hoje = new Date().toISOString().slice(0, 10);
+  const rows = (state.admin.holidays || []).slice().sort((a, b) =>
+    (a.holiday_date < hoje) - (b.holiday_date < hoje) || (a.holiday_date < b.holiday_date ? -1 : 1));
+  const linha = (r) => {
+    const ab = feriadoAbrangencia(r.scope);
+    return `<tr style="${r.holiday_date < hoje ? "color:var(--muted)" : ""}">
+      <td>${escapeHtml(String(r.holiday_date).split("-").reverse().join("/"))}</td>
+      <td>${escapeHtml(r.holiday_name)}</td>
+      <td>${ab === "Todas" ? "Todas" : `<span class="status-tag" style="background:#fef7e0;color:#8a6100">${escapeHtml(ab)}</span>`}</td>
+      <td><button class="btn btn-ghost btn-sm" onclick="deleteHoliday(${r.id}, '${jsAttr(r.holiday_date + " " + r.holiday_name)}')">Excluir</button></td>
+    </tr>`;
+  };
+  return `
+    <div class="table-card">
+      <div class="section-title"><h3>Feriados</h3><div class="text-small">Próximos primeiro. Feriados nacionais e do RS são recolocados automaticamente no reinício.</div></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Data</th><th>Feriado</th><th>Vale para</th><th></th></tr></thead>
+        <tbody>${rows.slice(0, 60).map(linha).join("") || '<tr><td colspan="4">Nenhum feriado cadastrado.</td></tr>'}</tbody>
+      </table></div>
+    </div>`;
 }
 
 async function saveVacation(event) {

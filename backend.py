@@ -6343,20 +6343,29 @@ def invalidate_calendar_cache(company_id: int | None = None) -> None:
 
 def _calendar_reference_data(
     conn: sqlite3.Connection, company_id: int, competence: str, start: date, end: date
-) -> tuple[dict[str, str], dict[str, list[dict[str, Any]]]]:
-    """Feriados da competência e férias agrupadas por pessoa, com cache."""
+) -> tuple[dict[str, list[tuple[str, str]]], dict[str, list[dict[str, Any]]]]:
+    """Feriados da competência e férias agrupadas por pessoa, com cache.
+
+    O cache guarda os feriados CRUS (todas as abrangências) — o filtro por
+    unidade acontece depois, em get_business_calendar. Se o filtro entrasse
+    aqui, a chave (empresa, competência) devolveria o calendário da primeira
+    unidade que consultasse para todas as outras.
+    """
     key = (company_id, competence)
     with _calendar_cache_lock:
         hit = _calendar_cache.get(key)
     if hit is not None:
         return hit
-    holidays = {
-        row["holiday_date"]: row["holiday_name"]
-        for row in conn.execute(
-            "SELECT holiday_date, holiday_name FROM holidays WHERE company_id = ? AND holiday_date BETWEEN ? AND ?",
-            (company_id, start.isoformat(), end.isoformat()),
-        ).fetchall()
-    }
+    # Feriado agora tem ABRANGÊNCIA: "NACIONAL_RS" (todas as unidades) ou o
+    # nome de uma unidade (feriado municipal). Data → lista de (nome, unidade
+    # ou "" para todas). Quem filtra por unidade é get_business_calendar.
+    holidays: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for row in conn.execute(
+        "SELECT holiday_date, holiday_name, scope FROM holidays WHERE company_id = ? AND holiday_date BETWEEN ? AND ?",
+        (company_id, start.isoformat(), end.isoformat()),
+    ).fetchall():
+        holidays[row["holiday_date"]].append((row["holiday_name"], holiday_scope_unit(row["scope"])))
+    holidays = dict(holidays)
     vacations_by_person: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in conn.execute(
         """
@@ -6375,6 +6384,31 @@ def _calendar_reference_data(
     return result
 
 
+def holiday_scope_unit(scope: str | None) -> str:
+    """Unidade do feriado municipal, ou "" quando vale para todas.
+
+    Tudo que não é uma unidade conhecida (NACIONAL_RS, NACIONAL, vazio) é
+    feriado de todas — é o que os registros antigos sempre significaram.
+    """
+    unidade = normalize_unit(scope)
+    return unidade if unidade in CANONICAL_UNITS else ""
+
+
+def _unidade_do_vendedor_no_mes(conn: sqlite3.Connection, company_id: int, competence: str,
+                                seller_name: str) -> str:
+    chave = (company_id, competence, "__mapa_vendedor_unidade__")
+    with _calendar_cache_lock:
+        mapa = _calendar_cache.get(chave)
+    if mapa is None:
+        try:
+            mapa = build_seller_unit_map(conn, company_id, competence)
+        except Exception:
+            mapa = {}
+        with _calendar_cache_lock:
+            _calendar_cache[chave] = mapa
+    return normalize_unit(mapa.get(person_key(seller_name)) or mapa.get(short_person_key(seller_name)) or "")
+
+
 def get_business_calendar(
     conn: sqlite3.Connection,
     company_id: int,
@@ -6382,10 +6416,25 @@ def get_business_calendar(
     seller_name: str | None = None,
     reference_today: date | None = None,
     include_current_day: bool = True,
+    unit_name: str | None = None,
 ) -> dict[str, Any]:
+    """Dias úteis da competência.
+
+    Feriado MUNICIPAL só desconta da unidade dele. Sem unidade (visão do
+    grupo), valem apenas os feriados de todas: o grupo é a soma das unidades e
+    um feriado de Pelotas não tira dia útil de Lajeado. Com vendedor e sem
+    unidade explícita, usa a unidade do vendedor no mês.
+    """
     start = first_day_of_competence(competence)
     end = last_day_of_competence(competence)
-    holidays, vacations_by_person = _calendar_reference_data(conn, company_id, competence, start, end)
+    todos_feriados, vacations_by_person = _calendar_reference_data(conn, company_id, competence, start, end)
+    unidade_cal = normalize_unit(unit_name) if unit_name else (
+        _unidade_do_vendedor_no_mes(conn, company_id, competence, seller_name) if seller_name else "")
+    holidays: dict[str, str] = {}
+    for dia, lista in todos_feriados.items():
+        nomes = [nome for nome, un in lista if not un or (unidade_cal and un == unidade_cal)]
+        if nomes:
+            holidays[dia] = " / ".join(nomes)
     vacation_dates = set()
     vacations = []
     if seller_name:
@@ -10480,7 +10529,11 @@ def contact_history(
     # Meta de ligações no RITMO do período, não a meta fechada do mês. Cobrar 60
     # no dia 6 marcaria todo mundo como irregular — é a mesma regra dos faróis.
     competencia = inicio[:7]
-    calendario = get_business_calendar(conn, company_id, competencia)
+    # Feriado municipal: o ritmo e o do recorte da tela. Filtrando Pelotas, o
+    # denominador e o de Pelotas; sem filtro, so os feriados de todas.
+    calendario = get_business_calendar(conn, company_id, competencia,
+                                       seller_name=vendedor or None,
+                                       unit_name=unidade or None)
     decorridos = int(calendario.get("elapsedWorkingDays") or 0)
     totais = int(calendario.get("totalWorkingDays") or 0)
     ritmo = safe_div(decorridos, totais) if totais else 1.0
@@ -11490,7 +11543,8 @@ def activity_progress(
     }
 
     # Ritmo do mês, para não cobrar 100% no dia 6 — mesma regra dos faróis.
-    calendario = get_business_calendar(conn, company_id, competence)
+    calendario = get_business_calendar(conn, company_id, competence,
+                                       unit_name=unidade if isinstance(unidade, str) else None)
     decorridos = int(calendario.get("elapsedWorkingDays") or 0)
     totais = int(calendario.get("totalWorkingDays") or 0)
     ritmo = safe_div(decorridos, totais) if totais else 1.0
@@ -15011,7 +15065,14 @@ def brand_sales_report(
     # fatura. Mês fechado devolve 1.0 e a conta é a de sempre.
     ritmo = 1.0
     if comp == today_in_brazil().strftime("%Y-%m"):
-        _cal = get_business_calendar(conn, company_id, comp)
+        # Feriado municipal: a fatia do mes anterior sai do calendario do
+        # recorte. Com o do grupo, a unidade que teve feriado se compararia
+        # com uma fatia de dias uteis que ela nao teve.
+        _cal = get_business_calendar(
+            conn, company_id, comp,
+            seller_name=(eu if atual == "vendedor" and eu else (vendedor_pedido or None)),
+            unit_name=(unidade_pedida
+                       or (minha_unidade if permitidas is not None else "")) or None)
         _total_du = int(_cal.get("totalWorkingDays") or 0)
         _passados = int(_cal.get("elapsedWorkingDays") or 0)
         if _total_du > 0 and _passados > 0:
@@ -21313,6 +21374,7 @@ def get_dashboard_data(conn: sqlite3.Connection, company_id: int, filters: dict[
         primary_competence,
         reference_today=competence_state["today"],
         include_current_day=False,
+        unit_name=filters.get("unit_name") or None,
     )
     # ── Faróis ────────────────────────────────────────────────────────────────
     # Percentual do mês já decorrido: base para avaliar ritmo em vez de valor cheio.
@@ -22298,7 +22360,8 @@ def single_competence_summary(
         summary_qty_sold = float(official_totals_unit["qtySold"] or 0.0)
         summary_gross = float(official_totals_unit["revenueGross"] or 0.0)
 
-    calendar = get_business_calendar(conn, company_id, competence)
+    calendar = get_business_calendar(conn, company_id, competence,
+                                     unit_name=scoped_filters.get("unit_name") or None)
     return {
         "competence": competence,
         "unit": scoped_filters.get("unit_name"),
@@ -23467,7 +23530,7 @@ def save_json_payload(conn: sqlite3.Connection, company_id: int, user_id: int, t
                 VALUES (?, ?, ?, ?, ?)
                 """,
                 (company_id, _hd.strftime("%Y-%m-%d"), normalize_whitespace(row["holiday_name"]),
-                 row.get("scope", "NACIONAL_RS"), now_iso()),
+                 holiday_scope_unit(row.get("scope")) or "NACIONAL_RS", now_iso()),
             )
             created += 1
     elif table_name == "goals_seller":
@@ -23658,6 +23721,8 @@ def csv_template(kind: str) -> bytes:
     elif kind == "holidays":
         writer.writerow(["holiday_date", "holiday_name", "scope"])
         writer.writerow(["2026-09-20", "Revolução Farroupilha", "NACIONAL_RS"])
+        # Feriado municipal: o nome da unidade no lugar de NACIONAL_RS.
+        writer.writerow(["2026-07-07", "Feriado municipal (exemplo)", "PELOTAS"])
     elif kind == "goals_seller":
         writer.writerow(["competence", "seller_name", "base_unit", "revenue_goal"])
         writer.writerow(["2026-04", "NOME DO VENDEDOR", "MATRIZ", "150000"])
@@ -26216,7 +26281,12 @@ def resultados_serie(
         # Faturamento por dia útil: compara meses de tamanho diferente (um mês
         # com feriado tem menos dias para vender). Mês em curso divide pelos
         # dias já decorridos, igual à tela de Produtividade.
-        _cal = get_business_calendar(conn, company_id, comp)
+        # Feriado municipal: a série da unidade (ou do vendedor) desconta o
+        # feriado dela; a do grupo, só os de todas.
+        _cal = get_business_calendar(
+            conn, company_id, comp,
+            seller_name=alvo if nivel == "vendedor" and alvo else None,
+            unit_name=alvo if nivel == "unidade" and alvo else None)
         _tot = int(_cal.get("totalWorkingDays") or 0)
         _dec = int(_cal.get("elapsedWorkingDays") or 0)
         dias_uteis = (_dec if comp == hoje_comp and _dec else _tot) or 0
@@ -26276,7 +26346,7 @@ RESULTADOS_SENSIBILIDADE = {"empresa": 0.45, "unidade": 0.75, "vendedor": 1.0}
 
 def resultados_fatos(
     conn: sqlite3.Connection, company_id: int, serie: list[dict[str, Any]],
-    competencia: str = "", nivel: str = "empresa",
+    competencia: str = "", nivel: str = "empresa", alvo: str = "",
 ) -> dict[str, Any]:
     """O que fugiu do esperado no mês — o FATO do FCA.
 
@@ -26297,7 +26367,11 @@ def resultados_fatos(
 
     ritmo = 1.0
     if atual["competence"] == today_in_brazil().strftime("%Y-%m"):
-        _cal = get_business_calendar(conn, company_id, atual["competence"])
+        # Mesmo calendario da serie: feriado municipal desconta so da unidade.
+        _cal = get_business_calendar(
+            conn, company_id, atual["competence"],
+            seller_name=alvo if nivel == "vendedor" and alvo else None,
+            unit_name=alvo if nivel == "unidade" and alvo else None)
         _tot = int(_cal.get("totalWorkingDays") or 0)
         _pas = int(_cal.get("elapsedWorkingDays") or 0)
         if _tot > 0 and _pas > 0:
@@ -26748,7 +26822,9 @@ def resultados_produtividade(
         [company_id, competencia, *par]).fetchone()["n"] or 0)
 
     # ── Dias úteis: o denominador do faturamento por dia ─────────────────────
-    cal = get_business_calendar(conn, company_id, competencia)
+    cal = get_business_calendar(conn, company_id, competencia,
+                                seller_name=alvo if nivel == "vendedor" and alvo else None,
+                                unit_name=alvo if nivel == "unidade" and alvo else None)
     dias_totais = int(cal.get("totalWorkingDays") or 0)
     dias_corridos = int(cal.get("elapsedWorkingDays") or 0)
     mes_aberto = competencia == today_in_brazil().strftime("%Y-%m")
@@ -27327,7 +27403,7 @@ def sugerir_metas_unidade(
         "WHERE company_id = ? AND competence = ? AND unit_name = ?",
         (company_id, competencia, unidade)).fetchone()["v"] or 0)
 
-    cal = get_business_calendar(conn, company_id, competencia)
+    cal = get_business_calendar(conn, company_id, competencia, unit_name=unidade)
     dias_alvo = int(cal.get("totalWorkingDays") or 0) or 21
 
     # Meses FECHADOS anteriores à competência alvo. O mês corrente mente: no
@@ -30695,7 +30771,7 @@ class AppHandler(BaseHTTPRequestHandler):
                             nivel = "unidade"
                             alvo = permitidas[0] if permitidas else ""
                     serie = resultados_serie(conn, user["company_id"], nivel, alvo)
-                    fatos = resultados_fatos(conn, user["company_id"], serie, comp, nivel)
+                    fatos = resultados_fatos(conn, user["company_id"], serie, comp, nivel, alvo)
                     idx = next((i for i, r in enumerate(serie)
                                 if r["competence"] == fatos["competence"]), len(serie) - 1)
                     anterior = serie[idx - 1]["competence"] if idx > 0 else ""
@@ -32037,6 +32113,61 @@ class AppHandler(BaseHTTPRequestHandler):
                     return
                 self._set_headers(200)
                 self.wfile.write(json_dumps(result))
+                return
+            if path in ("/api/admin/holiday", "/api/admin/holiday/delete"):
+                # Feriado com abrangência: todas as unidades ou uma só (municipal).
+                # Antes o formulário chamava uma função que não existia e o
+                # feriado nunca era gravado pela tela.
+                user = self._require_auth()
+                if not user or not self._require_admin_area(user):
+                    return
+                payload = self._read_json()
+                with closing(get_connection()) as conn:
+                    if path.endswith("/delete"):
+                        hid = int(payload.get("id") or 0)
+                        row = conn.execute("SELECT holiday_date, holiday_name, scope FROM holidays "
+                                           "WHERE id = ? AND company_id = ?", (hid, user["company_id"])).fetchone()
+                        if not row:
+                            self._set_headers(404)
+                            self.wfile.write(json_dumps({"error": "Feriado não encontrado."}))
+                            return
+                        conn.execute("DELETE FROM holidays WHERE id = ? AND company_id = ?", (hid, user["company_id"]))
+                        audit_log(conn, user["company_id"], user["id"], "excluir", "holidays", str(hid), dict(row))
+                    else:
+                        data_f = parse_datetime_flexible(payload.get("holiday_date"))
+                        nome_f = normalize_whitespace(payload.get("holiday_name"))
+                        unidade_f = holiday_scope_unit(payload.get("unit_name"))
+                        if not data_f or not nome_f:
+                            self._set_headers(400)
+                            self.wfile.write(json_dumps({"error": "Informe a data e a descrição do feriado."}))
+                            return
+                        if normalize_whitespace(payload.get("unit_name")) and not unidade_f:
+                            self._set_headers(400)
+                            self.wfile.write(json_dumps({"error": "Unidade não reconhecida."}))
+                            return
+                        dia = data_f.strftime("%Y-%m-%d")
+                        existe = conn.execute(
+                            "SELECT id, scope FROM holidays WHERE company_id = ? AND holiday_date = ? AND holiday_name = ?",
+                            (user["company_id"], dia, nome_f)).fetchone()
+                        if existe:
+                            self._set_headers(409)
+                            self.wfile.write(json_dumps({"error": (
+                                f"Já existe '{nome_f}' em {data_f.strftime('%d/%m/%Y')} "
+                                f"({holiday_scope_unit(existe['scope']) or 'todas as unidades'}). "
+                                "Para outra unidade no mesmo dia, inclua a cidade no nome — "
+                                "ex.: 'Feriado municipal de Pelotas'.")}))
+                            return
+                        conn.execute(
+                            "INSERT INTO holidays (company_id, holiday_date, holiday_name, scope, created_at) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (user["company_id"], dia, nome_f, unidade_f or "NACIONAL_RS", now_iso()))
+                        audit_log(conn, user["company_id"], user["id"], "criar", "holidays", "",
+                                  {"data": dia, "nome": nome_f, "unidade": unidade_f or "TODAS"})
+                    conn.commit()
+                invalidate_calendar_cache(user["company_id"])
+                invalidate_dashboard_cache(user["company_id"])
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"ok": True}))
                 return
             if path == "/api/admin/vacation":
                 user = self._require_auth()
