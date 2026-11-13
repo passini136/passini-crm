@@ -5780,10 +5780,23 @@ def import_package(
             # O Alfa exporta alguns campos como ="00123" para o Excel não comer
             # o zero à esquerda. Sem tirar isso, nada casa com o faturamento.
             catalogo_novos = catalogo_atualizados = 0
+            ensure_item_first_seen(conn)
+            # Primeira importação de catálogo da história: tudo o que vier é
+            # base inicial, sem data real de cadastro.
+            primeira_vez = not conn.execute(
+                "SELECT 1 FROM item_first_seen WHERE company_id = ? LIMIT 1", (company_id,)).fetchone()
+            hoje_cat = today_in_brazil().isoformat()
             for row in rows:
                 codigo = unwrap_excel_text(row.get("CODIGO"))
                 if not codigo:
                     continue
+                conn.execute(
+                    "INSERT OR IGNORE INTO item_first_seen (company_id, item_code, first_seen_at, baseline) "
+                    "VALUES (?, ?, ?, ?)", (company_id, codigo, hoje_cat, 1 if primeira_vez else 0))
+                _dt_alfa = item_data_cadastro_da_linha(row)
+                if _dt_alfa:
+                    conn.execute("UPDATE item_first_seen SET registered_at = ? WHERE company_id = ? AND item_code = ?",
+                                 (_dt_alfa, company_id, codigo))
                 valores = (
                     normalize_upper(row.get("TIPO")),
                     normalize_whitespace(row.get("SUB DESCRICAO")),
@@ -5828,6 +5841,12 @@ def import_package(
                         """,
                         (company_id, codigo, *valores, now_iso(), now_iso()))
                     catalogo_novos += 1
+            # created_at do catálogo passa a ser a data de cadastro real, não a
+            # da importação (a troca da base apagava e regravava tudo hoje).
+            conn.execute(
+                "UPDATE item_catalog SET created_at = COALESCE((SELECT COALESCE(f.registered_at, f.first_seen_at) "
+                "FROM item_first_seen f WHERE f.company_id = item_catalog.company_id "
+                "AND f.item_code = item_catalog.item_code), created_at) WHERE company_id = ?", (company_id,))
             catalog_new_total += catalogo_novos
             catalog_updated_total += catalogo_atualizados
             print(f"[catalogo] {catalogo_novos} item(ns) novo(s), "
@@ -17164,6 +17183,9 @@ def sales_debut_novelties(
         # Marca cadastrada cujo portfólio inteiro ainda não vendeu: entrou na
         # casa e ninguém ofereceu. É notícia, e é a mais acionável de todas.
         "brandsUnsold": catalog_unsold_brands(conn, company_id),
+        # Cadastros recentes, vendidos ou não. Novidade por venda (acima) leva
+        # meses para aparecer; o que acabou de entrar no catálogo aparece aqui.
+        "recentRegistrations": catalog_recent_registrations(conn, company_id, unidade),
         "inStockCount": sum(1 for i in itens if i["inStock"]),
         "establishedCount": sum(1 for i in itens if i["brandStatus"] == "CONSOLIDADA"),
         "funnel": funil,
@@ -17456,13 +17478,17 @@ def catalog_unsold_items(
             (company_id,)).fetchall()
     }
     saida: list[dict[str, Any]] = []
+    ensure_item_first_seen(conn)
     for r in conn.execute(
         """
-        SELECT item_code, manufacturer_ref, brand_name, item_subgroup, item_group,
-               sale_price, created_at
-        FROM item_catalog
-        WHERE company_id = ? AND TRIM(COALESCE(manufacturer_ref,'')) <> ''
-        ORDER BY created_at DESC, CAST(item_code AS INTEGER) DESC
+        SELECT c.item_code, c.manufacturer_ref, c.brand_name, c.item_subgroup, c.item_group,
+               c.sale_price,
+               CASE WHEN f.registered_at IS NULL AND COALESCE(f.baseline, 1) = 1 THEN ''
+                    ELSE COALESCE(f.registered_at, f.first_seen_at) END AS created_at
+        FROM item_catalog c
+        LEFT JOIN item_first_seen f ON f.company_id = c.company_id AND f.item_code = c.item_code
+        WHERE c.company_id = ? AND TRIM(COALESCE(c.manufacturer_ref,'')) <> ''
+        ORDER BY created_at DESC, CAST(c.item_code AS INTEGER) DESC
         """,
         (company_id,)).fetchall():
         ref = normalize_upper(r["manufacturer_ref"])
@@ -17487,11 +17513,115 @@ def catalog_unsold_items(
             # A tela precisa distinguir "vendeu pouco" de "nunca vendeu": o
             # segundo não é fracasso, é oportunidade intocada.
             "neverSold": True,
+            # Vazio = item da base inicial, sem data real de cadastro.
             "registeredAt": str(r["created_at"] or "")[:10],
         })
         if len(saida) >= limit:
             break
     return saida
+
+
+# ─── Data de cadastro do item ──────────────────────────────────────────────
+#
+# A importação do catálogo SUBSTITUI a base inteira (item retirado de linha
+# tem de sumir). Por isso item_catalog.created_at virava a data da última
+# importação para TODOS os itens: em Novidades, tudo aparecia "cadastrado
+# hoje" e o que entrou de verdade se perdia no meio.
+#
+# Esta tabela nunca é apagada pela importação. Guarda o primeiro dia em que o
+# código apareceu num catálogo importado (ou a data de cadastro do Alfa, se o
+# relatório trouxer a coluna). "baseline" marca o que já existia na primeira
+# importação registrada: para esses não há como saber a data real.
+ITEM_DATA_CADASTRO_COLUNAS = ("DATA CADASTRO", "DT CADASTRO", "DATA DE CADASTRO", "DT. CADASTRO",
+                              "DATA INCLUSAO", "DT INCLUSAO", "DATA DE INCLUSAO", "CADASTRO")
+
+
+def ensure_item_first_seen(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS item_first_seen (
+            company_id INTEGER NOT NULL,
+            item_code TEXT NOT NULL,
+            first_seen_at TEXT NOT NULL,
+            baseline INTEGER NOT NULL DEFAULT 0,
+            registered_at TEXT,
+            PRIMARY KEY (company_id, item_code)
+        )""")
+
+
+def item_data_cadastro_da_linha(row: dict[str, Any]) -> str | None:
+    """Data de cadastro do Alfa, se o relatório trouxer a coluna."""
+    chaves = {normalize_upper(strip_accents(k)): k for k in row.keys() if k}
+    for nome in ITEM_DATA_CADASTRO_COLUNAS:
+        k = chaves.get(nome)
+        if k and row.get(k):
+            dt = parse_datetime_pt(row.get(k)) if "parse_datetime_pt" in globals() else None
+            dt = dt or parse_datetime_flexible(row.get(k))
+            if dt:
+                return dt.strftime("%Y-%m-%d")
+    return None
+
+
+def item_cadastro_info(conn: sqlite3.Connection, company_id: int) -> dict[str, tuple[str, bool]]:
+    """código → (data de cadastro, é da base inicial sem data real)."""
+    ensure_item_first_seen(conn)
+    return {
+        str(r["item_code"]): ((r["registered_at"] or r["first_seen_at"] or "")[:10],
+                              bool(r["baseline"]) and not r["registered_at"])
+        for r in conn.execute(
+            "SELECT item_code, first_seen_at, baseline, registered_at FROM item_first_seen "
+            "WHERE company_id = ?", (company_id,)).fetchall()
+    }
+
+
+def catalog_recent_registrations(
+    conn: sqlite3.Connection, company_id: int, unit_name: str = "", days: int = 30, limit: int = 150,
+) -> dict[str, Any]:
+    """Itens que ENTRARAM no catálogo nos últimos dias, vendidos ou não.
+
+    Só conta o que tem data real (primeira aparição num catálogo importado ou
+    data de cadastro do Alfa). A base inicial fica de fora: sem data, não dá
+    para chamar de recente.
+    """
+    ensure_item_first_seen(conn)
+    corte = (today_in_brazil() - timedelta(days=days)).isoformat()
+    com_saldo = unit_item_stock_refs(conn, company_id, unit_name) if unit_name else set()
+    linhas = conn.execute(
+        """
+        SELECT c.item_code, c.manufacturer_ref, c.brand_name, c.item_subgroup, c.item_group,
+               c.sale_price, COALESCE(f.registered_at, f.first_seen_at) AS cadastro
+        FROM item_catalog c
+        JOIN item_first_seen f ON f.company_id = c.company_id AND f.item_code = c.item_code
+        WHERE c.company_id = ? AND (f.registered_at IS NOT NULL OR f.baseline = 0)
+          AND substr(COALESCE(f.registered_at, f.first_seen_at),1,10) >= ?
+        ORDER BY cadastro DESC, CAST(c.item_code AS INTEGER) DESC
+        """, (company_id, corte)).fetchall()
+    refs = [normalize_upper(r["manufacturer_ref"]) for r in linhas if normalize_upper(r["manufacturer_ref"])]
+    vendas: dict[str, tuple[int, int]] = {}
+    for i in range(0, len(refs), 400):
+        lote = refs[i:i + 400]
+        marc = ",".join("?" for _ in lote)
+        for v in conn.execute(
+            f"SELECT UPPER(TRIM(sku_key)) ref, COUNT(*) n, COUNT(DISTINCT client_name) cli "
+            f"FROM fact_sales_detail WHERE company_id = ? AND net_value > 0 "
+            f"AND UPPER(TRIM(sku_key)) IN ({marc}) GROUP BY ref", (company_id, *lote)).fetchall():
+            vendas[v["ref"]] = (int(v["n"] or 0), int(v["cli"] or 0))
+    itens = []
+    for r in linhas:
+        ref = normalize_upper(r["manufacturer_ref"]) or "—"
+        n, cli = vendas.get(ref, (0, 0))
+        itens.append({
+            "ref": ref, "code": str(r["item_code"] or ""),
+            "brand": normalize_upper(r["brand_name"]) or "—",
+            "line": normalize_upper(r["item_subgroup"]) or "—",
+            "group": normalize_upper(r["item_group"]) or "—",
+            "registeredAt": str(r["cadastro"] or "")[:10],
+            "unitPrice": round(float(r["sale_price"] or 0), 2),
+            "sales": n, "clients": cli,
+            "inStock": (ref in com_saldo) if unit_name else None,
+        })
+    return {"days": days, "since": corte, "total": len(itens), "items": itens[:limit],
+            "brands": len({i["brand"] for i in itens}),
+            "soldCount": sum(1 for i in itens if i["sales"])}
 
 
 def catalog_unsold_brands(
@@ -17506,12 +17636,16 @@ def catalog_unsold_brands(
         if normalize_upper(r["marca"])
     }
     saida: list[dict[str, Any]] = []
+    ensure_item_first_seen(conn)
     for r in conn.execute(
         """
-        SELECT UPPER(TRIM(COALESCE(brand_name,''))) AS marca,
-               COUNT(*) AS itens, MAX(created_at) AS cadastro
-        FROM item_catalog
-        WHERE company_id = ? AND TRIM(COALESCE(brand_name,'')) <> ''
+        SELECT UPPER(TRIM(COALESCE(c.brand_name,''))) AS marca,
+               COUNT(*) AS itens,
+               MAX(CASE WHEN f.registered_at IS NULL AND COALESCE(f.baseline, 1) = 1 THEN ''
+                        ELSE COALESCE(f.registered_at, f.first_seen_at) END) AS cadastro
+        FROM item_catalog c
+        LEFT JOIN item_first_seen f ON f.company_id = c.company_id AND f.item_code = c.item_code
+        WHERE c.company_id = ? AND TRIM(COALESCE(c.brand_name,'')) <> ''
         GROUP BY marca
         ORDER BY cadastro DESC, itens DESC
         """,

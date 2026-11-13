@@ -9065,7 +9065,8 @@ function buscaNovidadesBloco() {
                     <td>${escapeHtml(i.brand)}</td>
                     <td>${escapeHtml(i.line)}</td>
                     <td class="text-small">${escapeHtml(i.group || "—")}</td>
-                    <td style="text-align:right" class="text-small">${dataBr(i.registeredAt) || "—"}</td>
+                    <td style="text-align:right" class="text-small">${i.registeredAt ? dataBr(i.registeredAt)
+                      : '<span title="Já estava no catálogo na primeira importação — sem data real de cadastro" style="color:var(--muted)">base inicial</span>'}</td>
                     <td style="text-align:right">${i.unitPrice ? currency(i.unitPrice) : "—"}</td>
                     <td class="text-small" style="color:${i.inStock === false ? "var(--bad)" : "var(--good)"}">
                       ${i.inStock === false ? "sem saldo" : (i.inStock ? "tem" : "—")}</td>
@@ -9171,6 +9172,42 @@ function dicasProspeccaoBloco() {
     </div>`;
 }
 
+/* Cadastros recentes: o que ENTROU no catálogo nos últimos 30 dias, vendido
+ * ou não. A novidade "por venda" leva meses para aparecer (precisa provar
+ * comportamento de portfólio); esta lista mostra o que acabou de chegar. */
+function blocoCadastrosRecentes(rc) {
+  if (!rc) return "";
+  const itens = rc.items || [];
+  if (!itens.length) return `
+    <div class="table-card"><div class="section-title"><div><h3>🆕 Cadastrados nos últimos ${rc.days || 30} dias</h3>
+      <div class="text-small">Nenhum item novo no catálogo no período.</div></div></div></div>`;
+  return `
+    <div class="table-card">
+      <div class="section-title"><div><h3>🆕 Cadastrados nos últimos ${rc.days} dias (${number(rc.total)})</h3>
+        <div class="text-small">${number(rc.brands)} marca(s) · ${number(rc.soldCount)} já venderam.
+          Data = quando o item entrou no catálogo da Passini. Quem oferecer primeiro leva o cliente do item.</div></div></div>
+      <div class="table-wrap" style="max-height:420px;overflow:auto">
+        <table>
+          <thead><tr><th>Referência</th><th>Marca</th><th>Linha</th>
+            <th style="text-align:right">Cadastro</th><th style="text-align:right">Preço tabela</th>
+            <th style="text-align:right">Vendas</th><th>Loja</th></tr></thead>
+          <tbody>${itens.map((i) => `
+            <tr>
+              <td><strong>${escapeHtml(i.ref)}</strong>${i.code ? `<div class="text-small">cód. ${escapeHtml(i.code)}</div>` : ""}</td>
+              <td>${escapeHtml(i.brand)}</td>
+              <td>${escapeHtml(i.line)}</td>
+              <td style="text-align:right" class="text-small">${dataBr(i.registeredAt)}</td>
+              <td style="text-align:right">${i.unitPrice ? currency(i.unitPrice) : "—"}</td>
+              <td style="text-align:right">${i.sales ? `${i.sales} · ${i.clients} cli.` : '<span class="text-small" style="color:var(--muted)">nenhuma</span>'}</td>
+              <td class="text-small" style="color:${i.inStock === false ? "var(--bad)" : "var(--good)"}">
+                ${i.inStock === false ? "sem saldo" : (i.inStock ? "tem" : "—")}</td>
+            </tr>`).join("")}</tbody>
+        </table>
+      </div>
+      ${rc.total > itens.length ? `<div class="text-small" style="color:var(--muted);margin-top:6px">Mostrando ${itens.length} de ${number(rc.total)}. Use a busca por marca para ver todos.</div>` : ""}
+    </div>`;
+}
+
 function novidadesView() {
   const d = state.crm.novidades;
   if (!d) { loadNovidades(); return '<div class="loader panel">Procurando as novidades…</div>'; }
@@ -9261,6 +9298,8 @@ function novidadesView() {
       `}
 
       ${listaEstreante(d.brands || [], "🏷️ Marcas que entraram na casa")}
+
+      ${blocoCadastrosRecentes(d.recentRegistrations)}
 
       ${(d.brandsUnsold || []).length ? `
         <div class="table-card">
