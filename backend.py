@@ -685,6 +685,8 @@ CONTACT_ORIGINS = [
     {"id": "LIVRE",      "label": "Direcionamento",     "icon": "🎯"},
     {"id": "APOIO",      "label": "Apoio a outro",      "icon": "🤝"},
     {"id": "ESPONTANEO", "label": "Carteira / Missão do Dia", "icon": "📋"},
+    # Gravado pela tela Cotações: o cliente procurou (telefone/WhatsApp).
+    {"id": "COTACAO",    "label": "Cotação recebida",   "icon": "🧾"},
 ]
 CONTACT_ORIGIN_LABELS = {o["id"]: o["label"] for o in CONTACT_ORIGINS}
 CONTACT_ORIGIN_PRIORITY = [o["id"] for o in CONTACT_ORIGINS]
@@ -1521,6 +1523,12 @@ def init_crm_schema(conn: sqlite3.Connection) -> None:
         # agenda de quem trabalha a carteira por conta própria — e são
         # comportamentos bem diferentes.
         conn.execute("ALTER TABLE crm_interactions ADD COLUMN origin TEXT")
+    quote_columns = {row["name"] for row in conn.execute("PRAGMA table_info(crm_quotes)").fetchall()}
+    if quote_columns and "interaction_id" not in quote_columns:
+        # A cotação recebida por telefone/WhatsApp grava o próprio contato
+        # RECEPTIVO no histórico; esta coluna liga um ao outro para o desfecho
+        # atualizar a mesma linha em vez de criar outra.
+        conn.execute("ALTER TABLE crm_quotes ADD COLUMN interaction_id INTEGER")
     if "initiative" not in interaction_columns:
         # ATIVO = o vendedor procurou o cliente. É o que conta na meta.
         # RECEPTIVO = o cliente procurou, ou é uma anotação sobre ele. Registra
@@ -28402,6 +28410,75 @@ def _cotacao_agora() -> str:
     return datetime.now(APP_TIMEZONE).replace(tzinfo=None).isoformat(timespec="seconds")
 
 
+COTACAO_TIPO_CONTATO = {"TELEFONE": "LIGACAO_RECEBIDA", "WHATSAPP": "MENSAGEM_RECEBIDA"}
+
+
+def _cotacao_texto_contato(r: sqlite3.Row) -> str:
+    canal = {"WHATSAPP": "WhatsApp", "TELEFONE": "telefone"}.get(r["channel"], r["channel"])
+    partes = [f"Cliente pediu cotação pelo {canal} (registrado na tela Cotações)."]
+    if normalize_whitespace(r["item_hint"]):
+        partes.append(f"Pediu: {normalize_whitespace(r['item_hint'])}.")
+    if r["status"] == "FECHOU":
+        partes.append("Desfecho: fechou.")
+    elif r["status"] == "NAO_FECHOU":
+        partes.append(f"Desfecho: não fechou ({COTACAO_MOTIVOS.get(r['loss_reason'] or '', 'sem motivo')}).")
+    elif r["status"] == "DECIDINDO":
+        partes.append("Desfecho: cliente decidindo — retorno agendado.")
+    return " ".join(partes)
+
+
+def _cotacao_sincronizar_contato(conn: sqlite3.Connection, cid: int, quote_id: int) -> None:
+    """Cria ou atualiza o contato RECEPTIVO da cotação recebida.
+
+    O cliente ligou ou mandou mensagem: isso vai para o histórico dele, mas
+    como RECEPTIVO — fora da meta de contatos ativos. Antes a cotação não
+    registrava nada e o vendedor anotava o mesmo atendimento pelo formulário
+    de contato, que nasce ATIVO: o cliente ligava e o ponto ia para a meta.
+    Inserção direta, sem a rotina do formulário, porque aquela fecha tarefas
+    de retorno — e um cliente ligando não é o vendedor cumprindo o retorno.
+    """
+    try:
+        r = conn.execute("SELECT * FROM crm_quotes WHERE company_id = ? AND id = ?", (cid, quote_id)).fetchone()
+        if not r or r["initiative"] != "RECEPTIVO" or r["channel"] not in COTACAO_TIPO_CONTATO:
+            return
+        texto = _cotacao_texto_contato(r)
+        existente = r["interaction_id"] if "interaction_id" in r.keys() else None
+        if existente and conn.execute("SELECT 1 FROM crm_interactions WHERE id = ?", (existente,)).fetchone():
+            conn.execute("UPDATE crm_interactions SET notes = ? WHERE id = ?", (texto, existente))
+            return
+        cur = conn.execute(
+            """
+            INSERT INTO crm_interactions (company_id, client_key, client_name, seller_name, unit_name,
+                contact_type_code, result_code, occurred_at, notes, had_progress, initiative, origin,
+                created_at, created_by_user_id)
+            VALUES (?,?,?,?,?,?, 'OUTRO', ?, ?, 0, 'RECEPTIVO', 'COTACAO', ?, NULL)
+            """,
+            (cid, r["client_key"], r["client_name"], r["seller_name"], r["unit_name"],
+             COTACAO_TIPO_CONTATO[r["channel"]], (r["quoted_at"] or "").replace("T", " ")[:19],
+             texto, now_iso()))
+        conn.execute("UPDATE crm_quotes SET interaction_id = ? WHERE id = ?", (cur.lastrowid, quote_id))
+        invalidate_activity_caches(cid)
+    except sqlite3.Error as exc:
+        # O histórico é complemento: falha aqui não pode impedir a cotação.
+        print(f"[cotacoes] contato receptivo não gravado para a cotação {quote_id}: {exc}", flush=True)
+
+
+def cotacao_receptiva_hoje(conn: sqlite3.Connection, cid: int, user: Any, client_key: str) -> dict[str, Any] | None:
+    """Cotação RECEPTIVA deste cliente hoje, para o formulário de contato avisar."""
+    chave = normalize_client_key(client_key)
+    if not chave:
+        return None
+    hoje = today_in_brazil().isoformat()
+    r = conn.execute(
+        "SELECT channel, quoted_at, status, seller_name FROM crm_quotes WHERE company_id = ? "
+        "AND client_key = ? AND initiative = 'RECEPTIVO' AND substr(quoted_at,1,10) = ? "
+        "ORDER BY quoted_at DESC LIMIT 1", (cid, chave, hoje)).fetchone()
+    if not r:
+        return None
+    return {"channel": r["channel"], "time": (r["quoted_at"] or "")[11:16],
+            "status": r["status"], "sellerName": r["seller_name"]}
+
+
 def _cotacao_proximo_dia_util(d: date) -> date:
     n = d + timedelta(days=1)
     while n.weekday() >= 5:
@@ -28954,6 +29031,7 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
          now_iso(), user["id"]))
     novo = int(cur.lastrowid)
     audit_log(conn, cid, user["id"], "criar", "crm_quotes", str(novo), {"cliente": chave, "canal": canal})
+    _cotacao_sincronizar_contato(conn, cid, novo)
 
     # Apoio (regra do MEC): cotação de cliente de OUTRA carteira avisa o dono,
     # pela tarefa que ele já usa todo dia — mesmo padrão do registro de interação.
@@ -29018,6 +29096,7 @@ def anotar_cotacao(
         args.append(valor)
     args.append(r["id"])
     conn.execute(f"UPDATE crm_quotes SET {', '.join(campos)} WHERE id = ?", args)
+    _cotacao_sincronizar_contato(conn, user["company_id"], r["id"])
     conn.commit()
     atual = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
     return 200, {"quote": _cotacao_dict(atual, today_in_brazil().isoformat())}
@@ -29074,6 +29153,7 @@ def desfecho_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], p
         (status, motivo, valor, peca, decidido, task_id, r["id"]))
     audit_log(conn, cid, user["id"], "desfecho", "crm_quotes", str(r["id"]),
               {"de": r["status"], "para": status, "motivo": motivo})
+    _cotacao_sincronizar_contato(conn, cid, r["id"])
     conn.commit()
     invalidate_crm_cache(cid)
     novo = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
@@ -29091,6 +29171,7 @@ def desfazer_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], p
                  (r["id"],))
     audit_log(conn, user["company_id"], user["id"], "desfazer", "crm_quotes", str(r["id"]),
               {"de": r["status"], "motivo": r["loss_reason"]})
+    _cotacao_sincronizar_contato(conn, user["company_id"], r["id"])
     conn.commit()
     novo = conn.execute("SELECT * FROM crm_quotes WHERE id = ?", (r["id"],)).fetchone()
     return 200, {"quote": _cotacao_dict(novo, hoje)}
@@ -30591,6 +30672,22 @@ class AppHandler(BaseHTTPRequestHandler):
                     codigo, corpo = rota_mec(conn, user, "GET", path, params)
                 self._set_headers(codigo)
                 self.wfile.write(json_dumps(corpo))
+                return
+            if path == "/api/crm/receptive-quote-today":
+                # O formulário de contato pergunta: este cliente pediu cotação
+                # hoje (cliente procurou)? Se sim, o contato nasce RECEPTIVO.
+                user = self._require_auth()
+                if not user:
+                    return
+                query = parse_qs(parsed.query)
+                with closing(get_connection()) as conn:
+                    try:
+                        achado = cotacao_receptiva_hoje(conn, user["company_id"], user,
+                                                        query.get("clientKey", [""])[0])
+                    except sqlite3.Error:
+                        achado = None
+                self._set_headers(200)
+                self.wfile.write(json_dumps({"quote": achado}))
                 return
             if path.startswith("/api/crm/quotes"):
                 user = self._require_auth()

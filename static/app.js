@@ -18361,9 +18361,63 @@ function setInteractionResult(resultCode, contactTypeCode) {
   requestRender();
 }
 
+// O cliente pediu cotação hoje (telefone/WhatsApp)? Então ele procurou: o
+// contato nasce RECEPTIVO, fora da meta de contatos ativos. Antes o formulário
+// nascia sempre ATIVO e o cliente que ligava virava ponto na meta.
+async function checarCotacaoReceptivaHoje(clientKey) {
+  const form = state.crm.interactionForm;
+  if (!form || !clientKey || form._cotacaoChecada === clientKey) return;
+  form._cotacaoChecada = clientKey;
+  try {
+    const r = await api(`/api/crm/receptive-quote-today?clientKey=${encodeURIComponent(clientKey)}`);
+    const atual = state.crm.interactionForm;
+    if (!atual || atual._cotacaoChecada !== clientKey) return;
+    atual.cotacaoHoje = r.quote || null;
+    if (r.quote && !atual._iniciativaEscolhida) atual.initiative = "RECEPTIVO";
+    requestRender();
+  } catch (e) { /* aviso é ajuda, não bloqueio */ }
+}
+
+function escolherIniciativaContato(valor) {
+  const form = state.crm.interactionForm;
+  if (!form) return;
+  form.initiative = valor;
+  form._iniciativaEscolhida = true;
+  requestRender();
+}
+
+function blocoIniciativaContato(form) {
+  const apoio = state.crm.selectedClient?.isOwnClient === false;
+  if (apoio) return "";
+  const atual = form.initiative || "ATIVO";
+  const cot = form.cotacaoHoje;
+  const canal = cot ? ({ TELEFONE: "pelo telefone", WHATSAPP: "pelo WhatsApp" }[cot.channel] || "") : "";
+  const botao = (valor, rotulo, dica) => `
+    <button type="button" class="btn ${atual === valor ? "btn-primary" : "btn-ghost"}"
+      style="${atual === valor ? "font-weight:800" : ""}" title="${dica}"
+      onclick="escolherIniciativaContato('${valor}')">${rotulo}</button>`;
+  return `
+    <div class="form-card" style="${cot ? "border-left:4px solid #f39c12" : ""}">
+      <div class="section-title"><h3>Quem procurou quem?</h3></div>
+      ${cot ? `
+        <div class="message" style="background:#fef7e0;color:#8a6100;margin-bottom:8px">
+          Este cliente pediu cotação ${canal} hoje${cot.time ? ` às ${escapeHtml(cot.time)}` : ""} — o atendimento
+          já está no histórico como <strong>receptivo</strong>. Só marque <strong>Eu liguei</strong> se este registro
+          é o retorno que você fez.
+        </div>` : ""}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        ${botao("ATIVO", "📤 Eu liguei (ativo)", "Você procurou o cliente. Conta na meta de contatos ativos.")}
+        ${botao("RECEPTIVO", "📥 O cliente me procurou", "O cliente ligou ou mandou mensagem. Vai para o histórico, fora da meta.")}
+      </div>
+      <div class="text-small" style="color:var(--muted);margin-top:6px;text-align:center">
+        Só o contato que <strong>você</strong> iniciou conta na meta do MEC.</div>
+    </div>`;
+}
+
 function crmInteractionView() {
   const form = state.crm.interactionForm;
   const hasClient = Boolean(form.clientName || form.clientKey);
+  if (hasClient) void checarCotacaoReceptivaHoje(form.clientCode || form.clientKey);
   const needsReturn = ["NAO_ATENDEU", "PEDIU_RETORNO"].includes(form.resultCode);
   const resultSold = form.resultCode === "GEROU_PEDIDO";
 
@@ -18398,6 +18452,8 @@ function crmInteractionView() {
             <button class="btn btn-ghost btn-sm" onclick="resetInteractionForm()">Trocar cliente</button>
           </div>
         </div>
+
+        ${blocoIniciativaContato(form)}
 
         <div class="form-card">
           <div class="section-title"><h3>Como foi o contato?</h3></div>
