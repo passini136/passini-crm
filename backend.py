@@ -28982,6 +28982,12 @@ def criar_cotacao(conn: sqlite3.Connection, user: Any, ctx: dict[str, Any], payl
                 "origin": "Cotação",
                 "closingTrigger": "COTACAO",
                 "notes": "Criado a partir de uma cotação do dia.",
+                # O cliente PROCUROU a Passini: o cadastro não pode virar
+                # ligação ATIVA no nome do vendedor. Era isso que gerava os
+                # contatos ativos no mesmo minuto da cotação (13/11/2026). O
+                # atendimento entra no histórico como RECEPTIVO logo abaixo,
+                # por _cotacao_sincronizar_contato.
+                "registerContact": False,
             }, exigir_contato=False)
         except (ValueError, PermissionError) as exc:
             return 400, {"error": str(exc)}
